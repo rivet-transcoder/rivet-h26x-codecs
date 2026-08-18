@@ -21,7 +21,11 @@ def run(exe, f):
     t = time.perf_counter()
     p = subprocess.Popen([exe, f], env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=HIGH_PRIORITY_CLASS)
     if os.environ.get("MT") != "1":
-        kernel32.SetProcessAffinityMask(wintypes.HANDLE(p._handle), ctypes.c_size_t(int(os.environ.get('AFFINITY', '4'), 0)))
+        # Pin to one core so the two builds get the same one. The default is
+        # a high core: the low ones are where everything else on the machine
+        # lands, and measuring there turned a 0.993-1.007 same-binary noise
+        # floor into something that could not separate a real 3% change.
+        kernel32.SetProcessAffinityMask(wintypes.HANDLE(p._handle), ctypes.c_size_t(int(os.environ.get('AFFINITY', '0x40000'), 0)))
     p.wait()
     return time.perf_counter() - t, cpu_seconds(p._handle)
 

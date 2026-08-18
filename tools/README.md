@@ -52,8 +52,35 @@ The suites, and what "accepted" means for each:
 | `benchmark.py [--runs N] [--streams a,b]` | The published comparison: Markdown tables, one per stream, a row per instruction-set rung and one for libavcodec, naming the processor. Cost in CPU seconds, throughput in frames per wall second. This is what the README's benchmark section is generated from — regenerate it rather than editing numbers by hand. |
 
 A caution learned the hard way: a 1–2% difference measured on a loaded machine
-is noise. If something else is building, either stop it or do not believe the
-number.
+is noise, and it is worse than that — measurements taken on a *contended core*
+were not merely noisy but systematically misleading, giving opposite signs on
+two streams for the same change. Two habits that fix it:
+
+**Know your floor before you trust a number.** Run `ab.py` with the *same
+binary as both arguments*. Whatever spread that reports is the smallest
+difference the machine can currently resolve; a change smaller than it has not
+been measured, it has been guessed at. `AFFINITY` picks the core (default
+`0x40000`, a high one — the low cores are where everything else lands).
+
+**Measure the function, not the program,** when the change is a few per cent of
+one hot function. Wrapping that function in `rdtsc` and reporting cycles per
+macroblock row separated variants that whole-program wall clock could not see
+at all, and gave a 2–3% noise floor while the end-to-end number was useless.
+That is how the deblocking rewrite was measured at 0.66x when end to end it
+only showed as 3-4%.
+
+## Traps
+
+`cargo fmt -- src/some/file.rs` does **not** scope to that path: it reformats
+the whole crate. The crate is not rustfmt-clean as a whole — parts of it are
+hand-laid-out — so that is a several-thousand-line diff sitting on top of
+whatever you were doing. To format one file, run `rustfmt --edition 2024
+<file>`, and check `git diff --stat` before committing either way.
+
+The conformance runners work from a frozen copy of the decoder
+(`h26xdec_conf`), so rebuilding mid-run cannot disturb a suite — but it also
+means **a suite run tests the copy, not your latest build**. `verify.sh` makes
+the copy itself; if you invoke a runner directly, refresh the copy first.
 
 ## Profiling
 
