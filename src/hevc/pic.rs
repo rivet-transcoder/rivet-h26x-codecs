@@ -308,7 +308,12 @@ impl PicInfo {
     /// block asks about several neighbours in a row, and all of them compare
     /// against the same z-order address, CTB, slice and tile: derive those
     /// once and hand them to `available_at`.
-    #[inline]
+    ///
+    /// Both halves are `inline(always)`: a caller that asks after only four
+    /// or five neighbours, as intra prediction does, wants the context in
+    /// registers rather than a 32-byte stack temporary, and measures slower
+    /// than the unhoisted test without it.
+    #[inline(always)]
     pub fn avail_ctx(&self, xc: i32, yc: i32, pic_w: i32, pic_h: i32) -> AvailCtx {
         let (xc, yc) = (xc as usize, yc as usize);
         let cc = self.ctb_of(xc, yc);
@@ -324,7 +329,7 @@ impl PicInfo {
 
     /// z-scan availability (6.4.1) of the block containing `(xn, yn)` for the
     /// current block `c` describes.
-    #[inline]
+    #[inline(always)]
     pub fn available_at(&self, c: &AvailCtx, xn: i32, yn: i32) -> bool {
         if xn < 0 || yn < 0 || xn >= c.pic_w || yn >= c.pic_h {
             return false;
