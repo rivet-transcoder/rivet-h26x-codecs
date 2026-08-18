@@ -32,6 +32,9 @@ pub mod hevc_avx2_u8;
 #[cfg(target_arch = "aarch64")]
 #[allow(unused_unsafe)]
 pub mod hevc_neon_u8;
+#[cfg(target_arch = "aarch64")]
+#[allow(unused_unsafe)]
+pub mod neon_dotprod;
 
 /// What the running CPU can do, detected once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +45,15 @@ pub struct Cpu {
     pub sse41: bool,
     /// AArch64 NEON (baseline on every AArch64 CPU).
     pub neon: bool,
+    /// AArch64 with the ARMv8.2-A dot product extension (`sdot` / `udot`):
+    /// four 8-bit products summed into a 32-bit lane, which is the shape of
+    /// the byte-tap interpolation filters. Cortex-A75 and later, Apple A11
+    /// and later — not an exotic target.
+    pub dotprod: bool,
+    /// AArch64 with the ARMv8.6-A 8-bit matrix multiply extension (`usdot` /
+    /// `usmmla`). Detected, but no kernel uses it yet: `neon_dotprod`'s
+    /// module documentation says why it does not pay on these filters.
+    pub i8mm: bool,
 }
 
 impl Cpu {
@@ -51,19 +63,21 @@ impl Cpu {
         {
             let avx2 = std::is_x86_feature_detected!("avx2");
             let sse41 = std::is_x86_feature_detected!("sse4.1");
-            return Self { avx2, sse41, neon: false };
+            return Self { avx2, sse41, ..Self::SCALAR };
         }
         #[cfg(target_arch = "aarch64")]
         {
-            return Self { avx2: false, sse41: false, neon: true };
+            let dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
+            let i8mm = std::arch::is_aarch64_feature_detected!("i8mm");
+            return Self { neon: true, dotprod, i8mm, ..Self::SCALAR };
         }
         #[allow(unreachable_code)]
-        Self { avx2: false, sse41: false, neon: false }
+        Self::SCALAR
     }
 
     /// Scalar only — the reference paths. What the SIMD kernels are checked
     /// against, and what a `H26X_NO_SIMD=1` environment asks for.
-    pub const SCALAR: Self = Self { avx2: false, sse41: false, neon: false };
+    pub const SCALAR: Self = Self { avx2: false, sse41: false, neon: false, dotprod: false, i8mm: false };
 
     /// [`Self::detect`], unless the environment turns SIMD off.
     pub fn detect_honouring_env() -> Self {
