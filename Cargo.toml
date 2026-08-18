@@ -1,18 +1,24 @@
 [package]
 name = "rivet-h26x"
-version.workspace = true
-edition.workspace = true
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
 license-file = "LICENSE.md"
 readme = "README.md"
-repository.workspace = true
-authors.workspace = true
-description = "Native H.264/AVC and H.265/HEVC decoders in pure Rust — no C, no system libraries — with runtime-dispatched SIMD kernels. rivet's software decode tier. Imported as `h26x`."
+repository = "https://github.com/rivet-transcoder/rivet-h26x-codecs"
+homepage = "https://github.com/rivet-transcoder/rivet-h26x-codecs"
+documentation = "https://docs.rs/rivet-h26x"
+authors = ["Ely Erin Fox"]
+description = "Native H.264/AVC and H.265/HEVC decoders in pure Rust — no C, no system libraries — bit-exact against the JVT / JCT-VC conformance suites, frame- and wavefront-threaded, with runtime-dispatched AVX2 / NEON kernels. rivet's software decode tier. Imported as `h26x`."
+keywords = ["h264", "hevc", "h265", "video", "decoder"]
+categories = ["multimedia::video", "multimedia::encoding"]
+exclude = [".github/", "docs/"]
 
 [lib]
 name = "h26x"
 
 [dependencies]
-thiserror.workspace = true
+thiserror = "2"
 
 [dev-dependencies]
 md5 = "0.7"

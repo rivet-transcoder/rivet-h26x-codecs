@@ -1,15 +1,27 @@
 # rivet-h26x
 
-Native **H.264/AVC** and **H.265/HEVC** decoders for the
-**[rivet](https://crates.io/crates/rivet-transcoder)** transcoder: pure Rust,
-no C, no system libraries. They are the software decode tier for the two codecs
-every camera, phone and broadcast chain emits, sitting under the GPU decoders
-(NVDEC / AMF / QSV) so a machine without a usable GPU still decodes.
+[![crates.io](https://img.shields.io/crates/v/rivet-h26x.svg)](https://crates.io/crates/rivet-h26x)
+[![docs.rs](https://docs.rs/rivet-h26x/badge.svg)](https://docs.rs/rivet-h26x)
+[![CI](https://github.com/rivet-transcoder/rivet-h26x-codecs/actions/workflows/ci.yml/badge.svg)](https://github.com/rivet-transcoder/rivet-h26x-codecs/actions/workflows/ci.yml)
 
-Published as `rivet-h26x`; **imported as `h26x`** (`use h26x::…`). This is an
-internal crate of the rivet project — see the
-**[rivet-transcoder](https://crates.io/crates/rivet-transcoder)** crate and the
-[repository](https://github.com/rivet-transcoder/rivet) for the full architecture.
+Native **H.264/AVC** and **H.265/HEVC** decoders in pure Rust: no C, no system
+libraries, nothing to install on a build host. Bit-exact against the JVT and
+JCT-VC conformance suites, frame- and wavefront-threaded, with AVX2 and NEON
+kernels chosen at run time.
+
+Written for the **[rivet](https://github.com/rivet-transcoder/rivet)**
+transcoder, where they are the software decode tier for the two codecs every
+camera, phone and broadcast chain emits — under the GPU decoders (NVDEC / AMF /
+QSV) so a machine without a usable GPU still decodes — and usable on their own
+by anything that has Annex-B NAL units and wants planar pictures back.
+
+Published as `rivet-h26x`; **imported as `h26x`** (`use h26x::…`). One
+dependency (`thiserror`), no features, no build script.
+
+```toml
+[dependencies]
+h26x = { package = "rivet-h26x", version = "0.2" }
+```
 
 ## What it decodes
 
@@ -101,6 +113,11 @@ with x264, x265, OpenH264 or FFmpeg. Source availability was never the
 licensed act; distribution of a decoding product is.
 
 ## Using it
+
+Feed whole NAL units (Annex-B framed, parameter sets included) in decode order;
+pictures come back in output order as [`Picture`](src/picture.rs) — cropped
+planar samples (8-bit as bytes, 9–14-bit as little-endian 16-bit words) with
+the chroma format, bit depth and picture order count of the stream:
 
 ```rust
 let mut dec = h26x::hevc::HevcDecoder::new();   // or h26x::h264::H264Decoder
