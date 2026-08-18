@@ -46,6 +46,10 @@ struct SubBlockTables {
     sig: [[[u8; 16]; 4]; 3],
     /// Inverse 4x4 scan: `[scan_idx][yP * 4 + xP]` = scan position.
     inv4: [[u8; 16]; 3],
+    /// `ctxIdxMap` of a 4x4 block by scan position: `[scan_idx][n]`. Scan
+    /// position 15 is always the last significant coefficient of the block,
+    /// so it has no entry and is never asked for.
+    ctx4: [[u8; 16]; 3],
     /// Inverse sub-block scan: `[scan_idx][log2_sb][yS * w + xS]` = index.
     inv_sb: [[[u8; 64]; 4]; 3],
 }
@@ -53,7 +57,7 @@ struct SubBlockTables {
 fn sub_block_tables() -> &'static SubBlockTables {
     static T: std::sync::OnceLock<SubBlockTables> = std::sync::OnceLock::new();
     T.get_or_init(|| {
-        let mut t = SubBlockTables { pos: [[(0, 0); 16]; 3], sig: [[[0; 16]; 4]; 3], inv4: [[0; 16]; 3], inv_sb: [[[0; 64]; 4]; 3] };
+        let mut t = SubBlockTables { pos: [[(0, 0); 16]; 3], sig: [[[0; 16]; 4]; 3], inv4: [[0; 16]; 3], ctx4: [[0; 16]; 3], inv_sb: [[[0; 64]; 4]; 3] };
         for scan in 0..3 {
             for log2_sb in 0..4 {
                 let w = 1usize << log2_sb;
@@ -65,6 +69,9 @@ fn sub_block_tables() -> &'static SubBlockTables {
             for n in 0..16 {
                 let (xp, yp) = scan_pos(scan as u32, 2, n);
                 t.inv4[scan][yp * 4 + xp] = n as u8;
+                if n < 15 {
+                    t.ctx4[scan][n] = CTX_IDX_MAP_4X4[yp * 4 + xp];
+                }
             }
             for n in 0..16 {
                 let (xp, yp) = scan_pos(scan as u32, 2, n);
@@ -288,33 +295,54 @@ pub fn parse_residual(cabac: &mut Cabac, cx: &mut Contexts, p: &ResidualParams, 
         };
         let sig_ctx_off = SIGNIFICANT_COEFF_FLAG_OFFSET + if c_idx == 0 { 0 } else { 27 };
         if coded {
+            // Significance context per scan position (9.3.4.2.5): which of
+            // the three derivations applies is fixed for the whole transform
+            // block, and the rest depends only on the position inside this
+            // sub-block. Build the context indices of the positions this
+            // sub-block will read, once, instead of deriving one per
+            // coefficient inside the loop below.
+            let mut ctx_of = [0u16; 16];
+            let fill = (start_n + 1) as usize;
+            if let Some(c) = ts_sig_ctx {
+                // Transform-skipped / bypassed: one context for every position.
+                ctx_of[..fill].fill((sig_ctx_off + c - if c_idx == 0 { 0 } else { 27 }) as u16);
+            } else if log2 == 2 {
+                for (t, &m) in ctx_of[..fill].iter_mut().zip(&tabs.ctx4[p.scan_idx as usize]) {
+                    *t = (sig_ctx_off + m as usize) as u16;
+                }
+            } else {
+                for (t, &s) in ctx_of[..fill].iter_mut().zip(sig_tab.iter()) {
+                    *t = (sig_ctx_off + sig_base as usize + s as usize) as u16;
+                }
+                if xs + ys == 0 && fill > 0 {
+                    // (xC, yC) == (0, 0): the DC of the block.
+                    ctx_of[0] = sig_ctx_off as u16;
+                }
+            }
+            // Scan position 0 is the only one that can be inferred, so it
+            // comes after the loop rather than being tested inside it.
             let mut nn = start_n;
-            while nn >= 0 {
+            while nn > 0 {
                 let npos = nn as usize;
-                if npos > 0 || !infer_sb_dc_sig {
-                    let sig_ctx: u32 = if let Some(c) = ts_sig_ctx {
-                        c as u32 - if c_idx == 0 { 0 } else { 27 }
-                    } else if log2 == 2 {
-                        let (xp, yp) = pos_tab[npos];
-                        CTX_IDX_MAP_4X4[((yp as usize) << 2) + xp as usize] as u32
-                    } else if xs + ys == 0 && npos == 0 {
-                        // (xC, yC) == (0, 0): the DC of the block.
-                        0
-                    } else {
-                        sig_base + sig_tab[npos] as u32
-                    };
-                    let f = cabac.decision(&mut cx.c[sig_ctx_off + sig_ctx as usize]) != 0;
-                    if f {
-                        sig_pos[n_sig] = npos as u8;
+                if cabac.decision(&mut cx.c[ctx_of[npos] as usize]) != 0 {
+                    sig_pos[n_sig] = npos as u8;
+                    n_sig += 1;
+                    infer_sb_dc_sig = false;
+                }
+                nn -= 1;
+            }
+            if nn == 0 {
+                if !infer_sb_dc_sig {
+                    if cabac.decision(&mut cx.c[ctx_of[0] as usize]) != 0 {
+                        sig_pos[n_sig] = 0;
                         n_sig += 1;
-                        infer_sb_dc_sig = false;
                     }
                 } else {
-                    // DC of a coded sub-block with no other significant coefficient: inferred 1.
+                    // DC of a coded sub-block with no other significant
+                    // coefficient: inferred 1.
                     sig_pos[n_sig] = 0;
                     n_sig += 1;
                 }
-                nn -= 1;
             }
         }
         if p.trace {
