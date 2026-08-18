@@ -11,6 +11,38 @@ const INTRA_PRED_ANGLE: [i32; 33] = [
 /// `invAngle` for modes 11..=25 (Table 8-5), indexed by `mode - 11`.
 const INV_ANGLE: [i32; 15] = [-4096, -1638, -910, -630, -482, -390, -315, -256, -315, -390, -482, -630, -910, -1638, -4096];
 
+/// Reference-sample scratch, reused from block to block. Every entry a
+/// block reads it writes first — the gathering pass and the substitution
+/// between them define `left[..2n]` and `top[..2n]`, and the reference
+/// buffer is written as far as the angular predictor reaches — so nothing
+/// here needs clearing, while clearing it per transform block cost a
+/// kilobyte and a half of stack traffic.
+pub struct IntraScratch {
+    /// `p[-1][y]` and `p[x][-1]` for y, x in 0..2n.
+    left: [i32; 64],
+    top: [i32; 64],
+    /// The smoothing filter's output.
+    fl: [i32; 64],
+    ft: [i32; 64],
+    /// `ref[]` of the angular predictor, biased by `n`.
+    ref_buf: [i32; 3 * 64 + 1],
+    /// Which reference samples may be used.
+    pub avail: RefAvail,
+}
+
+impl Default for IntraScratch {
+    fn default() -> Self {
+        IntraScratch {
+            left: [0; 64],
+            top: [0; 64],
+            fl: [0; 64],
+            ft: [0; 64],
+            ref_buf: [0; 3 * 64 + 1],
+            avail: RefAvail { corner: false, left: [false; 64], top: [false; 64] },
+        }
+    }
+}
+
 /// Availability of each reference sample of a block: `left[0..2n]` for
 /// `p[-1][y]`, `top[0..2n]` for `p[x][-1]`, and the corner.
 pub struct RefAvail {
@@ -29,11 +61,12 @@ pub struct RefAvail {
 /// range extension disables it), `boundary_filter` whether DC and the pure
 /// horizontal / vertical modes smooth the block edge (luma, unless a
 /// lossless block with implicit RDPCM), `bit_depth` the sample depth,
-/// `strong` the SPS strong intra smoothing flag, `avail` says which
-/// neighbouring samples may be used.
+/// `strong` the SPS strong intra smoothing flag; `sc.avail` says which
+/// neighbouring samples may be used and the rest of `sc` is scratch.
 #[allow(clippy::too_many_arguments)]
 pub fn predict<S: Sample>(
     plane: &mut Plane16<S>,
+    sc: &mut IntraScratch,
     x0: usize,
     y0: usize,
     n: usize,
@@ -43,16 +76,14 @@ pub fn predict<S: Sample>(
     boundary_filter: bool,
     bit_depth: u32,
     strong: bool,
-    avail: &RefAvail,
 ) {
+    let IntraScratch { left, top, fl, ft, ref_buf, avail } = sc;
     let stride = plane.stride;
     let base = plane.offset(x0 as isize, y0 as isize);
     // Gather p[-1][-1..2n-1] (index 0 = corner, 1..=2n = left samples y=0..)
     // and p[-1..2n-1][-1] (index 0 = corner, 1..=2n = top samples).
     // We use two arrays: left[y] for y in 0..2n, top[x] for x in 0..2n, corner.
     let n2 = 2 * n;
-    let mut left = [0i32; 64];
-    let mut top = [0i32; 64];
     let mut corner: i32 = 0;
     let mut any = false;
     if avail.corner {
@@ -135,8 +166,6 @@ pub fn predict<S: Sample>(
             _ => 10, // never filtered
         };
         if min_dist > thres {
-            let mut fl = [0i32; 64];
-            let mut ft = [0i32; 64];
             let bi = strong
                 && c_idx == 0
                 && n == 32
@@ -165,8 +194,8 @@ pub fn predict<S: Sample>(
                 }
                 ft[n2 - 1] = top[n2 - 1];
             }
-            left = fl;
-            top = ft;
+            left[..n2].copy_from_slice(&fl[..n2]);
+            top[..n2].copy_from_slice(&ft[..n2]);
             corner = fc;
         }
     }
@@ -209,7 +238,6 @@ pub fn predict<S: Sample>(
         _ => {
             let angle = INTRA_PRED_ANGLE[(mode - 2) as usize];
             // ref[] with an offset so negative indices work: ref_buf[i + n]
-            let mut ref_buf = [0i32; 3 * 64 + 1];
             let off = n as i32; // ref[k] at ref_buf[(k + off) as usize]
             if mode >= 18 {
                 // ref[x] = p[-1+x][-1] for x = 0..n  (ref[0] = corner)

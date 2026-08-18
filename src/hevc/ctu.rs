@@ -10,7 +10,7 @@ use crate::{Error, Result};
 use super::ctx::*;
 use super::frame::{Frame, MotionInfo, Mv, SharedFrame, Sample};
 use super::inter::{McScratch, Weighting, predict_block};
-use super::intra::{RefAvail, predict as intra_predict};
+use super::intra::{IntraScratch, predict as intra_predict};
 use super::mvpred::{Cand, PuPos, RefCtx, amvp, merge_candidate};
 use super::pic::{AvailCtx, PicInfo, SaoParams};
 use super::pps::Pps;
@@ -137,6 +137,8 @@ pub struct SliceDec<'a, S: Sample = u16> {
     pub dsp: HevcDsp<S>,
     /// Motion compensation scratch.
     pub mc: McScratch<S>,
+    /// Intra reference-sample scratch.
+    pub intra: IntraScratch,
     /// Non-fatal problems seen.
     pub warnings: u64,
     /// Debug tracing (from the `H26X_TRACE_*` environment variables).
@@ -1155,22 +1157,27 @@ impl<'a, S: Sample> SliceDec<'a, S> {
         let xl = (x * sw) as i32;
         let yl = (y * sh) as i32;
         let cip = self.pps.constrained_intra_pred;
-        let mut av = RefAvail { corner: false, left: [false; 64], top: [false; 64] };
         // Every reference sample is a neighbour of this one transform block.
         let ac = self.avail_ctx(xl, yl);
-        let check = |s: &Self, xn: i32, yn: i32| -> bool {
-            if !s.info.available_at(&ac, xn, yn) {
+        let (pw, ph) = (self.frame.width as i32, self.frame.height as i32);
+        let bd = if c_idx == 0 { self.sps.bit_depth_luma } else { self.sps.bit_depth_chroma };
+        let strong = self.sps.strong_intra_smoothing;
+        let filter = (c_idx == 0 || self.sps.chroma_array_type() == 3) && !self.sps.intra_smoothing_disabled();
+        let boundary_filter = c_idx == 0 && !(self.sps.implicit_rdpcm() && bypass);
+        // Borrow the side data on its own so the scratch, which lives beside
+        // it, stays reachable.
+        let info: &PicInfo = self.info;
+        let check = |xn: i32, yn: i32| -> bool {
+            if !info.available_at(&ac, xn, yn) {
                 return false;
             }
-            !cip || s.info.pred_mode[s.info.idx4(xn as usize, yn as usize)] == 1
+            !cip || info.pred_mode[info.idx4(xn as usize, yn as usize)] == 1
         };
-        av.corner = check(self, xl - 1, yl - 1);
         // Left samples y = 0..2n and top samples x = 0..2n, in units of 4x4
         // luma blocks. Without constrained intra prediction, availability is
         // uniform over each aligned n-block of neighbours (the left n-block,
         // the below-left n-block: z-scan order decides for the whole block)
         // as long as it lies inside the picture — one check per half.
-        let (pw, ph) = (self.frame.width as i32, self.frame.height as i32);
         let side = |vertical: bool, av_side: &mut [bool; 64]| {
             // Along this edge: the subsampling and the luma span of the block.
             let scale = if vertical { sh } else { sw };
@@ -1181,7 +1188,7 @@ impl<'a, S: Sample> SliceDec<'a, S> {
                 let (nx, ny) = if vertical { (xl - 1, yl + half as i32 * span) } else { (xl + half as i32 * span, yl - 1) };
                 let inside = if vertical { ny + span <= ph } else { nx + span <= pw };
                 if !cip && inside {
-                    let a = check(self, nx, ny);
+                    let a = check(nx, ny);
                     for k in 0..n {
                         if start + k < 64 {
                             av_side[start + k] = a;
@@ -1191,7 +1198,7 @@ impl<'a, S: Sample> SliceDec<'a, S> {
                     let mut i = 0;
                     while i < n {
                         let (cx, cy) = if vertical { (nx, ny + (i * scale) as i32) } else { (nx + (i * scale) as i32, ny) };
-                        let a = check(self, cx, cy);
+                        let a = check(cx, cy);
                         for k in 0..unit {
                             if start + i + k < 64 {
                                 av_side[start + i + k] = a;
@@ -1202,18 +1209,17 @@ impl<'a, S: Sample> SliceDec<'a, S> {
                 }
             }
         };
-        side(true, &mut av.left);
-        side(false, &mut av.top);
-        let bd = if c_idx == 0 { self.sps.bit_depth_luma } else { self.sps.bit_depth_chroma };
-        let strong = self.sps.strong_intra_smoothing;
-        let filter = (c_idx == 0 || self.sps.chroma_array_type() == 3) && !self.sps.intra_smoothing_disabled();
-        let boundary_filter = c_idx == 0 && !(self.sps.implicit_rdpcm() && bypass);
+        let corner = check(xl - 1, yl - 1);
+        let sc = &mut self.intra;
+        sc.avail.corner = corner;
+        side(true, &mut sc.avail.left);
+        side(false, &mut sc.avail.top);
         let plane = match c_idx {
             0 => &mut self.frame.y,
             1 => &mut self.frame.cb,
             _ => &mut self.frame.cr,
         };
-        intra_predict(plane, x, y, n, mode, c_idx, filter, boundary_filter, bd, strong, &av);
+        intra_predict(plane, sc, x, y, n, mode, c_idx, filter, boundary_filter, bd, strong);
     }
 
     /// Cross-component prediction for a chroma block without a residual of

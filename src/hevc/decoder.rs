@@ -30,6 +30,7 @@ use crate::threading::{Pool, default_threads, prof};
 use crate::{Error, Result};
 
 use super::ctu::{SliceDec, TraceCfg};
+use super::intra::IntraScratch;
 use super::ctx::Contexts;
 use super::deblock::{DeblockScratch, deblock_rows};
 use super::dpb::{Dpb, DpbPic, RefSets};
@@ -496,6 +497,7 @@ fn run_substream<S: Sample>(pic_arc: &Arc<PicShared<S>>, seg_arc: &Arc<Segment>,
             }
             m
         },
+        intra: IntraScratch::default(),
         warnings: 0,
         trace: pic.trace,
     };
