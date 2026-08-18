@@ -109,6 +109,31 @@ impl Cpu {
         i8mm: false,
     };
 
+    /// The name of the widest rung this `Cpu` selects, for reporting.
+    ///
+    /// Which rung a machine takes decides its speed by more than a factor of
+    /// two, so a user who cannot ask which one they got cannot make sense of
+    /// a measurement. `h26xdec --rung` prints this.
+    pub fn rung(&self) -> &'static str {
+        if self.avx2 {
+            "AVX2"
+        } else if self.avx {
+            "AVX (VEX-128)"
+        } else if self.sse41 {
+            "SSE4.1"
+        } else if self.ssse3 {
+            "SSSE3"
+        } else if self.sse2 {
+            "SSE2"
+        } else if self.dotprod {
+            "NEON + DotProd"
+        } else if self.neon {
+            "NEON"
+        } else {
+            "scalar"
+        }
+    }
+
     /// [`Self::detect`], with what it found capped by the environment.
     ///
     /// `H26X_NO_SIMD=1` asks for the scalar reference paths. `H26X_MAX_SIMD`

@@ -62,8 +62,13 @@ impl Dec {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() == 2 && args[1] == "--rung" {
+        println!("{}", h26x::dsp::Cpu::detect_honouring_env().rung());
+        return;
+    }
     if args.len() < 2 {
-        eprintln!("usage: h26xdec <input.264|.265> [out.yuv]");
+        eprintln!("usage: h26xdec <input.264|.265> [out.yuv]
+       h26xdec --rung");
         std::process::exit(2);
     }
     let path = &args[1];

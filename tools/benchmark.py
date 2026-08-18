@@ -14,6 +14,12 @@ disk. Cost is CPU seconds (user+kernel) — wall time on a machine doing
 anything else measures the scheduler — and throughput is frames per wall
 second, which is what a multi-threaded run is actually for.
 
+Best of N, not the median: these are absolute costs, where the fastest run is
+the one least disturbed by everything else on the machine. That is the
+opposite of the choice `ab.py` makes, and for the opposite reason — comparing
+two builds divides one noisy measurement by another, and there the minimum is
+the statistic a single lucky run can poison.
+
   python benchmark.py [--runs N] [--dec PATH] [--ffmpeg PATH] [--streams a,b]
 """
 import argparse
@@ -107,7 +113,18 @@ def available_tiers():
                 ("scalar", {"H26X_NO_SIMD": "1"})]
     return [("AVX2", {}), ("AVX (VEX-128)", {"H26X_MAX_SIMD": "avx"}),
             ("SSE4.1", {"H26X_MAX_SIMD": "sse41"}),
+            ("SSSE3", {"H26X_MAX_SIMD": "ssse3"}),
+            ("SSE2", {"H26X_MAX_SIMD": "sse2"}),
             ("scalar", {"H26X_NO_SIMD": "1"})]
+
+
+def selected_rung(dec):
+    """The rung the decoder picks when nothing caps it — what a user gets."""
+    try:
+        return subprocess.run([dec, "--rung"], capture_output=True, text=True,
+                              timeout=60).stdout.strip()
+    except Exception:
+        return ""
 
 
 def main():
@@ -129,31 +146,39 @@ def main():
                     "bbb_720p_cabac.264", "bbb_720p_cavlc.264",
                     "bbb_720p_hevc.265", "bbb_720p_wpp.265") if os.path.exists(f)][:4]
     threads = cpu_threads()
+    tiers = available_tiers()
+    picked = selected_rung(args.dec)
+    selected = next((i for i, (n, _) in enumerate(tiers) if n == picked), -1)
 
-    print(f"**{cpu_name()}**, {threads} hardware threads. Best of {args.runs}. "
+    print(f"**{cpu_name()}**, {threads} hardware threads, "
+          f"selecting **{picked or 'unknown'}**. Best of {args.runs}. "
           f"Cost is CPU seconds, throughput is frames per wall second.\n")
 
     for path in streams:
         frames, w, h = stream_info(args.dec, path)
         codec = "H.265" if path.endswith((".265", ".hevc")) else "H.264"
         print(f"### `{path}` — {codec}, {w}x{h}, {frames} frames\n")
-        print("| instructions | 1 thread: CPU s | fps | all threads: CPU s | fps |")
-        print("|---|---:|---:|---:|---:|")
+        print("| instructions | 1 thread: CPU s | vs libav | fps | "
+              "all threads: CPU s | fps |")
+        print("|---|---:|---:|---:|---:|---:|")
+        f1, _ = run_best([args.ffmpeg, "-threads", "1", "-i", path, "-f",
+                          "rawvideo", "-y", null], {}, args.runs)
+        fm, fmw = run_best([args.ffmpeg, "-i", path, "-f", "rawvideo", "-y",
+                            null], {}, args.runs)
         rows = []
-        for name, extra in available_tiers():
+        for name, extra in tiers:
             e1 = dict(extra, H26X_THREADS="1", H26XDEC_NOMD5="1")
             em = dict(extra, H26XDEC_NOMD5="1")
             c1, _ = run_best([args.dec, path], e1, args.runs)
             cm, wm = run_best([args.dec, path], em, args.runs)
             rows.append((name, c1, frames / c1 if c1 else 0, cm,
                          frames / wm if wm else 0))
-        f1, _ = run_best([args.ffmpeg, "-threads", "1", "-i", path, "-f",
-                          "rawvideo", "-y", null], {}, args.runs)
-        fm, fmw = run_best([args.ffmpeg, "-i", path, "-f", "rawvideo", "-y",
-                            null], {}, args.runs)
-        for name, c1, fps1, cm, fpsm in rows:
-            print(f"| {name} | {c1:.3f} | {fps1:.0f} | {cm:.3f} | {fpsm:.0f} |")
-        print(f"| libavcodec | {f1:.3f} | {frames / f1 if f1 else 0:.0f} | "
+        for i, (name, c1, fps1, cm, fpsm) in enumerate(rows):
+            # The rung this CPU selects on its own is the one a user gets.
+            tag = f"**{name}**" if i == selected else name
+            print(f"| {tag} | {c1:.3f} | {c1 / f1:.2f}x | {fps1:.0f} | "
+                  f"{cm:.3f} | {fpsm:.0f} |")
+        print(f"| libavcodec | {f1:.3f} | 1.00x | {frames / f1 if f1 else 0:.0f} | "
               f"{fm:.3f} | {frames / fmw if fmw else 0:.0f} |")
         best = rows[0]
         print(f"\nWidest rung against libavcodec: **{best[1] / f1:.2f}x** its "
