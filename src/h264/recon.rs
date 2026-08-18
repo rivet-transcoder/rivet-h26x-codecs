@@ -455,8 +455,8 @@ pub fn derive<S: Sample>(
     // Only CABAC reads the neighbours' mvds (context selection).
     if ctx.cabac {
         for l in 0..2 {
-            for b in 0..16 {
-                info.mvd[l][base + b] = layer.mvd[b].mvd[l];
+            for (d, e) in info.mvd[l][base..base + 16].iter_mut().zip(&layer.mvd) {
+                *d = e.mvd[l];
             }
         }
     }
