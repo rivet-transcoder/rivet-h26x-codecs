@@ -57,6 +57,30 @@ pub struct MotionInfo {
 
 const _: () = assert!(std::mem::size_of::<MotionInfo>() == 16);
 
+/// Fill a rectangle of per-4x4 motion entries with one value. `MotionInfo`
+/// is exactly a 16-byte word of plain data, but the generic fill leaves a
+/// scalar loop with an iterator compare per entry; a splat of 16-byte stores
+/// is what these two- to sixteen-wide rows want (the same reasoning as
+/// `PicInfo::fill4`).
+#[inline(always)]
+pub fn fill_motion(motion: &mut [MotionInfo], w4: usize, x: usize, y: usize, w: usize, h: usize, v: MotionInfo) {
+    let (bx0, bx1) = (x >> 2, (x + w) >> 2);
+    if bx1 <= bx0 {
+        return;
+    }
+    // SAFETY: `MotionInfo` is 16 bytes of plain data (asserted above), so the
+    // copy reads exactly the value; `transmute_copy` does not assume alignment.
+    let word: u128 = unsafe { std::mem::transmute_copy(&v) };
+    for by in (y >> 2)..((y + h) >> 2) {
+        let row = &mut motion[by * w4 + bx0..by * w4 + bx1];
+        let p = row.as_mut_ptr() as *mut u128;
+        for i in 0..row.len() {
+            // SAFETY: `row` holds `row.len()` entries of exactly 16 bytes.
+            unsafe { std::ptr::write_unaligned(p.add(i), word) };
+        }
+    }
+}
+
 impl Default for MotionInfo {
     fn default() -> Self {
         MotionInfo::INTRA

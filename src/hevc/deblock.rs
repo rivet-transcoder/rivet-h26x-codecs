@@ -53,7 +53,7 @@ fn motion_bs(a: &MotionInfo, b: &MotionInfo) -> u8 {
 /// Compute the boundary strengths of the vertical (`ver`) and horizontal
 /// (`hor`) edges at 4x4 granularity (index = 4x4 block whose left / top
 /// side the edge is; only the 8x8 luma grid gets nonzero values).
-fn boundary_strengths<S: Sample>(frame: &Frame<S>, info: &PicInfo, pps: &Pps, by0: usize, by1: usize, ver: &mut Vec<u8>, hor: &mut Vec<u8>) {
+fn boundary_strengths<S: Sample>(frame: &Frame<S>, info: &PicInfo, pps: &Pps, by0: usize, by1: usize, ver: &mut Vec<u8>, hor: &mut Vec<u8>) -> [u8; 2] {
     let w4 = info.w4;
     ver.clear();
     ver.resize(w4 * (by1 - by0), 0);
@@ -61,6 +61,7 @@ fn boundary_strengths<S: Sample>(frame: &Frame<S>, info: &PicInfo, pps: &Pps, by
     hor.resize(w4 * (by1 - by0), 0);
     let ctb_mask = (1usize << info.log2_ctb) - 1;
     let wc = info.wc;
+    let mut or = [0u8; 2];
     for by in by0..by1 {
         let y = by * 4;
         // Horizontal edges lie on the 8-sample grid: odd 4x4 rows have none,
@@ -115,13 +116,15 @@ fn boundary_strengths<S: Sample>(frame: &Frame<S>, info: &PicInfo, pps: &Pps, by
                     }
                 }
                 if ok {
-                    ver[out + bx] = if intra_q || info.pred_mode[p] == 1 {
+                    let b = if intra_q || info.pred_mode[p] == 1 {
                         2
                     } else if (edges & 1) != 0 && (info.cbf_luma[p] != 0 || info.cbf_luma[q] != 0) {
                         1
                     } else {
                         motion_bs(&frame.motion[p], mq)
                     };
+                    ver[out + bx] = b;
+                    or[0] |= b;
                 }
             }
             // Horizontal edge on the top side.
@@ -139,18 +142,21 @@ fn boundary_strengths<S: Sample>(frame: &Frame<S>, info: &PicInfo, pps: &Pps, by
                     }
                 }
                 if ok {
-                    hor[out + bx] = if intra_q || info.pred_mode[p] == 1 {
+                    let b = if intra_q || info.pred_mode[p] == 1 {
                         2
                     } else if (edges & 4) != 0 && (info.cbf_luma[p] != 0 || info.cbf_luma[q] != 0) {
                         1
                     } else {
                         motion_bs(&frame.motion[p], mq)
                     };
+                    hor[out + bx] = b;
+                    or[1] |= b;
                 }
             }
             bx += bx_step;
         }
     }
+    or
 }
 
 /// The slice filter parameters of the CTB a luma sample belongs to,
@@ -202,7 +208,7 @@ pub fn deblock_rows<S: Sample>(dsp: &HevcDsp<S>, scratch: &mut DeblockScratch, f
         return;
     }
     let w4 = info.w4;
-    boundary_strengths(frame, info, pps, by0, by1, &mut scratch.ver, &mut scratch.hor);
+    let or = boundary_strengths(frame, info, pps, by0, by1, &mut scratch.ver, &mut scratch.hor);
     let max_l = (1i32 << bit_depth_luma) - 1;
     let max_c = (1i32 << bit_depth_chroma) - 1;
     let sh_l = bit_depth_luma as i32 - 8;
@@ -234,6 +240,11 @@ pub fn deblock_rows<S: Sample>(dsp: &HevcDsp<S>, scratch: &mut DeblockScratch, f
     let mut slices = SliceCache { ctb: usize::MAX, idx: 0 };
 
     for pass in 0..2 {
+        // Nothing to filter on this pass: no edge of these rows has a
+        // boundary strength at all.
+        if or[pass] == 0 {
+            continue;
+        }
         let bs = if pass == 0 { &scratch.ver } else { &scratch.hor };
         // Luma: pairs of segments along the edge (two rows for a vertical
         // edge, two columns for a horizontal one).
@@ -320,7 +331,7 @@ pub fn deblock_rows<S: Sample>(dsp: &HevcDsp<S>, scratch: &mut DeblockScratch, f
         // segment is 4 / SubHeightC (vertical edges) or 4 / SubWidthC
         // (horizontal) chroma lines, so it feeds one kernel segment in 4:2:0
         // and two (same parameters) where chroma is not subsampled that way.
-        if has_chroma {
+        if has_chroma && or[pass] & 2 != 0 {
             let stride = frame.cb.stride;
             if pass == 0 {
                 // Vertical edges: chroma x on the 8-grid = luma x on the 8·SubWidthC grid.
