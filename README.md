@@ -6,8 +6,8 @@
 
 Native **H.264/AVC** and **H.265/HEVC** decoders in pure Rust: no C, no system
 libraries, nothing to install on a build host. Bit-exact against the JVT and
-JCT-VC conformance suites, frame- and wavefront-threaded, with AVX2 and NEON
-kernels chosen at run time.
+JCT-VC conformance suites, frame- and wavefront-threaded, with AVX2, AVX /
+SSE4.1 and NEON kernels chosen at run time.
 
 Written for the **[rivet](https://github.com/rivet-transcoder/rivet)**
 transcoder, where they are the software decode tier for the two codecs every
@@ -73,10 +73,15 @@ machine (`H26X_THREADS`, default every core, up to 32):
 The pixel kernels — interpolation, weighting, inverse transforms, residual add,
 SAO for H.265; the sixteen quarter-sample positions, chroma bilinear, averaging
 and weighting for H.264 — sit behind a function table filled at run time from
-what the CPU has: **AVX2** on x86-64, **NEON** on AArch64, scalar otherwise
-(`H26X_NO_SIMD=1` forces scalar). Every SIMD kernel is checked bit-exact against
-the scalar reference by the crate's tests, on both architectures in CI.
-`H26X_PROF=1` prints where the time went.
+what the CPU has: **AVX2** on x86-64, **AVX** or **SSE4.1** on the x86-64 CPUs
+without it, **NEON** on AArch64, scalar otherwise. The AVX / SSE4.1 tier is the
+same kernels at 128 bits: AVX adds no 256-bit *integer* operation — that is
+AVX2 — so what it buys over SSE4.1 is VEX's three-operand encoding, worth a
+couple of per cent, while the step from scalar to either is worth 2.3–2.7x.
+`H26X_NO_SIMD=1` forces scalar and `H26X_MAX_SIMD=avx | sse41 | none` caps the
+x86 tier, so one machine can exercise all of them. Every SIMD kernel is checked
+bit-exact against the scalar reference by the crate's tests, on both
+architectures in CI. `H26X_PROF=1` prints where the time went.
 
 **Speed** (2026-08-18, one Ryzen 5 5600X 6C/12T box, 720p Big Buck Bunny
 clips, whole-file decode into output pictures; libavcodec 8.0 writing raw

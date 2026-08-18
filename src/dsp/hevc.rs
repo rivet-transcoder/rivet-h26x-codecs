@@ -239,6 +239,14 @@ impl HevcDsp<u8> {
 /// SIMD kernels for 16-bit sample planes.
 #[allow(unused_variables)]
 pub fn install_simd_u16(d: &mut HevcDsp<u16>, cpu: Cpu) {
+    // Widest last: the 128-bit install is the floor for every SSE4.1 CPU,
+    // and AVX2 overwrites the entries it has a wider kernel for.
+    #[cfg(target_arch = "x86_64")]
+    if cpu.avx {
+        super::hevc_avx::install_avx_u16(d);
+    } else if cpu.sse41 {
+        super::hevc_avx::install_sse41_u16(d);
+    }
     #[cfg(target_arch = "x86_64")]
     if cpu.avx2 {
         super::hevc_avx2::install(d);
@@ -252,6 +260,12 @@ pub fn install_simd_u16(d: &mut HevcDsp<u16>, cpu: Cpu) {
 /// SIMD kernels for 8-bit sample planes.
 #[allow(unused_variables)]
 pub fn install_simd_u8(d: &mut HevcDsp<u8>, cpu: Cpu) {
+    #[cfg(target_arch = "x86_64")]
+    if cpu.avx {
+        super::hevc_avx::install_avx_u8(d);
+    } else if cpu.sse41 {
+        super::hevc_avx::install_sse41_u8(d);
+    }
     #[cfg(target_arch = "x86_64")]
     if cpu.avx2 {
         super::hevc_avx2_u8::install(d);

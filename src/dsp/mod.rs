@@ -16,10 +16,16 @@ pub mod hevc;
 // functions.
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_unsafe)]
+pub mod h264_avx;
+#[cfg(target_arch = "x86_64")]
+#[allow(unused_unsafe)]
 pub mod h264_avx2;
 #[cfg(target_arch = "aarch64")]
 #[allow(unused_unsafe)]
 pub mod h264_neon;
+#[cfg(target_arch = "x86_64")]
+#[allow(unused_unsafe)]
+pub mod hevc_avx;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_unsafe)]
 pub mod hevc_avx2;
@@ -39,8 +45,10 @@ pub mod neon_dotprod;
 /// What the running CPU can do, detected once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cpu {
-    /// x86-64 with AVX2 (implies SSE4.1 / SSSE3).
+    /// x86-64 with AVX2 (implies AVX / SSE4.1 / SSSE3).
     pub avx2: bool,
+    /// x86-64 with AVX: the 128-bit kernels, VEX-encoded.
+    pub avx: bool,
     /// x86-64 with SSE4.1 (a superset of the SSSE3 kernels need).
     pub sse41: bool,
     /// AArch64 NEON (baseline on every AArch64 CPU).
@@ -62,8 +70,9 @@ impl Cpu {
         #[cfg(target_arch = "x86_64")]
         {
             let avx2 = std::is_x86_feature_detected!("avx2");
+            let avx = std::is_x86_feature_detected!("avx");
             let sse41 = std::is_x86_feature_detected!("sse4.1");
-            return Self { avx2, sse41, ..Self::SCALAR };
+            return Self { avx2, avx, sse41, ..Self::SCALAR };
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -77,14 +86,35 @@ impl Cpu {
 
     /// Scalar only — the reference paths. What the SIMD kernels are checked
     /// against, and what a `H26X_NO_SIMD=1` environment asks for.
-    pub const SCALAR: Self = Self { avx2: false, sse41: false, neon: false, dotprod: false, i8mm: false };
+    pub const SCALAR: Self =
+        Self { avx2: false, avx: false, sse41: false, neon: false, dotprod: false, i8mm: false };
 
-    /// [`Self::detect`], unless the environment turns SIMD off.
+    /// [`Self::detect`], with what it found capped by the environment.
+    ///
+    /// `H26X_NO_SIMD=1` asks for the scalar reference paths. `H26X_MAX_SIMD`
+    /// caps the x86 install level — `avx2` (no cap), `avx`, `sse41` or `none`
+    /// — so the 128-bit and scalar paths can be exercised for bit-exactness
+    /// on a machine whose CPU would otherwise always take the widest one.
+    /// An unrecognised value is ignored rather than silently downgrading.
     pub fn detect_honouring_env() -> Self {
         if std::env::var_os("H26X_NO_SIMD").is_some_and(|v| v == "1" || v == "true") {
-            Self::SCALAR
-        } else {
-            Self::detect()
+            return Self::SCALAR;
         }
+        let mut cpu = Self::detect();
+        match std::env::var("H26X_MAX_SIMD").as_deref() {
+            Ok("none") | Ok("scalar") => cpu = Self::SCALAR,
+            Ok("sse41") | Ok("sse4.1") => {
+                cpu.avx2 = false;
+                cpu.avx = false;
+            }
+            Ok("avx") => cpu.avx2 = false,
+            // AArch64: cap at baseline NEON.
+            Ok("neon") => {
+                cpu.dotprod = false;
+                cpu.i8mm = false;
+            }
+            _ => {}
+        }
+        cpu
     }
 }
