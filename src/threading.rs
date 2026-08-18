@@ -14,13 +14,15 @@ use std::thread::JoinHandle;
 
 /// Row progress of a picture being decoded.
 ///
-/// `decoded` — luma rows whose blocks are reconstructed (samples before the
-/// loop filters, motion vectors final); `done` — luma rows that are final
-/// and edge-extended, safe to motion-compensate from. Both are prefix
-/// counts (everything above them is ready), never decreasing, and reach the
-/// picture height (or [`Progress::COMPLETE`]) when the picture is finished
-/// or abandoned.
+/// `derived` — luma rows whose macroblocks are parsed and their motion
+/// derived (what a later picture's direct modes read); `decoded` — luma
+/// rows whose blocks are reconstructed (samples before the loop filters);
+/// `done` — luma rows that are final and edge-extended, safe to
+/// motion-compensate from. All are prefix counts (everything above them is
+/// ready), never decreasing, and reach the picture height (or
+/// [`Progress::COMPLETE`]) when the picture is finished or abandoned.
 pub struct Progress {
+    derived: AtomicI32,
     decoded: AtomicI32,
     done: AtomicI32,
     lock: Mutex<()>,
@@ -35,15 +37,26 @@ impl Progress {
 
     /// Nothing done yet.
     pub fn new() -> Self {
-        Progress { decoded: AtomicI32::new(0), done: AtomicI32::new(0), lock: Mutex::new(()), cv: Condvar::new(), error: AtomicBool::new(false) }
+        Progress { derived: AtomicI32::new(0), decoded: AtomicI32::new(0), done: AtomicI32::new(0), lock: Mutex::new(()), cv: Condvar::new(), error: AtomicBool::new(false) }
     }
 
     /// Already complete (a generated or synchronously decoded picture).
     pub fn complete() -> Self {
         let p = Self::new();
+        p.derived.store(Self::COMPLETE, Ordering::Release);
         p.decoded.store(Self::COMPLETE, Ordering::Release);
         p.done.store(Self::COMPLETE, Ordering::Release);
         p
+    }
+
+    /// Rows `< y` are parsed and their motion derived.
+    pub fn set_derived(&self, y: i32) {
+        if self.derived.load(Ordering::Relaxed) >= y {
+            return;
+        }
+        let _g = self.lock.lock().unwrap();
+        self.derived.fetch_max(y, Ordering::AcqRel);
+        self.cv.notify_all();
     }
 
     /// Rows `< y` are reconstructed.
@@ -71,6 +84,7 @@ impl Progress {
     /// Everything is final (or abandoned after an error).
     pub fn finish(&self) {
         let _g = self.lock.lock().unwrap();
+        self.derived.store(Self::COMPLETE, Ordering::Release);
         self.decoded.store(Self::COMPLETE, Ordering::Release);
         self.done.store(Self::COMPLETE, Ordering::Release);
         self.cv.notify_all();
@@ -101,6 +115,21 @@ impl Progress {
         }
     }
 
+    /// Block until rows `< y` are parsed and their motion derived.
+    pub fn wait_derived(&self, y: i32) {
+        if self.derived.load(Ordering::Acquire) >= y {
+            return;
+        }
+        let t = std::time::Instant::now();
+        let mut g = self.lock.lock().unwrap();
+        while self.derived.load(Ordering::Acquire) < y {
+            g = self.cv.wait(g).unwrap();
+        }
+        if prof::enabled() {
+            prof::add(&prof::WAIT_REF, t);
+        }
+    }
+
     /// Block until rows `< y` are reconstructed.
     pub fn wait_decoded(&self, y: i32) {
         if self.decoded.load(Ordering::Acquire) >= y {
@@ -123,6 +152,55 @@ impl Progress {
 }
 
 impl Default for Progress {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A monotonic count other threads can wait on: how many macroblocks of a
+/// row are reconstructed, how many of a picture's rows are done. Waiting
+/// takes the lock only when the count is short.
+pub struct Counter {
+    value: std::sync::atomic::AtomicU32,
+    lock: Mutex<()>,
+    cv: Condvar,
+}
+
+impl Counter {
+    /// Zero.
+    pub const fn new() -> Self {
+        Counter { value: std::sync::atomic::AtomicU32::new(0), lock: Mutex::new(()), cv: Condvar::new() }
+    }
+
+    /// The count.
+    #[inline]
+    pub fn get(&self) -> u32 {
+        self.value.load(Ordering::Acquire)
+    }
+
+    /// Set the count to at least `v` (never lower) and wake waiters.
+    pub fn publish(&self, v: u32) {
+        if self.value.load(Ordering::Relaxed) >= v {
+            return;
+        }
+        let _g = self.lock.lock().unwrap();
+        self.value.fetch_max(v, Ordering::AcqRel);
+        self.cv.notify_all();
+    }
+
+    /// Block until the count is at least `v`.
+    pub fn wait_ge(&self, v: u32) {
+        if self.value.load(Ordering::Acquire) >= v {
+            return;
+        }
+        let mut g = self.lock.lock().unwrap();
+        while self.value.load(Ordering::Acquire) < v {
+            g = self.cv.wait(g).unwrap();
+        }
+    }
+}
+
+impl Default for Counter {
     fn default() -> Self {
         Self::new()
     }

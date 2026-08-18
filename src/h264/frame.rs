@@ -775,6 +775,22 @@ impl<S: Sample> SharedFrame<S> {
         }
     }
 
+    /// Block until frame rows `< y` of the picture `parity` are parsed and
+    /// their motion derived (what direct prediction reads of a colocated
+    /// picture).
+    pub fn wait_derived(&self, parity: u8, y: i32) {
+        for p in Self::parities(parity) {
+            self.progress[p].wait_derived(y);
+        }
+    }
+
+    /// Frame rows `< y` of the picture `parity` are parsed and derived.
+    pub fn set_derived(&self, parity: u8, y: i32) {
+        for p in Self::parities(parity) {
+            self.progress[p].set_derived(y);
+        }
+    }
+
     /// Both fields (the frame) finished.
     pub fn is_complete(&self) -> bool {
         self.progress[0].is_complete() && self.progress[1].is_complete()

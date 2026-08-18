@@ -629,6 +629,10 @@ impl<S: Sample> RowFilters<'_, S> {
             let dst: &mut Frame<S> = unsafe { self.shared.get_mut() };
             dst.take_field_motion_row(frame, r, self.parity as usize);
         }
+        // Derived (motion final — what a later picture's direct modes read)
+        // and reconstructed are published together while the two passes run
+        // back to back per macroblock.
+        self.shared.set_derived(self.parity, self.frame_rows(r));
         self.shared.set_decoded(self.parity, self.frame_rows(r));
         if r >= 1 {
             if self.deblock {

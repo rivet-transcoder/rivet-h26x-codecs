@@ -1363,7 +1363,7 @@ fn direct_partitions<S: Sample>(
             } else {
                 (PARITY_FRAME, mby + 1)
             };
-            cs.wait_decoded(wait_parity, (frow_end * 16) as i32);
+            cs.wait_derived(wait_parity, (frow_end * 16) as i32);
         }
     }
     if ctx.direct_spatial {
