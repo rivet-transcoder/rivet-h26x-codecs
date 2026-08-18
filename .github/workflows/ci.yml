@@ -19,10 +19,13 @@ jobs:
         include:
           # The SIMD kernels are checked bit-exact against the scalar
           # reference on every host: AVX2 on x86-64, NEON on arm64.
+          # `require` names a SIMD rung the host is expected to have, so the
+          # tests for it fail rather than skip if a runner ever loses it —
+          # a skipped kernel test is indistinguishable from a passing one.
           - { name: linux x86-64 (AVX2), os: ubuntu-latest }
-          - { name: linux arm64 (NEON),  os: ubuntu-24.04-arm }
+          - { name: linux arm64 (NEON),  os: ubuntu-24.04-arm, require: dotprod }
           - { name: windows x86-64,      os: windows-latest }
-          - { name: macos arm64 (NEON),  os: macos-latest }
+          - { name: macos arm64 (NEON),  os: macos-latest,     require: dotprod }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -31,6 +34,8 @@ jobs:
         run: cargo build --release --examples
       - name: Tests
         run: cargo test --release
+        env:
+          H26X_REQUIRE_DOTPROD: ${{ matrix.require == 'dotprod' && '1' || '' }}
 
   msrv:
     name: MSRV (1.85)
