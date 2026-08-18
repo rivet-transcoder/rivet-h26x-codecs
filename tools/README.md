@@ -57,6 +57,21 @@ is noise, and it is worse than that — measurements taken on a *contended core*
 were not merely noisy but systematically misleading, giving opposite signs on
 two streams for the same change. Two habits that fix it:
 
+**The cheap rdtsc instrument is sound only when the variants differ in how they
+compute, not in how they store.** Wrapping a function in `_rdtsc()` and
+accumulating into an `AtomicU64` with `fetch_add` is the best tool here for a
+change worth a few per cent of one function — but `fetch_add` compiles to
+`lock xadd`, which is a full barrier, so it drains the store buffer at the
+closing timestamp. Two variants that issue different amounts of store traffic
+are charged differently for it, and one measurement of a 512-bit kernel against
+its 128-bit equivalent came out **5x** wrong that way. Two variants that write
+identical bytes in identical order drain the same thing and it cancels in the
+ratio: re-measuring a CABAC change under `lock xadd`, a relaxed load/add/store,
+and `lfence`-serialised rdtsc gave 0.9001, 0.9076 and 0.9093 — the artefact
+moved it by under a point. So: if your change alters what gets written or in
+what order, serialise the instrument or use a relaxed accumulator, and say
+which one you used.
+
 **The ladder is its own control.** `benchmark.py` checks that no rung comes
 out ahead of the rung above it, and says so above any table where one does
 rather than printing it as a result. Best-of-N defends against a brief
