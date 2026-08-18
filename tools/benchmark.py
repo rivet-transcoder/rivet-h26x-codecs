@@ -169,11 +169,40 @@ def available_tiers():
     if machine in ("aarch64", "arm64"):
         return [("NEON + DotProd", {}), ("NEON", {"H26X_MAX_SIMD": "neon"}),
                 ("scalar", {"H26X_NO_SIMD": "1"})]
-    return [("AVX2", {}), ("AVX (VEX-128)", {"H26X_MAX_SIMD": "avx"}),
+    return [("AVX-512", {}), ("AVX2", {"H26X_MAX_SIMD": "avx2"}),
+            ("AVX (VEX-128)", {"H26X_MAX_SIMD": "avx"}),
             ("SSE4.1", {"H26X_MAX_SIMD": "sse41"}),
             ("SSSE3", {"H26X_MAX_SIMD": "ssse3"}),
             ("SSE2", {"H26X_MAX_SIMD": "sse2"}),
             ("scalar", {"H26X_NO_SIMD": "1"})]
+
+
+def check_ladder(name, rows, tol=0.05):
+    """Rungs that beat the rung above them, which cannot happen honestly.
+
+    Best-of-N defends against a brief interruption; it cannot defend against
+    something that runs for the whole benchmark, which shifts every row and
+    leaves the table looking perfectly plausible. The ladder itself is the
+    control: it is ordered by construction, so SSE4.1 coming out 20% ahead of
+    AVX2 is not a measurement, it is a machine that was busy. Reported loudly,
+    because a wrong table is worse than no table.
+    """
+    bad = []
+    for i in range(len(rows) - 1):
+        higher, lower = rows[i], rows[i + 1]
+        if higher[1] > lower[1] * (1 + tol):
+            bad.append("{} ({:.3f} s) beats {} ({:.3f} s) by {:.0f}%".format(
+                lower[0], lower[1], higher[0], higher[1],
+                (higher[1] / lower[1] - 1) * 100))
+    if bad:
+        print()
+        print("> **These `" + name + "` numbers are not trustworthy.** A lower "
+              "rung of the ladder came out ahead of a higher one, which does "
+              "not happen on a quiet machine:")
+        for b in bad:
+            print("> - " + b)
+        print("> Re-run on an idle machine before believing this table.")
+    return not bad
 
 
 def selected_rung(dec):
@@ -212,6 +241,7 @@ def main():
           f"selecting **{picked or 'unknown'}**. Best of {args.runs}. "
           f"Cost is CPU seconds, throughput is frames per wall second.\n")
 
+    clean = True
     for path in streams:
         frames, w, h = stream_info(args.dec, path)
         codec = "H.265" if path.endswith((".265", ".hevc")) else "H.264"
@@ -238,11 +268,16 @@ def main():
                   f"{cm:.3f} | {fpsm:.0f} |")
         print(f"| libavcodec | {f1:.3f} | 1.00x | {frames / f1 if f1 else 0:.0f} | "
               f"{fm:.3f} | {frames / fmw if fmw else 0:.0f} |")
+        clean &= check_ladder(path, rows)
         best = rows[0]
         print(f"\nWidest rung against libavcodec: **{best[1] / f1:.2f}x** its "
               f"single-threaded CPU time, **{best[3] / fm:.2f}x** with every "
               f"thread; SIMD is worth **{rows[-1][1] / best[1]:.1f}x** over the "
               f"scalar reference.\n")
+    if not clean:
+        print("At least one table failed the ladder check; exiting non-zero "
+              "so a regeneration cannot publish it unnoticed.", file=sys.stderr)
+        return 1
     return 0
 
 
