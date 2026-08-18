@@ -8,7 +8,7 @@ use crate::picture::ChromaFormat;
 use crate::{Error, Result};
 
 use super::ctx::*;
-use super::frame::{Frame, MotionInfo, Mv, SharedFrame, Sample};
+use super::frame::{Frame, MotionInfo, Mv, SharedFrame, Sample, fill_motion};
 use super::inter::{McScratch, Weighting, predict_block};
 use super::intra::{IntraScratch, predict as intra_predict};
 use super::mvpred::{Cand, PuPos, RefCtx, amvp, merge_candidate};
@@ -441,10 +441,7 @@ impl<'a, S: Sample> SliceDec<'a, S> {
         // inter CU's prediction units cover it entirely and write their own.
         if intra {
             let w4 = self.frame.w4;
-            let (bx0, bx1) = (x0 as usize >> 2, (x0 as usize + cw) >> 2);
-            for by in (y0 as usize >> 2)..((y0 as usize + ch) >> 2) {
-                self.frame.motion[by * w4 + bx0..by * w4 + bx1].fill(MotionInfo::INTRA);
-            }
+            fill_motion(&mut self.frame.motion, w4, x0 as usize, y0 as usize, cw, ch, MotionInfo::INTRA);
         }
 
         let mut intra_modes = [1u32; 4];
@@ -797,10 +794,7 @@ impl<'a, S: Sample> SliceDec<'a, S> {
         let ch = h.min(ph - y_pb) as usize;
         {
             let w4 = self.frame.w4;
-            let (bx0, bx1) = (x_pb as usize >> 2, (x_pb as usize + cw) >> 2);
-            for by in (y_pb as usize >> 2)..((y_pb as usize + ch) >> 2) {
-                self.frame.motion[by * w4 + bx0..by * w4 + bx1].fill(mi);
-            }
+            fill_motion(&mut self.frame.motion, w4, x_pb as usize, y_pb as usize, cw, ch, mi);
         }
         // Motion compensation: wait for the reference rows the filters reach
         // (8-tap luma: 3 above / 4 below; 4-tap chroma: 1 / 2, in luma rows).

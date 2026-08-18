@@ -163,7 +163,16 @@ pub struct ResidualInfo {
 pub fn parse_residual(cabac: &mut Cabac, cx: &mut Contexts, p: &ResidualParams, coeffs: &mut [i16]) -> Result<ResidualInfo> {
     let log2 = p.log2_size;
     let n = 1usize << log2;
-    coeffs[..n * n].fill(0);
+    // Every coefficient is written here, zeros included, because the inverse
+    // transform runs in place and left the whole block dirty. A memset call
+    // for the 32 bytes of a 4x4 block costs several times the stores, so give
+    // the small sizes a constant length to clear inline.
+    match log2 {
+        2 => coeffs[..16].fill(0),
+        3 => coeffs[..64].fill(0),
+        4 => coeffs[..256].fill(0),
+        _ => coeffs[..n * n].fill(0),
+    }
     let c_idx = p.c_idx;
     let mut max_x = 0usize;
     let mut max_y = 0usize;
