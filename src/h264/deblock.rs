@@ -162,6 +162,46 @@ fn gather_col(x: u16, s: u32) -> u32 {
     (x | (x >> 3) | (x >> 6) | (x >> 9)) & 0xF
 }
 
+/// One internal edge's strengths, packed a byte per segment. An internal
+/// edge has the same macroblock on both sides, so none of the frame /
+/// field geometry of a macroblock edge reaches it and both drivers derive
+/// it the same way: a coefficient on either side settles a segment at
+/// bS 2, and otherwise motion can differ only where a partition boundary
+/// runs, which `MbInfo::part_edges` already records. `coef` is the
+/// nonzero mask ORed with itself shifted to the neighbour in the edge's
+/// direction, `part` the partition edges for that direction.
+#[inline]
+fn internal_edge<S: Sample>(
+    frame: &Frame<S>,
+    addr: usize,
+    coef: u16,
+    part: u16,
+    e: usize,
+    vertical: bool,
+    mvy_limit: i16,
+) -> u32 {
+    let c = if vertical {
+        gather_col(coef, e as u32 - 1)
+    } else {
+        (coef >> ((e - 1) * 4)) as u32 & 0xF
+    };
+    let mut bs = BS2_SPREAD[c as usize];
+    // Motion only where a partition boundary runs and no coefficient
+    // decided the segment already.
+    let mut rest = ((part >> (e * 4)) as u32 & 0xF) & !c;
+    while rest != 0 {
+        let k = rest.trailing_zeros() as usize;
+        let (pb, qb) = if vertical {
+            (k * 4 + e - 1, k * 4 + e)
+        } else {
+            ((e - 1) * 4 + k, e * 4 + k)
+        };
+        bs |= (motion_bs(frame, addr, pb, addr, qb, mvy_limit) as u32) << (k * 8);
+        rest &= rest - 1;
+    }
+    bs
+}
+
 /// The motion-derived strengths of the segments in `rest`, packed one
 /// byte per segment. `chg` marks the segments (1..3) whose two sides are
 /// not the same pair of partitions as the segment before them: within a
@@ -571,19 +611,7 @@ pub fn deblock_mb_rows<S: Sample>(
                     let coef_v = nz | (nz >> 1);
                     let mut e = step;
                     while e < 4 {
-                        let c = gather_col(coef_v, e as u32 - 1);
-                        let mut bs = BS2_SPREAD[c as usize];
-                        // Motion only where a partition boundary runs and
-                        // no coefficient decided the segment already.
-                        let mut rest = ((pe_v >> (e * 4)) as u32 & 0xF) & !c;
-                        while rest != 0 {
-                            let k = rest.trailing_zeros() as usize;
-                            let pb = k * 4 + e - 1;
-                            bs |= (motion_bs(frame, addr, pb, addr, pb + 1, mvy_limit) as u32)
-                                << (k * 8);
-                            rest &= rest - 1;
-                        }
-                        bs_v[e] = bs;
+                        bs_v[e] = internal_edge(frame, addr, coef_v, pe_v, e, true, mvy_limit);
                         e += step;
                     }
                 }
@@ -592,17 +620,7 @@ pub fn deblock_mb_rows<S: Sample>(
                     let coef_h = nz | (nz >> 4);
                     let mut e = step;
                     while e < 4 {
-                        let c = (coef_h >> ((e - 1) * 4)) as u32 & 0xF;
-                        let mut bs = BS2_SPREAD[c as usize];
-                        let mut rest = ((pe_h >> (e * 4)) as u32 & 0xF) & !c;
-                        while rest != 0 {
-                            let k = rest.trailing_zeros() as usize;
-                            let pb = (e - 1) * 4 + k;
-                            bs |= (motion_bs(frame, addr, pb, addr, pb + 4, mvy_limit) as u32)
-                                << (k * 8);
-                            rest &= rest - 1;
-                        }
-                        bs_h[e] = bs;
+                        bs_h[e] = internal_edge(frame, addr, coef_h, pe_h, e, false, mvy_limit);
                         e += step;
                     }
                 }
@@ -871,6 +889,9 @@ fn deblock_mbaff_pairs<S: Sample>(
                 );
                 let nz_q = nz_mask(info, sa);
                 let internal_odd = !m.transform_8x8;
+                // An internal edge compares the macroblock against itself,
+                // so its vectors are in its own units (NOTE 3 of 8.7.2.1).
+                let mvy_int: i16 = if m.field { 2 } else { 4 };
 
                 // ---------- vertical edges ----------
                 // Left MB edge.
@@ -1053,32 +1074,19 @@ fn deblock_mbaff_pairs<S: Sample>(
                         // Chroma still has its edge at e == 2 only (4:2:0).
                         continue;
                     }
-                    let mut bs = [0u8; 4];
-                    for k in 0..4 {
-                        bs[k] = bs_mbaff(
-                            frame,
-                            info,
-                            Side {
-                                addr: sa,
-                                blk: k * 4 + e - 1,
-                            },
-                            Side {
-                                addr: sa,
-                                blk: k * 4 + e,
-                            },
-                            false,
-                            true,
-                            nz_q,
-                            nz_q,
-                        );
-                    }
-                    if u32::from_le_bytes(bs) == 0 {
+                    let bs = if m.kind.is_intra() {
+                        0x0303_0303
+                    } else {
+                        let coef = nz_q | (nz_q >> 1);
+                        internal_edge(frame, sa, coef, m.part_edges[0], e, true, mvy_int)
+                    };
+                    if bs == 0 {
                         continue;
                     }
                     let t = thr.get(m.qp as i32, m.qp as i32);
                     let (alpha, beta) = (t.alpha, t.beta);
                     let off = frame.y.offset((x0 + e * 4) as isize, y_p as isize);
-                    if bs[0] == 4 {
+                    if bs as u8 == 4 {
                         (dsp.deblock_luma_v_intra)(
                             &mut frame.y.data,
                             off,
@@ -1094,7 +1102,7 @@ fn deblock_mbaff_pairs<S: Sample>(
                             ystride * dy,
                             alpha,
                             beta,
-                            &tc4(u32::from_le_bytes(bs), &t.lut),
+                            &tc4(bs, &t.lut),
                             max,
                         );
                     }
@@ -1108,16 +1116,7 @@ fn deblock_mbaff_pairs<S: Sample>(
                             };
                             let base = plane.offset((xc0 + 4) as isize, yc_p as isize);
                             let stride = plane.stride * dy;
-                            chroma_v_edge(
-                                dsp,
-                                plane,
-                                base,
-                                stride,
-                                chroma422,
-                                u32::from_le_bytes(bs),
-                                &t,
-                                max,
-                            );
+                            chroma_v_edge(dsp, plane, base, stride, chroma422, bs, &t, max);
                         }
                     }
                 }
@@ -1309,33 +1308,20 @@ fn deblock_mbaff_pairs<S: Sample>(
                     if !luma_edge && !chroma_edge {
                         continue;
                     }
-                    let mut bs = [0u8; 4];
-                    for k in 0..4 {
-                        bs[k] = bs_mbaff(
-                            frame,
-                            info,
-                            Side {
-                                addr: sa,
-                                blk: (e - 1) * 4 + k,
-                            },
-                            Side {
-                                addr: sa,
-                                blk: e * 4 + k,
-                            },
-                            false,
-                            false,
-                            nz_q,
-                            nz_q,
-                        );
-                    }
-                    if u32::from_le_bytes(bs) == 0 {
+                    let bs = if m.kind.is_intra() {
+                        0x0303_0303
+                    } else {
+                        let coef = nz_q | (nz_q >> 4);
+                        internal_edge(frame, sa, coef, m.part_edges[1], e, false, mvy_int)
+                    };
+                    if bs == 0 {
                         continue;
                     }
                     if luma_edge {
                         let t = thr.get(m.qp as i32, m.qp as i32);
                         let (alpha, beta) = (t.alpha, t.beta);
                         let off = frame.y.offset(x0 as isize, (y_p + dy * e * 4) as isize);
-                        if bs[0] == 4 {
+                        if bs as u8 == 4 {
                             (dsp.deblock_luma_h_intra)(
                                 &mut frame.y.data,
                                 off,
@@ -1351,7 +1337,7 @@ fn deblock_mbaff_pairs<S: Sample>(
                                 ystride * dy,
                                 alpha,
                                 beta,
-                                &tc4(u32::from_le_bytes(bs), &t.lut),
+                                &tc4(bs, &t.lut),
                                 max,
                             );
                         }
@@ -1368,7 +1354,7 @@ fn deblock_mbaff_pairs<S: Sample>(
                                 &mut frame.cr
                             };
                             let off = plane.offset(xc0 as isize, (yc_p + dy * cy) as isize);
-                            if bs[0] == 4 {
+                            if bs as u8 == 4 {
                                 (dsp.deblock_chroma_h_intra)(
                                     &mut plane.data,
                                     off,
@@ -1384,7 +1370,7 @@ fn deblock_mbaff_pairs<S: Sample>(
                                     cstride * dy,
                                     alpha,
                                     beta,
-                                    &tc4(u32::from_le_bytes(bs), &t.lut),
+                                    &tc4(bs, &t.lut),
                                     max,
                                 );
                             }
