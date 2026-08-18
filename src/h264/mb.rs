@@ -984,6 +984,11 @@ pub fn neighbour_motion_at<S: Sample>(
     n
 }
 
+/// One macroblock's motion, per reference list, in raster order — where a
+/// macroblock's partitions write it and its own later partitions predict
+/// from it, before it is copied into the picture in one go.
+pub type MbMotion = [[BlockMotion; 16]; 2];
+
 /// The neighbouring motion a macroblock's partitions predict from,
 /// gathered once per macroblock so the many lookups of 8.4.1.3.2 (A, B, C
 /// and D of every partition, in both lists) are array reads: the blocks
@@ -1084,9 +1089,9 @@ impl MotionCache {
 
     /// The motion of the block holding luma sample `(xn, yn)` relative to
     /// the current macroblock (6.4.11.7): a cached neighbour outside it, a
-    /// live read inside it (available once `done` has the block).
+    /// live read of `cur` inside it (available once `done` has the block).
     #[inline(always)]
-    pub fn at<S: Sample>(&self, nb: &MbNeighbours, frame: &Frame<S>, done: u16, list: usize, xn: i32, yn: i32) -> NbMotion {
+    pub fn at(&self, cur: &MbMotion, done: u16, list: usize, xn: i32, yn: i32) -> NbMotion {
         if yn < 0 {
             if xn < 0 {
                 self.top[list][5]
@@ -1098,7 +1103,7 @@ impl MotionCache {
         } else if xn < 0 {
             if yn & 3 == 0 { self.left[list][(yn >> 2) as usize] } else { self.left[list][4 + (yn >> 2) as usize] }
         } else if xn < 16 && block_available(done, xn >> 2, yn >> 2) {
-            let m = frame.motion[list][nb.addr * 16 + ((yn >> 2) * 4 + (xn >> 2)) as usize];
+            let m = cur[list][((yn >> 2) * 4 + (xn >> 2)) as usize];
             NbMotion { avail: true, ref_idx: m.ref_idx, mv: m.mv }
         } else {
             NbMotion::NONE
@@ -1112,10 +1117,9 @@ impl MotionCache {
 /// (above-left of the top-left block) when C is unavailable) — 8.4.1.3.2.
 /// `(bx, by)` is the partition's top-left 4x4 block, `w4` its width in 4x4
 /// units.
-pub fn prediction_neighbours<S: Sample>(
+pub fn prediction_neighbours(
     cache: &MotionCache,
-    nb: &MbNeighbours,
-    frame: &Frame<S>,
+    cur: &MbMotion,
     done: u16,
     list: usize,
     bx: i32,
@@ -1125,11 +1129,11 @@ pub fn prediction_neighbours<S: Sample>(
     // The samples (x - 1, y), (x, y - 1), (x + w, y - 1) and (x - 1, y - 1)
     // of the partition at (x, y) = (4 bx, 4 by) (6.4.11.7).
     let (x, y) = (bx * 4, by * 4);
-    let a = cache.at(nb, frame, done, list, x - 1, y);
-    let b = cache.at(nb, frame, done, list, x, y - 1);
-    let mut c = cache.at(nb, frame, done, list, x + w4 * 4, y - 1);
+    let a = cache.at(cur, done, list, x - 1, y);
+    let b = cache.at(cur, done, list, x, y - 1);
+    let mut c = cache.at(cur, done, list, x + w4 * 4, y - 1);
     if !c.avail {
-        c = cache.at(nb, frame, done, list, x - 1, y - 1);
+        c = cache.at(cur, done, list, x - 1, y - 1);
     }
     (a, b, c)
 }
@@ -1164,10 +1168,9 @@ fn median3(a: i16, b: i16, c: i16) -> i16 {
 /// directional for 16x8 / 8x16, median otherwise. `part_w`/`part_h` in
 /// samples, `(x, y)` the partition's top-left in samples within the MB.
 #[allow(clippy::too_many_arguments)]
-pub fn predict_mv<S: Sample>(
+pub fn predict_mv(
     cache: &MotionCache,
-    nb: &MbNeighbours,
-    frame: &Frame<S>,
+    cur: &MbMotion,
     done: u16,
     list: usize,
     ref_idx: i8,
@@ -1179,7 +1182,7 @@ pub fn predict_mv<S: Sample>(
     let bx = (x / 4) as i32;
     let by = (y / 4) as i32;
     let w4 = (part_w / 4) as i32;
-    let (a, b, c) = prediction_neighbours(cache, nb, frame, done, list, bx, by, w4);
+    let (a, b, c) = prediction_neighbours(cache, cur, done, list, bx, by, w4);
     if part_w == 16 && part_h == 8 {
         if y == 0 {
             if b.ref_idx == ref_idx {
@@ -1202,9 +1205,9 @@ pub fn predict_mv<S: Sample>(
 
 /// P_Skip motion (8.4.1.1): reference index 0 and either the zero vector or
 /// the 16x16 median prediction.
-pub fn p_skip_mv<S: Sample>(cache: &MotionCache, nb: &MbNeighbours, frame: &Frame<S>) -> Mv {
-    let a = cache.at(nb, frame, 0, 0, -1, 0);
-    let b = cache.at(nb, frame, 0, 0, 0, -1);
+pub fn p_skip_mv(cache: &MotionCache, cur: &MbMotion) -> Mv {
+    let a = cache.at(cur, 0, 0, -1, 0);
+    let b = cache.at(cur, 0, 0, 0, -1);
     if !a.avail
         || !b.avail
         || (a.ref_idx == 0 && a.mv == Mv::ZERO)
@@ -1212,24 +1215,17 @@ pub fn p_skip_mv<S: Sample>(cache: &MotionCache, nb: &MbNeighbours, frame: &Fram
     {
         return Mv::ZERO;
     }
-    predict_mv(cache, nb, frame, 0, 0, 0, 0, 0, 16, 16)
+    predict_mv(cache, cur, 0, 0, 0, 0, 0, 16, 16)
 }
 
 /// Write `motion` for list `list` into the 4x4 blocks of the rectangle
-/// `(x, y, w, h)` (samples within the macroblock) of macroblock `addr`.
-pub fn fill_motion<S: Sample>(
-    frame: &mut Frame<S>,
-    addr: usize,
-    list: usize,
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-    motion: BlockMotion,
-) {
+/// `(x, y, w, h)` (samples within the macroblock) of the macroblock being
+/// derived.
+pub fn fill_motion(cur: &mut MbMotion, list: usize, x: usize, y: usize, w: usize, h: usize, motion: BlockMotion) {
+    let blocks = &mut cur[list];
     for by in y / 4..(y + h) / 4 {
         for bx in x / 4..(x + w) / 4 {
-            frame.motion[list][addr * 16 + by * 4 + bx] = motion;
+            blocks[by * 4 + bx] = motion;
         }
     }
 }
@@ -1243,14 +1239,10 @@ fn min_positive(a: i8, b: i8) -> i8 {
 
 /// Reference indices for spatial direct prediction (8.4.1.2.2): the
 /// `MinPositive` over the whole-macroblock neighbours A, B, C for each list.
-pub fn spatial_direct_ref_idx<S: Sample>(
-    cache: &MotionCache,
-    nb: &MbNeighbours,
-    frame: &Frame<S>,
-) -> [i8; 2] {
+pub fn spatial_direct_ref_idx(cache: &MotionCache, cur: &MbMotion) -> [i8; 2] {
     let mut out = [0i8; 2];
     for list in 0..2 {
-        let (a, b, c) = prediction_neighbours(cache, nb, frame, 0, list, 0, 0, 4);
+        let (a, b, c) = prediction_neighbours(cache, cur, 0, list, 0, 0, 4);
         out[list] = min_positive(a.ref_idx, min_positive(b.ref_idx, c.ref_idx));
     }
     out

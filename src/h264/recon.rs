@@ -11,7 +11,7 @@ use super::frame::{BlockMotion, Frame, Mv, PARITY_FRAME, SharedFrame};
 use super::inter::{MbGeom, Weighting, predict_partition};
 use super::intra::{IntraAvail, predict_4x4, predict_8x8, predict_16x16, predict_chroma};
 use super::mb::{
-    Jobs, MbKind, MbLayer, MbNeighbours, MotionCache, PicInfo, SliceCtx, SubMbShape, block_available,
+    Jobs, MbKind, MbLayer, MbMotion, MbNeighbours, MotionCache, PicInfo, SliceCtx, SubMbShape, block_available,
     colocated_block, colocated_motion, fill_motion, median_mvp, p_skip_mv, predict_mv,
     prediction_neighbours, spatial_direct_ref_idx,
 };
@@ -371,9 +371,7 @@ pub fn derive<S: Sample>(
     if intra {
         // No motion for the deblocking / direct-mode readers.
         for l in 0..2 {
-            for b in 0..16 {
-                cur.motion[l][addr * 16 + b] = BlockMotion::default();
-            }
+            cur.motion[l][addr * 16..addr * 16 + 16].fill(BlockMotion::default());
         }
         // Intra prediction modes are validated here so reconstruction
         // cannot fail on them.
@@ -388,6 +386,10 @@ pub fn derive<S: Sample>(
         }
     } else {
         part_edges = derive_motion(ctx, cur, info, nb, layer, refs, geom, scratch)?;
+        // The macroblock's motion, in one copy per list.
+        for l in 0..2 {
+            cur.motion[l][addr * 16..addr * 16 + 16].copy_from_slice(&scratch.mb_motion[l]);
+        }
     }
 
     // Bookkeeping.
@@ -951,6 +953,10 @@ fn add_chroma_residual<S: Sample>(
 #[derive(Default)]
 pub struct DeriveScratch {
     motion: MotionCache,
+    /// The macroblock's own motion while it is being derived: its later
+    /// partitions predict from it and it is copied into the picture once,
+    /// instead of every partition writing through the picture-wide arrays.
+    mb_motion: MbMotion,
 }
 
 /// The same for [`reconstruct`]: the motion-compensation prediction blocks
@@ -974,7 +980,6 @@ fn derive_motion<S: Sample>(
     geom: MbGeom,
     scratch: &mut DeriveScratch,
 ) -> Result<[u16; 2]> {
-    let addr = nb.addr;
     // An MBAFF field macroblock: reference indices name fields of the
     // frame list (twice as many entries).
     let field_mb = geom.step == 2;
@@ -986,28 +991,27 @@ fn derive_motion<S: Sample>(
     let jobs = &mut layer.jobs;
     jobs.len = 0;
     // The neighbouring motion every partition predicts from, gathered once.
-    let cache = &mut scratch.motion;
+    let DeriveScratch { motion: cache, mb_motion: mot } = scratch;
     cache.gather(nb, cur, info);
     let cache = &*cache;
 
     match layer.kind {
         MbKind::PSkip => {
-            let mv = p_skip_mv(cache, nb, cur);
+            let mv = p_skip_mv(cache, mot);
             fill_motion(
-                cur,
-                addr,
-                0,
+                        mot,
+                        0,
                 0,
                 0,
                 16,
                 16,
                 refs.motion_of(0, 0, mv, field_mb, mb_parity),
             );
-            fill_motion(cur, addr, 1, 0, 0, 16, 16, BlockMotion::default());
+            fill_motion(mot, 1, 0, 0, 16, 16, BlockMotion::default());
             jobs.push((0, 0, 16, 16, 0, mv, -1, Mv::ZERO));
         }
         MbKind::BSkip | MbKind::BDirect16x16 => {
-            direct_partitions(ctx, cur, info, nb, refs, cache, &[0, 1, 2, 3], jobs, geom)?;
+            direct_partitions(ctx, cur, info, nb, refs, cache, mot, &[0, 1, 2, 3], jobs, geom)?;
         }
         MbKind::Inter16x16 | MbKind::Inter16x8 | MbKind::Inter8x16 => {
             let parts = mb_partitions(layer.kind);
@@ -1018,19 +1022,18 @@ fn derive_motion<S: Sample>(
                 let mut rids = [-1i8; 2];
                 for list in 0..2 {
                     if dir & (1 << list) == 0 {
-                        fill_motion(cur, addr, list, x, y, w, h, BlockMotion::default());
+                        fill_motion(mot, list, x, y, w, h, BlockMotion::default());
                         continue;
                     }
                     let ri = layer.ref_idx[list][part];
                     if ri < 0 || ri as usize >= refs.frames[list].len() * list_mult {
                         return Err(Error::bitstream("ref_idx beyond the reference list"));
                     }
-                    let mvp = predict_mv(cache, nb, cur, done, list, ri, x, y, w, h);
+                    let mvp = predict_mv(cache, mot, done, list, ri, x, y, w, h);
                     let mvd = layer.mvd[(y / 4) * 4 + x / 4].mvd[list];
                     let mv = Mv::new(mvp.x.wrapping_add(mvd.x), mvp.y.wrapping_add(mvd.y));
                     fill_motion(
-                        cur,
-                        addr,
+                        mot,
                         list,
                         x,
                         y,
@@ -1053,7 +1056,7 @@ fn derive_motion<S: Sample>(
             for part in 0..4 {
                 let shape = layer.sub_shape[part];
                 if shape == SubMbShape::Direct {
-                    direct_partitions(ctx, cur, info, nb, refs, cache, &[part], jobs, geom)?;
+                    direct_partitions(ctx, cur, info, nb, refs, cache, mot, &[part], jobs, geom)?;
                     let (x, y, w, h) = sub_partition_rect(part, shape, 0);
                     for by in y / 4..(y + h) / 4 {
                         for bx in x / 4..(x + w) / 4 {
@@ -1069,20 +1072,19 @@ fn derive_motion<S: Sample>(
                     let mut rids = [-1i8; 2];
                     for list in 0..2 {
                         if dir & (1 << list) == 0 {
-                            fill_motion(cur, addr, list, x, y, w, h, BlockMotion::default());
+                            fill_motion(mot, list, x, y, w, h, BlockMotion::default());
                             continue;
                         }
                         let ri = layer.ref_idx[list][part];
                         if ri < 0 || ri as usize >= refs.frames[list].len() * list_mult {
                             return Err(Error::bitstream("ref_idx beyond the reference list"));
                         }
-                        let mvp = predict_mv(cache, nb, cur, done, list, ri, x, y, w, h);
+                        let mvp = predict_mv(cache, mot, done, list, ri, x, y, w, h);
                         let mvd = layer.mvd[(y / 4) * 4 + x / 4].mvd[list];
                         let mv = Mv::new(mvp.x.wrapping_add(mvd.x), mvp.y.wrapping_add(mvd.y));
                         fill_motion(
-                            cur,
-                            addr,
-                            list,
+                        mot,
+                        list,
                             x,
                             y,
                             w,
@@ -1321,6 +1323,7 @@ fn direct_partitions<S: Sample>(
     nb: &MbNeighbours,
     refs: &SliceRefs<S>,
     cache: &MotionCache,
+    mot: &mut MbMotion,
     parts: &[usize],
     jobs: &mut Jobs,
     geom: MbGeom,
@@ -1367,14 +1370,14 @@ fn direct_partitions<S: Sample>(
         }
     }
     if ctx.direct_spatial {
-        let mut ref_idx = spatial_direct_ref_idx(cache, nb, cur);
+        let mut ref_idx = spatial_direct_ref_idx(cache, mot);
         let mut mvp = [Mv::ZERO; 2];
         if ref_idx[0] < 0 && ref_idx[1] < 0 {
             ref_idx = [0, 0];
         } else {
             for list in 0..2 {
                 if ref_idx[list] >= 0 {
-                    let (a, b, c) = prediction_neighbours(cache, nb, cur, 0, list, 0, 0, 4);
+                    let (a, b, c) = prediction_neighbours(cache, mot, 0, list, 0, 0, 4);
                     mvp[list] = median_mvp(a, b, c, ref_idx[list]);
                 }
             }
@@ -1419,7 +1422,7 @@ fn direct_partitions<S: Sample>(
                 let mut rids = [-1i8; 2];
                 for list in 0..2 {
                     if ref_idx[list] < 0 {
-                        fill_motion(cur, addr, list, x, y, w, h, BlockMotion::default());
+                        fill_motion(mot, list, x, y, w, h, BlockMotion::default());
                         continue;
                     }
                     let mv = if ref_idx[list] == 0 && col_zero {
@@ -1428,8 +1431,7 @@ fn direct_partitions<S: Sample>(
                         mvp[list]
                     };
                     fill_motion(
-                        cur,
-                        addr,
+                        mot,
                         list,
                         x,
                         y,
@@ -1539,9 +1541,8 @@ fn direct_partitions<S: Sample>(
                     )
                 };
                 fill_motion(
-                    cur,
-                    addr,
-                    0,
+                        mot,
+                        0,
                     x,
                     y,
                     w,
@@ -1549,9 +1550,8 @@ fn direct_partitions<S: Sample>(
                     refs.motion_of(0, ref0, mv0, field_mb, mb_parity),
                 );
                 fill_motion(
-                    cur,
-                    addr,
-                    1,
+                        mot,
+                        1,
                     x,
                     y,
                     w,
