@@ -46,6 +46,22 @@ pub type WeightedBiFn<S> = fn(dst: &mut [S], stride: usize, a: &[S], b: &[S], w:
 pub type LumaDeblockFn<S> = fn(data: &mut [S], off: usize, stride: usize, alpha: i32, beta: i32, tc0: &[i16; 4], max: i32);
 /// Deblock sixteen lines of a luma edge with bS 4 (8.7.2.4).
 pub type LumaDeblockIntraFn<S> = fn(data: &mut [S], off: usize, stride: usize, alpha: i32, beta: i32, max: i32);
+/// Deblock eight lines of a luma *vertical* edge with bS < 4, `tc0[i / 2]`.
+///
+/// This is the mixed frame / field macroblock edge of an MBAFF picture
+/// (8.7.1), and only that: there, the sixteen lines of the edge belong
+/// alternately to the two macroblocks of the neighbouring pair, so each
+/// one's half is eight lines two rows apart, with one QP and one pair of
+/// thresholds. Their strengths change every two lines rather than every
+/// four, because a line's strength is read from a block row on each side
+/// and the p side advances twice as fast — hence `tc0[i / 2]` over the
+/// same four entries. Horizontal mixed edges do not need this: they are
+/// already filtered as whole field edges by the sixteen-line kernels.
+pub type LumaDeblock8Fn<S> = fn(data: &mut [S], off: usize, stride: usize, alpha: i32, beta: i32, tc0: &[i16; 4], max: i32);
+/// Deblock eight lines of a luma vertical edge with bS 4 — the same edge
+/// as [`LumaDeblock8Fn`], whose strength is 4 for a whole half or for
+/// none of it.
+pub type LumaDeblock8IntraFn<S> = fn(data: &mut [S], off: usize, stride: usize, alpha: i32, beta: i32, max: i32);
 /// Deblock eight lines of a 4:2:0 chroma edge with bS < 4; `tc0[i / 2]`.
 pub type ChromaDeblockFn<S> = fn(data: &mut [S], off: usize, stride: usize, alpha: i32, beta: i32, tc0: &[i16; 4], max: i32);
 /// Deblock eight lines of a 4:2:0 chroma edge with bS 4.
@@ -94,6 +110,10 @@ pub struct H264Dsp<S: Sample = u8> {
     pub deblock_luma_v_intra: LumaDeblockIntraFn<S>,
     /// Deblocking: luma horizontal edge (bS 4).
     pub deblock_luma_h_intra: LumaDeblockIntraFn<S>,
+    /// Deblocking: eight lines of a luma vertical edge (bS < 4).
+    pub deblock_luma8_v: LumaDeblock8Fn<S>,
+    /// Deblocking: eight lines of a luma vertical edge (bS 4).
+    pub deblock_luma8_v_intra: LumaDeblock8IntraFn<S>,
     /// Deblocking: chroma vertical edge (bS < 4).
     pub deblock_chroma_v: ChromaDeblockFn<S>,
     /// Deblocking: chroma horizontal edge (bS < 4).
@@ -147,6 +167,8 @@ macro_rules! scalar_table {
             deblock_luma_h: |d, off, stride, a, b, tc0, max| deblock_luma_scalar(d, off, 1, stride, a, b, Some(tc0), max),
             deblock_luma_v_intra: |d, off, stride, a, b, max| deblock_luma_scalar(d, off, stride, 1, a, b, None, max),
             deblock_luma_h_intra: |d, off, stride, a, b, max| deblock_luma_scalar(d, off, 1, stride, a, b, None, max),
+            deblock_luma8_v: |d, off, stride, a, b, tc0, max| deblock_luma8_scalar(d, off, stride, 1, a, b, Some(tc0), max),
+            deblock_luma8_v_intra: |d, off, stride, a, b, max| deblock_luma8_scalar(d, off, stride, 1, a, b, None, max),
             deblock_chroma_v: |d, off, stride, a, b, tc0, max| deblock_chroma_scalar(d, off, stride, 1, a, b, Some(tc0), max),
             deblock_chroma_h: |d, off, stride, a, b, tc0, max| deblock_chroma_scalar(d, off, 1, stride, a, b, Some(tc0), max),
             deblock_chroma_v_intra: |d, off, stride, a, b, max| deblock_chroma_scalar(d, off, stride, 1, a, b, None, max),
@@ -412,16 +434,20 @@ pub(crate) fn deblock_line(p: &mut [i32; 4], q: &mut [i32; 4], tc0: Option<i32>,
     }
 }
 
-/// Sixteen luma lines: `step` moves along the edge, `across` across it.
+/// `LINES` luma lines: `step` moves along the edge, `across` across it.
+/// The four tC0 entries always span the edge, so a line takes
+/// `tc0[i / (LINES / 4)]` — every fourth line of sixteen, every second of
+/// eight.
 #[allow(clippy::too_many_arguments)]
-fn deblock_luma_scalar<S: Sample>(data: &mut [S], off: usize, step: usize, across: usize, alpha: i32, beta: i32, tc0: Option<&[i16; 4]>, max: i32) {
-    for i in 0..16 {
+#[inline(always)]
+fn deblock_luma_lines<S: Sample, const LINES: usize>(data: &mut [S], off: usize, step: usize, across: usize, alpha: i32, beta: i32, tc0: Option<&[i16; 4]>, max: i32) {
+    for i in 0..LINES {
         let t = match tc0 {
             Some(t) => {
-                if t[i / 4] < 0 {
+                if t[i / (LINES / 4)] < 0 {
                     continue;
                 }
-                Some(t[i / 4] as i32)
+                Some(t[i / (LINES / 4)] as i32)
             }
             None => None,
         };
@@ -438,6 +464,18 @@ fn deblock_luma_scalar<S: Sample>(data: &mut [S], off: usize, step: usize, acros
             data[base + k * across] = S::from_i32(q[k]);
         }
     }
+}
+
+/// Sixteen luma lines.
+#[allow(clippy::too_many_arguments)]
+fn deblock_luma_scalar<S: Sample>(data: &mut [S], off: usize, step: usize, across: usize, alpha: i32, beta: i32, tc0: Option<&[i16; 4]>, max: i32) {
+    deblock_luma_lines::<S, 16>(data, off, step, across, alpha, beta, tc0, max);
+}
+
+/// Eight luma lines, for an MBAFF mixed edge (see [`LumaDeblock8Fn`]).
+#[allow(clippy::too_many_arguments)]
+fn deblock_luma8_scalar<S: Sample>(data: &mut [S], off: usize, step: usize, across: usize, alpha: i32, beta: i32, tc0: Option<&[i16; 4]>, max: i32) {
+    deblock_luma_lines::<S, 8>(data, off, step, across, alpha, beta, tc0, max);
 }
 
 /// Eight chroma lines (4:2:0): line `i` uses `tc0[i / 2]`.
