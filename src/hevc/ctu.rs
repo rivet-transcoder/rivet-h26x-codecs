@@ -12,7 +12,7 @@ use super::frame::{Frame, MotionInfo, Mv, SharedFrame, Sample};
 use super::inter::{McScratch, Weighting, predict_block};
 use super::intra::{RefAvail, predict as intra_predict};
 use super::mvpred::{Cand, PuPos, RefCtx, amvp, merge_candidate};
-use super::pic::{PicInfo, SaoParams};
+use super::pic::{AvailCtx, PicInfo, SaoParams};
 use super::pps::Pps;
 use super::residual::{ResidualParams, ScalingSource, parse_residual, rdpcm_residual, rotate_residual4, scale_coefficients, transform_skip_residual};
 use crate::dsp::hevc::HevcDsp;
@@ -185,10 +185,10 @@ impl<'a, S: Sample> SliceDec<'a, S> {
         self.sps.bit_depth_luma
     }
 
-    /// Whether the neighbouring luma location is available for the current
-    /// block at `(xc, yc)` (z-scan availability, 6.4.1).
-    fn avail(&self, xc: i32, yc: i32, xn: i32, yn: i32) -> bool {
-        self.info.available(xc, yc, xn, yn, self.frame.width as i32, self.frame.height as i32)
+    /// The current block's side of the z-scan availability test (6.4.1),
+    /// for a block about to ask after several neighbours.
+    fn avail_ctx(&self, xc: i32, yc: i32) -> AvailCtx {
+        self.info.avail_ctx(xc, yc, self.frame.width as i32, self.frame.height as i32)
     }
 
     // ------------------------------------------------------------------
@@ -314,10 +314,11 @@ impl<'a, S: Sample> SliceDec<'a, S> {
         let split = if x0 + size <= pw && y0 + size <= ph && log2_cb > self.sps.log2_min_cb_size {
             // split_cu_flag with context from the neighbours' depth.
             let mut inc = 0usize;
-            if self.avail(x0, y0, x0 - 1, y0) && self.info.ct_depth[self.info.idx4((x0 - 1) as usize, y0 as usize)] as u32 > depth {
+            let ac = self.avail_ctx(x0, y0);
+            if self.info.available_at(&ac, x0 - 1, y0) && self.info.ct_depth[self.info.idx4((x0 - 1) as usize, y0 as usize)] as u32 > depth {
                 inc += 1;
             }
-            if self.avail(x0, y0, x0, y0 - 1) && self.info.ct_depth[self.info.idx4(x0 as usize, (y0 - 1) as usize)] as u32 > depth {
+            if self.info.available_at(&ac, x0, y0 - 1) && self.info.ct_depth[self.info.idx4(x0 as usize, (y0 - 1) as usize)] as u32 > depth {
                 inc += 1;
             }
             bin(&mut self.cabac, &mut self.cx, SPLIT_CODING_UNIT_FLAG_OFFSET + inc) != 0
@@ -368,12 +369,13 @@ impl<'a, S: Sample> SliceDec<'a, S> {
         let (xq, yq) = self.qg;
         let prev = self.qg_qp_prev;
         let ctb_cur = self.info.ctb_of(x_cb as usize, y_cb as usize);
-        let qa = if self.avail(x_cb, y_cb, xq - 1, yq) && self.info.ctb_of((xq - 1) as usize, yq as usize) == ctb_cur {
+        let ac = self.avail_ctx(x_cb, y_cb);
+        let qa = if self.info.available_at(&ac, xq - 1, yq) && self.info.ctb_of((xq - 1) as usize, yq as usize) == ctb_cur {
             self.info.qp_y[self.info.idx4((xq - 1) as usize, yq as usize)] as i32
         } else {
             prev
         };
-        let qb = if self.avail(x_cb, y_cb, xq, yq - 1) && self.info.ctb_of(xq as usize, (yq - 1) as usize) == ctb_cur {
+        let qb = if self.info.available_at(&ac, xq, yq - 1) && self.info.ctb_of(xq as usize, (yq - 1) as usize) == ctb_cur {
             self.info.qp_y[self.info.idx4(xq as usize, (yq - 1) as usize)] as i32
         } else {
             prev
@@ -400,10 +402,11 @@ impl<'a, S: Sample> SliceDec<'a, S> {
         let mut skip = false;
         if self.hdr.slice_type != SliceType::I {
             let mut inc = 0usize;
-            if self.avail(x0, y0, x0 - 1, y0) && self.info.skip[self.info.idx4((x0 - 1) as usize, y0 as usize)] != 0 {
+            let ac = self.avail_ctx(x0, y0);
+            if self.info.available_at(&ac, x0 - 1, y0) && self.info.skip[self.info.idx4((x0 - 1) as usize, y0 as usize)] != 0 {
                 inc += 1;
             }
-            if self.avail(x0, y0, x0, y0 - 1) && self.info.skip[self.info.idx4(x0 as usize, (y0 - 1) as usize)] != 0 {
+            if self.info.available_at(&ac, x0, y0 - 1) && self.info.skip[self.info.idx4(x0 as usize, (y0 - 1) as usize)] != 0 {
                 inc += 1;
             }
             skip = bin(&mut self.cabac, &mut self.cx, SKIP_FLAG_OFFSET + inc) != 0;
@@ -623,8 +626,9 @@ impl<'a, S: Sample> SliceDec<'a, S> {
 
     /// The three MPM candidates (8.4.2) for the PU at `(xp, yp)`.
     fn mpm_candidates(&self, xp: i32, yp: i32) -> [u32; 3] {
+        let ac = self.avail_ctx(xp, yp);
         let cand = |xn: i32, yn: i32, is_above: bool| -> u32 {
-            if !self.avail(xp, yp, xn, yn) {
+            if !self.info.available_at(&ac, xn, yn) {
                 return 1;
             }
             let i = self.info.idx4(xn as usize, yn as usize);
@@ -1152,8 +1156,10 @@ impl<'a, S: Sample> SliceDec<'a, S> {
         let yl = (y * sh) as i32;
         let cip = self.pps.constrained_intra_pred;
         let mut av = RefAvail { corner: false, left: [false; 64], top: [false; 64] };
+        // Every reference sample is a neighbour of this one transform block.
+        let ac = self.avail_ctx(xl, yl);
         let check = |s: &Self, xn: i32, yn: i32| -> bool {
-            if !s.info.available(xl, yl, xn, yn, s.frame.width as i32, s.frame.height as i32) {
+            if !s.info.available_at(&ac, xn, yn) {
                 return false;
             }
             !cip || s.info.pred_mode[s.info.idx4(xn as usize, yn as usize)] == 1

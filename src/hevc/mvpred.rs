@@ -3,7 +3,7 @@
 //! scaling, temporal), on top of the collocated motion vector derivation.
 
 use super::frame::{Frame, MotionInfo, Mv, Sample};
-use super::pic::PicInfo;
+use super::pic::{AvailCtx, PicInfo};
 
 /// The reference pictures of the current slice, as the predictor needs them.
 pub struct RefCtx<'a, S: Sample = u16> {
@@ -69,11 +69,10 @@ pub struct PuPos {
 
 /// Prediction block availability (6.4.2) of the neighbour at `(xn, yn)`,
 /// returning its motion when available and inter.
-fn neighbour_pb<S: Sample>(info: &PicInfo, cur: &Frame<S>, pu: &PuPos, xn: i32, yn: i32) -> Option<MotionInfo> {
-    let (pw, ph) = (cur.width as i32, cur.height as i32);
+fn neighbour_pb<S: Sample>(info: &PicInfo, cur: &Frame<S>, ac: &AvailCtx, pu: &PuPos, xn: i32, yn: i32) -> Option<MotionInfo> {
     let same_cb = xn >= pu.x_cb && xn < pu.x_cb + pu.n_cb && yn >= pu.y_cb && yn < pu.y_cb + pu.n_cb;
     let avail = if !same_cb {
-        info.available(pu.x_pb, pu.y_pb, xn, yn, pw, ph)
+        info.available_at(ac, xn, yn)
     } else if (pu.w << 1) == pu.n_cb && (pu.h << 1) == pu.n_cb && pu.part_idx == 1 && pu.y_cb + pu.h <= yn && pu.x_cb + pu.w > xn {
         false
     } else {
@@ -190,6 +189,8 @@ pub fn merge_candidate<S: Sample>(info: &PicInfo, cur: &Frame<S>, refs: &RefCtx<
     let part_mode_second_horizontal = orig.part_idx == 1 && orig.h < orig.n_cb && orig.w == orig.n_cb; // 2NxN, 2NxnU, 2NxnD
     let single = refs.log2_par_mrg_level > 2 && pu.n_cb == 8;
 
+    // Every candidate position is a neighbour of the same prediction block.
+    let ac = info.avail_ctx(x_pb, y_pb, cur.width as i32, cur.height as i32);
     let mut list: Small<Cand, 5> = Small::new(Cand { mv: [Mv::ZERO; 2], ref_idx: [-1; 2] });
     let to_cand = |m: MotionInfo| Cand { mv: m.mv, ref_idx: m.ref_idx };
 
@@ -198,7 +199,7 @@ pub fn merge_candidate<S: Sample>(info: &PicInfo, cur: &Frame<S>, refs: &RefCtx<
     let a1 = if same_mer(xa1, ya1) || (part_mode_second_vertical && !single) {
         None
     } else {
-        neighbour_pb(info, cur, &pu, xa1, ya1).map(to_cand)
+        neighbour_pb(info, cur, &ac, &pu, xa1, ya1).map(to_cand)
     };
     if let Some(c) = a1 {
         list.push(c);
@@ -208,7 +209,7 @@ pub fn merge_candidate<S: Sample>(info: &PicInfo, cur: &Frame<S>, refs: &RefCtx<
     let b1 = if same_mer(xb1, yb1) || (part_mode_second_horizontal && !single) {
         None
     } else {
-        neighbour_pb(info, cur, &pu, xb1, yb1).map(to_cand)
+        neighbour_pb(info, cur, &ac, &pu, xb1, yb1).map(to_cand)
     };
     if let Some(c) = b1 {
         if !a1.is_some_and(|a| a.same_motion(&c)) {
@@ -217,7 +218,7 @@ pub fn merge_candidate<S: Sample>(info: &PicInfo, cur: &Frame<S>, refs: &RefCtx<
     }
     // B0
     let (xb0, yb0) = (x_pb + w, y_pb - 1);
-    let b0 = if same_mer(xb0, yb0) { None } else { neighbour_pb(info, cur, &pu, xb0, yb0).map(to_cand) };
+    let b0 = if same_mer(xb0, yb0) { None } else { neighbour_pb(info, cur, &ac, &pu, xb0, yb0).map(to_cand) };
     if let Some(c) = b0 {
         if !b1.is_some_and(|b| b.same_motion(&c)) {
             list.push(c);
@@ -225,7 +226,7 @@ pub fn merge_candidate<S: Sample>(info: &PicInfo, cur: &Frame<S>, refs: &RefCtx<
     }
     // A0
     let (xa0, ya0) = (x_pb - 1, y_pb + h);
-    let a0 = if same_mer(xa0, ya0) { None } else { neighbour_pb(info, cur, &pu, xa0, ya0).map(to_cand) };
+    let a0 = if same_mer(xa0, ya0) { None } else { neighbour_pb(info, cur, &ac, &pu, xa0, ya0).map(to_cand) };
     if let Some(c) = a0 {
         if !a1.is_some_and(|a| a.same_motion(&c)) {
             list.push(c);
@@ -234,7 +235,7 @@ pub fn merge_candidate<S: Sample>(info: &PicInfo, cur: &Frame<S>, refs: &RefCtx<
     // B2 (only if fewer than four so far)
     if list.len() < 4 {
         let (xb2, yb2) = (x_pb - 1, y_pb - 1);
-        let b2 = if same_mer(xb2, yb2) { None } else { neighbour_pb(info, cur, &pu, xb2, yb2).map(to_cand) };
+        let b2 = if same_mer(xb2, yb2) { None } else { neighbour_pb(info, cur, &ac, &pu, xb2, yb2).map(to_cand) };
         if let Some(c) = b2 {
             if !a1.is_some_and(|a| a.same_motion(&c)) && !b1.is_some_and(|b| b.same_motion(&c)) {
                 list.push(c);
@@ -339,11 +340,12 @@ pub fn amvp<S: Sample>(info: &PicInfo, cur: &Frame<S>, refs: &RefCtx<S>, pu: &Pu
     let target_lt = refs.long_term[list][ref_idx as usize];
     let (x_pb, y_pb, w, h) = (pu.x_pb, pu.y_pb, pu.w, pu.h);
     // Neighbours A0, A1 (below-left, left-bottom), B0, B1, B2.
-    let a0 = neighbour_pb(info, cur, pu, x_pb - 1, y_pb + h);
-    let a1 = neighbour_pb(info, cur, pu, x_pb - 1, y_pb + h - 1);
-    let b0 = neighbour_pb(info, cur, pu, x_pb + w, y_pb - 1);
-    let b1 = neighbour_pb(info, cur, pu, x_pb + w - 1, y_pb - 1);
-    let b2 = neighbour_pb(info, cur, pu, x_pb - 1, y_pb - 1);
+    let ac = info.avail_ctx(x_pb, y_pb, cur.width as i32, cur.height as i32);
+    let a0 = neighbour_pb(info, cur, &ac, pu, x_pb - 1, y_pb + h);
+    let a1 = neighbour_pb(info, cur, &ac, pu, x_pb - 1, y_pb + h - 1);
+    let b0 = neighbour_pb(info, cur, &ac, pu, x_pb + w, y_pb - 1);
+    let b1 = neighbour_pb(info, cur, &ac, pu, x_pb + w - 1, y_pb - 1);
+    let b2 = neighbour_pb(info, cur, &ac, pu, x_pb - 1, y_pb - 1);
     let is_scaled = a0.is_some() || a1.is_some();
 
     // First pass on a candidate: same reference picture (any list).

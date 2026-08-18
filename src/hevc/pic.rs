@@ -182,6 +182,56 @@ impl Geometry {
     }
 }
 
+/// Recycled per-picture side data: `PicInfo` is close to half a megabyte of
+/// arrays for a 720p picture, so allocating and zeroing a fresh one per
+/// picture costs page faults and a memset that pictures leaving the DPB can
+/// pay for one another instead. Mirrors `FramePool`.
+#[derive(Clone, Default)]
+pub struct PicInfoPool(std::sync::Arc<std::sync::Mutex<Vec<PicInfo>>>);
+
+impl PicInfoPool {
+    /// Side data for `geo`, recycled if the pool holds one built for exactly
+    /// that geometry (its arrays are reset to the same values `new` gives).
+    pub fn take(&self, geo: std::sync::Arc<Geometry>) -> PicInfo {
+        let mut g = self.0.lock().unwrap();
+        if let Some(i) = g.iter().position(|p| std::sync::Arc::ptr_eq(&p.geo, &geo)) {
+            let mut info = g.swap_remove(i);
+            drop(g);
+            info.reset();
+            return info;
+        }
+        drop(g);
+        PicInfo::new(geo)
+    }
+
+    /// Return side data (an emptied shell holds no arrays worth keeping).
+    pub fn give(&self, info: PicInfo) {
+        if info.pred_mode.is_empty() {
+            return;
+        }
+        let mut g = self.0.lock().unwrap();
+        if g.len() < 32 {
+            g.push(info);
+        }
+    }
+}
+
+
+/// The current block's side of a z-scan availability test, as
+/// `PicInfo::avail_ctx` derives it.
+#[derive(Clone, Copy)]
+pub struct AvailCtx {
+    /// `MinTbAddrZs` of the current block.
+    zs: u32,
+    /// The current block's CTB, and that CTB's slice address and tile.
+    ctb: usize,
+    slice_addr: u32,
+    tile: u16,
+    /// Picture bounds.
+    pic_w: i32,
+    pic_h: i32,
+}
+
 impl PicInfo {
     /// Fresh per-picture arrays over shared geometry.
     pub fn new(geo: std::sync::Arc<Geometry>) -> Self {
@@ -201,6 +251,26 @@ impl PicInfo {
             ctb_slice_addr: vec![u32::MAX; nc],
             sao: vec![[SaoParams::default(); 3]; nc],
             slices: vec![SliceFilterParams::default(); nc],
+        }
+    }
+
+    /// A shell holding nothing but the geometry, to leave behind when the
+    /// arrays are handed to the pool.
+    pub fn empty(geo: std::sync::Arc<Geometry>) -> Self {
+        PicInfo {
+            geo,
+            pred_mode: Vec::new(),
+            skip: Vec::new(),
+            ct_depth: Vec::new(),
+            intra_mode: Vec::new(),
+            qp_y: Vec::new(),
+            filter_exempt: Vec::new(),
+            cbf_luma: Vec::new(),
+            edges: Vec::new(),
+            ctb_slice: Vec::new(),
+            ctb_slice_addr: Vec::new(),
+            sao: Vec::new(),
+            slices: Vec::new(),
         }
     }
 
@@ -234,32 +304,56 @@ impl PicInfo {
         (y >> self.log2_ctb) * self.wc + (x >> self.log2_ctb)
     }
 
-    /// z-scan availability (6.4.1) of the block containing `(xn, yn)` for a
-    /// current block at `(xc, yc)`.
-    pub fn available(&self, xc: i32, yc: i32, xn: i32, yn: i32, pic_w: i32, pic_h: i32) -> bool {
-        if xn < 0 || yn < 0 || xn >= pic_w || yn >= pic_h {
+    /// The current block's half of a z-scan availability test (6.4.1). A
+    /// block asks about several neighbours in a row, and all of them compare
+    /// against the same z-order address, CTB, slice and tile: derive those
+    /// once and hand them to `available_at`.
+    #[inline]
+    pub fn avail_ctx(&self, xc: i32, yc: i32, pic_w: i32, pic_h: i32) -> AvailCtx {
+        let (xc, yc) = (xc as usize, yc as usize);
+        let cc = self.ctb_of(xc, yc);
+        AvailCtx {
+            zs: self.min_tb_addr_zs[self.idx4(xc, yc)],
+            ctb: cc,
+            slice_addr: self.ctb_slice_addr[cc],
+            tile: self.ctb_tile[cc],
+            pic_w,
+            pic_h,
+        }
+    }
+
+    /// z-scan availability (6.4.1) of the block containing `(xn, yn)` for the
+    /// current block `c` describes.
+    #[inline]
+    pub fn available_at(&self, c: &AvailCtx, xn: i32, yn: i32) -> bool {
+        if xn < 0 || yn < 0 || xn >= c.pic_w || yn >= c.pic_h {
             return false;
         }
-        let (xc, yc, xn, yn) = (xc as usize, yc as usize, xn as usize, yn as usize);
+        let (xn, yn) = (xn as usize, yn as usize);
         let in_ = self.idx4(xn, yn);
-        if self.min_tb_addr_zs[in_] > self.min_tb_addr_zs[self.idx4(xc, yc)] {
+        if self.min_tb_addr_zs[in_] > c.zs {
             return false;
         }
         let cn = self.ctb_of(xn, yn);
-        let cc = self.ctb_of(xc, yc);
         // Inside the current CTB the slice and tile are the same by
         // construction (both change only at CTB boundaries).
-        if cn != cc {
-            if self.ctb_slice_addr[cn] != self.ctb_slice_addr[cc] || self.ctb_slice_addr[cn] == u32::MAX {
+        if cn != c.ctb {
+            if self.ctb_slice_addr[cn] != c.slice_addr || self.ctb_slice_addr[cn] == u32::MAX {
                 return false;
             }
-            if self.ctb_tile[cn] != self.ctb_tile[cc] {
+            if self.ctb_tile[cn] != c.tile {
                 return false;
             }
         }
         // Not yet decoded (a hole from a lost slice, or the block is later in
         // the same CTB): pred_mode 2 means unwritten.
         self.pred_mode[in_] != 2
+    }
+
+    /// z-scan availability (6.4.1) of the block containing `(xn, yn)` for a
+    /// current block at `(xc, yc)`, for the callers that ask only once.
+    pub fn available(&self, xc: i32, yc: i32, xn: i32, yn: i32, pic_w: i32, pic_h: i32) -> bool {
+        self.available_at(&self.avail_ctx(xc, yc, pic_w, pic_h), xn, yn)
     }
 
     /// Fill a rectangle of 4x4 entries in a per-4x4 array. Byte-sized
