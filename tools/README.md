@@ -75,7 +75,9 @@ CARGO_PROFILE_RELEASE_DEBUG=1 CARGO_PROFILE_RELEASE_STRIP=none \
 
 `H26X_NO_SIMD=1` forces the scalar kernels — the executable specification the
 SIMD paths are tested against, and the first thing to try when a SIMD kernel is
-suspected. `H26X_THREADS=1` decodes on the calling thread. The rest
+suspected. `H26X_MAX_SIMD=avx|sse41|neon|none` caps the ladder one rung at a
+time instead, which is how one machine checks that every rung decodes to the
+same bytes. `H26X_THREADS=1` decodes on the calling thread. The rest
 (`H26X_NO_DEBLOCK`, `H26X_TRACE=<mbaddr>|all`, `H26X_TRACE_IPM`,
 `H26X_TRACE_DPB`, `H26X_TRACE_PS`, `H26X_TRACE_CU`, `H26X_TRACE_PU`,
 `H26X_TRACE_TB`, `H26X_VERIFY_HASH`) are listed in the crate README.
