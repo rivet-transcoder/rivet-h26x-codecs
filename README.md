@@ -44,8 +44,8 @@ decoded on 1 and 12 threads gives the same bytes). It matches libavcodec on
 the workspace fixtures too (CAVLC/CABAC, B-pyramids, weighting, 8x8, slices,
 CQM, 10-bit, 4:2:2, 4:0:0, 4:4:4, lossless, x264 interlaced). H.265 passes **146 of the 147** JCT-VC HEVC_v1 conformance bitstreams
 against the suite's own MD5s (the one exception is the unequal-bit-depth
-stream, which is refused) and **31 of the 31** RExt bitstreams it accepts (the
-other 18 are refused up front: 16-bit, extended precision, CABAC bypass
+stream, which is refused) and **32 of the 32** RExt bitstreams it accepts (the
+other 17 are refused up front: 16-bit, extended precision, CABAC bypass
 alignment, unequal bit depths — the same set libavcodec declines), plus
 fifteen x265 feature fixtures; every HM stream's decoded-picture-hash SEI is
 checked as well.
