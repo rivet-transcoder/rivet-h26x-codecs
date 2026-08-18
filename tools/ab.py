@@ -102,6 +102,20 @@ ca = [c for _, c in ra]
 cb = [c for _, c in rb]
 wa = [w for w, _ in ra]
 wb = [w for w, _ in rb]
-print(f"A {os.path.basename(a)}: cpu min={min(ca):.3f} med={statistics.median(ca):.3f}  wall min={min(wa):.3f}")
-print(f"B {os.path.basename(b)}: cpu min={min(cb):.3f} med={statistics.median(cb):.3f}  wall min={min(wb):.3f}")
-print(f"B/A cpu min ratio = {min(cb) / min(ca):.3f}, median ratio = {statistics.median(cb) / statistics.median(ca):.3f}")
+# The headline is the median of the *paired* ratios, one per round. A and B run
+# back to back within a round, so pairing them cancels drift that neither the
+# ratio-of-medians nor the ratio-of-minimums does; and the median discards the
+# round where something else woke up. Minimum is not the statistic to lead
+# with here — with interleaving on a live machine one lucky run poisons it, and
+# a same-binary control has been seen to read 1.120 and 0.862 on consecutive
+# rounds while its medians read 1.018 and 1.000.
+paired = sorted(y / x for x, y in zip(ca, cb))
+ratio = statistics.median(paired)
+print(f"A {os.path.basename(a)}: cpu med={statistics.median(ca):.3f} min={min(ca):.3f}  wall min={min(wa):.3f}")
+print(f"B {os.path.basename(b)}: cpu med={statistics.median(cb):.3f} min={min(cb):.3f}  wall min={min(wb):.3f}")
+print(f"B/A = {ratio:.3f}  (paired ratios {paired[0]:.3f}..{paired[-1]:.3f}, {n} rounds)")
+spread = paired[-1] - paired[0]
+if spread > 0.02:
+    print(f"  the paired ratios span {spread * 100:.0f}% — wider than a change worth "
+          f"believing, so treat {ratio:.3f} as 'no measurable difference' unless a\n"
+          f"  same-binary control on this machine spans less than that")

@@ -60,7 +60,14 @@ two streams for the same change. Two habits that fix it:
 **Know your floor before you trust a number.** Run `ab.py` with the *same
 binary as both arguments*. Whatever spread that reports is the smallest
 difference the machine can currently resolve; a change smaller than it has not
-been measured, it has been guessed at.
+been measured, it has been guessed at. `ab.py` leads with the **median of the
+paired ratios** — A and B run back to back within a round, so pairing them
+cancels drift that neither a ratio of medians nor a ratio of minimums does, and
+the median discards the round where something else woke up. It is deliberately
+not the minimum: with interleaving on a live machine one lucky run poisons it,
+and a same-binary control has read 1.120 and 0.862 on consecutive rounds while
+its medians read 1.018 and 1.000. It prints the span of those ratios and tells
+you when the span is wider than any change worth believing.
 
 `ab.py` picks the core itself, sampling per-processor load at start-up and
 taking the quieter half of the quietest SMT *pair* — a sibling shares the
