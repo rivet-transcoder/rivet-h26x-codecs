@@ -459,15 +459,6 @@ fn filter_chroma_style<S: Sample>(
     }
 }
 
-/// Deblock the whole picture in place.
-pub fn deblock_picture<S: Sample>(
-    dsp: &H264Dsp<S>,
-    frame: &mut Frame<S>,
-    info: &PicInfo,
-    params: &[DeblockParams],
-) {
-    deblock_mb_rows(dsp, frame, info, params, 0, info.mb_height);
-}
 
 /// Deblock macroblock rows `r0..r1` in raster order (each row's top edges
 /// reach three lines into the row above). Rows must be filtered in order,

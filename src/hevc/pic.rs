@@ -27,8 +27,6 @@ pub struct SliceFilterParams {
     pub tc_offset: i32,
     /// `slice_loop_filter_across_slices_enabled_flag`.
     pub loop_filter_across_slices: bool,
-    /// `SliceAddrRs` — the address of the slice's first (independent) segment.
-    pub slice_addr: u32,
     /// `pps_cb_qp_offset`, `pps_cr_qp_offset` (chroma deblocking uses the PPS
     /// offsets, not the slice ones).
     pub cb_qp_offset: i32,
@@ -355,11 +353,6 @@ impl PicInfo {
         self.pred_mode[in_] != 2
     }
 
-    /// z-scan availability (6.4.1) of the block containing `(xn, yn)` for a
-    /// current block at `(xc, yc)`, for the callers that ask only once.
-    pub fn available(&self, xc: i32, yc: i32, xn: i32, yn: i32, pic_w: i32, pic_h: i32) -> bool {
-        self.available_at(&self.avail_ctx(xc, yc, pic_w, pic_h), xn, yn)
-    }
 
     /// Fill a rectangle of 4x4 entries in a per-4x4 array. Byte-sized
     /// entries (all the per-4x4 tables) are written as whole words for the

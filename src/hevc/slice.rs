@@ -8,6 +8,7 @@ use super::pps::Pps;
 use super::sps::{Sps, StRps, parse_st_rps};
 
 /// NAL unit types the decoder distinguishes.
+#[allow(dead_code)]
 pub mod nal_type {
     /// TRAIL_N.
     pub const TRAIL_N: u8 = 0;
@@ -94,10 +95,6 @@ pub enum SliceType {
 }
 
 impl SliceType {
-    /// Intra?
-    pub fn is_intra(self) -> bool {
-        self == SliceType::I
-    }
     /// B?
     pub fn is_b(self) -> bool {
         self == SliceType::B
@@ -215,15 +212,6 @@ pub struct SliceHeader {
 }
 
 impl SliceHeader {
-    /// Whether this is an IRAP picture.
-    pub fn is_irap(&self) -> bool {
-        nal_type::is_irap(self.nal_type)
-    }
-    /// IDR?
-    pub fn is_idr(&self) -> bool {
-        nal_type::is_idr(self.nal_type)
-    }
-
     /// Parse a slice segment header. `rbsp` is the whole NAL RBSP with its
     /// two header bytes. For a dependent slice segment, `independent` supplies
     /// the fields copied from the preceding independent segment.

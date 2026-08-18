@@ -3,24 +3,26 @@
 //! H.264 half of the crate: parameter sets, slice segments, CTU parsing and
 //! reconstruction, deblocking + SAO, and an output-order DPB.
 
-pub mod ctu;
-pub mod ctx;
-pub mod deblock;
-pub mod decoder;
-pub mod dpb;
-pub mod frame;
-pub mod hash;
-pub mod inter;
-pub mod intra;
-pub mod mvpred;
-pub mod pic;
-pub mod pps;
-pub mod residual;
-pub mod sao;
-pub mod slice;
-pub mod sps;
-pub mod tables;
-#[allow(missing_docs, clippy::all, rustdoc::broken_intra_doc_links)]
-pub mod tables_gen;
+pub(crate) mod ctu;
+pub(crate) mod ctx;
+pub(crate) mod deblock;
+pub(crate) mod decoder;
+pub(crate) mod dpb;
+pub(crate) mod frame;
+pub(crate) mod hash;
+pub(crate) mod inter;
+pub(crate) mod intra;
+pub(crate) mod mvpred;
+pub(crate) mod pic;
+pub(crate) mod pps;
+pub(crate) mod residual;
+pub(crate) mod sao;
+pub(crate) mod slice;
+pub(crate) mod sps;
+pub(crate) mod tables;
+// Generated: the standard's tables in full, whether or not the decoder
+// reaches for every entry.
+#[allow(dead_code, missing_docs, clippy::all, rustdoc::broken_intra_doc_links)]
+pub(crate) mod tables_gen;
 
 pub use decoder::HevcDecoder;

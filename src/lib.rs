@@ -21,9 +21,9 @@
 //!
 //! # Layout
 //!
-//! - [`bitreader`] — RBSP bit reader (Exp-Golomb, fixed-width, alignment).
+//! - `bitreader` — RBSP bit reader (Exp-Golomb, fixed-width, alignment).
 //! - [`nal`] — Annex-B start-code splitting and emulation-prevention removal.
-//! - [`cabac`] — the arithmetic decoding engine both standards share.
+//! - `cabac` — the arithmetic decoding engine both standards share.
 //! - [`h264`] — the H.264 decoder: parameter sets, slice header, POC,
 //!   reference lists and DPB, CAVLC + CABAC macroblock parsing, intra/inter
 //!   prediction, transforms, deblocking, output ordering.
@@ -42,15 +42,22 @@
 
 #![warn(missing_docs)]
 
-pub mod bitreader;
-pub mod cabac;
+// The public surface is deliberately small: the two decoders, the Annex B
+// splitter that feeds them, and the picture they hand back. Everything below
+// is machinery — an arithmetic decoder, a bit reader, a thread pool, a table
+// of kernel function pointers — whose shape is chosen for the decoders'
+// convenience and changes whenever that is the faster thing to do. Publishing
+// it would make every such change a breaking one; this crate's first release
+// already rewrote the CABAC engine and deleted three `pub` statics from it.
+pub(crate) mod bitreader;
+pub(crate) mod cabac;
 pub mod dsp;
 pub mod h264;
 pub mod hevc;
 pub mod nal;
 pub mod picture;
-pub mod sample;
-pub mod threading;
+pub(crate) mod sample;
+pub(crate) mod threading;
 
 pub use picture::{ChromaFormat, OutputPool, Picture, Plane};
 

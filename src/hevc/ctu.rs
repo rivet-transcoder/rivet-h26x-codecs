@@ -540,7 +540,7 @@ impl<'a, S: Sample> SliceDec<'a, S> {
                 } else {
                     self.sps.max_th_depth_inter
                 };
-                let cu = CuCtx { x0, y0, log2_cb, intra, part_mode, intra_split, max_depth, chroma_modes, chroma_syntax: chroma_mode_syntax, bypass, intra_modes };
+                let cu = CuCtx { x0, y0, log2_cb, intra, part_mode, intra_split, max_depth, chroma_modes, chroma_syntax: chroma_mode_syntax, bypass };
                 self.transform_tree(&cu, x0, y0, x0, y0, log2_cb, 0, 0, [[true; 2]; 2])?;
             } else if intra {
                 // Intra CU with no residual still needs its prediction.
@@ -1399,6 +1399,4 @@ pub struct CuCtx {
     pub chroma_syntax: [u32; 4],
     /// `cu_transquant_bypass_flag`.
     pub bypass: bool,
-    /// Luma intra modes per PU (NxN: 4).
-    pub intra_modes: [u32; 4],
 }

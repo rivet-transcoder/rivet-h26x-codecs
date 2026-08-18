@@ -187,11 +187,6 @@ pub struct DeblockScratch {
     hor: Vec<u8>,
 }
 
-/// Deblock the whole picture in place.
-pub fn deblock_picture<S: Sample>(dsp: &HevcDsp<S>, frame: &mut Frame<S>, info: &PicInfo, pps: &Pps, bit_depth_luma: u32, bit_depth_chroma: u32) {
-    let mut scratch = DeblockScratch::default();
-    deblock_rows(dsp, &mut scratch, frame, info, pps, bit_depth_luma, bit_depth_chroma, 0, info.h4);
-}
 
 /// Deblock the 4x4-block rows `by0..by1` in place: all their vertical edges,
 /// then all their horizontal edges (including the top edge of row `by0`,

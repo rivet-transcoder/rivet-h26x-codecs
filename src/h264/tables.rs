@@ -104,5 +104,3 @@ pub static BLK4X4_X: [u8; 16] = [0, 1, 0, 1, 2, 3, 2, 3, 0, 1, 0, 1, 2, 3, 2, 3]
 /// See [`BLK4X4_X`].
 pub static BLK4X4_Y: [u8; 16] = [0, 0, 1, 1, 0, 0, 1, 1, 2, 2, 3, 3, 2, 2, 3, 3];
 
-/// Chroma DC 2x2 scan (4:2:0): raster order.
-pub static CHROMA_DC_SCAN: [u8; 4] = [0, 1, 2, 3];

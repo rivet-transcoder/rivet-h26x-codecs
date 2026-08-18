@@ -80,15 +80,6 @@ impl SubMbShape {
             SubMbShape::S4x4 => 4,
         }
     }
-    /// Width and height in samples of each sub-partition.
-    pub fn size(self) -> (usize, usize) {
-        match self {
-            SubMbShape::S8x8 | SubMbShape::Direct => (8, 8),
-            SubMbShape::S8x4 => (8, 4),
-            SubMbShape::S4x8 => (4, 8),
-            SubMbShape::S4x4 => (4, 4),
-        }
-    }
 }
 
 /// Prediction direction flags of a partition: bit 0 = list 0, bit 1 = list 1.
@@ -518,13 +509,6 @@ pub struct MbNeighbours {
 }
 
 impl MbNeighbours {
-    /// Derive for `addr` (6.4.11.1) with the availability rule of 6.4.9:
-    /// a macroblock is available if it is decoded and in the same slice.
-    pub fn derive(info: &PicInfo, addr: usize, slice: u16) -> Self {
-        let mut nb = MbNeighbours::default();
-        nb.derive_into(info, addr, slice);
-        nb
-    }
 
     /// [`Self::derive`] into an existing value (the slice decoder keeps one
     /// and refills it per macroblock; the struct is a few hundred bytes and
@@ -640,14 +624,6 @@ impl MbNeighbours {
         }
     }
 
-    /// Derive for the macroblock at storage address `addr` of an MBAFF frame
-    /// (6.4.10 for the pairs, 6.4.12.2 for the macroblock-level neighbours),
-    /// the current pair being frame / field per `cur_field`.
-    pub fn derive_mbaff(info: &PicInfo, addr: usize, slice: u16, cur_field: bool) -> Self {
-        let mut nb = MbNeighbours::default();
-        nb.derive_mbaff_into(info, addr, slice, cur_field);
-        nb
-    }
 
     /// [`Self::derive_mbaff`] into an existing value.
     pub fn derive_mbaff_into(&mut self, info: &PicInfo, addr: usize, slice: u16, cur_field: bool) {

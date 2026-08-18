@@ -13,20 +13,6 @@ use super::pic::{PicInfo, SaoParams};
 use super::pps::Pps;
 use super::sps::Sps;
 
-/// Apply SAO to the whole picture in place.
-pub fn sao_picture<S: Sample>(dsp: &HevcDsp<S>, frame: &mut Frame<S>, info: &PicInfo, sps: &Sps, pps: &Pps) {
-    if !sps.sao_enabled {
-        return;
-    }
-    if !info.sao.iter().any(|s| s.iter().any(|c| c.type_idx != 0)) {
-        return;
-    }
-    let src = frame.clone();
-    let band = SaoBand::<S>::new();
-    for ry in 0..info.hc {
-        sao_ctb_row(dsp, frame, &src, &band, info, sps, pps, ry);
-    }
-}
 
 /// The deblocked source samples for one CTB row's SAO: a copy of the row
 /// plus a line above and below (see [`sao_ctb_row`]), and which picture

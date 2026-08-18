@@ -19,28 +19,30 @@
 //! bit depths and bit depths above 14.
 //!
 //! Module map: `sps` / `pps` / `slice` parse the parameter sets and slice
-//! header; `cavlc` and `cabac_mb` parse a macroblock into an [`mb::MbLayer`];
+//! header; `cavlc` and `cabac_mb` parse a macroblock into an `mb::MbLayer`;
 //! `recon` turns it into samples (through `intra`, `inter`, `transform`);
 //! `deblock` filters the finished picture; `dpb` owns POC, reference marking,
 //! list construction and output order; `decoder` drives it all.
 
-pub mod cabac_mb;
-pub mod cavlc;
-pub mod deblock;
-pub mod decoder;
-pub mod dpb;
-pub mod frame;
-pub mod inter;
-pub mod intra;
-pub mod mb;
-pub mod pps;
-pub mod recon;
-pub mod slice;
-pub mod sps;
-pub mod tables;
-#[allow(missing_docs, clippy::all, rustdoc::broken_intra_doc_links)]
-pub mod tables_gen;
-pub mod transform;
+pub(crate) mod cabac_mb;
+pub(crate) mod cavlc;
+pub(crate) mod deblock;
+pub(crate) mod decoder;
+pub(crate) mod dpb;
+pub(crate) mod frame;
+pub(crate) mod inter;
+pub(crate) mod intra;
+pub(crate) mod mb;
+pub(crate) mod pps;
+pub(crate) mod recon;
+pub(crate) mod slice;
+pub(crate) mod sps;
+pub(crate) mod tables;
+// Generated: the standard's tables in full, whether or not the decoder
+// reaches for every entry.
+#[allow(dead_code, missing_docs, clippy::all, rustdoc::broken_intra_doc_links)]
+pub(crate) mod tables_gen;
+pub(crate) mod transform;
 
 pub use decoder::H264Decoder;
 pub use pps::Pps;

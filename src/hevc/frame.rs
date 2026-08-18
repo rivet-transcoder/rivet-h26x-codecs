@@ -153,11 +153,6 @@ impl<S: Sample> Plane16<S> {
         let yy = y.clamp(0, self.height as i32 - 1) as isize;
         self.data[self.offset(xx, yy)]
     }
-    /// Sample at (x, y) — the coordinates must be inside the padded area.
-    #[inline(always)]
-    pub fn at(&self, x: isize, y: isize) -> S {
-        self.data[self.offset(x, y)]
-    }
     /// Replicate the left/right edge samples of rows `y0..y1` into the border.
     pub fn extend_rows(&mut self, y0: usize, y1: usize) {
         let (w, pad, stride) = (self.width, self.pad, self.stride);
@@ -195,31 +190,6 @@ impl<S: Sample> Plane16<S> {
         }
     }
 
-    /// Replicate the visible edges into the border.
-    pub fn extend_edges(&mut self) {
-        let (w, h, pad, stride) = (self.width, self.height, self.pad, self.stride);
-        if w == 0 || h == 0 {
-            return;
-        }
-        let origin = self.origin();
-        for y in 0..h {
-            let row = origin + y * stride;
-            let l = self.data[row];
-            let r = self.data[row + w - 1];
-            for i in 1..=pad {
-                self.data[row - i] = l;
-                self.data[row + w - 1 + i] = r;
-            }
-        }
-        let first = origin - pad;
-        for i in 1..=pad {
-            self.data.copy_within(first..first + stride, first - i * stride);
-        }
-        let last = origin + (h - 1) * stride - pad;
-        for i in 1..=pad {
-            self.data.copy_within(last..last + stride, last + i * stride);
-        }
-    }
 }
 
 /// A decoded HEVC picture.
@@ -241,21 +211,17 @@ pub struct Frame<S: Sample = u16> {
     pub height: usize,
     /// Width in 4x4 blocks (`ceil(width / 4)`).
     pub w4: usize,
-    /// Height in 4x4 blocks.
-    pub h4: usize,
     /// Motion per 4x4 block, raster over the picture: `y4 * w4 + x4`.
     pub motion: Vec<MotionInfo>,
     /// POC.
     pub poc: i32,
-    /// Long-term reference (as seen when used as a collocated picture).
-    pub long_term: bool,
 }
 
 impl<S: Sample> Frame<S> {
     /// A zero-size placeholder (no buffers).
     pub fn empty() -> Self {
         let none = || Plane16 { data: Vec::new(), width: 0, height: 0, pad: 0, stride: 0 };
-        Frame { y: none(), cb: none(), cr: none(), chroma: ChromaFormat::Yuv420, bit_depth: 8, width: 0, height: 0, w4: 0, h4: 0, motion: Vec::new(), poc: 0, long_term: false }
+        Frame { y: none(), cb: none(), cr: none(), chroma: ChromaFormat::Yuv420, bit_depth: 8, width: 0, height: 0, w4: 0, motion: Vec::new(), poc: 0 }
     }
 
     /// Allocate.
@@ -277,10 +243,8 @@ impl<S: Sample> Frame<S> {
             width,
             height,
             w4,
-            h4,
             motion: vec![MotionInfo::default(); w4 * h4],
             poc: 0,
-            long_term: false,
         }
     }
 
@@ -290,14 +254,6 @@ impl<S: Sample> Frame<S> {
         &self.motion[(y / 4) * self.w4 + x / 4]
     }
 
-    /// Replicate edges of every plane.
-    pub fn extend_edges(&mut self) {
-        self.y.extend_edges();
-        if self.chroma != ChromaFormat::Monochrome {
-            self.cb.extend_edges();
-            self.cr.extend_edges();
-        }
-    }
 
     /// Extend the borders of luma rows `y0..y1` (and the matching chroma rows)
     /// left/right; the top border once `y0 == 0`, the bottom once `y1 >= height`.

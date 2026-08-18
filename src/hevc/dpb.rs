@@ -270,10 +270,6 @@ impl<S: Sample> Dpb<S> {
         self.pics.retain(|p| p.is_ref);
     }
 
-    /// Drop everything.
-    pub fn clear(&mut self) {
-        self.pics.clear();
-    }
 
     /// 8.3.2: derive the RPS of the current picture from its slice header,
     /// mark the DPB accordingly, generate missing references (8.3.3), and

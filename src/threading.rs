@@ -90,10 +90,6 @@ impl Progress {
         self.cv.notify_all();
     }
 
-    /// Current `done` count.
-    pub fn done_rows(&self) -> i32 {
-        self.done.load(Ordering::Acquire)
-    }
 
     /// Whether the picture is finished.
     pub fn is_complete(&self) -> bool {
@@ -152,55 +148,6 @@ impl Progress {
 }
 
 impl Default for Progress {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// A monotonic count other threads can wait on: how many macroblocks of a
-/// row are reconstructed, how many of a picture's rows are done. Waiting
-/// takes the lock only when the count is short.
-pub struct Counter {
-    value: std::sync::atomic::AtomicU32,
-    lock: Mutex<()>,
-    cv: Condvar,
-}
-
-impl Counter {
-    /// Zero.
-    pub const fn new() -> Self {
-        Counter { value: std::sync::atomic::AtomicU32::new(0), lock: Mutex::new(()), cv: Condvar::new() }
-    }
-
-    /// The count.
-    #[inline]
-    pub fn get(&self) -> u32 {
-        self.value.load(Ordering::Acquire)
-    }
-
-    /// Set the count to at least `v` (never lower) and wake waiters.
-    pub fn publish(&self, v: u32) {
-        if self.value.load(Ordering::Relaxed) >= v {
-            return;
-        }
-        let _g = self.lock.lock().unwrap();
-        self.value.fetch_max(v, Ordering::AcqRel);
-        self.cv.notify_all();
-    }
-
-    /// Block until the count is at least `v`.
-    pub fn wait_ge(&self, v: u32) {
-        if self.value.load(Ordering::Acquire) >= v {
-            return;
-        }
-        let mut g = self.lock.lock().unwrap();
-        while self.value.load(Ordering::Acquire) < v {
-            g = self.cv.wait(g).unwrap();
-        }
-    }
-}
-
-impl Default for Counter {
     fn default() -> Self {
         Self::new()
     }
@@ -269,11 +216,6 @@ impl Pool {
             workers.push(h);
         }
         Arc::new(Pool { state, workers, capacity: capacity.max(1) })
-    }
-
-    /// Number of worker threads.
-    pub fn threads(&self) -> usize {
-        self.workers.len()
     }
 
     /// Queue `job`, waiting while the pool is at capacity. Never call this

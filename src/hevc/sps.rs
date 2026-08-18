@@ -117,10 +117,6 @@ impl ScalingList {
         }
         s
     }
-    /// Flat 16.
-    pub fn flat() -> Self {
-        ScalingList { lists: [[[16; 64]; 6]; 4], dc: [[16; 6]; 2] }
-    }
 }
 
 /// Parse `scaling_list_data()` (7.3.4) into raster-ordered lists.
@@ -610,10 +606,6 @@ impl Sps {
         }
     }
 
-    /// `MinCbSizeY`.
-    pub fn min_cb_size(&self) -> u32 {
-        1 << self.log2_min_cb_size
-    }
     /// `CtbSizeY`.
     pub fn ctb_size(&self) -> u32 {
         1 << self.log2_ctb_size
@@ -625,22 +617,6 @@ impl Sps {
     /// `PicHeightInCtbsY`.
     pub fn pic_height_in_ctbs(&self) -> u32 {
         self.height.div_ceil(self.ctb_size())
-    }
-    /// `PicWidthInMinCbsY`.
-    pub fn pic_width_in_min_cbs(&self) -> u32 {
-        self.width / self.min_cb_size()
-    }
-    /// `PicHeightInMinCbsY`.
-    pub fn pic_height_in_min_cbs(&self) -> u32 {
-        self.height / self.min_cb_size()
-    }
-    /// `(SubWidthC, SubHeightC)`.
-    pub fn chroma_subsampling(&self) -> (u32, u32) {
-        match self.chroma_format_idc {
-            1 => (2, 2),
-            2 => (2, 1),
-            _ => (1, 1),
-        }
     }
     /// `MaxPicOrderCntLsb`.
     pub fn max_poc_lsb(&self) -> i32 {

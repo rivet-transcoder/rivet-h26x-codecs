@@ -110,11 +110,6 @@ impl<S: Sample> PaddedPlane<S> {
     pub fn offset(&self, x: isize, y: isize) -> usize {
         (self.origin() as isize + y * self.stride as isize + x) as usize
     }
-    /// Sample at (x, y) — x and y may reach into the border.
-    #[inline(always)]
-    pub fn at(&self, x: isize, y: isize) -> S {
-        self.data[self.offset(x, y)]
-    }
     /// Replicate the left/right edge samples of rows `y0..y1` into the border.
     pub fn extend_rows(&mut self, y0: usize, y1: usize) {
         self.extend_rows_step(y0, y1, 1);
@@ -689,8 +684,6 @@ pub struct SharedFrame<S: Sample = u8> {
     /// row covers two frame rows). Readers of a frame wait on both, readers
     /// of a field on its parity.
     pub progress: [Progress; 2],
-    /// POC (fixed at creation).
-    pub poc: i32,
     /// Unique id.
     pub id: u64,
     pool: Option<FramePool<S>>,
@@ -702,7 +695,7 @@ unsafe impl<S: Sample> Send for SharedFrame<S> {}
 
 impl<S: Sample> SharedFrame<S> {
     /// Wrap a fresh frame.
-    pub fn new(frame: Frame<S>, poc: i32, id: u64, complete: bool) -> Self {
+    pub fn new(frame: Frame<S>, id: u64, complete: bool) -> Self {
         let mk = || {
             if complete {
                 Progress::complete()
@@ -713,18 +706,16 @@ impl<S: Sample> SharedFrame<S> {
         SharedFrame {
             inner: std::cell::UnsafeCell::new(frame),
             progress: [mk(), mk()],
-            poc,
             id,
             pool: None,
         }
     }
 
     /// Wrap a frame whose buffers return to `pool` on drop.
-    pub fn with_pool(frame: Frame<S>, poc: i32, id: u64, pool: FramePool<S>) -> Self {
+    pub fn with_pool(frame: Frame<S>, id: u64, pool: FramePool<S>) -> Self {
         SharedFrame {
             inner: std::cell::UnsafeCell::new(frame),
             progress: [Progress::new(), Progress::new()],
-            poc,
             id,
             pool: Some(pool),
         }
@@ -768,12 +759,6 @@ impl<S: Sample> SharedFrame<S> {
         }
     }
 
-    /// Block until frame rows `< y` of the picture `parity` are reconstructed.
-    pub fn wait_decoded(&self, parity: u8, y: i32) {
-        for p in Self::parities(parity) {
-            self.progress[p].wait_decoded(y);
-        }
-    }
 
     /// Block until frame rows `< y` of the picture `parity` are parsed and
     /// their motion derived (what direct prediction reads of a colocated
@@ -796,10 +781,6 @@ impl<S: Sample> SharedFrame<S> {
         self.progress[0].is_complete() && self.progress[1].is_complete()
     }
 
-    /// The picture `parity` finished.
-    pub fn is_parity_complete(&self, parity: u8) -> bool {
-        Self::parities(parity).all(|p| self.progress[p].is_complete())
-    }
 
     /// Record a decoding error.
     pub fn set_error(&self) {
@@ -808,12 +789,6 @@ impl<S: Sample> SharedFrame<S> {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Whether decoding hit an error.
-    pub fn has_error(&self) -> bool {
-        self.progress[0]
-            .error
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
 
     /// Shared view; only rows the progress covers may be read.
     ///

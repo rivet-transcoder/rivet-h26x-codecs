@@ -20,31 +20,31 @@ pub mod hevc;
 pub(crate) mod x86_compat;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_unsafe)]
-pub mod h264_x86_128;
+pub(crate) mod h264_x86_128;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_unsafe)]
-pub mod h264_avx2;
+pub(crate) mod h264_avx2;
 #[cfg(target_arch = "aarch64")]
 #[allow(unused_unsafe)]
-pub mod h264_neon;
+pub(crate) mod h264_neon;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_unsafe)]
-pub mod hevc_x86_128;
+pub(crate) mod hevc_x86_128;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_unsafe)]
-pub mod hevc_avx2;
+pub(crate) mod hevc_avx2;
 #[cfg(target_arch = "aarch64")]
 #[allow(unused_unsafe)]
-pub mod hevc_neon;
+pub(crate) mod hevc_neon;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_unsafe)]
-pub mod hevc_avx2_u8;
+pub(crate) mod hevc_avx2_u8;
 #[cfg(target_arch = "aarch64")]
 #[allow(unused_unsafe)]
-pub mod hevc_neon_u8;
+pub(crate) mod hevc_neon_u8;
 #[cfg(target_arch = "aarch64")]
 #[allow(unused_unsafe)]
-pub mod neon_dotprod;
+pub(crate) mod neon_dotprod;
 
 /// What the running CPU can do, detected once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1040,7 +1040,7 @@ impl<S: Sample> H264DecoderImpl<S> {
             }
             let id = self.next_id;
             self.next_id += 1;
-            self.grey = Some(Arc::new(SharedFrame::new(g, 0, id, true)));
+            self.grey = Some(Arc::new(SharedFrame::new(g, id, true)));
         }
         self.grey.clone().unwrap()
     }
@@ -1285,7 +1285,7 @@ impl<S: Sample> H264DecoderImpl<S> {
                     f.field_poc = [top, bottom];
                 }
                 (
-                    Arc::new(SharedFrame::with_pool(f, poc, id, self.frames.clone())),
+                    Arc::new(SharedFrame::with_pool(f, id, self.frames.clone())),
                     self.decode_index,
                 )
             }

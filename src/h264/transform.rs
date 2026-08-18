@@ -44,9 +44,16 @@ impl Dequant {
     }
 }
 
+// The routines below are the standard's transform and dequantisation written
+// literally, separate from the fused idct-and-add kernels in `dsp::h264` that
+// the decoder actually runs. Only the tests at the bottom of this file call
+// them, to check the definition and the `DEQUANT4_INIT` table the production
+// kernels are built on, so they are compiled out of a release build.
+
 /// Dequantise a 4x4 block of coefficients in place (8.5.12.1), all
 /// positions (the caller zeroes position 0 or handles DC separately for
 /// Intra16x16/chroma). `qp` is qP for the block (luma QP_Y or chroma QP_C).
+#[cfg(test)]
 #[inline]
 pub fn dequant4x4(coeffs: &mut [i32; 16], scale: &[i32; 16], qp: i32, skip_dc: bool) {
     let q6 = qp / 6;
@@ -65,27 +72,11 @@ pub fn dequant4x4(coeffs: &mut [i32; 16], scale: &[i32; 16], qp: i32, skip_dc: b
     }
 }
 
-/// Dequantise an 8x8 block in place (8.5.13.1).
-#[inline]
-pub fn dequant8x8(coeffs: &mut [i32; 64], scale: &[i32; 64], qp: i32) {
-    let q6 = qp / 6;
-    if qp >= 36 {
-        let sh = q6 - 6;
-        for i in 0..64 {
-            coeffs[i] = (coeffs[i] * scale[i]) << sh;
-        }
-    } else {
-        let sh = 6 - q6;
-        let round = 1 << (5 - q6);
-        for i in 0..64 {
-            coeffs[i] = (coeffs[i] * scale[i] + round) >> sh;
-        }
-    }
-}
 
 /// Inverse 4x4 transform (8.5.12.2) producing the residual `r[i][j]`
 /// (already `(x + 32) >> 6`), in place.
 #[inline]
+#[cfg(test)]
 pub fn idct4x4(d: &mut [i32; 16]) {
     let mut tmp = [0i32; 16];
     // Rows.
@@ -115,6 +106,7 @@ pub fn idct4x4(d: &mut [i32; 16]) {
 }
 
 /// Inverse 8x8 transform (8.5.13.2), in place, `(x + 32) >> 6` applied.
+#[cfg(test)]
 pub fn idct8x8(d: &mut [i32; 64]) {
     let mut tmp = [0i32; 64];
     for i in 0..8 {
@@ -134,6 +126,7 @@ pub fn idct8x8(d: &mut [i32; 64]) {
 }
 
 #[inline(always)]
+#[cfg(test)]
 fn idct8_1d(d: &[i32], out: &mut [i32; 8]) {
     let a0 = d[0] + d[4];
     let a4 = d[0] - d[4];
@@ -243,17 +236,6 @@ pub fn chroma_dc_transform_422(dc: &mut [i32; 8], scale00: i32, qp: i32) {
     }
 }
 
-/// Add a residual block to the prediction in place with clipping (8-bit).
-#[inline(always)]
-pub fn add_residual(dst: &mut [u8], stride: usize, res: &[i32], size: usize) {
-    for y in 0..size {
-        let row = &mut dst[y * stride..y * stride + size];
-        for x in 0..size {
-            let v = row[x] as i32 + res[y * size + x];
-            row[x] = v.clamp(0, 255) as u8;
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

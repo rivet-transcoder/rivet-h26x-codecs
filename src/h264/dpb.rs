@@ -83,11 +83,6 @@ impl<S: Sample> DecodedPic<S> {
     pub fn both_long(&self) -> bool {
         self.mark[0] == RefMark::Long && self.mark[1] == RefMark::Long
     }
-    /// The frame's mark for a frame reference (both fields agree).
-    #[inline]
-    pub fn frame_long(&self) -> bool {
-        self.both_long()
-    }
     fn set_all(&mut self, m: RefMark) {
         self.mark = [m, m];
     }
@@ -272,10 +267,6 @@ impl<S: Sample> Dpb<S> {
         self.crop = sps.crop;
     }
 
-    /// Number of frames with any field marked as reference.
-    pub fn num_refs(&self) -> usize {
-        self.pics.iter().filter(|p| p.is_ref()).count()
-    }
 
     fn remove_unneeded(&mut self) {
         self.pics.retain(|p| p.is_ref() || p.needed_for_output || p.awaiting_field);

@@ -1114,7 +1114,6 @@ impl<S: Sample> HevcDecoderImpl<S> {
                     beta_offset: hdr.beta_offset,
                     tc_offset: hdr.tc_offset,
                     loop_filter_across_slices: hdr.loop_filter_across_slices,
-                    slice_addr: hdr.segment_address,
                     cb_qp_offset: pic.pps.cb_qp_offset,
                     cr_qp_offset: pic.pps.cr_qp_offset,
                 };

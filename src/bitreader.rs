@@ -57,10 +57,6 @@ impl<'a> BitReader<'a> {
         (self.pos as u64) * 8 - self.bits as u64
     }
 
-    /// Bits left, saturating at zero.
-    pub fn bits_left(&self) -> u64 {
-        self.len_bits().saturating_sub(self.position())
-    }
 
     /// Whether any read went past the end (or met a malformed code).
     #[inline]
@@ -68,10 +64,6 @@ impl<'a> BitReader<'a> {
         self.bad || self.position() > self.len_bits()
     }
 
-    /// The underlying bytes.
-    pub fn data(&self) -> &'a [u8] {
-        self.data
-    }
 
     #[inline(always)]
     fn refill(&mut self) {
@@ -124,15 +116,6 @@ impl<'a> BitReader<'a> {
         v
     }
 
-    /// Read `n` bits (0..=64) as an unsigned 64-bit value.
-    pub fn bits64(&mut self, n: u32) -> u64 {
-        if n <= 32 {
-            return self.bits(n) as u64;
-        }
-        let hi = self.bits(n - 32) as u64;
-        let lo = self.bits(32) as u64;
-        (hi << 32) | lo
-    }
 
     /// Read one bit as a bool.
     #[inline(always)]
@@ -235,15 +218,11 @@ impl<'a> BitReader<'a> {
     }
 
     /// The byte offset of the current position (must be byte aligned).
+    #[cfg(test)]
     pub fn byte_position(&self) -> usize {
         (self.position() / 8) as usize
     }
 
-    /// The remaining bytes from the current (byte-aligned) position.
-    pub fn remaining_bytes(&self) -> &'a [u8] {
-        let p = self.byte_position().min(self.data.len());
-        &self.data[p..]
-    }
 
     /// `more_rbsp_data()`: true if there is more data before the
     /// `rbsp_trailing_bits`. The RBSP ends with a stop bit `1` followed by
