@@ -59,11 +59,27 @@ pub struct Cpu {
     /// x86-64 with AVX2 (implies AVX / SSE4.1 / SSSE3).
     pub avx2: bool,
     /// x86-64 with AVX-512 F + BW + VL: 512-bit vectors, byte and word
-    /// lanes, and masked stores narrower than the vector. Unlike the rungs
+    /// lanes, and masked stores narrower than the vector. Masked *loads* are
+    /// a different matter on Zen 5 and cost several times a plain one: a
+    /// chroma kernel that read its nine bytes with one `vmovdqu8` came out
+    /// twice as slow as AVX2, and two plain loads and an unpack made the same
+    /// kernel 1.5x faster instead. Unlike the rungs
     /// below it this one is a *supplement*, not a replacement — the AVX-512
     /// modules install over a finished AVX2 table and leave every kernel and
     /// block shape they do not carry alone.
     pub avx512: bool,
+    /// x86-64 with AVX-512 VNNI (`vpdpwssd`). Detected, but no kernel uses
+    /// it: it folds the `vpaddd` after `pmaddwd` into the multiply, which is
+    /// one instruction saved of four in every accumulate loop here — and it
+    /// measured *slower*, because it also serialises them. `pmaddwd` and
+    /// `vpaddd` let the products issue in parallel and chain only the adds;
+    /// `vpdpwssd` puts the accumulator in the dependency chain of every
+    /// multiply. The 32-point transform, which accumulates up to sixteen
+    /// coefficient pairs into one register, lost 5-9% to it; the eight-tap
+    /// vertical filter, chaining only four, came out level. Worth revisiting
+    /// with several accumulators to break the chain, which would want the
+    /// non-VNNI bodies restructured the same way.
+    pub avx512vnni: bool,
     /// x86-64 with AVX: the 128-bit kernels, VEX-encoded.
     pub avx: bool,
     /// x86-64 with SSE4.1 (`pblendvb`, `pmovzx`, `pminsd` / `pmaxsd`, `ptest`).
@@ -104,7 +120,8 @@ impl Cpu {
                 && std::is_x86_feature_detected!("avx512f")
                 && std::is_x86_feature_detected!("avx512bw")
                 && std::is_x86_feature_detected!("avx512vl");
-            return Self { avx2, avx512, avx, sse41, ssse3, sse2, ..Self::SCALAR };
+            let avx512vnni = avx512 && std::is_x86_feature_detected!("avx512vnni");
+            return Self { avx2, avx512, avx512vnni, avx, sse41, ssse3, sse2, ..Self::SCALAR };
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -121,6 +138,7 @@ impl Cpu {
     pub const SCALAR: Self = Self {
         avx2: false,
         avx512: false,
+        avx512vnni: false,
         avx: false,
         sse41: false,
         ssse3: false,
@@ -177,6 +195,7 @@ impl Cpu {
             Ok("none") | Ok("scalar") => cpu = Self::SCALAR,
             Ok("sse2") => {
                 cpu.avx512 = false;
+                cpu.avx512vnni = false;
                 cpu.avx2 = false;
                 cpu.avx = false;
                 cpu.sse41 = false;
@@ -184,20 +203,26 @@ impl Cpu {
             }
             Ok("ssse3") => {
                 cpu.avx512 = false;
+                cpu.avx512vnni = false;
                 cpu.avx2 = false;
                 cpu.avx = false;
                 cpu.sse41 = false;
             }
             Ok("sse41") | Ok("sse4.1") => {
                 cpu.avx512 = false;
+                cpu.avx512vnni = false;
                 cpu.avx2 = false;
                 cpu.avx = false;
             }
             Ok("avx") => {
                 cpu.avx512 = false;
+                cpu.avx512vnni = false;
                 cpu.avx2 = false;
             }
-            Ok("avx2") => cpu.avx512 = false,
+            Ok("avx2") => {
+                cpu.avx512 = false;
+                cpu.avx512vnni = false;
+            }
             // The top of the ladder: recognised so that it is documented and
             // so `verify.sh` can name every rung uniformly, but there is
             // nothing above it to switch off.
