@@ -3,11 +3,11 @@
 //! the luma and chroma edge filters, macroblock by macroblock in raster
 //! order — vertical edges first, then horizontal, luma then chroma.
 
-use crate::dsp::h264::H264Dsp;
+use crate::dsp::h264::{H264Dsp, LumaDeblockFn, LumaDeblockIntraFn};
 use crate::sample::Sample;
 
 use super::frame::Frame;
-use super::mb::{MbKind, PicInfo};
+use super::mb::PicInfo;
 use super::tables::{ALPHA, BETA, TC0};
 
 /// The per-slice deblocking parameters the filter needs at each macroblock.
@@ -89,16 +89,374 @@ fn clip3(lo: i32, hi: i32, v: i32) -> i32 {
     v.clamp(lo, hi)
 }
 
-/// tC0 per 4-line segment for a bS < 4 edge (−1 = bS 0, leave alone).
+/// The four tC0 values a bS byte can select at one indexA, indexed by the
+/// strength itself (0 = leave the segment alone). One of these serves a
+/// whole group of edges that share a QP average, instead of a table walk
+/// per segment.
 #[inline]
-fn tc0_of(bs: &[u8; 4], index_a: i32, bd_shift: u32) -> [i16; 4] {
-    let mut t = [-1i16; 4];
+fn tc_lut(index_a: i32, bd_shift: u32) -> [i16; 4] {
+    let t = &TC0[index_a as usize];
+    [
+        -1,
+        (t[0] as i16) << bd_shift,
+        (t[1] as i16) << bd_shift,
+        (t[2] as i16) << bd_shift,
+    ]
+}
+
+/// The four segments' tC0 of a packed edge (byte `k` holds segment `k`'s
+/// strength, which is 0..3 whenever this is reached — bS 4 has its own
+/// kernel).
+#[inline(always)]
+fn tc4(bs: u32, lut: &[i16; 4]) -> [i16; 4] {
+    let b = bs.to_le_bytes();
+    [
+        lut[(b[0] & 3) as usize],
+        lut[(b[1] & 3) as usize],
+        lut[(b[2] & 3) as usize],
+        lut[(b[3] & 3) as usize],
+    ]
+}
+
+/// One packed edge through the bS 4 kernel or the bS < 4 one. Within an
+/// edge the strengths are either all 4 or all below it (only a macroblock
+/// edge against an intra macroblock is 4, and then for its whole length),
+/// so byte 0 decides for the edge.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn filter_edge<S: Sample>(
+    f: LumaDeblockFn<S>,
+    f_intra: LumaDeblockIntraFn<S>,
+    data: &mut [S],
+    off: usize,
+    stride: usize,
+    bs: u32,
+    alpha: i32,
+    beta: i32,
+    lut: &[i16; 4],
+    max: i32,
+) {
+    if bs as u8 == 4 {
+        f_intra(data, off, stride, alpha, beta, max);
+    } else {
+        f(data, off, stride, alpha, beta, &tc4(bs, lut), max);
+    }
+}
+
+/// A four-segment "these have coefficients" mask spread to bS 2 in one
+/// byte per segment.
+#[rustfmt::skip]
+static BS2_SPREAD: [u32; 16] = [
+    0x0000_0000, 0x0000_0002, 0x0000_0200, 0x0000_0202,
+    0x0002_0000, 0x0002_0002, 0x0002_0200, 0x0002_0202,
+    0x0200_0000, 0x0200_0002, 0x0200_0200, 0x0200_0202,
+    0x0202_0000, 0x0202_0002, 0x0202_0200, 0x0202_0202,
+];
+
+/// Bits `s`, `s + 4`, `s + 8` and `s + 12` of a 4x4 block mask gathered
+/// into bits 0..3 — one column of it, which is what a vertical edge
+/// reads. (A horizontal edge reads a row, already a nibble.)
+#[inline(always)]
+fn gather_col(x: u16, s: u32) -> u32 {
+    let x = ((x >> s) as u32) & 0x1111;
+    (x | (x >> 3) | (x >> 6) | (x >> 9)) & 0xF
+}
+
+/// The motion-derived strengths of the segments in `rest`, packed one
+/// byte per segment. `chg` marks the segments (1..3) whose two sides are
+/// not the same pair of partitions as the segment before them: within a
+/// run without such a boundary the comparison of 8.7.2.1 reads the same
+/// motion on both sides and is made once.
+#[inline(always)]
+fn edge_motion(rest: u32, chg: u32, mut bs_of: impl FnMut(usize) -> u8) -> u32 {
+    if rest == 0 {
+        return 0;
+    }
+    let mut packed = 0u32;
+    let mut held = 0u32;
+    let mut known = false;
     for k in 0..4 {
-        if bs[k] != 0 {
-            t[k] = (TC0[index_a as usize][(bs[k] - 1).min(2) as usize] as i16) << bd_shift;
+        if chg >> k & 1 != 0 {
+            known = false;
+        }
+        if rest >> k & 1 == 0 {
+            continue;
+        }
+        if !known {
+            held = bs_of(k) as u32;
+            known = true;
+        }
+        packed |= held << (k * 8);
+    }
+    packed
+}
+
+/// The thresholds one QP average yields under 8.7.2.2: alpha, beta, and
+/// the four tC0 values a boundary strength can select (index 0, bS 0,
+/// meaning "leave the segment alone").
+#[derive(Clone, Copy)]
+struct Thr {
+    alpha: i32,
+    beta: i32,
+    lut: [i16; 4],
+}
+
+/// Every QP average a picture can present, for one slice's filter
+/// offsets. 8.7.2.2 is a pure function of the average and of those
+/// offsets, and a macroblock asks for up to nine of them across its
+/// planes and edge groups, so they are derived once per slice and looked
+/// up. QP_Y runs from -QpBdOffset_Y to 51 and so does the average, which
+/// the table is biased by; a 14-bit picture, the deepest H.264 allows,
+/// needs all 88 entries.
+struct ThrTable {
+    t: [Thr; 88],
+    bias: i32,
+}
+
+impl ThrTable {
+    fn new(par: &DeblockParams, bd_shift: u32) -> ThrTable {
+        let bias = 6 * bd_shift as i32;
+        let mut t = [Thr {
+            alpha: 0,
+            beta: 0,
+            lut: [0; 4],
+        }; 88];
+        let n = (52 + bias as usize).min(88);
+        for (i, e) in t.iter_mut().enumerate().take(n) {
+            let qp_av = i as i32 - bias;
+            let index_a = clip3(0, 51, qp_av + par.offset_a) as usize;
+            let index_b = clip3(0, 51, qp_av + par.offset_b) as usize;
+            *e = Thr {
+                alpha: (ALPHA[index_a] as i32) << bd_shift,
+                beta: (BETA[index_b] as i32) << bd_shift,
+                lut: tc_lut(index_a as i32, bd_shift),
+            };
+        }
+        ThrTable { t, bias }
+    }
+
+    /// The entry for one edge's two QPs. Only averages the table was
+    /// built for are reachable, so the clamp is on the array bound.
+    #[inline(always)]
+    fn get(&self, qp_p: i32, qp_q: i32) -> &Thr {
+        &self.t[clip3(0, 87, ((qp_p + qp_q + 1) >> 1) + self.bias) as usize]
+    }
+}
+
+/// The luma edge set of one plane: the four vertical edges left to right,
+/// then the four horizontal ones top to bottom, at this plane's QP. Also
+/// the chroma planes of a 4:4:4 picture, whose chromaStyleFilteringFlag
+/// is 0.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn filter_luma_style<S: Sample>(
+    dsp: &H264Dsp<S>,
+    plane: &mut super::frame::PaddedPlane<S>,
+    bs_v: &[u32; 4],
+    bs_h: &[u32; 4],
+    qp_cur: i32,
+    qp_left: i32,
+    qp_above: i32,
+    internal_odd: bool,
+    x0: usize,
+    y0: usize,
+    thr: &ThrTable,
+    max: i32,
+) {
+    // The odd internal edges are no transform edges under the 8x8
+    // transform, whatever strength they carry for 4:2:2 chroma.
+    let step = if internal_odd { 1usize } else { 2 };
+    let (iv, ih) = if internal_odd {
+        (bs_v[1] | bs_v[2] | bs_v[3], bs_h[1] | bs_h[2] | bs_h[3])
+    } else {
+        (bs_v[2], bs_h[2])
+    };
+    if bs_v[0] | bs_h[0] | iv | ih == 0 {
+        return;
+    }
+    let stride = plane.stride;
+    let base = plane.offset(x0 as isize, y0 as isize);
+    // Every internal edge shares the macroblock's own QP average.
+    let ti = thr.get(qp_cur, qp_cur);
+    let (f, fi) = (dsp.deblock_luma_v, dsp.deblock_luma_v_intra);
+    if bs_v[0] != 0 {
+        let t = thr.get(qp_left, qp_cur);
+        filter_edge(
+            f,
+            fi,
+            &mut plane.data,
+            base,
+            stride,
+            bs_v[0],
+            t.alpha,
+            t.beta,
+            &t.lut,
+            max,
+        );
+    }
+    let mut e = step;
+    while e < 4 {
+        if bs_v[e] != 0 {
+            filter_edge(
+                f,
+                fi,
+                &mut plane.data,
+                base + e * 4,
+                stride,
+                bs_v[e],
+                ti.alpha,
+                ti.beta,
+                &ti.lut,
+                max,
+            );
+        }
+        e += step;
+    }
+    let (f, fi) = (dsp.deblock_luma_h, dsp.deblock_luma_h_intra);
+    if bs_h[0] != 0 {
+        let t = thr.get(qp_above, qp_cur);
+        filter_edge(
+            f,
+            fi,
+            &mut plane.data,
+            base,
+            stride,
+            bs_h[0],
+            t.alpha,
+            t.beta,
+            &t.lut,
+            max,
+        );
+    }
+    let mut e = step;
+    while e < 4 {
+        if bs_h[e] != 0 {
+            filter_edge(
+                f,
+                fi,
+                &mut plane.data,
+                base + e * 4 * stride,
+                stride,
+                bs_h[e],
+                ti.alpha,
+                ti.beta,
+                &ti.lut,
+                max,
+            );
+        }
+        e += step;
+    }
+}
+
+/// The chroma edge set of both components of a 4:2:0 or 4:2:2 picture:
+/// vertical edges at chroma x = 0 and 4 (luma edges 0 and 2), horizontal
+/// ones at chroma y = 0 and 4 for 4:2:0 (luma edges 0 and 2) and at 0, 4,
+/// 8, 12 for 4:2:2 (all four luma edge rows), each taking the strengths
+/// of the luma edge it lies on. Cb and Cr run together: they share the
+/// edge set and the geometry, and differ only in the QP each is filtered
+/// at.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn filter_chroma_style<S: Sample>(
+    dsp: &H264Dsp<S>,
+    cb: &mut super::frame::PaddedPlane<S>,
+    cr: &mut super::frame::PaddedPlane<S>,
+    bs_v: &[u32; 4],
+    bs_h: &[u32; 4],
+    qp_cur: [i32; 2],
+    qp_left: [i32; 2],
+    qp_above: [i32; 2],
+    c422: bool,
+    xc0: usize,
+    yc0: usize,
+    thr: &ThrTable,
+    max: i32,
+) {
+    let ih = if c422 {
+        bs_h[1] | bs_h[2] | bs_h[3]
+    } else {
+        bs_h[2]
+    };
+    if bs_v[0] | bs_h[0] | bs_v[2] | ih == 0 {
+        return;
+    }
+    let stride = cb.stride;
+    let base = cb.offset(xc0 as isize, yc0 as isize);
+    let (tib, tir) = (thr.get(qp_cur[0], qp_cur[0]), thr.get(qp_cur[1], qp_cur[1]));
+    if bs_v[0] != 0 {
+        let tb = thr.get(qp_left[0], qp_cur[0]);
+        let tr = thr.get(qp_left[1], qp_cur[1]);
+        chroma_v_edge(dsp, cb, base, stride, c422, bs_v[0], tb, max);
+        chroma_v_edge(dsp, cr, base, stride, c422, bs_v[0], tr, max);
+    }
+    if bs_v[2] != 0 {
+        chroma_v_edge(dsp, cb, base + 4, stride, c422, bs_v[2], tib, max);
+        chroma_v_edge(dsp, cr, base + 4, stride, c422, bs_v[2], tir, max);
+    }
+    let (f, fi) = (dsp.deblock_chroma_h, dsp.deblock_chroma_h_intra);
+    if bs_h[0] != 0 {
+        let tb = thr.get(qp_above[0], qp_cur[0]);
+        let tr = thr.get(qp_above[1], qp_cur[1]);
+        filter_edge(
+            f,
+            fi,
+            &mut cb.data,
+            base,
+            stride,
+            bs_h[0],
+            tb.alpha,
+            tb.beta,
+            &tb.lut,
+            max,
+        );
+        filter_edge(
+            f,
+            fi,
+            &mut cr.data,
+            base,
+            stride,
+            bs_h[0],
+            tr.alpha,
+            tr.beta,
+            &tr.lut,
+            max,
+        );
+    }
+    if ih != 0 {
+        // Chroma row of the edge: 4:2:0 only e = 2 (row 4), 4:2:2 e * 4.
+        let (step, scale) = if c422 { (1usize, 4) } else { (2usize, 2) };
+        let mut e = step;
+        while e < 4 {
+            if bs_h[e] != 0 {
+                let off = base + e * scale * stride;
+                filter_edge(
+                    f,
+                    fi,
+                    &mut cb.data,
+                    off,
+                    stride,
+                    bs_h[e],
+                    tib.alpha,
+                    tib.beta,
+                    &tib.lut,
+                    max,
+                );
+                filter_edge(
+                    f,
+                    fi,
+                    &mut cr.data,
+                    off,
+                    stride,
+                    bs_h[e],
+                    tir.alpha,
+                    tir.beta,
+                    &tir.lut,
+                    max,
+                );
+            }
+            e += step;
         }
     }
-    t
 }
 
 /// Deblock the whole picture in place.
@@ -132,7 +490,7 @@ pub fn deblock_mb_rows<S: Sample>(
     let mbw = info.mb_width;
     let mbh = info.mb_height;
     // Thresholds scale with the bit depth (8.7.2.2): alpha, beta and tC0 are
-    // multiplied by 2^(BitDepth − 8).
+    // multiplied by 2^(BitDepth - 8).
     let bd_shift = frame.bit_depth - 8;
     let max = (1i32 << frame.bit_depth) - 1;
     // A field picture: every macroblock is a field macroblock — intra
@@ -140,6 +498,22 @@ pub fn deblock_mb_rows<S: Sample>(
     // differences count in field units.
     let field_pic = frame.field_coded;
     let mvy_limit: i16 = if field_pic { 2 } else { 4 };
+    // Chroma geometry, fixed for the picture.
+    let c422 = frame.chroma == crate::picture::ChromaFormat::Yuv422;
+    let c420 = frame.chroma == crate::picture::ChromaFormat::Yuv420;
+    // 4:4:4 filters its chroma planes with the luma filters and edge set
+    // (chromaStyleFilteringFlag is 0 there), at the chroma QP.
+    let c444 = frame.chroma == crate::picture::ChromaFormat::Yuv444;
+    let mbh_c = if c422 { 16 } else { 8 };
+    // An intra macroblock's edges, packed one byte per segment: 4 on its
+    // macroblock edges (3 on a horizontal one in a field picture), 3 on
+    // its internal ones.
+    let intra_top: u32 = if field_pic { 0x0303_0303 } else { 0x0404_0404 };
+    // The filter thresholds of the slice being filtered, rebuilt when
+    // the macroblocks cross into another one.
+    let mut thr_slice = usize::MAX;
+    let mut thr = ThrTable::new(&DeblockParams::default(), bd_shift);
+
     for mby in r0..r1.min(mbh) {
         for mbx in 0..mbw {
             let addr = mby * mbw + mbx;
@@ -151,354 +525,194 @@ pub fn deblock_mb_rows<S: Sample>(
             if par.disable_idc == 1 {
                 continue;
             }
-            let left = if mbx > 0 { Some(addr - 1) } else { None };
-            let above = if mby > 0 { Some(addr - mbw) } else { None };
+            if m.slice as usize != thr_slice {
+                thr = ThrTable::new(&par, bd_shift);
+                thr_slice = m.slice as usize;
+            }
+            // Unavailable neighbours address the macroblock itself: their
+            // QPs are then never read, `filter_left` / `filter_top` being
+            // what decides whether the edge exists at all.
+            let left = if mbx > 0 { addr - 1 } else { addr };
+            let above = if mby > 0 { addr - mbw } else { addr };
             let across_slices = par.disable_idc != 2;
-            let filter_left = left.is_some_and(|l| {
-                info.mbs[l].decoded && (across_slices || info.mbs[l].slice == m.slice)
-            });
-            let filter_top = above.is_some_and(|a| {
-                info.mbs[a].decoded && (across_slices || info.mbs[a].slice == m.slice)
-            });
+            let filter_left = mbx > 0
+                && info.mbs[left].decoded
+                && (across_slices || info.mbs[left].slice == m.slice);
+            let filter_top = mby > 0
+                && info.mbs[above].decoded
+                && (across_slices || info.mbs[above].slice == m.slice);
 
-            // Boundary strengths for the vertical edges (4 edges x 4 rows)
-            // and horizontal edges (4 edges x 4 columns).
-            let mut bs_v = [[0u8; 4]; 4];
-            let mut bs_h = [[0u8; 4]; 4];
+            // Boundary strengths of the four vertical and the four
+            // horizontal edges, each edge's four segments packed one per
+            // byte: an edge is entirely bS 0 — the common case — exactly
+            // when its word is zero.
+            let mut bs_v = [0u32; 4];
+            let mut bs_h = [0u32; 4];
             // The odd internal edges are no luma transform edges under the
             // 8x8 transform (luma skips them below), but 4:2:2 chroma still
             // filters its edges there with the strength they would have.
             let internal_odd = !m.transform_8x8;
             if m.kind.is_intra() {
-                for e in 0..4 {
-                    let v = if e == 0 { 4 } else { 3 };
-                    if e != 0 || filter_left {
-                        bs_v[e] = [v; 4];
-                    }
-                    if e != 0 || filter_top {
-                        bs_h[e] = [if e == 0 && field_pic { 3 } else { v }; 4];
-                    }
+                if filter_left {
+                    bs_v[0] = 0x0404_0404;
                 }
+                if filter_top {
+                    bs_h[0] = intra_top;
+                }
+                bs_v[1] = 0x0303_0303;
+                bs_v[2] = 0x0303_0303;
+                bs_v[3] = 0x0303_0303;
+                bs_h[1] = 0x0303_0303;
+                bs_h[2] = 0x0303_0303;
+                bs_h[3] = 0x0303_0303;
             } else {
-                let nz = nz_mask(info, addr);
+                let nz = m.nz_mask;
                 let [pe_v, pe_h] = m.part_edges;
+                // The odd edges are not luma transform edges under the 8x8
+                // transform; only 4:2:2 chroma still needs their strengths.
+                let step = if internal_odd || c422 { 1usize } else { 2 };
                 // Internal edges: coefficients, else motion — which only
-                // differs across a partition boundary. The odd edges are
-                // not luma transform edges under the 8x8 transform; only
-                // 4:2:2 chroma still needs their strengths.
-                let need_odd = internal_odd || frame.chroma == crate::picture::ChromaFormat::Yuv422;
-                // A block or its right / lower neighbour has coefficients:
-                // bit `pb` of these for the edge between `pb` and `pb + 1`
-                // (vertical) / `pb + 4` (horizontal).
-                let coef_v = nz | (nz >> 1);
-                let coef_h = nz | (nz >> 4);
-                // Nothing to do at all for the common inter macroblock with
-                // one motion and no coefficients (a skip): every internal
-                // edge is bS 0.
+                // differs across a partition boundary. Nothing to do at all
+                // for the common inter macroblock with one motion and no
+                // coefficients (a skip): every internal edge is bS 0.
                 if nz != 0 || pe_v != 0 {
-                    for e in 1..4 {
-                        if e % 2 == 1 && !need_odd {
-                            continue;
-                        }
-                        for k in 0..4 {
+                    // A block or its right neighbour has coefficients.
+                    let coef_v = nz | (nz >> 1);
+                    let mut e = step;
+                    while e < 4 {
+                        let c = gather_col(coef_v, e as u32 - 1);
+                        let mut bs = BS2_SPREAD[c as usize];
+                        // Motion only where a partition boundary runs and
+                        // no coefficient decided the segment already.
+                        let mut rest = ((pe_v >> (e * 4)) as u32 & 0xF) & !c;
+                        while rest != 0 {
+                            let k = rest.trailing_zeros() as usize;
                             let pb = k * 4 + e - 1;
-                            bs_v[e][k] = if (coef_v >> pb) & 1 != 0 {
-                                2
-                            } else if (pe_v >> (e * 4 + k)) & 1 != 0 {
-                                motion_bs(frame, addr, pb, addr, pb + 1, mvy_limit)
-                            } else {
-                                0
-                            };
+                            bs |= (motion_bs(frame, addr, pb, addr, pb + 1, mvy_limit) as u32)
+                                << (k * 8);
+                            rest &= rest - 1;
                         }
+                        bs_v[e] = bs;
+                        e += step;
                     }
                 }
                 if nz != 0 || pe_h != 0 {
-                    for e in 1..4 {
-                        if e % 2 == 1 && !need_odd {
-                            continue;
-                        }
-                        for k in 0..4 {
+                    // A block or its lower neighbour has coefficients.
+                    let coef_h = nz | (nz >> 4);
+                    let mut e = step;
+                    while e < 4 {
+                        let c = (coef_h >> ((e - 1) * 4)) as u32 & 0xF;
+                        let mut bs = BS2_SPREAD[c as usize];
+                        let mut rest = ((pe_h >> (e * 4)) as u32 & 0xF) & !c;
+                        while rest != 0 {
+                            let k = rest.trailing_zeros() as usize;
                             let pb = (e - 1) * 4 + k;
-                            bs_h[e][k] = if (coef_h >> pb) & 1 != 0 {
-                                2
-                            } else if (pe_h >> (e * 4 + k)) & 1 != 0 {
-                                motion_bs(frame, addr, pb, addr, pb + 4, mvy_limit)
-                            } else {
-                                0
-                            };
+                            bs |= (motion_bs(frame, addr, pb, addr, pb + 4, mvy_limit) as u32)
+                                << (k * 8);
+                            rest &= rest - 1;
                         }
+                        bs_h[e] = bs;
+                        e += step;
                     }
                 }
                 if filter_left {
-                    let l = left.unwrap();
-                    if info.mbs[l].kind.is_intra() {
-                        bs_v[0] = [4; 4];
+                    let ml = &info.mbs[left];
+                    if ml.kind.is_intra() {
+                        bs_v[0] = 0x0404_0404;
                     } else {
-                        let nzl = nz_mask(info, l);
-                        for k in 0..4 {
-                            let (pb, qb) = (k * 4 + 3, k * 4);
-                            bs_v[0][k] = if (nzl >> pb | nz >> qb) & 1 != 0 {
-                                2
-                            } else {
-                                motion_bs(frame, l, pb, addr, qb, mvy_limit)
-                            };
-                        }
+                        let c = gather_col(ml.nz_mask, 3) | gather_col(nz, 0);
+                        let rest = !c & 0xF;
+                        // Segment k faces the same two partitions as segment
+                        // k - 1 unless a partition boundary crosses one side
+                        // there, so one comparison of 8.7.2.1 answers for a
+                        // whole run of segments.
+                        let chg = gather_col(ml.part_edges[1], 3) | gather_col(pe_h, 0);
+                        bs_v[0] = BS2_SPREAD[c as usize]
+                            | edge_motion(rest, chg, |k| {
+                                motion_bs(frame, left, k * 4 + 3, addr, k * 4, mvy_limit)
+                            });
                     }
                 }
                 if filter_top {
-                    let a = above.unwrap();
-                    if info.mbs[a].kind.is_intra() {
-                        bs_h[0] = [if field_pic { 3 } else { 4 }; 4];
+                    let ma = &info.mbs[above];
+                    if ma.kind.is_intra() {
+                        bs_h[0] = intra_top;
                     } else {
-                        let nza = nz_mask(info, a);
-                        for k in 0..4 {
-                            let (pb, qb) = (12 + k, k);
-                            bs_h[0][k] = if (nza >> pb | nz >> qb) & 1 != 0 {
-                                2
-                            } else {
-                                motion_bs(frame, a, pb, addr, qb, mvy_limit)
-                            };
-                        }
+                        let c = ((ma.nz_mask >> 12) | nz) as u32 & 0xF;
+                        let rest = !c & 0xF;
+                        let chg = gather_col(ma.part_edges[0], 3) | gather_col(pe_v, 0);
+                        bs_h[0] = BS2_SPREAD[c as usize]
+                            | edge_motion(rest, chg, |k| {
+                                motion_bs(frame, above, 12 + k, addr, k, mvy_limit)
+                            });
                     }
+                }
+                // An inter macroblock whose every edge came out bS 0 has
+                // nothing filtered in any plane.
+                if bs_v[0] | bs_v[1] | bs_v[2] | bs_v[3] | bs_h[0] | bs_h[1] | bs_h[2] | bs_h[3]
+                    == 0
+                {
+                    continue;
                 }
             }
 
             let (x0, y0) = (mbx * 16, mby * 16);
-            // Luma-style filtering: the luma plane, and in 4:4:4 the chroma
-            // planes too (chromaStyleFilteringFlag is 0 there: the luma
-            // filters and edge set, at the chroma QP).
-            let luma_style_planes = if frame.chroma == crate::picture::ChromaFormat::Yuv444 {
-                3
-            } else {
-                1
-            };
-            for p in 0..luma_style_planes {
-                let qp_of = |mb: &super::mb::MbInfo| -> i32 {
-                    if p == 0 {
-                        mb.qp as i32
-                    } else {
-                        mb.qpc[p - 1] as i32
-                    }
-                };
-                let qp_cur = qp_of(m);
-                let plane = match p {
-                    0 => &mut frame.y,
-                    1 => &mut frame.cb,
-                    _ => &mut frame.cr,
-                };
-                let stride = plane.stride;
-                // Vertical edges.
-                for e in 0..4 {
-                    if bs_v[e].iter().all(|&b| b == 0) || (e % 2 == 1 && !internal_odd) {
-                        continue;
-                    }
-                    let qp_p = if e == 0 {
-                        qp_of(&info.mbs[left.unwrap()])
-                    } else {
-                        qp_cur
-                    };
-                    let qp_av = (qp_p + qp_cur + 1) >> 1;
-                    let index_a = clip3(0, 51, qp_av + par.offset_a);
-                    let index_b = clip3(0, 51, qp_av + par.offset_b);
-                    let (alpha, beta) = (
-                        (ALPHA[index_a as usize] as i32) << bd_shift,
-                        (BETA[index_b as usize] as i32) << bd_shift,
-                    );
-                    let off = plane.offset((x0 + e * 4) as isize, y0 as isize);
-                    if bs_v[e][0] == 4 {
-                        (dsp.deblock_luma_v_intra)(&mut plane.data, off, stride, alpha, beta, max);
-                    } else {
-                        (dsp.deblock_luma_v)(
-                            &mut plane.data,
-                            off,
-                            stride,
-                            alpha,
-                            beta,
-                            &tc0_of(&bs_v[e], index_a, bd_shift),
-                            max,
-                        );
-                    }
-                }
-                // Horizontal edges.
-                for e in 0..4 {
-                    if bs_h[e].iter().all(|&b| b == 0) || (e % 2 == 1 && !internal_odd) {
-                        continue;
-                    }
-                    let qp_p = if e == 0 {
-                        qp_of(&info.mbs[above.unwrap()])
-                    } else {
-                        qp_cur
-                    };
-                    let qp_av = (qp_p + qp_cur + 1) >> 1;
-                    let index_a = clip3(0, 51, qp_av + par.offset_a);
-                    let index_b = clip3(0, 51, qp_av + par.offset_b);
-                    let (alpha, beta) = (
-                        (ALPHA[index_a as usize] as i32) << bd_shift,
-                        (BETA[index_b as usize] as i32) << bd_shift,
-                    );
-                    let off = plane.offset(x0 as isize, (y0 + e * 4) as isize);
-                    if bs_h[e][0] == 4 {
-                        (dsp.deblock_luma_h_intra)(&mut plane.data, off, stride, alpha, beta, max);
-                    } else {
-                        (dsp.deblock_luma_h)(
-                            &mut plane.data,
-                            off,
-                            stride,
-                            alpha,
-                            beta,
-                            &tc0_of(&bs_h[e], index_a, bd_shift),
-                            max,
-                        );
-                    }
-                }
-            }
-            // Chroma. Vertical edges at chroma x = 0 and 4 (luma edges 0
-            // and 2); horizontal edges at chroma y = 0 and 4 for 4:2:0
-            // (luma edges 0, 2) and at 0, 4, 8, 12 for 4:2:2 (all four luma
-            // edge rows). A kernel call covers eight chroma lines with
-            // `tc0[i / 2]`: for 4:2:0 that is the four luma segments (two
-            // chroma lines each); for 4:2:2 a vertical edge is sixteen lines,
-            // two calls of two luma segments (four chroma lines each).
-            let c422 = frame.chroma == crate::picture::ChromaFormat::Yuv422;
-            if frame.chroma == crate::picture::ChromaFormat::Yuv420 || c422 {
-                let mbh_c = if c422 { 16 } else { 8 };
+            let (ml, ma) = (&info.mbs[left], &info.mbs[above]);
+            filter_luma_style(
+                dsp,
+                &mut frame.y,
+                &bs_v,
+                &bs_h,
+                m.qp as i32,
+                ml.qp as i32,
+                ma.qp as i32,
+                internal_odd,
+                x0,
+                y0,
+                &thr,
+                max,
+            );
+            if c444 {
                 for comp in 0..2 {
-                    for &e in &[0usize, 2] {
-                        if bs_v[e].iter().all(|&b| b == 0) {
-                            continue;
-                        }
-                        let (qpc_p, qpc_q) = if e == 0 {
-                            (info.mbs[left.unwrap()].qpc[comp] as i32, m.qpc[comp] as i32)
-                        } else {
-                            (m.qpc[comp] as i32, m.qpc[comp] as i32)
-                        };
-                        let qp_av = (qpc_p + qpc_q + 1) >> 1;
-                        let index_a = clip3(0, 51, qp_av + par.offset_a);
-                        let index_b = clip3(0, 51, qp_av + par.offset_b);
-                        let (alpha, beta) = (
-                            (ALPHA[index_a as usize] as i32) << bd_shift,
-                            (BETA[index_b as usize] as i32) << bd_shift,
-                        );
-                        let plane = if comp == 0 {
-                            &mut frame.cb
-                        } else {
-                            &mut frame.cr
-                        };
-                        let stride = plane.stride;
-                        let tc = tc0_of(&bs_v[e], index_a, bd_shift);
-                        if !c422 {
-                            let off =
-                                plane.offset((mbx * 8 + e * 2) as isize, (mby * mbh_c) as isize);
-                            if bs_v[e][0] == 4 {
-                                (dsp.deblock_chroma_v_intra)(
-                                    &mut plane.data,
-                                    off,
-                                    stride,
-                                    alpha,
-                                    beta,
-                                    max,
-                                );
-                            } else {
-                                (dsp.deblock_chroma_v)(
-                                    &mut plane.data,
-                                    off,
-                                    stride,
-                                    alpha,
-                                    beta,
-                                    &tc,
-                                    max,
-                                );
-                            }
-                        } else {
-                            for half in 0..2 {
-                                let off = plane.offset(
-                                    (mbx * 8 + e * 2) as isize,
-                                    (mby * mbh_c + half * 8) as isize,
-                                );
-                                let t = [
-                                    tc[2 * half],
-                                    tc[2 * half],
-                                    tc[2 * half + 1],
-                                    tc[2 * half + 1],
-                                ];
-                                if bs_v[e][2 * half] == 4 {
-                                    (dsp.deblock_chroma_v_intra)(
-                                        &mut plane.data,
-                                        off,
-                                        stride,
-                                        alpha,
-                                        beta,
-                                        max,
-                                    );
-                                } else if t.iter().any(|&v| v >= 0) {
-                                    (dsp.deblock_chroma_v)(
-                                        &mut plane.data,
-                                        off,
-                                        stride,
-                                        alpha,
-                                        beta,
-                                        &t,
-                                        max,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    let h_edges: &[usize] = if c422 { &[0, 1, 2, 3] } else { &[0, 2] };
-                    for &e in h_edges {
-                        if bs_h[e].iter().all(|&b| b == 0) {
-                            continue;
-                        }
-                        let (qpc_p, qpc_q) = if e == 0 {
-                            (
-                                info.mbs[above.unwrap()].qpc[comp] as i32,
-                                m.qpc[comp] as i32,
-                            )
-                        } else {
-                            (m.qpc[comp] as i32, m.qpc[comp] as i32)
-                        };
-                        let qp_av = (qpc_p + qpc_q + 1) >> 1;
-                        let index_a = clip3(0, 51, qp_av + par.offset_a);
-                        let index_b = clip3(0, 51, qp_av + par.offset_b);
-                        let (alpha, beta) = (
-                            (ALPHA[index_a as usize] as i32) << bd_shift,
-                            (BETA[index_b as usize] as i32) << bd_shift,
-                        );
-                        let plane = if comp == 0 {
-                            &mut frame.cb
-                        } else {
-                            &mut frame.cr
-                        };
-                        // Chroma row of the edge: 4:2:0 e*2, 4:2:2 e*4.
-                        let cy = if c422 { e * 4 } else { e * 2 };
-                        let off = plane.offset((mbx * 8) as isize, (mby * mbh_c + cy) as isize);
-                        let stride = plane.stride;
-                        if bs_h[e][0] == 4 {
-                            (dsp.deblock_chroma_h_intra)(
-                                &mut plane.data,
-                                off,
-                                stride,
-                                alpha,
-                                beta,
-                                max,
-                            );
-                        } else {
-                            (dsp.deblock_chroma_h)(
-                                &mut plane.data,
-                                off,
-                                stride,
-                                alpha,
-                                beta,
-                                &tc0_of(&bs_h[e], index_a, bd_shift),
-                                max,
-                            );
-                        }
-                    }
+                    let plane = if comp == 0 {
+                        &mut frame.cb
+                    } else {
+                        &mut frame.cr
+                    };
+                    filter_luma_style(
+                        dsp,
+                        plane,
+                        &bs_v,
+                        &bs_h,
+                        m.qpc[comp] as i32,
+                        ml.qpc[comp] as i32,
+                        ma.qpc[comp] as i32,
+                        internal_odd,
+                        x0,
+                        y0,
+                        &thr,
+                        max,
+                    );
                 }
+            } else if c420 || c422 {
+                filter_chroma_style(
+                    dsp,
+                    &mut frame.cb,
+                    &mut frame.cr,
+                    &bs_v,
+                    &bs_h,
+                    [m.qpc[0] as i32, m.qpc[1] as i32],
+                    [ml.qpc[0] as i32, ml.qpc[1] as i32],
+                    [ma.qpc[0] as i32, ma.qpc[1] as i32],
+                    c422,
+                    mbx * 8,
+                    mby * mbh_c,
+                    &thr,
+                    max,
+                );
             }
         }
     }
-    let _ = MbKind::PSkip;
 }
 
 // ----------------------------------------------------------------------
@@ -551,28 +765,13 @@ fn bs_mbaff<S: Sample>(
     motion_bs(frame, p.addr, p.blk, q.addr, q.blk, mvy_limit)
 }
 
-/// The luma filter thresholds for a p / q macroblock pair.
-#[inline]
-fn thresholds(qp_p: i32, qp_q: i32, par: &DeblockParams, bd_shift: u32) -> (i32, i32, i32) {
-    let qp_av = (qp_p + qp_q + 1) >> 1;
-    let index_a = clip3(0, 51, qp_av + par.offset_a);
-    let index_b = clip3(0, 51, qp_av + par.offset_b);
-    (
-        index_a,
-        (ALPHA[index_a as usize] as i32) << bd_shift,
-        (BETA[index_b as usize] as i32) << bd_shift,
-    )
-}
-
 /// tC0 for one line of a bS < 4 edge (bS 0: no filtering, `None`).
 #[inline]
-fn tc0_line(bs: u8, index_a: i32, bd_shift: u32) -> Option<Option<i32>> {
+fn tc0_line(bs: u8, lut: &[i16; 4]) -> Option<Option<i32>> {
     match bs {
         0 => None,
         4 => Some(None),
-        _ => Some(Some(
-            (TC0[index_a as usize][(bs - 1).min(2) as usize] as i32) << bd_shift,
-        )),
+        _ => Some(Some(lut[(bs & 3) as usize] as i32)),
     }
 }
 
@@ -626,6 +825,11 @@ fn deblock_mbaff_pairs<S: Sample>(
     // handled here (no such streams are in circulation) — luma only.
     let do_chroma = chroma420 || chroma422;
     let mbh_c = if chroma422 { 16 } else { 8 };
+    // The filter thresholds of the slice being filtered, rebuilt when the
+    // macroblocks cross into another one.
+    let mut cur_slice = usize::MAX;
+    let mut par = DeblockParams::default();
+    let mut thr = ThrTable::new(&par, bd_shift);
     for pr in pr0..pr1.min(pairs_h) {
         for mbx in 0..mbw {
             let top_addr = (2 * pr) * mbw + mbx;
@@ -635,7 +839,11 @@ fn deblock_mbaff_pairs<S: Sample>(
                 if !m.decoded {
                     continue;
                 }
-                let par = params[m.slice as usize];
+                if m.slice as usize != cur_slice {
+                    cur_slice = m.slice as usize;
+                    par = params[cur_slice];
+                    thr = ThrTable::new(&par, bd_shift);
+                }
                 if par.disable_idc == 1 {
                     continue;
                 }
@@ -702,10 +910,11 @@ fn deblock_mbaff_pairs<S: Sample>(
                                 nz_q,
                             );
                         }
-                        let (index_a, alpha, beta) =
-                            thresholds(info.mbs[pa].qp as i32, m.qp as i32, &par, bd_shift);
+                        let t = thr.get(info.mbs[pa].qp as i32, m.qp as i32);
+                        let (alpha, beta) = (t.alpha, t.beta);
                         let off = frame.y.offset(x0 as isize, y_p as isize);
-                        if bs.iter().any(|&b| b != 0) {
+                        let any = u32::from_le_bytes(bs) != 0;
+                        if any {
                             if bs[0] == 4 {
                                 (dsp.deblock_luma_v_intra)(
                                     &mut frame.y.data,
@@ -722,27 +931,30 @@ fn deblock_mbaff_pairs<S: Sample>(
                                     ystride * dy,
                                     alpha,
                                     beta,
-                                    &tc0_of(&bs, index_a, bd_shift),
+                                    &tc4(u32::from_le_bytes(bs), &t.lut),
                                     max,
                                 );
                             }
                         }
-                        if do_chroma && bs.iter().any(|&b| b != 0) {
+                        if do_chroma && any {
                             for comp in 0..2 {
-                                let (index_a, alpha, beta) = thresholds(
-                                    info.mbs[pa].qpc[comp] as i32,
-                                    m.qpc[comp] as i32,
-                                    &par,
-                                    bd_shift,
-                                );
+                                let t = thr.get(info.mbs[pa].qpc[comp] as i32, m.qpc[comp] as i32);
                                 let plane = if comp == 0 {
                                     &mut frame.cb
                                 } else {
                                     &mut frame.cr
                                 };
+                                let base = plane.offset(xc0 as isize, yc_p as isize);
+                                let stride = plane.stride * dy;
                                 chroma_v_edge(
-                                    dsp, plane, xc0, yc_p, dy, chroma422, &bs, index_a, alpha,
-                                    beta, bd_shift, max,
+                                    dsp,
+                                    plane,
+                                    base,
+                                    stride,
+                                    chroma422,
+                                    u32::from_le_bytes(bs),
+                                    &t,
+                                    max,
                                 );
                             }
                         }
@@ -790,9 +1002,9 @@ fn deblock_mbaff_pairs<S: Sample>(
                                 continue;
                             }
                             let pa = line_pa[k];
-                            let (index_a, alpha, beta) =
-                                thresholds(info.mbs[pa].qp as i32, m.qp as i32, &par, bd_shift);
-                            let Some(tc) = tc0_line(line_bs[k], index_a, bd_shift) else {
+                            let t = thr.get(info.mbs[pa].qp as i32, m.qp as i32);
+                            let (alpha, beta) = (t.alpha, t.beta);
+                            let Some(tc) = tc0_line(line_bs[k], &t.lut) else {
                                 continue;
                             };
                             let pos = frame.y.offset(x0 as isize, (y_p + dy * k) as isize);
@@ -817,13 +1029,10 @@ fn deblock_mbaff_pairs<S: Sample>(
                                 }
                                 let pa = line_pa[l];
                                 for comp in 0..2 {
-                                    let (index_a, alpha, beta) = thresholds(
-                                        info.mbs[pa].qpc[comp] as i32,
-                                        m.qpc[comp] as i32,
-                                        &par,
-                                        bd_shift,
-                                    );
-                                    let Some(tc) = tc0_line(line_bs[l], index_a, bd_shift) else {
+                                    let t =
+                                        thr.get(info.mbs[pa].qpc[comp] as i32, m.qpc[comp] as i32);
+                                    let (alpha, beta) = (t.alpha, t.beta);
+                                    let Some(tc) = tc0_line(line_bs[l], &t.lut) else {
                                         continue;
                                     };
                                     let plane = if comp == 0 {
@@ -872,11 +1081,11 @@ fn deblock_mbaff_pairs<S: Sample>(
                             nz_q,
                         );
                     }
-                    if bs.iter().all(|&b| b == 0) {
+                    if u32::from_le_bytes(bs) == 0 {
                         continue;
                     }
-                    let (index_a, alpha, beta) =
-                        thresholds(m.qp as i32, m.qp as i32, &par, bd_shift);
+                    let t = thr.get(m.qp as i32, m.qp as i32);
+                    let (alpha, beta) = (t.alpha, t.beta);
                     let off = frame.y.offset((x0 + e * 4) as isize, y_p as isize);
                     if bs[0] == 4 {
                         (dsp.deblock_luma_v_intra)(
@@ -894,31 +1103,28 @@ fn deblock_mbaff_pairs<S: Sample>(
                             ystride * dy,
                             alpha,
                             beta,
-                            &tc0_of(&bs, index_a, bd_shift),
+                            &tc4(u32::from_le_bytes(bs), &t.lut),
                             max,
                         );
                     }
                     if do_chroma && e == 2 {
                         for comp in 0..2 {
-                            let (index_a, alpha, beta) =
-                                thresholds(m.qpc[comp] as i32, m.qpc[comp] as i32, &par, bd_shift);
+                            let t = thr.get(m.qpc[comp] as i32, m.qpc[comp] as i32);
                             let plane = if comp == 0 {
                                 &mut frame.cb
                             } else {
                                 &mut frame.cr
                             };
+                            let base = plane.offset((xc0 + 4) as isize, yc_p as isize);
+                            let stride = plane.stride * dy;
                             chroma_v_edge(
                                 dsp,
                                 plane,
-                                xc0 + 4,
-                                yc_p,
-                                dy,
+                                base,
+                                stride,
                                 chroma422,
-                                &bs,
-                                index_a,
-                                alpha,
-                                beta,
-                                bd_shift,
+                                u32::from_le_bytes(bs),
+                                &t,
                                 max,
                             );
                         }
@@ -950,8 +1156,8 @@ fn deblock_mbaff_pairs<S: Sample>(
                             );
                         }
                         top_edge_plain(
-                            dsp, frame, info, &par, sa, pa, &bs, x0, y_p, xc0, yc_p, 1, do_chroma,
-                            bd_shift, max,
+                            dsp, frame, info, &thr, sa, pa, &bs, x0, y_p, xc0, yc_p, 1, do_chroma,
+                            max,
                         );
                     } else if !mf {
                         // Top frame MB below a pair.
@@ -980,11 +1186,11 @@ fn deblock_mbaff_pairs<S: Sample>(
                                         nz_q,
                                     );
                                 }
-                                if bs.iter().all(|&b| b == 0) {
+                                if u32::from_le_bytes(bs) == 0 {
                                     continue;
                                 }
-                                let (index_a, alpha, beta) =
-                                    thresholds(info.mbs[pa].qp as i32, m.qp as i32, &par, bd_shift);
+                                let t = thr.get(info.mbs[pa].qp as i32, m.qp as i32);
+                                let (alpha, beta) = (t.alpha, t.beta);
                                 // q0 at row y_p + pass, step 2 across the edge.
                                 let off = frame.y.offset(x0 as isize, (y_p + pass) as isize);
                                 if bs[0] == 4 {
@@ -1003,18 +1209,15 @@ fn deblock_mbaff_pairs<S: Sample>(
                                         ystride * 2,
                                         alpha,
                                         beta,
-                                        &tc0_of(&bs, index_a, bd_shift),
+                                        &tc4(u32::from_le_bytes(bs), &t.lut),
                                         max,
                                     );
                                 }
                                 if do_chroma {
                                     for comp in 0..2 {
-                                        let (index_a, alpha, beta) = thresholds(
-                                            info.mbs[pa].qpc[comp] as i32,
-                                            m.qpc[comp] as i32,
-                                            &par,
-                                            bd_shift,
-                                        );
+                                        let t = thr
+                                            .get(info.mbs[pa].qpc[comp] as i32, m.qpc[comp] as i32);
+                                        let (alpha, beta) = (t.alpha, t.beta);
                                         let plane = if comp == 0 {
                                             &mut frame.cb
                                         } else {
@@ -1038,7 +1241,7 @@ fn deblock_mbaff_pairs<S: Sample>(
                                                 cstride * 2,
                                                 alpha,
                                                 beta,
-                                                &tc0_of(&bs, index_a, bd_shift),
+                                                &tc4(u32::from_le_bytes(bs), &t.lut),
                                                 max,
                                             );
                                         }
@@ -1067,8 +1270,8 @@ fn deblock_mbaff_pairs<S: Sample>(
                                 );
                             }
                             top_edge_plain(
-                                dsp, frame, info, &par, sa, pa, &bs, x0, y_p, xc0, yc_p, 1,
-                                do_chroma, bd_shift, max,
+                                dsp, frame, info, &thr, sa, pa, &bs, x0, y_p, xc0, yc_p, 1,
+                                do_chroma, max,
                             );
                         }
                     } else {
@@ -1102,8 +1305,8 @@ fn deblock_mbaff_pairs<S: Sample>(
                             );
                         }
                         top_edge_plain(
-                            dsp, frame, info, &par, sa, pa, &bs, x0, y_p, xc0, yc_p, 2, do_chroma,
-                            bd_shift, max,
+                            dsp, frame, info, &thr, sa, pa, &bs, x0, y_p, xc0, yc_p, 2, do_chroma,
+                            max,
                         );
                     }
                 }
@@ -1134,12 +1337,12 @@ fn deblock_mbaff_pairs<S: Sample>(
                             nz_q,
                         );
                     }
-                    if bs.iter().all(|&b| b == 0) {
+                    if u32::from_le_bytes(bs) == 0 {
                         continue;
                     }
                     if luma_edge {
-                        let (index_a, alpha, beta) =
-                            thresholds(m.qp as i32, m.qp as i32, &par, bd_shift);
+                        let t = thr.get(m.qp as i32, m.qp as i32);
+                        let (alpha, beta) = (t.alpha, t.beta);
                         let off = frame.y.offset(x0 as isize, (y_p + dy * e * 4) as isize);
                         if bs[0] == 4 {
                             (dsp.deblock_luma_h_intra)(
@@ -1157,7 +1360,7 @@ fn deblock_mbaff_pairs<S: Sample>(
                                 ystride * dy,
                                 alpha,
                                 beta,
-                                &tc0_of(&bs, index_a, bd_shift),
+                                &tc4(u32::from_le_bytes(bs), &t.lut),
                                 max,
                             );
                         }
@@ -1166,8 +1369,8 @@ fn deblock_mbaff_pairs<S: Sample>(
                         // Chroma row of the edge: 4:2:0 only e = 2 (row 4), 4:2:2 e * 4.
                         let cy = if chroma422 { e * 4 } else { 4 };
                         for comp in 0..2 {
-                            let (index_a, alpha, beta) =
-                                thresholds(m.qpc[comp] as i32, m.qpc[comp] as i32, &par, bd_shift);
+                            let t = thr.get(m.qpc[comp] as i32, m.qpc[comp] as i32);
+                            let (alpha, beta) = (t.alpha, t.beta);
                             let plane = if comp == 0 {
                                 &mut frame.cb
                             } else {
@@ -1190,7 +1393,7 @@ fn deblock_mbaff_pairs<S: Sample>(
                                     cstride * dy,
                                     alpha,
                                     beta,
-                                    &tc0_of(&bs, index_a, bd_shift),
+                                    &tc4(u32::from_le_bytes(bs), &t.lut),
                                     max,
                                 );
                             }
@@ -1206,45 +1409,52 @@ fn deblock_mbaff_pairs<S: Sample>(
 /// `yc, yc + dy, ...`: its eight lines for 4:2:0; sixteen for 4:2:2 in
 /// two eight-line halves, each line taking the bS of the luma line at
 /// its position.
-#[allow(clippy::too_many_arguments)]
 fn chroma_v_edge<S: Sample>(
     dsp: &H264Dsp<S>,
     plane: &mut super::frame::PaddedPlane<S>,
-    xc: usize,
-    yc: usize,
-    dy: usize,
+    base: usize,
+    stride: usize,
     c422: bool,
-    bs: &[u8; 4],
-    index_a: i32,
-    alpha: i32,
-    beta: i32,
-    bd_shift: u32,
+    bs: u32,
+    t: &Thr,
     max: i32,
 ) {
-    let stride = plane.stride * dy;
-    let tc = tc0_of(bs, index_a, bd_shift);
     if !c422 {
-        let off = plane.offset(xc as isize, yc as isize);
-        if bs[0] == 4 {
-            (dsp.deblock_chroma_v_intra)(&mut plane.data, off, stride, alpha, beta, max);
-        } else {
-            (dsp.deblock_chroma_v)(&mut plane.data, off, stride, alpha, beta, &tc, max);
-        }
+        filter_edge(
+            dsp.deblock_chroma_v,
+            dsp.deblock_chroma_v_intra,
+            &mut plane.data,
+            base,
+            stride,
+            bs,
+            t.alpha,
+            t.beta,
+            &t.lut,
+            max,
+        );
         return;
     }
+    let b = bs.to_le_bytes();
     for half in 0..2 {
         // Chroma lines 8h..8h+7 sit against luma segments 2h and 2h + 1.
-        let off = plane.offset(xc as isize, (yc + 8 * half * dy) as isize);
-        let t = [
-            tc[2 * half],
-            tc[2 * half],
-            tc[2 * half + 1],
-            tc[2 * half + 1],
-        ];
-        if bs[2 * half] == 4 {
-            (dsp.deblock_chroma_v_intra)(&mut plane.data, off, stride, alpha, beta, max);
-        } else if bs[2 * half] != 0 || bs[2 * half + 1] != 0 {
-            (dsp.deblock_chroma_v)(&mut plane.data, off, stride, alpha, beta, &t, max);
+        let (b0, b1) = (b[2 * half], b[2 * half + 1]);
+        if b0 == 0 && b1 == 0 {
+            continue;
+        }
+        let off = base + 8 * half * stride;
+        if b0 == 4 {
+            (dsp.deblock_chroma_v_intra)(&mut plane.data, off, stride, t.alpha, t.beta, max);
+        } else {
+            let (t0, t1) = (t.lut[(b0 & 3) as usize], t.lut[(b1 & 3) as usize]);
+            (dsp.deblock_chroma_v)(
+                &mut plane.data,
+                off,
+                stride,
+                t.alpha,
+                t.beta,
+                &[t0, t0, t1, t1],
+                max,
+            );
         }
     }
 }
@@ -1257,7 +1467,7 @@ fn top_edge_plain<S: Sample>(
     dsp: &H264Dsp<S>,
     frame: &mut Frame<S>,
     info: &PicInfo,
-    par: &DeblockParams,
+    thr: &ThrTable,
     sa: usize,
     pa: usize,
     bs: &[u8; 4],
@@ -1267,14 +1477,15 @@ fn top_edge_plain<S: Sample>(
     yc_p: usize,
     dy: usize,
     do_chroma: bool,
-    bd_shift: u32,
     max: i32,
 ) {
-    if bs.iter().all(|&b| b == 0) {
+    let bsw = u32::from_le_bytes(*bs);
+    if bsw == 0 {
         return;
     }
     let m = &info.mbs[sa];
-    let (index_a, alpha, beta) = thresholds(info.mbs[pa].qp as i32, m.qp as i32, par, bd_shift);
+    let t = thr.get(info.mbs[pa].qp as i32, m.qp as i32);
+    let (alpha, beta) = (t.alpha, t.beta);
     let ystride = frame.y.stride;
     let off = frame.y.offset(x0 as isize, y_p as isize);
     if bs[0] == 4 {
@@ -1286,19 +1497,15 @@ fn top_edge_plain<S: Sample>(
             ystride * dy,
             alpha,
             beta,
-            &tc0_of(bs, index_a, bd_shift),
+            &tc4(bsw, &t.lut),
             max,
         );
     }
     if do_chroma {
         let cstride = frame.cb.stride;
         for comp in 0..2 {
-            let (index_a, alpha, beta) = thresholds(
-                info.mbs[pa].qpc[comp] as i32,
-                m.qpc[comp] as i32,
-                par,
-                bd_shift,
-            );
+            let t = thr.get(info.mbs[pa].qpc[comp] as i32, m.qpc[comp] as i32);
+            let (alpha, beta) = (t.alpha, t.beta);
             let plane = if comp == 0 {
                 &mut frame.cb
             } else {
@@ -1314,7 +1521,7 @@ fn top_edge_plain<S: Sample>(
                     cstride * dy,
                     alpha,
                     beta,
-                    &tc0_of(bs, index_a, bd_shift),
+                    &tc4(bsw, &t.lut),
                     max,
                 );
             }
