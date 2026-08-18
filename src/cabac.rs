@@ -427,13 +427,15 @@ mod tests {
 #[cfg(test)]
 mod engine_equivalence {
     use super::*;
-    // The previous (spec-literal, one-bit-at-a-time) engine, kept as the reference.
-pub struct OldCabac<'a> {
+    // The previous (spec-literal, one-bit-at-a-time) engine, kept as the
+    // reference: the standard's flowcharts transcribed, renormalising one bit
+    // at a time, with nothing folded into a table.
+    pub struct OldCabac<'a> {
         reader: BitReader<'a>,
         range: u32,
         offset: u32,
     }
-    
+
     impl<'a> OldCabac<'a> {
         /// Start decoding at the beginning of `data` (which must begin at the
         /// byte-aligned first byte of `slice_data()` / a substream).
@@ -442,34 +444,12 @@ pub struct OldCabac<'a> {
             let offset = reader.bits(9);
             Self { reader, range: 510, offset }
         }
-    
-        /// Re-initialise the engine at the reader's current byte-aligned position
-        /// (after PCM samples, or at the start of a new substream in the same
-        /// buffer).
-        pub fn reinit(&mut self) {
-            self.reader.align();
-            self.range = 510;
-            self.offset = self.reader.bits(9);
-        }
-    
-        /// The bit reader underneath, positioned exactly where the arithmetic
-        /// decoder has consumed to. Only meaningful right after a terminate bin
-        /// decoded as 1 (PCM samples, end of substream), when the standard hands
-        /// the bitstream back to plain bit reading.
-        pub fn reader(&mut self) -> &mut BitReader<'a> {
-            &mut self.reader
-        }
-    
-        /// Whether the underlying data ran out (a malformed slice).
-        pub fn overrun(&self) -> bool {
-            self.reader.overrun()
-        }
-    
+
         /// Bits consumed from the start of the buffer.
         pub fn position(&self) -> u64 {
             self.reader.position()
         }
-    
+
         /// Decode one context-coded bin.
         #[inline(always)]
         pub fn decision(&mut self, ctx: &mut Ctx) -> u32 {
@@ -498,7 +478,7 @@ pub struct OldCabac<'a> {
                 1 - mps
             }
         }
-    
+
         /// Decode one bypass bin (equiprobable).
         #[inline(always)]
         pub fn bypass(&mut self) -> u32 {
@@ -510,7 +490,7 @@ pub struct OldCabac<'a> {
                 0
             }
         }
-    
+
         /// Decode `n` bypass bins as an unsigned integer, MSB first.
         #[inline]
         pub fn bypass_bits(&mut self, n: u32) -> u32 {
@@ -520,7 +500,7 @@ pub struct OldCabac<'a> {
             }
             v
         }
-    
+
         /// Decode a terminate bin. Returns 1 when the arithmetic codeword ends
         /// here (end of slice / substream, or PCM samples follow); the engine then
         /// stops and the reader is at the standard's bit position.
@@ -538,8 +518,8 @@ pub struct OldCabac<'a> {
             }
         }
     }
-    
-    
+
+
     #[test]
     fn prefetching_engine_matches_reference() {
         let mut seed = 42u64;

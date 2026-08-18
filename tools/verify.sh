@@ -39,6 +39,32 @@ done < "$GOLD"
 echo "fixtures: $ok matched, $bad failed"
 [ "$bad" = 0 ] || fail=1
 
+# Every rung of the SIMD ladder has to decode to the same bytes as the scalar
+# reference. The README says so, so it is gated here rather than checked by
+# hand once: a kernel added at one rung and not another is otherwise invisible
+# until it reaches a machine that selects that rung, which is never this one.
+echo
+echo "== SIMD rungs (all fixtures, every rung must agree) =="
+case "$(uname -m)" in
+  aarch64 | arm64) RUNGS="neon none" ;;
+  *) RUNGS="avx2 avx sse41 ssse3 sse2 none" ;;
+esac
+ref=""
+for r in $RUNGS; do
+  all=""
+  while read -r f m; do
+    [ -f "$f" ] || continue
+    all="$all$(H26X_MAX_SIMD=$r H26X_THREADS=4 "$DEC" "$f" 2>/dev/null | md5sum | cut -c1-32)"
+  done < "$GOLD"
+  h=$(printf %s "$all" | md5sum | cut -c1-32)
+  if [ -z "$ref" ]; then ref=$h; printf "  %-6s %s
+" "$r" "$h"
+  elif [ "$h" = "$ref" ]; then printf "  %-6s %s  same
+" "$r" "$h"
+  else printf "  %-6s %s  DIFFERS
+" "$r" "$h"; fail=1; fi
+done
+
 echo
 echo "== conformance suites =="
 # A private copy, so a rebuild mid-run cannot disturb the suites and a
