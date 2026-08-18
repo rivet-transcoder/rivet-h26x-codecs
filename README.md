@@ -74,12 +74,18 @@ The pixel kernels — interpolation, weighting, inverse transforms, residual add
 SAO for H.265; the sixteen quarter-sample positions, chroma bilinear, averaging
 and weighting for H.264 — sit behind a function table filled at run time from
 what the CPU has: **AVX2** on x86-64, **AVX** or **SSE4.1** on the x86-64 CPUs
-without it, **NEON** on AArch64, scalar otherwise. The AVX / SSE4.1 tier is the
-same kernels at 128 bits: AVX adds no 256-bit *integer* operation — that is
-AVX2 — so what it buys over SSE4.1 is VEX's three-operand encoding, worth a
-couple of per cent, while the step from scalar to either is worth 2.3–2.7x.
-`H26X_NO_SIMD=1` forces scalar and `H26X_MAX_SIMD=avx | sse41 | none` caps the
-x86 tier, so one machine can exercise all of them. Every SIMD kernel is checked
+without it, **NEON** on AArch64 and the ARMv8.2-A **dot product** extension on
+top of it where present, scalar otherwise. The rungs are cumulative — each
+replaces only the kernels its instructions actually improve, so a CPU ends up
+with the best available version of every one. The AVX / SSE4.1 tier is the same
+kernels at 128 bits: AVX adds no 256-bit *integer* operation — that is AVX2 —
+so what it buys over SSE4.1 is VEX's three-operand encoding, worth a couple of
+per cent, while the step from scalar to either is worth 2.3–2.7x. `sdot` is
+worth having for the one kernel whose shape it fits, HEVC's eight-tap
+horizontal luma filter, and measurably not worth it for H.264's six-tap, whose
+taps LLVM already folds into `umlal` pairs. `H26X_NO_SIMD=1` forces scalar and
+`H26X_MAX_SIMD=avx | sse41 | neon | none` caps the ladder, so one machine can
+exercise every rung. Every SIMD kernel is checked
 bit-exact against the scalar reference by the crate's tests, on both
 architectures in CI. `H26X_PROF=1` prints where the time went.
 
