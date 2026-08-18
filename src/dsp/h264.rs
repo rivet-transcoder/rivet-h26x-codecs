@@ -189,6 +189,14 @@ impl<S: Sample> H264Dsp<S> {
 /// SIMD kernels for 8-bit sample planes.
 #[allow(unused_variables)]
 pub fn install_simd_u8(d: &mut H264Dsp<u8>, cpu: Cpu) {
+    // Widest last: the 128-bit install is the floor for every SSE4.1 CPU,
+    // and AVX2 overwrites the entries it has a wider kernel for.
+    #[cfg(target_arch = "x86_64")]
+    if cpu.avx {
+        super::h264_avx::install_avx(d);
+    } else if cpu.sse41 {
+        super::h264_avx::install_sse41(d);
+    }
     #[cfg(target_arch = "x86_64")]
     if cpu.avx2 {
         super::h264_avx2::install(d);
