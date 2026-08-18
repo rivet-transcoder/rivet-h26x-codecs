@@ -30,6 +30,23 @@ struct Window<S: Sample> {
     data: [S; 32 * 32],
 }
 
+/// The scratch a partition's motion compensation writes into: per list and
+/// component a 16x16 block (stride [`PRED_STRIDE`]) holding the prediction
+/// in its top-left, and the gather window. Owned by the slice decoder and
+/// reused for every partition — its contents never need clearing (every
+/// kernel writes before the combine step reads), and clearing 2.5 KB per
+/// partition was measurable.
+pub struct McScratch<S: Sample> {
+    pred: [[[S; 16 * PRED_STRIDE]; 3]; 2],
+    window: Window<S>,
+}
+
+impl<S: Sample> Default for McScratch<S> {
+    fn default() -> Self {
+        Self { pred: [[[S::default(); 16 * PRED_STRIDE]; 3]; 2], window: Window { data: [S::default(); 32 * 32] } }
+    }
+}
+
 /// A read view of a reference plane: the frame, or one of its fields
 /// (every other row, half the height). `pad_y` is how far above / below the
 /// picture the border can be trusted for this view: a frame's own borders
@@ -158,15 +175,13 @@ pub fn predict_partition<S: Sample>(
     ref0: Option<PartRef<S>>,
     ref1: Option<PartRef<S>>,
     weighting: Weighting,
+    scratch: &mut McScratch<S>,
 ) {
     let cur_parity = geom.parity;
     let (x, y) = (geom.x + x_in, geom.y_pic + y_in);
     // Per list and component: a 16x16 scratch block (stride PRED_STRIDE), the
     // prediction in its top-left. Chroma uses the same shape.
-    let mut pred = [[[S::default(); 16 * PRED_STRIDE]; 3]; 2];
-    let mut window = Window {
-        data: [S::default(); 32 * 32],
-    };
+    let McScratch { pred, window } = scratch;
     let (sw, sh) = cur.chroma.subsampling();
     let (sw, sh) = (sw as usize, sh as usize);
     let mono = cur.chroma == crate::picture::ChromaFormat::Monochrome;
@@ -189,7 +204,7 @@ pub fn predict_partition<S: Sample>(
             yi - 2,
             w + 5,
             h + 5,
-            &mut window,
+            window,
             pl,
             |o, s, st| k(o, s, st, w, h, max),
         );
@@ -203,7 +218,7 @@ pub fn predict_partition<S: Sample>(
                 yi - 2,
                 w + 5,
                 h + 5,
-                &mut window,
+                window,
                 pcb,
                 |o, s, st| k(o, s, st, w, h, max),
             );
@@ -213,7 +228,7 @@ pub fn predict_partition<S: Sample>(
                 yi - 2,
                 w + 5,
                 h + 5,
-                &mut window,
+                window,
                 pcr,
                 |o, s, st| k(o, s, st, w, h, max),
             );
@@ -245,7 +260,7 @@ pub fn predict_partition<S: Sample>(
             yci,
             cw + 1,
             ch + 1,
-            &mut window,
+            window,
             pcb,
             |o, s, st| kc(o, s, st, cw, ch, xf, yf),
         );
@@ -255,7 +270,7 @@ pub fn predict_partition<S: Sample>(
             yci,
             cw + 1,
             ch + 1,
-            &mut window,
+            window,
             pcr,
             |o, s, st| kc(o, s, st, cw, ch, xf, yf),
         );

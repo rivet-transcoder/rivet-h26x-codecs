@@ -11,9 +11,9 @@ use super::frame::{BlockMotion, Frame, Mv, PARITY_FRAME, SharedFrame};
 use super::inter::{MbGeom, Weighting, predict_partition};
 use super::intra::{IntraAvail, predict_4x4, predict_8x8, predict_16x16, predict_chroma};
 use super::mb::{
-    MbKind, MbLayer, MbNeighbours, PicInfo, SliceCtx, SubMbShape, block_available, colocated_block,
-    colocated_motion, fill_motion, median_mvp, p_skip_mv, predict_mv, prediction_neighbours,
-    spatial_direct_ref_idx,
+    MbKind, MbLayer, MbNeighbours, MotionCache, PicInfo, SliceCtx, SubMbShape, block_available,
+    colocated_block, colocated_motion, fill_motion, median_mvp, p_skip_mv, predict_mv,
+    prediction_neighbours, spatial_direct_ref_idx,
 };
 use super::slice::PredWeightTable;
 use super::tables::{BLK4X4_FROM_RASTER, CHROMA_QP};
@@ -274,6 +274,7 @@ pub fn reconstruct<S: Sample>(
     nb: &MbNeighbours,
     layer: &MbLayer,
     refs: &SliceRefs<S>,
+    scratch: &mut Scratch<S>,
 ) -> Result<()> {
     let addr = nb.addr;
     let mbx = addr % info.mb_width;
@@ -379,6 +380,8 @@ pub fn reconstruct<S: Sample>(
     let bypass = ctx.transform_bypass && qp == 0;
     let plane_qp = [qp, qpc[0], qpc[1]];
 
+    // Partition boundaries inside the macroblock (inter): see MbInfo::part_edges.
+    let mut part_edges = [0u16; 2];
     if intra {
         // No motion for the deblocking / direct-mode readers.
         for l in 0..2 {
@@ -582,7 +585,7 @@ pub fn reconstruct<S: Sample>(
             _ => unreachable!(),
         }
     } else {
-        derive_motion_and_predict(ctx, cur, info, nb, layer, refs, geom)?;
+        part_edges = derive_motion_and_predict(ctx, cur, info, nb, layer, refs, geom, scratch)?;
         // Residual.
         for p in 0..planes {
             let plane = plane_mut(cur, p);
@@ -656,6 +659,22 @@ pub fn reconstruct<S: Sample>(
 
     // Bookkeeping.
     let m = &mut info.mbs[addr];
+    m.part_edges = part_edges;
+    m.nz_mask = if layer.kind == MbKind::IPcm {
+        0xffff
+    } else {
+        let mut nzm = 0u16;
+        for b in 0..16 {
+            nzm |= ((layer.nz[0][b] != 0) as u16) << b;
+        }
+        if layer.transform_8x8 {
+            // Spread each 8x8's bit over its four 4x4s.
+            let q = |bits: u16| -> u16 { if bits != 0 { 0x33 } else { 0 } };
+            q(nzm & 0x0033) | (q(nzm & 0x00cc) << 2) | (q(nzm & 0x3300) << 8) | (q(nzm & 0xcc00) << 10)
+        } else {
+            nzm
+        }
+    };
     m.kind = layer.kind;
     m.slice = ctx.slice_num;
     m.decoded = true;
@@ -956,7 +975,7 @@ fn add_chroma_residual<S: Sample>(
 /// macroblock coordinates.
 type Job = (usize, usize, usize, usize, i8, Mv, i8, Mv);
 
-/// The predictions of one macroblock, on the stack (at most sixteen 4x4s).
+/// The predictions of one macroblock (at most sixteen 4x4s).
 #[derive(Default)]
 struct Jobs {
     items: [Job; 16],
@@ -975,6 +994,16 @@ impl Jobs {
     }
 }
 
+/// Per-slice-decoder scratch that reconstruction reuses from macroblock to
+/// macroblock instead of building on the stack each time (which cost a
+/// memset / memcpy of a few KB per macroblock or partition).
+#[derive(Default)]
+pub struct Scratch<S: Sample> {
+    mc: super::inter::McScratch<S>,
+    jobs: Jobs,
+    motion: MotionCache,
+}
+
 /// Derive every partition's motion (8.4.1), store it, and motion-compensate
 /// the whole macroblock.
 fn derive_motion_and_predict<S: Sample>(
@@ -985,7 +1014,8 @@ fn derive_motion_and_predict<S: Sample>(
     layer: &MbLayer,
     refs: &SliceRefs<S>,
     geom: MbGeom,
-) -> Result<()> {
+    scratch: &mut Scratch<S>,
+) -> Result<[u16; 2]> {
     let addr = nb.addr;
     let py = geom.y_pic;
     // An MBAFF field macroblock: reference indices name fields of the
@@ -996,11 +1026,15 @@ fn derive_motion_and_predict<S: Sample>(
     // Blocks of the current MB whose motion is final (for neighbour prediction).
     let mut done: u16 = 0;
     // The predictions to run: (x, y, w, h, ref0, mv0, ref1, mv1) in MB coords.
-    let mut jobs = Jobs::default();
+    let Scratch { mc, jobs, motion: cache } = scratch;
+    jobs.len = 0;
+    // The neighbouring motion every partition predicts from, gathered once.
+    cache.gather(nb, cur, info);
+    let cache = &*cache;
 
     match layer.kind {
         MbKind::PSkip => {
-            let mv = p_skip_mv(nb, cur, info);
+            let mv = p_skip_mv(cache, nb, cur);
             fill_motion(
                 cur,
                 addr,
@@ -1015,7 +1049,7 @@ fn derive_motion_and_predict<S: Sample>(
             jobs.push((0, 0, 16, 16, 0, mv, -1, Mv::ZERO));
         }
         MbKind::BSkip | MbKind::BDirect16x16 => {
-            direct_partitions(ctx, cur, info, nb, refs, &[0, 1, 2, 3], &mut jobs, geom)?;
+            direct_partitions(ctx, cur, info, nb, refs, cache, &[0, 1, 2, 3], jobs, geom)?;
         }
         MbKind::Inter16x16 | MbKind::Inter16x8 | MbKind::Inter8x16 => {
             let parts = mb_partitions(layer.kind);
@@ -1033,7 +1067,7 @@ fn derive_motion_and_predict<S: Sample>(
                     if ri < 0 || ri as usize >= refs.frames[list].len() * list_mult {
                         return Err(Error::bitstream("ref_idx beyond the reference list"));
                     }
-                    let mvp = predict_mv(nb, cur, info, done, list, ri, x, y, w, h);
+                    let mvp = predict_mv(cache, nb, cur, done, list, ri, x, y, w, h);
                     let mvd = layer.mvd[(y / 4) * 4 + x / 4].mvd[list];
                     let mv = Mv::new(mvp.x.wrapping_add(mvd.x), mvp.y.wrapping_add(mvd.y));
                     fill_motion(
@@ -1061,7 +1095,7 @@ fn derive_motion_and_predict<S: Sample>(
             for part in 0..4 {
                 let shape = layer.sub_shape[part];
                 if shape == SubMbShape::Direct {
-                    direct_partitions(ctx, cur, info, nb, refs, &[part], &mut jobs, geom)?;
+                    direct_partitions(ctx, cur, info, nb, refs, cache, &[part], jobs, geom)?;
                     let (x, y, w, h) = sub_partition_rect(part, shape, 0);
                     for by in y / 4..(y + h) / 4 {
                         for bx in x / 4..(x + w) / 4 {
@@ -1084,7 +1118,7 @@ fn derive_motion_and_predict<S: Sample>(
                         if ri < 0 || ri as usize >= refs.frames[list].len() * list_mult {
                             return Err(Error::bitstream("ref_idx beyond the reference list"));
                         }
-                        let mvp = predict_mv(nb, cur, info, done, list, ri, x, y, w, h);
+                        let mvp = predict_mv(cache, nb, cur, done, list, ri, x, y, w, h);
                         let mvd = layer.mvd[(y / 4) * 4 + x / 4].mvd[list];
                         let mv = Mv::new(mvp.x.wrapping_add(mvd.x), mvp.y.wrapping_add(mvd.y));
                         fill_motion(
@@ -1110,6 +1144,22 @@ fn derive_motion_and_predict<S: Sample>(
             }
         }
         _ => unreachable!(),
+    }
+
+    // The internal edges between partitions (for the deblocking filter's
+    // motion comparison): each partition's left and top edge inside the MB.
+    let mut part_edges = [0u16; 2];
+    for &(x, y, w, h, ..) in jobs.as_slice() {
+        if x > 0 {
+            for k in y / 4..(y + h) / 4 {
+                part_edges[0] |= 1 << ((x / 4) * 4 + k);
+            }
+        }
+        if y > 0 {
+            for k in x / 4..(x + w) / 4 {
+                part_edges[1] |= 1 << ((y / 4) * 4 + k);
+            }
+        }
     }
 
     // Motion compensation: wait for the reference rows the filters reach
@@ -1138,9 +1188,9 @@ fn derive_motion_and_predict<S: Sample>(
             fr[list] = Some((refs.frames[list][fi], mv, rpar));
         }
         let weighting = refs.weighting(r0, r1, field_mb, geom.parity);
-        predict_partition(&refs.dsp, cur, geom, x, y, w, h, fr[0], fr[1], weighting);
+        predict_partition(&refs.dsp, cur, geom, x, y, w, h, fr[0], fr[1], weighting, mc);
     }
-    Ok(())
+    Ok(part_edges)
 }
 
 /// How the colocated vertical vector relates to the current picture's
@@ -1307,6 +1357,7 @@ fn direct_partitions<S: Sample>(
     info: &PicInfo,
     nb: &MbNeighbours,
     refs: &SliceRefs<S>,
+    cache: &MotionCache,
     parts: &[usize],
     jobs: &mut Jobs,
     geom: MbGeom,
@@ -1353,14 +1404,14 @@ fn direct_partitions<S: Sample>(
         }
     }
     if ctx.direct_spatial {
-        let mut ref_idx = spatial_direct_ref_idx(nb, cur, info);
+        let mut ref_idx = spatial_direct_ref_idx(cache, nb, cur);
         let mut mvp = [Mv::ZERO; 2];
         if ref_idx[0] < 0 && ref_idx[1] < 0 {
             ref_idx = [0, 0];
         } else {
             for list in 0..2 {
                 if ref_idx[list] >= 0 {
-                    let (a, b, c) = prediction_neighbours(nb, cur, info, 0, list, 0, 0, 4);
+                    let (a, b, c) = prediction_neighbours(cache, nb, cur, 0, list, 0, 0, 4);
                     mvp[list] = median_mvp(a, b, c, ref_idx[list]);
                 }
             }

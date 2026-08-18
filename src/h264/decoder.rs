@@ -27,7 +27,7 @@ use super::dpb::{DecodedPic, Dpb, PocState, RefEntry, RefMark, build_ref_lists, 
 use super::frame::{Frame, FramePool, PARITY_FRAME, SharedFrame};
 use super::mb::{InfoPool, MbKind, MbLayer, MbNeighbours, PicInfo, SliceCtx};
 use super::pps::Pps;
-use super::recon::{QpState, SliceRefs, reconstruct};
+use super::recon::{QpState, Scratch, SliceRefs, reconstruct};
 use super::slice::{Mmco, SliceHeader, SliceType};
 use super::sps::{ScalingLists, Sps};
 use super::transform::Dequant;
@@ -224,6 +224,7 @@ impl<S: Sample> PictureDecoder<S> {
                 pps.second_chroma_qp_index_offset,
             ],
         };
+        let mut scratch = Scratch::<S>::default();
         let total_mbs = cur_main.mb_width * cur_main.mb_height;
         let mbw = cur_main.mb_width;
         // `addr` counts macroblocks in decoding order: raster, or in an MBAFF
@@ -269,13 +270,32 @@ impl<S: Sample> PictureDecoder<S> {
             }
         };
         // Neighbours of the macroblock at storage address `sa`.
-        let neighbours = |info: &PicInfo, sa: usize, field: bool| -> MbNeighbours {
-            if mbaff {
-                MbNeighbours::derive_mbaff(info, sa, slice_num, field)
-            } else {
-                MbNeighbours::derive(info, sa, slice_num)
-            }
+        // Luma-like planes and 4:2:0 / 4:2:2 chroma block rows whose
+        // neighbouring nonzero counts the entropy decoders read.
+        let (nz_planes, nz_chroma_rows) = match ctx.chroma_format_idc {
+            1 => (1, 2),
+            2 => (1, 4),
+            3 => (3, 0),
+            _ => (1, 0),
         };
+        // (A function rather than a closure so the ~200-byte result is
+        // built in place instead of copied out of a non-inlined closure.)
+        #[inline(always)]
+        fn derive_neighbours(nb: &mut MbNeighbours, info: &PicInfo, sa: usize, field: bool, mbaff: bool, slice_num: u16, planes: usize, chroma_rows: usize) {
+            if mbaff {
+                nb.derive_mbaff_into(info, sa, slice_num, field);
+            } else {
+                nb.derive_into(info, sa, slice_num);
+            }
+            nb.gather_nz(info, planes, chroma_rows);
+        }
+        macro_rules! neighbours {
+            ($nb:ident, $info:expr, $sa:expr, $field:expr) => {
+                derive_neighbours(&mut $nb, $info, $sa, $field, mbaff, slice_num, nz_planes, nz_chroma_rows)
+            };
+        }
+        let mut nb = MbNeighbours::default();
+        let mut nb_bot = MbNeighbours::default();
 
         // The macroblock info of this slice's plane (a fresh borrow each
         // time, so the row filters can read every plane's in between).
@@ -326,7 +346,7 @@ impl<S: Sample> PictureDecoder<S> {
                 if mbaff && is_top {
                     pair_field = infer_field(info, sa);
                 }
-                let mut nb = neighbours(info, sa, pair_field);
+                neighbours!(nb, info, sa, pair_field);
                 let mut skipped = false;
                 if !hdr.slice_type.is_intra() {
                     let skip = match peeked_bottom_skip.take() {
@@ -354,7 +374,7 @@ impl<S: Sample> PictureDecoder<S> {
                             m.slice = slice_num;
                             m.decoded = true;
                             m.field = pair_field;
-                            let nb_bot = neighbours(info, sa + mbw, pair_field);
+                            neighbours!(nb_bot, info, sa + mbw, pair_field);
                             let bottom_skip = decode_mb_skip(
                                 &mut cabac,
                                 &mut st,
@@ -365,7 +385,7 @@ impl<S: Sample> PictureDecoder<S> {
                             if !bottom_skip {
                                 pair_field = decode_mb_field(&mut cabac, &mut st, &nb_bot);
                                 info.mbs[sa].field = pair_field;
-                                nb = neighbours(info, sa, pair_field);
+                                neighbours!(nb, info, sa, pair_field);
                             }
                             peeked_bottom_skip = Some(bottom_skip);
                         }
@@ -377,7 +397,7 @@ impl<S: Sample> PictureDecoder<S> {
                         // coded bottom after a skipped top had it decoded at
                         // the peek, and one after a coded top shares it.
                         pair_field = decode_mb_field(&mut cabac, &mut st, &nb);
-                        nb = neighbours(info, sa, pair_field);
+                        neighbours!(nb, info, sa, pair_field);
                     }
                     layer.field = pair_field;
                     parse_mb_cabac(
@@ -391,7 +411,7 @@ impl<S: Sample> PictureDecoder<S> {
                     )?;
                 }
                 layer.field = pair_field;
-                reconstruct(&ctx, &mut qps, dq, cur, info, &nb, &layer, &refs)?;
+                reconstruct(&ctx, &mut qps, dq, cur, info, &nb, &layer, &refs, &mut scratch)?;
                 mb_done!();
                 // No end_of_slice_flag after the top macroblock of an MBAFF
                 // pair (7.3.4): a slice holds whole pairs.
@@ -437,7 +457,7 @@ impl<S: Sample> PictureDecoder<S> {
                                 field_read = true;
                             }
                         }
-                        let nb = neighbours(info, sa, pair_field);
+                        neighbours!(nb, info, sa, pair_field);
                         let kind = if hdr.slice_type.is_b() {
                             MbKind::BSkip
                         } else {
@@ -445,7 +465,7 @@ impl<S: Sample> PictureDecoder<S> {
                         };
                         layer.reset(kind, false);
                         layer.field = pair_field;
-                        reconstruct(&ctx, &mut qps, dq, cur, info, &nb, &layer, &refs)?;
+                        reconstruct(&ctx, &mut qps, dq, cur, info, &nb, &layer, &refs, &mut scratch)?;
                         mb_done!();
                     }
                     prev_skipped = run > 0;
@@ -467,11 +487,11 @@ impl<S: Sample> PictureDecoder<S> {
                     pair_field = r.flag();
                 }
                 field_read = false;
-                let nb = neighbours(info, sa, pair_field);
+                neighbours!(nb, info, sa, pair_field);
                 let t = r.ue();
                 layer.field = pair_field;
                 parse_mb_cavlc(&mut r, &ctx, info, &nb, t, &mut layer)?;
-                reconstruct(&ctx, &mut qps, dq, cur, info, &nb, &layer, &refs)?;
+                reconstruct(&ctx, &mut qps, dq, cur, info, &nb, &layer, &refs, &mut scratch)?;
                 mb_done!();
                 if r.overrun() {
                     return Err(Error::bitstream("CAVLC slice data exhausted"));
@@ -730,6 +750,8 @@ pub(crate) struct H264DecoderImpl<S: Sample> {
     x264_build: Option<u32>,
     /// A decoded first field whose second field may follow.
     open_field: Option<OpenField<S>>,
+    /// Output buffers, recycled through the pictures handed out.
+    output_pool: crate::picture::OutputPool,
 }
 
 impl<S: Sample> H264DecoderImpl<S> {
@@ -760,6 +782,7 @@ impl<S: Sample> H264DecoderImpl<S> {
             x264_build: None,
             open_field: None,
             dsp: H264Dsp::new(crate::dsp::Cpu::detect_honouring_env()),
+            output_pool: crate::picture::OutputPool::default(),
         }
     }
 
@@ -912,7 +935,7 @@ impl<S: Sample> H264DecoderImpl<S> {
         if let Some(p) = self.output.pop_front() {
             return Some(p);
         }
-        self.dpb.output.pop_front().map(|p| p.into_picture())
+        self.dpb.output.pop_front().map(|p| p.into_picture(&self.output_pool))
     }
 
     /// The next picture in output order if it has finished decoding.
@@ -926,7 +949,7 @@ impl<S: Sample> H264DecoderImpl<S> {
             .front()
             .is_some_and(|p| p.frame.is_complete())
         {
-            return self.dpb.output.pop_front().map(|p| p.into_picture());
+            return self.dpb.output.pop_front().map(|p| p.into_picture(&self.output_pool));
         }
         None
     }

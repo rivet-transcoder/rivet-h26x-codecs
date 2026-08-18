@@ -285,6 +285,16 @@ pub struct MbInfo {
     /// A field macroblock (of a field picture, or a field pair of an MBAFF
     /// frame): its motion is in field units.
     pub field: bool,
+    /// The deblocking filter's "has coefficients" mask of the 4x4 luma
+    /// blocks (raster), an 8x8 transform's four blocks all set when any is;
+    /// all set for I_PCM.
+    pub nz_mask: u16,
+    /// Internal 4x4 edges that are partition boundaries (where motion can
+    /// differ): bit `e * 4 + k` for vertical edge `e` (1..4) at block row
+    /// `k`, and for horizontal edge `e` at block column `k`. Only these
+    /// need the motion comparison of 8.7.2.1; the rest of an inter
+    /// macroblock's internal edges are bS 0 without coefficients.
+    pub part_edges: [u16; 2],
 }
 
 impl Default for MbInfo {
@@ -302,6 +312,8 @@ impl Default for MbInfo {
             dc_cbf: 0,
             sub_direct: 0,
             field: false,
+            nz_mask: 0,
+            part_edges: [0; 2],
         }
     }
 }
@@ -407,7 +419,7 @@ impl PicInfo {
 /// neighbouring pairs are frame or field pairs (6.4.12.2, Table 6-4); the
 /// pair-level neighbours are kept and every lookup goes through
 /// [`Self::locate`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct MbNeighbours {
     /// Current macroblock address.
     pub addr: usize,
@@ -432,12 +444,35 @@ pub struct MbNeighbours {
     pub pair_field: [bool; 4],
     /// Picture width in macroblocks (for pair arithmetic).
     pub mb_width: usize,
+    /// Neighbouring nonzero-coefficient counts, gathered once (see
+    /// [`Self::gather_nz`]): whether the left / top side is available.
+    pub nz_avail: [bool; 2],
+    /// Per luma-like plane, the count of the block left of block row `r`
+    /// (0 for a skipped neighbour, 16 for I_PCM — the stored values).
+    pub nz_left: [[u8; 4]; 3],
+    /// Per luma-like plane, the count of the block above block column `c`.
+    pub nz_top: [[u8; 4]; 3],
+    /// Per chroma component (4:2:0 / 4:2:2), the count of the chroma block
+    /// left of chroma block row `r` (two or four rows).
+    pub nzc_left: [[u8; 4]; 2],
+    /// Per chroma component, the count of the chroma block above column `c`.
+    pub nzc_top: [[u8; 2]; 2],
 }
 
 impl MbNeighbours {
     /// Derive for `addr` (6.4.11.1) with the availability rule of 6.4.9:
     /// a macroblock is available if it is decoded and in the same slice.
     pub fn derive(info: &PicInfo, addr: usize, slice: u16) -> Self {
+        let mut nb = MbNeighbours::default();
+        nb.derive_into(info, addr, slice);
+        nb
+    }
+
+    /// [`Self::derive`] into an existing value (the slice decoder keeps one
+    /// and refills it per macroblock; the struct is a few hundred bytes and
+    /// building it in a temporary was a copy per macroblock). The nonzero
+    /// caches are left for [`Self::gather_nz`].
+    pub fn derive_into(&mut self, info: &PicInfo, addr: usize, slice: u16) {
         let w = info.mb_width;
         let avail = |a: usize| -> Option<usize> {
             let m = &info.mbs[a];
@@ -460,18 +495,90 @@ impl MbNeighbours {
         } else {
             None
         };
-        MbNeighbours {
-            addr,
-            a,
-            b,
-            c,
-            d,
-            mbaff: false,
-            cur_field: false,
-            is_top: true,
-            pair: [None; 4],
-            pair_field: [false; 4],
-            mb_width: w,
+        self.addr = addr;
+        self.a = a;
+        self.b = b;
+        self.c = c;
+        self.d = d;
+        self.mbaff = false;
+        self.cur_field = false;
+        self.is_top = true;
+        self.mb_width = w;
+    }
+
+    /// Gather the neighbouring nonzero counts CAVLC's nC (9.2.1) and
+    /// CABAC's coded_block_flag contexts (9.3.3.1.1.9) read: the blocks
+    /// left of each block row and above each block column, for `planes`
+    /// luma-like planes (1, or 3 in 4:4:4) and, when `chroma_rows` is 2 or
+    /// 4, the 4:2:0 / 4:2:2 chroma blocks. Skipped and I_PCM neighbours
+    /// are already stored as 0 / 16 in the picture's arrays; unavailable
+    /// sides are flagged in `nz_avail` (`nz_left` / `nz_top` read 0 then).
+    pub fn gather_nz(&mut self, info: &PicInfo, planes: usize, chroma_rows: usize) {
+        self.nz_avail = [false; 2];
+        if !self.mbaff {
+            if let Some(a) = self.a {
+                self.nz_avail[0] = true;
+                for p in 0..planes {
+                    for r in 0..4 {
+                        self.nz_left[p][r] = info.plane_nz(p, a, r * 4 + 3);
+                    }
+                }
+                if chroma_rows > 0 {
+                    for comp in 0..2 {
+                        for r in 0..chroma_rows {
+                            self.nzc_left[comp][r] = info.chroma_nz[a * 32 + comp * 16 + r * 2 + 1];
+                        }
+                    }
+                }
+            }
+            if let Some(b) = self.b {
+                self.nz_avail[1] = true;
+                for p in 0..planes {
+                    for c in 0..4 {
+                        self.nz_top[p][c] = info.plane_nz(p, b, 12 + c);
+                    }
+                }
+                if chroma_rows > 0 {
+                    for comp in 0..2 {
+                        for c in 0..2 {
+                            self.nzc_top[comp][c] = info.chroma_nz[b * 32 + comp * 16 + (chroma_rows - 1) * 2 + c];
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        // MBAFF: each row / column through Table 6-4 (a frame macroblock
+        // next to a field pair reads the two macroblocks alternately).
+        for r in 0..4 {
+            if let Some((addr, blk)) = self.block(-1, r as i32) {
+                self.nz_avail[0] = true;
+                for p in 0..planes {
+                    self.nz_left[p][r] = info.plane_nz(p, addr, blk);
+                }
+            }
+            if let Some((addr, blk)) = self.block(r as i32, -1) {
+                self.nz_avail[1] = true;
+                for p in 0..planes {
+                    self.nz_top[p][r] = info.plane_nz(p, addr, blk);
+                }
+            }
+        }
+        if chroma_rows > 0 {
+            for r in 0..chroma_rows {
+                if let Some((addr, blk)) = self.block_c(-1, r as i32, chroma_rows as i32) {
+                    for comp in 0..2 {
+                        self.nzc_left[comp][r] = info.chroma_nz[addr * 32 + comp * 16 + blk];
+                    }
+                }
+            }
+            for c in 0..2 {
+                if let Some((addr, blk)) = self.block_c(c as i32, -1, chroma_rows as i32) {
+                    for comp in 0..2 {
+                        self.nzc_top[comp][c] = info.chroma_nz[addr * 32 + comp * 16 + blk];
+                    }
+                }
+            }
         }
     }
 
@@ -479,6 +586,13 @@ impl MbNeighbours {
     /// (6.4.10 for the pairs, 6.4.12.2 for the macroblock-level neighbours),
     /// the current pair being frame / field per `cur_field`.
     pub fn derive_mbaff(info: &PicInfo, addr: usize, slice: u16, cur_field: bool) -> Self {
+        let mut nb = MbNeighbours::default();
+        nb.derive_mbaff_into(info, addr, slice, cur_field);
+        nb
+    }
+
+    /// [`Self::derive_mbaff`] into an existing value.
+    pub fn derive_mbaff_into(&mut self, info: &PicInfo, addr: usize, slice: u16, cur_field: bool) {
         let w = info.mb_width;
         let x = addr % w;
         let frow = addr / w;
@@ -505,24 +619,17 @@ impl MbNeighbours {
             pair_at(x as isize - 1, pr as isize - 1),
         ];
         let pair_field = [0, 1, 2, 3].map(|k| pair[k].is_some_and(|t| info.mbs[t].field));
-        let mut nb = MbNeighbours {
-            addr,
-            a: None,
-            b: None,
-            c: None,
-            d: None,
-            mbaff: true,
-            cur_field,
-            is_top,
-            pair,
-            pair_field,
-            mb_width: w,
-        };
-        nb.a = nb.locate(-1, 0, 16, 16).map(|(a, _, _)| a);
-        nb.b = nb.locate(0, -1, 16, 16).map(|(a, _, _)| a);
-        nb.c = nb.locate(16, -1, 16, 16).map(|(a, _, _)| a);
-        nb.d = nb.locate(-1, -1, 16, 16).map(|(a, _, _)| a);
-        nb
+        self.addr = addr;
+        self.mbaff = true;
+        self.cur_field = cur_field;
+        self.is_top = is_top;
+        self.pair = pair;
+        self.pair_field = pair_field;
+        self.mb_width = w;
+        self.a = self.locate(-1, 0, 16, 16).map(|(a, _, _)| a);
+        self.b = self.locate(0, -1, 16, 16).map(|(a, _, _)| a);
+        self.c = self.locate(16, -1, 16, 16).map(|(a, _, _)| a);
+        self.d = self.locate(-1, -1, 16, 16).map(|(a, _, _)| a);
     }
 
     /// The macroblock holding the neighbouring sample `(xn, yn)` (relative
@@ -743,15 +850,17 @@ pub fn block_available(done: u16, bx: i32, by: i32) -> bool {
 // Motion vector prediction (8.4.1.3)
 // ---------------------------------------------------------------------------
 
-/// A neighbour's motion for one list, for prediction.
+/// A neighbour's motion for one list, for prediction. Eight aligned bytes,
+/// so the caches of them move as whole words.
 #[derive(Debug, Clone, Copy)]
+#[repr(C, align(8))]
 pub struct NbMotion {
-    /// Available (partition exists and is decoded)?
-    pub avail: bool,
-    /// Reference index (-1 when unavailable or intra / not using the list).
-    pub ref_idx: i8,
     /// Motion vector (zero when unavailable).
     pub mv: Mv,
+    /// Reference index (-1 when unavailable or intra / not using the list).
+    pub ref_idx: i8,
+    /// Available (partition exists and is decoded)?
+    pub avail: bool,
 }
 
 impl NbMotion {
@@ -763,34 +872,13 @@ impl NbMotion {
     };
 }
 
-/// Read the motion of the 4x4 block at 4x4-unit offset `(bx, by)` relative
-/// to the current macroblock, for `list`. Blocks in the current macroblock
-/// must be in `done` to count as available.
-pub fn neighbour_motion<S: Sample>(
-    nb: &MbNeighbours,
-    frame: &Frame<S>,
-    info: &PicInfo,
-    done: u16,
-    list: usize,
-    bx: i32,
-    by: i32,
-) -> NbMotion {
-    // The neighbouring sample: left of / above the block's top-left.
-    let xn = if bx < 0 {
-        -1
-    } else if bx > 3 {
-        16
-    } else {
-        bx * 4
-    };
-    let yn = if by < 0 { -1 } else { by * 4 };
-    neighbour_motion_at(nb, frame, info, done, list, xn, yn)
-}
 
-/// [`neighbour_motion`] for the block holding the neighbouring luma sample
-/// `(xn, yn)` (relative to the current macroblock's top-left) — the form
-/// 6.4.11.7 uses, which matters in an MBAFF frame where the row's parity
-/// picks the macroblock of a neighbouring pair of the other kind.
+/// The motion of the block holding the neighbouring luma sample `(xn, yn)`
+/// (relative to the current macroblock's top-left) for one list, as
+/// prediction needs it — the form 6.4.11.7 uses, which matters in an MBAFF
+/// frame where the row's parity picks the macroblock of a neighbouring pair
+/// of the other kind. The general derivation; [`MotionCache`] gathers its
+/// results once per macroblock.
 pub fn neighbour_motion_at<S: Sample>(
     nb: &MbNeighbours,
     frame: &Frame<S>,
@@ -838,6 +926,128 @@ pub fn neighbour_motion_at<S: Sample>(
     n
 }
 
+/// The neighbouring motion a macroblock's partitions predict from,
+/// gathered once per macroblock so the many lookups of 8.4.1.3.2 (A, B, C
+/// and D of every partition, in both lists) are array reads: the blocks
+/// left of luma rows 0 / 4 / 8 / 12 (A of each partition row) and 3 / 7 /
+/// 11 (D of the partitions below the first row — a different macroblock in
+/// an MBAFF frame), and above columns 0 / 4 / 8 / 12 (B), 16 (C of the last
+/// column) and -1 (D of the first row). Positions inside the current
+/// macroblock are read live (they are still being decoded).
+#[derive(Debug, Clone, Copy)]
+pub struct MotionCache {
+    /// Per list: rows 0, 4, 8, 12 at 0..4; rows 3, 7, 11 at 4..7.
+    left: [[NbMotion; 8]; 2],
+    /// Per list: columns 0, 4, 8, 12 at 0..4; column 16 at 4; column -1 at 5.
+    top: [[NbMotion; 6]; 2],
+}
+
+impl Default for MotionCache {
+    fn default() -> Self {
+        MotionCache { left: [[NbMotion::NONE; 8]; 2], top: [[NbMotion::NONE; 6]; 2] }
+    }
+}
+
+impl MotionCache {
+    /// Gather the neighbours of macroblock `nb` from `frame`'s motion into
+    /// `self` (in place: the cache lives in the slice decoder's scratch).
+    pub fn gather<S: Sample>(&mut self, nb: &MbNeighbours, frame: &Frame<S>, info: &PicInfo) {
+        let c = self;
+        if nb.mbaff {
+            // Table 6-4 neighbours, through the general derivation.
+            for list in 0..2 {
+                for r in 0..4 {
+                    c.left[list][r] = neighbour_motion_at(nb, frame, info, 0, list, -1, r as i32 * 4);
+                    c.top[list][r] = neighbour_motion_at(nb, frame, info, 0, list, r as i32 * 4, -1);
+                }
+                for r in 0..3 {
+                    c.left[list][4 + r] = neighbour_motion_at(nb, frame, info, 0, list, -1, r as i32 * 4 + 3);
+                }
+                c.top[list][4] = neighbour_motion_at(nb, frame, info, 0, list, 16, -1);
+                c.top[list][5] = neighbour_motion_at(nb, frame, info, 0, list, -1, -1);
+            }
+            return;
+        }
+        // An intra neighbour is available but "not used for inter
+        // prediction": refIdx -1, mv 0.
+        const INTRA: NbMotion = NbMotion { avail: true, ref_idx: -1, mv: Mv::ZERO };
+        let of = |list: usize, addr: usize, blk: usize| -> NbMotion {
+            let m = frame.motion[list][addr * 16 + blk];
+            NbMotion { avail: true, ref_idx: m.ref_idx, mv: m.mv }
+        };
+        // Each side is written whole: its entries, or NONE when unavailable.
+        match nb.a {
+            Some(a) => {
+                let intra = info.mbs[a].kind.is_intra();
+                for list in 0..2 {
+                    for r in 0..4 {
+                        c.left[list][r] = if intra { INTRA } else { of(list, a, r * 4 + 3) };
+                    }
+                    // Rows 3, 7, 11 lie in the same left blocks as rows 0, 4, 8.
+                    for r in 0..3 {
+                        c.left[list][4 + r] = c.left[list][r];
+                    }
+                }
+            }
+            None => c.left = [[NbMotion::NONE; 8]; 2],
+        }
+        match nb.b {
+            Some(b) => {
+                let intra = info.mbs[b].kind.is_intra();
+                for list in 0..2 {
+                    for x in 0..4 {
+                        c.top[list][x] = if intra { INTRA } else { of(list, b, 12 + x) };
+                    }
+                }
+            }
+            None => {
+                for list in 0..2 {
+                    for x in 0..4 {
+                        c.top[list][x] = NbMotion::NONE;
+                    }
+                }
+            }
+        }
+        for list in 0..2 {
+            c.top[list][4] = match nb.c {
+                Some(cc) => {
+                    if info.mbs[cc].kind.is_intra() { INTRA } else { of(list, cc, 12) }
+                }
+                None => NbMotion::NONE,
+            };
+            c.top[list][5] = match nb.d {
+                Some(d) => {
+                    if info.mbs[d].kind.is_intra() { INTRA } else { of(list, d, 15) }
+                }
+                None => NbMotion::NONE,
+            };
+        }
+    }
+
+    /// The motion of the block holding luma sample `(xn, yn)` relative to
+    /// the current macroblock (6.4.11.7): a cached neighbour outside it, a
+    /// live read inside it (available once `done` has the block).
+    #[inline(always)]
+    pub fn at<S: Sample>(&self, nb: &MbNeighbours, frame: &Frame<S>, done: u16, list: usize, xn: i32, yn: i32) -> NbMotion {
+        if yn < 0 {
+            if xn < 0 {
+                self.top[list][5]
+            } else if xn < 16 {
+                self.top[list][(xn >> 2) as usize]
+            } else {
+                self.top[list][4]
+            }
+        } else if xn < 0 {
+            if yn & 3 == 0 { self.left[list][(yn >> 2) as usize] } else { self.left[list][4 + (yn >> 2) as usize] }
+        } else if xn < 16 && block_available(done, xn >> 2, yn >> 2) {
+            let m = frame.motion[list][nb.addr * 16 + ((yn >> 2) * 4 + (xn >> 2)) as usize];
+            NbMotion { avail: true, ref_idx: m.ref_idx, mv: m.mv }
+        } else {
+            NbMotion::NONE
+        }
+    }
+}
+
 /// The three neighbours used for a partition's motion vector prediction:
 /// A (left of the top-left block), B (above the top-left block), C (above
 /// the block right of the partition's top-right block, falling back to D
@@ -845,9 +1055,9 @@ pub fn neighbour_motion_at<S: Sample>(
 /// `(bx, by)` is the partition's top-left 4x4 block, `w4` its width in 4x4
 /// units.
 pub fn prediction_neighbours<S: Sample>(
+    cache: &MotionCache,
     nb: &MbNeighbours,
     frame: &Frame<S>,
-    info: &PicInfo,
     done: u16,
     list: usize,
     bx: i32,
@@ -857,11 +1067,11 @@ pub fn prediction_neighbours<S: Sample>(
     // The samples (x - 1, y), (x, y - 1), (x + w, y - 1) and (x - 1, y - 1)
     // of the partition at (x, y) = (4 bx, 4 by) (6.4.11.7).
     let (x, y) = (bx * 4, by * 4);
-    let a = neighbour_motion_at(nb, frame, info, done, list, x - 1, y);
-    let b = neighbour_motion_at(nb, frame, info, done, list, x, y - 1);
-    let mut c = neighbour_motion_at(nb, frame, info, done, list, x + w4 * 4, y - 1);
+    let a = cache.at(nb, frame, done, list, x - 1, y);
+    let b = cache.at(nb, frame, done, list, x, y - 1);
+    let mut c = cache.at(nb, frame, done, list, x + w4 * 4, y - 1);
     if !c.avail {
-        c = neighbour_motion_at(nb, frame, info, done, list, x - 1, y - 1);
+        c = cache.at(nb, frame, done, list, x - 1, y - 1);
     }
     (a, b, c)
 }
@@ -897,9 +1107,9 @@ fn median3(a: i16, b: i16, c: i16) -> i16 {
 /// samples, `(x, y)` the partition's top-left in samples within the MB.
 #[allow(clippy::too_many_arguments)]
 pub fn predict_mv<S: Sample>(
+    cache: &MotionCache,
     nb: &MbNeighbours,
     frame: &Frame<S>,
-    info: &PicInfo,
     done: u16,
     list: usize,
     ref_idx: i8,
@@ -911,7 +1121,7 @@ pub fn predict_mv<S: Sample>(
     let bx = (x / 4) as i32;
     let by = (y / 4) as i32;
     let w4 = (part_w / 4) as i32;
-    let (a, b, c) = prediction_neighbours(nb, frame, info, done, list, bx, by, w4);
+    let (a, b, c) = prediction_neighbours(cache, nb, frame, done, list, bx, by, w4);
     if part_w == 16 && part_h == 8 {
         if y == 0 {
             if b.ref_idx == ref_idx {
@@ -934,9 +1144,9 @@ pub fn predict_mv<S: Sample>(
 
 /// P_Skip motion (8.4.1.1): reference index 0 and either the zero vector or
 /// the 16x16 median prediction.
-pub fn p_skip_mv<S: Sample>(nb: &MbNeighbours, frame: &Frame<S>, info: &PicInfo) -> Mv {
-    let a = neighbour_motion(nb, frame, info, 0, 0, -1, 0);
-    let b = neighbour_motion(nb, frame, info, 0, 0, 0, -1);
+pub fn p_skip_mv<S: Sample>(cache: &MotionCache, nb: &MbNeighbours, frame: &Frame<S>) -> Mv {
+    let a = cache.at(nb, frame, 0, 0, -1, 0);
+    let b = cache.at(nb, frame, 0, 0, 0, -1);
     if !a.avail
         || !b.avail
         || (a.ref_idx == 0 && a.mv == Mv::ZERO)
@@ -944,7 +1154,7 @@ pub fn p_skip_mv<S: Sample>(nb: &MbNeighbours, frame: &Frame<S>, info: &PicInfo)
     {
         return Mv::ZERO;
     }
-    predict_mv(nb, frame, info, 0, 0, 0, 0, 0, 16, 16)
+    predict_mv(cache, nb, frame, 0, 0, 0, 0, 0, 16, 16)
 }
 
 /// Write `motion` for list `list` into the 4x4 blocks of the rectangle
@@ -976,13 +1186,13 @@ fn min_positive(a: i8, b: i8) -> i8 {
 /// Reference indices for spatial direct prediction (8.4.1.2.2): the
 /// `MinPositive` over the whole-macroblock neighbours A, B, C for each list.
 pub fn spatial_direct_ref_idx<S: Sample>(
+    cache: &MotionCache,
     nb: &MbNeighbours,
     frame: &Frame<S>,
-    info: &PicInfo,
 ) -> [i8; 2] {
     let mut out = [0i8; 2];
     for list in 0..2 {
-        let (a, b, c) = prediction_neighbours(nb, frame, info, 0, list, 0, 0, 4);
+        let (a, b, c) = prediction_neighbours(cache, nb, frame, 0, list, 0, 0, 4);
         out[list] = min_positive(a.ref_idx, min_positive(b.ref_idx, c.ref_idx));
     }
     out

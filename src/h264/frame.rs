@@ -604,7 +604,7 @@ impl<S: Sample> Frame<S> {
 
     /// Copy out the visible picture, cropped by `(left, right, top, bottom)`
     /// luma samples.
-    pub fn to_picture(&self, crop: (u32, u32, u32, u32), poc: i32, decode_index: u64) -> Picture {
+    pub fn to_picture(&self, crop: (u32, u32, u32, u32), poc: i32, decode_index: u64, pool: &crate::picture::OutputPool) -> Picture {
         let (l, r, t, b) = (
             crop.0 as usize,
             crop.1 as usize,
@@ -615,12 +615,25 @@ impl<S: Sample> Frame<S> {
         let height = self.y.height - t - b;
         let mut planes = Vec::with_capacity(3);
         let bps = S::BYTES;
+        // One buffer for every plane: a zeroed allocation (fresh pages are
+        // zero already, and glibc recycles the mapping), filled row by row.
+        let (sw, sh) = self.chroma.subsampling();
+        let (sw, sh) = (sw as usize, sh as usize);
+        let total = if self.colour_planes.is_some() {
+            3 * width * height
+        } else if self.chroma == ChromaFormat::Monochrome {
+            width * height
+        } else {
+            width * height + 2 * (width / sw) * (height / sh)
+        } * bps;
+        let mut data = pool.take(total);
+        let mut at = 0usize;
         let mut plane = |p: &PaddedPlane<S>, x0: usize, y0: usize, w: usize, h: usize| {
-            let mut data = vec![0u8; w * h * bps];
+            let start = at;
             for yy in 0..h {
                 let off = p.offset((x0) as isize, (y0 + yy) as isize);
                 let src = &p.data[off..off + w];
-                let dst = &mut data[yy * w * bps..(yy + 1) * w * bps];
+                let dst = &mut data[start + yy * w * bps..start + (yy + 1) * w * bps];
                 if bps == 1 || cfg!(target_endian = "little") {
                     // Bytes, or little-endian u16 already in memory order.
                     // SAFETY: `src` is `w` samples of `bps` bytes; `dst` is `bps * w` bytes.
@@ -637,11 +650,8 @@ impl<S: Sample> Frame<S> {
                     }
                 }
             }
-            planes.push(Plane {
-                data,
-                width: w as u32,
-                height: h as u32,
-            });
+            planes.push(Plane { offset: start, width: w as u32, height: h as u32 });
+            at = start + w * h * bps;
         };
         plane(&self.y, l, t, width, height);
         let mut chroma = self.chroma;
@@ -651,12 +661,12 @@ impl<S: Sample> Frame<S> {
             plane(&cp[1].y, l, t, width, height);
             chroma = ChromaFormat::Yuv444;
         } else if self.chroma != ChromaFormat::Monochrome {
-            let (sw, sh) = self.chroma.subsampling();
-            let (sw, sh) = (sw as usize, sh as usize);
             plane(&self.cb, l / sw, t / sh, width / sw, height / sh);
             plane(&self.cr, l / sw, t / sh, width / sw, height / sh);
         }
         Picture {
+            pool: Some(pool.clone()),
+            data,
             width: width as u32,
             height: height as u32,
             bit_depth: self.bit_depth,

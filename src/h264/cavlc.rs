@@ -204,8 +204,7 @@ fn tables() -> &'static VlcTables {
 /// Decode `coeff_token` for the given `nC` (−1 for 4:2:0 chroma DC, −2 for
 /// 4:2:2 chroma DC). Returns `(TotalCoeff, TrailingOnes)`.
 #[inline(always)]
-fn read_coeff_token(r: &mut BitReader, nc: i32) -> Result<(usize, usize)> {
-    let t = tables();
+fn read_coeff_token(r: &mut BitReader, t: &VlcTables, nc: i32) -> Result<(usize, usize)> {
     let cls = match nc {
         -2 => 5,
         -1 => 4,
@@ -232,8 +231,9 @@ fn read_coeff_token(r: &mut BitReader, nc: i32) -> Result<(usize, usize)> {
 /// `out[scan[i]]` for scan positions `i` in `start_idx..=end_idx` — `out` is
 /// the block in raster order and must be zero where nothing is written (the
 /// macroblock layer's reset guarantees it). Returns `TotalCoeff`.
-pub fn residual_block(
+fn residual_block(
     r: &mut BitReader,
+    t: &VlcTables,
     nc: i32,
     out: &mut [i32],
     scan: &[u8],
@@ -244,7 +244,7 @@ pub fn residual_block(
     // Work on a local copy of the reader so its fields live in registers
     // through the many small reads below, then hand the position back.
     let mut rd = r.clone();
-    let res = residual_block_inner(&mut rd, nc, out, scan, start_idx, end_idx, max_num_coeff);
+    let res = residual_block_inner(&mut rd, t, nc, out, scan, start_idx, end_idx, max_num_coeff);
     *r = rd;
     res
 }
@@ -252,6 +252,7 @@ pub fn residual_block(
 #[inline(always)]
 fn residual_block_inner(
     r: &mut BitReader,
+    t: &VlcTables,
     nc: i32,
     out: &mut [i32],
     scan: &[u8],
@@ -259,72 +260,101 @@ fn residual_block_inner(
     end_idx: usize,
     max_num_coeff: usize,
 ) -> Result<usize> {
-    let (total_coeff, trailing_ones) = read_coeff_token(r, nc)?;
+    let (total_coeff, trailing_ones) = read_coeff_token(r, t, nc)?;
     if total_coeff > end_idx - start_idx + 1 {
         return Err(Error::bitstream("CAVLC: TotalCoeff larger than the block"));
     }
     if total_coeff == 0 {
         return Ok(0);
     }
+    // Levels, highest frequency first (9.2.2): the trailing ones are sign
+    // bits; the first coded level has suffixLength 0 (or 1 for a block
+    // with many coefficients and few trailing ones), and its magnitude is
+    // raised by one when fewer than three trailing ones preceded it;
+    // every later level has suffixLength >= 1, growing with the magnitudes.
     let mut level_val = [0i32; 16];
-    let mut suffix_length: u32 = if total_coeff > 10 && trailing_ones < 3 {
-        1
-    } else {
-        0
-    };
+    let mut i = 0;
     if trailing_ones > 0 {
         let signs = r.bits(trailing_ones as u32);
-        for i in 0..trailing_ones {
-            level_val[i] = 1 - 2 * ((signs >> (trailing_ones - 1 - i)) & 1) as i32;
+        for k in 0..trailing_ones {
+            level_val[k] = 1 - 2 * ((signs >> (trailing_ones - 1 - k)) & 1) as i32;
         }
+        i = trailing_ones;
     }
-    for i in trailing_ones..total_coeff {
-        {
-            // level_prefix: leading zeros before a 1.
-            let level_prefix = r.peek(32).leading_zeros();
-            if level_prefix >= 32 {
-                return Err(Error::bitstream("CAVLC: level_prefix runaway"));
+    // level_prefix: leading zeros before a one.
+    #[inline(always)]
+    fn level_prefix(r: &mut BitReader) -> Result<u32> {
+        let p = r.peek(32).leading_zeros();
+        if p >= 32 {
+            return Err(Error::bitstream("CAVLC: level_prefix runaway"));
+        }
+        r.skip(p + 1);
+        Ok(p)
+    }
+    // Sign from the parity of level_code: even is positive.
+    #[inline(always)]
+    fn signed(level_code: i32) -> i32 {
+        let mask = -(level_code & 1);
+        (((2 + level_code) >> 1) ^ mask) - mask
+    }
+    // The suffixLength after a level of the given magnitude (Table 9-9's
+    // thresholds 3, 6, 12, 24, 48).
+    const SUFFIX_LIMIT: [i32; 7] = [0, 3, 6, 12, 24, 48, i32::MAX];
+    let mut suffix_length: usize;
+    if i < total_coeff {
+        // The first level.
+        let prefix = level_prefix(r)?;
+        let sl0 = (total_coeff > 10 && trailing_ones < 3) as u32;
+        let mut level_code: i32 = if prefix < 14 {
+            ((prefix << sl0) + if sl0 > 0 { r.bits(sl0) } else { 0 }) as i32
+        } else if prefix == 14 {
+            if sl0 == 0 { 14 + r.bits(4) as i32 } else { (14 << sl0) as i32 + r.bits(sl0) as i32 }
+        } else {
+            // prefix >= 15: a (prefix - 3)-bit suffix, escape from 15 (and
+            // 15 more when suffixLength is 0): 30 either way.
+            let mut lc = 30i32;
+            if prefix >= 16 {
+                lc += (1i32 << (prefix - 3)) - 4096;
             }
-            r.skip(level_prefix + 1);
-            let mut level_code: i32 = ((level_prefix.min(15)) << suffix_length) as i32;
-            if suffix_length > 0 || level_prefix >= 14 {
-                let level_suffix_size = if level_prefix == 14 && suffix_length == 0 {
-                    4
-                } else if level_prefix >= 15 {
-                    level_prefix - 3
-                } else {
-                    suffix_length
-                };
-                if level_suffix_size > 0 {
-                    level_code += r.bits(level_suffix_size) as i32;
-                }
-            }
-            if level_prefix >= 15 && suffix_length == 0 {
-                level_code += 15;
-            }
-            if level_prefix >= 16 {
-                level_code += (1i32 << (level_prefix - 3)) - 4096;
-            }
-            if i == trailing_ones && trailing_ones < 3 {
-                level_code += 2;
-            }
-            level_val[i] = if level_code % 2 == 0 {
-                (level_code + 2) >> 1
+            lc + r.bits(prefix - 3) as i32
+        };
+        if trailing_ones < 3 {
+            level_code += 2;
+        }
+        let v = signed(level_code);
+        level_val[i] = v;
+        i += 1;
+        suffix_length = if sl0 == 0 {
+            // suffixLength 0 -> 1, then the usual growth (magnitude > 3 -> 2).
+            if v.unsigned_abs() > 3 { 2 } else { 1 }
+        } else {
+            1 + (v.unsigned_abs() > 3) as usize
+        };
+        // The remaining levels: suffixLength >= 1.
+        while i < total_coeff {
+            let prefix = level_prefix(r)?;
+            let level_code: i32 = if prefix < 15 {
+                ((prefix << suffix_length) + r.bits(suffix_length as u32)) as i32
             } else {
-                (-level_code - 1) >> 1
+                let mut lc = (15 << suffix_length) as i32;
+                if prefix >= 16 {
+                    lc += (1i32 << (prefix - 3)) - 4096;
+                }
+                lc + r.bits(prefix - 3) as i32
             };
-            if suffix_length == 0 {
-                suffix_length = 1;
-            }
-            if level_val[i].unsigned_abs() > (3u32 << (suffix_length - 1)) && suffix_length < 6 {
+            let v = signed(level_code);
+            level_val[i] = v;
+            i += 1;
+            if v.unsigned_abs() as i32 > SUFFIX_LIMIT[suffix_length] {
                 suffix_length += 1;
             }
         }
     }
 
+    // total_zeros, then the runs before each coefficient (highest frequency
+    // first), writing each coefficient as its position becomes known.
     let mut zeros_left: usize = 0;
     if total_coeff < end_idx - start_idx + 1 {
-        let t = tables();
         let e = if max_num_coeff == 4 {
             t.chroma_dc_total_zeros[total_coeff - 1][r.peek(9) as usize]
         } else if max_num_coeff == 8 {
@@ -338,53 +368,51 @@ fn residual_block_inner(
         r.skip(e.len as u32);
         zeros_left = e.a as usize;
     }
-    let mut run_val = [0usize; 16];
-    for run in run_val.iter_mut().take(total_coeff.saturating_sub(1)) {
-        if zeros_left > 0 {
-            if zeros_left > 6 {
-                // Table 9-10, zerosLeft > 6: three-bit codes 111..001 for
-                // runs 0..6, then a run of `k` zeros and a one for run 4 + k.
-                let bits = r.peek(11);
-                let top3 = bits >> 8;
-                if top3 != 0 {
-                    r.skip(3);
-                    *run = (7 - top3) as usize;
-                } else {
-                    let lz = (bits << 21).leading_zeros(); // within the 11 peeked bits
-                    if lz >= 11 {
-                        return Err(Error::bitstream("CAVLC: invalid run_before"));
-                    }
-                    r.skip(lz + 1);
-                    *run = lz as usize + 4;
-                }
+    // Scan position (from start_idx) of the highest-frequency coefficient.
+    let mut coeff_num = zeros_left + total_coeff - 1;
+    if start_idx + coeff_num > end_idx {
+        return Err(Error::bitstream("CAVLC: coefficient position past the block"));
+    }
+    out[scan[start_idx + coeff_num] as usize] = level_val[0];
+    let mut i = 1;
+    while i < total_coeff && zeros_left > 0 {
+        let run = if zeros_left > 6 {
+            // Table 9-10, zerosLeft > 6: three-bit codes 111..001 for
+            // runs 0..6, then a run of `k` zeros and a one for run 4 + k.
+            let bits = r.peek(11);
+            let top3 = bits >> 8;
+            if top3 != 0 {
+                r.skip(3);
+                (7 - top3) as usize
             } else {
-                let t = tables();
-                let e = t.run_before[zeros_left - 1][r.peek(3) as usize];
-                if e.len == 0 {
+                let lz = (bits << 21).leading_zeros(); // within the 11 peeked bits
+                if lz >= 11 {
                     return Err(Error::bitstream("CAVLC: invalid run_before"));
                 }
-                r.skip(e.len as u32);
-                *run = e.a as usize;
+                r.skip(lz + 1);
+                lz as usize + 4
             }
-            if *run > zeros_left {
-                return Err(Error::bitstream("CAVLC: run_before exceeds zerosLeft"));
-            }
-            zeros_left -= *run;
         } else {
-            *run = 0;
+            let e = t.run_before[zeros_left - 1][r.peek(3) as usize];
+            if e.len == 0 {
+                return Err(Error::bitstream("CAVLC: invalid run_before"));
+            }
+            r.skip(e.len as u32);
+            e.a as usize
+        };
+        if run > zeros_left {
+            return Err(Error::bitstream("CAVLC: run_before exceeds zerosLeft"));
         }
+        zeros_left -= run;
+        coeff_num -= 1 + run;
+        out[scan[start_idx + coeff_num] as usize] = level_val[i];
+        i += 1;
     }
-    run_val[total_coeff - 1] = zeros_left;
-    let mut coeff_num: isize = -1;
-    for i in (0..total_coeff).rev() {
-        coeff_num += run_val[i] as isize + 1;
-        let idx = start_idx as isize + coeff_num;
-        if idx as usize > end_idx {
-            return Err(Error::bitstream(
-                "CAVLC: coefficient position past the block",
-            ));
-        }
-        out[scan[idx as usize] as usize] = level_val[i];
+    // No zeros left: the rest are consecutive.
+    while i < total_coeff {
+        coeff_num -= 1;
+        out[scan[start_idx + coeff_num] as usize] = level_val[i];
+        i += 1;
     }
     if r.overrun() {
         return Err(Error::bitstream("CAVLC: slice data truncated"));
@@ -396,63 +424,27 @@ fn residual_block_inner(
 // nC derivation (9.2.1)
 // ---------------------------------------------------------------------------
 
-/// The `TotalCoeff` a neighbouring 4x4 block of colour plane `p` (luma, or
-/// a 4:4:4 chroma plane) contributes to nC: 0 for a skipped MB, 16 for
-/// I_PCM, else the stored count.
-fn plane_nb_count(
-    info: &PicInfo,
-    layer: &MbLayer,
-    cur: usize,
-    addr: usize,
-    p: usize,
-    blk: usize,
-) -> u8 {
-    if addr == cur {
-        return layer.nz[p][blk];
-    }
-    let m = &info.mbs[addr];
-    match m.kind {
-        MbKind::PSkip | MbKind::BSkip => 0,
-        MbKind::IPcm => 16,
-        _ => info.plane_nz(p, addr, blk),
-    }
-}
-
-fn chroma_nb_count(
-    info: &PicInfo,
-    layer: &MbLayer,
-    cur: usize,
-    addr: usize,
-    comp: usize,
-    blk: usize,
-) -> u8 {
-    if addr == cur {
-        return layer.chroma_nz[comp][blk];
-    }
-    let m = &info.mbs[addr];
-    match m.kind {
-        MbKind::PSkip | MbKind::BSkip => 0,
-        MbKind::IPcm => 16,
-        _ => info.chroma_nz[addr * 32 + comp * 16 + blk],
-    }
-}
-
 /// nC for the 4x4 block at raster `(bx, by)` of colour plane `p` (luma, or
-/// Cb / Cr in 4:4:4, whose neighbours are the same plane's blocks).
-pub fn plane_nc(
-    info: &PicInfo,
-    layer: &MbLayer,
-    nb: &MbNeighbours,
-    p: usize,
-    bx: usize,
-    by: usize,
-) -> i32 {
-    let a = nb
-        .block(bx as i32 - 1, by as i32)
-        .map(|(addr, blk)| plane_nb_count(info, layer, nb.addr, addr, p, blk));
-    let b = nb
-        .block(bx as i32, by as i32 - 1)
-        .map(|(addr, blk)| plane_nb_count(info, layer, nb.addr, addr, p, blk));
+/// Cb / Cr in 4:4:4, whose neighbours are the same plane's blocks): the
+/// rounded mean of the left and above blocks' TotalCoeff (9.2.1), from
+/// this macroblock's blocks decoded so far or the neighbours gathered in
+/// [`MbNeighbours::gather_nz`] (skip 0, I_PCM 16, unavailable left out).
+#[inline]
+pub fn plane_nc(layer: &MbLayer, nb: &MbNeighbours, p: usize, bx: usize, by: usize) -> i32 {
+    let a = if bx > 0 {
+        Some(layer.nz[p][by * 4 + bx - 1])
+    } else if nb.nz_avail[0] {
+        Some(nb.nz_left[p][by])
+    } else {
+        None
+    };
+    let b = if by > 0 {
+        Some(layer.nz[p][(by - 1) * 4 + bx])
+    } else if nb.nz_avail[1] {
+        Some(nb.nz_top[p][bx])
+    } else {
+        None
+    };
     match (a, b) {
         (Some(a), Some(b)) => (a as i32 + b as i32 + 1) >> 1,
         (Some(a), None) => a as i32,
@@ -461,23 +453,25 @@ pub fn plane_nc(
     }
 }
 
-/// nC for chroma AC block `(bx, by)` of component `comp`: a 2-column grid of
-/// `rows` rows (2 for 4:2:0, 4 for 4:2:2).
-pub fn chroma_nc(
-    info: &PicInfo,
-    layer: &MbLayer,
-    nb: &MbNeighbours,
-    comp: usize,
-    bx: usize,
-    by: usize,
-    rows: usize,
-) -> i32 {
-    // Chroma block neighbours (6.4.11.5): the blocks holding the sample
-    // left of / above the block's top-left, in this or a neighbouring MB.
-    let a = nb.block_c(bx as i32 - 1, by as i32, rows as i32);
-    let b = nb.block_c(bx as i32, by as i32 - 1, rows as i32);
-    let a = a.map(|(addr, blk)| chroma_nb_count(info, layer, nb.addr, addr, comp, blk));
-    let b = b.map(|(addr, blk)| chroma_nb_count(info, layer, nb.addr, addr, comp, blk));
+/// nC for chroma AC block `(bx, by)` (a two-column, `rows`-row grid: 4:2:0
+/// has two rows, 4:2:2 four) of component `comp` — as [`plane_nc`], on the
+/// chroma blocks (6.4.11.5).
+#[inline]
+pub fn chroma_nc(layer: &MbLayer, nb: &MbNeighbours, comp: usize, bx: usize, by: usize) -> i32 {
+    let a = if bx > 0 {
+        Some(layer.chroma_nz[comp][by * 2 + bx - 1])
+    } else if nb.nz_avail[0] {
+        Some(nb.nzc_left[comp][by])
+    } else {
+        None
+    };
+    let b = if by > 0 {
+        Some(layer.chroma_nz[comp][(by - 1) * 2 + bx])
+    } else if nb.nz_avail[1] {
+        Some(nb.nzc_top[comp][bx])
+    } else {
+        None
+    };
     match (a, b) {
         (Some(a), Some(b)) => (a as i32 + b as i32 + 1) >> 1,
         (Some(a), None) => a as i32,
@@ -946,7 +940,7 @@ pub fn parse_mb_cavlc(
         if !(-26..=25).contains(&layer.qp_delta) {
             return Err(Error::bitstream("mb_qp_delta out of range"));
         }
-        parse_residual_cavlc(r, ctx, info, nb, layer)?;
+        parse_residual_cavlc(r, ctx, nb, layer)?;
     }
     if r.overrun() {
         return Err(Error::bitstream("slice data truncated in macroblock"));
@@ -1010,11 +1004,12 @@ static SCAN_CHROMA_DC: [u8; 4] = [0, 1, 2, 3];
 fn parse_residual_luma_like(
     r: &mut BitReader,
     ctx: &SliceCtx,
-    info: &PicInfo,
     nb: &MbNeighbours,
     layer: &mut MbLayer,
     p: usize,
 ) -> Result<()> {
+    let t = tables();
+    let trace = super::mb::syntax_trace();
     // Field pictures (and field macroblocks) use the field scans.
     let (scan4, scan8sub): (&[u8; 16], &[[u8; 16]; 4]) = if ctx.field_pic || layer.field {
         (&FIELD_SCAN4X4, &SCAN8_SUB_FIELD)
@@ -1022,8 +1017,8 @@ fn parse_residual_luma_like(
         (&ZIGZAG4X4, &SCAN8_SUB)
     };
     if layer.kind == MbKind::I16x16 {
-        let nc = plane_nc(info, layer, nb, p, 0, 0);
-        residual_block(r, nc, &mut layer.dc[p], scan4, 0, 15, 16)?;
+        let nc = plane_nc(layer, nb, p, 0, 0);
+        residual_block(r, t, nc, &mut layer.dc[p], scan4, 0, 15, 16)?;
     }
     for blk8 in 0..4 {
         let (bx8, by8) = ((blk8 & 1) * 2, (blk8 >> 1) * 2);
@@ -1034,15 +1029,15 @@ fn parse_residual_luma_like(
             for sub in 0..4 {
                 let (bx, by) = (bx8 + (sub & 1), by8 + (sub >> 1));
                 let raster = by * 4 + bx;
-                let nc = plane_nc(info, layer, nb, p, bx, by);
+                let nc = plane_nc(layer, nb, p, bx, by);
                 let base = raster * 16;
                 let pos0 = r.position();
                 let n = if layer.kind == MbKind::I16x16 {
-                    residual_block(r, nc, &mut layer.coef[p][base..base + 16], scan4, 1, 15, 15)?
+                    residual_block(r, t, nc, &mut layer.coef[p][base..base + 16], scan4, 1, 15, 15)?
                 } else {
-                    residual_block(r, nc, &mut layer.coef[p][base..base + 16], scan4, 0, 15, 16)?
+                    residual_block(r, t, nc, &mut layer.coef[p][base..base + 16], scan4, 0, 15, 16)?
                 };
-                if super::mb::syntax_trace() {
+                if trace {
                     eprintln!(
                         "cavlc blk raster={raster} nc={nc} @{pos0} -> n={n} end={}",
                         r.position()
@@ -1056,9 +1051,10 @@ fn parse_residual_luma_like(
             for sub in 0..4 {
                 let (bx, by) = (bx8 + (sub & 1), by8 + (sub >> 1));
                 let raster = by * 4 + bx;
-                let nc = plane_nc(info, layer, nb, p, bx, by);
+                let nc = plane_nc(layer, nb, p, bx, by);
                 let n = residual_block(
                     r,
+                    t,
                     nc,
                     &mut layer.coef[p][base..base + 64],
                     &scan8sub[sub],
@@ -1076,15 +1072,15 @@ fn parse_residual_luma_like(
 fn parse_residual_cavlc(
     r: &mut BitReader,
     ctx: &SliceCtx,
-    info: &PicInfo,
     nb: &MbNeighbours,
     layer: &mut MbLayer,
 ) -> Result<()> {
+    let t = tables();
     // Luma, then (4:4:4) Cb and Cr coded the same way.
-    parse_residual_luma_like(r, ctx, info, nb, layer, 0)?;
+    parse_residual_luma_like(r, ctx, nb, layer, 0)?;
     if ctx.chroma_format_idc == 3 {
-        parse_residual_luma_like(r, ctx, info, nb, layer, 1)?;
-        parse_residual_luma_like(r, ctx, info, nb, layer, 2)?;
+        parse_residual_luma_like(r, ctx, nb, layer, 1)?;
+        parse_residual_luma_like(r, ctx, nb, layer, 2)?;
     }
     let scan4: &[u8; 16] = if ctx.field_pic || layer.field {
         &FIELD_SCAN4X4
@@ -1100,6 +1096,7 @@ fn parse_residual_cavlc(
             if c422 {
                 residual_block(
                     r,
+                    t,
                     -2,
                     &mut layer.chroma_dc[comp],
                     &SCAN_CHROMA_DC_422,
@@ -1110,6 +1107,7 @@ fn parse_residual_cavlc(
             } else {
                 residual_block(
                     r,
+                    t,
                     -1,
                     &mut layer.chroma_dc[comp][..4],
                     &SCAN_CHROMA_DC,
@@ -1124,9 +1122,9 @@ fn parse_residual_cavlc(
             for comp in 0..2 {
                 for blk in 0..2 * rows {
                     let (bx, by) = (blk & 1, blk >> 1);
-                    let nc = chroma_nc(info, layer, nb, comp, bx, by, rows);
+                    let nc = chroma_nc(layer, nb, comp, bx, by);
                     let n =
-                        residual_block(r, nc, &mut layer.chroma_ac[comp][blk], scan4, 1, 15, 15)?;
+                        residual_block(r, t, nc, &mut layer.chroma_ac[comp][blk], scan4, 1, 15, 15)?;
                     layer.chroma_nz[comp][blk] = n as u8;
                 }
             }

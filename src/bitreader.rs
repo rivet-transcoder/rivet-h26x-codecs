@@ -8,25 +8,42 @@
 
 use crate::{Error, Result};
 
-/// A bit reader with a 64-bit cache.
+/// A bit reader with a 64-bit cache. The position is not counted per read:
+/// it is `8 * pos - bits` (bytes loaded, less what is still in the cache),
+/// so `bits()` is a shift and a subtraction, and running past the end shows
+/// up as a position beyond the data.
 #[derive(Clone)]
 pub struct BitReader<'a> {
     data: &'a [u8],
-    /// Next byte to load into the cache.
+    /// Next byte to load into the cache (past the end: virtual zero bytes,
+    /// still counted).
     pos: usize,
     /// Left-aligned bits not yet consumed.
     cache: u64,
     /// How many bits of `cache` are valid.
     bits: u32,
-    /// Bits consumed so far (from the start of `data`).
-    consumed: u64,
-    overrun: bool,
+    /// Bit position of the RBSP stop bit (`more_rbsp_data` compares against
+    /// it); `u64::MAX` when the data has no set bit at all.
+    stop_bit: u64,
+    /// A malformed code was met (Exp-Golomb with more than 32 leading zeros).
+    bad: bool,
 }
 
 impl<'a> BitReader<'a> {
     /// A reader positioned at the first bit of `data`.
     pub fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0, cache: 0, bits: 0, consumed: 0, overrun: false }
+        // The RBSP ends with a stop bit `1` followed by zero bits to the byte
+        // boundary (and possibly trailing zero bytes, which callers strip).
+        let mut last = data.len();
+        while last > 0 && data[last - 1] == 0 {
+            last -= 1;
+        }
+        let stop_bit = if last == 0 {
+            u64::MAX
+        } else {
+            (last as u64) * 8 - 1 - data[last - 1].trailing_zeros() as u64
+        };
+        Self { data, pos: 0, cache: 0, bits: 0, stop_bit, bad: false }
     }
 
     /// Total number of bits in the underlying data.
@@ -35,18 +52,20 @@ impl<'a> BitReader<'a> {
     }
 
     /// Bits consumed so far.
+    #[inline(always)]
     pub fn position(&self) -> u64 {
-        self.consumed
+        (self.pos as u64) * 8 - self.bits as u64
     }
 
     /// Bits left, saturating at zero.
     pub fn bits_left(&self) -> u64 {
-        self.len_bits().saturating_sub(self.consumed)
+        self.len_bits().saturating_sub(self.position())
     }
 
-    /// Whether any read went past the end.
+    /// Whether any read went past the end (or met a malformed code).
+    #[inline]
     pub fn overrun(&self) -> bool {
-        self.overrun
+        self.bad || self.position() > self.len_bits()
     }
 
     /// The underlying bytes.
@@ -102,10 +121,6 @@ impl<'a> BitReader<'a> {
         let v = (self.cache >> (64 - n)) as u32;
         self.cache <<= n;
         self.bits -= n;
-        self.consumed += n as u64;
-        if self.consumed > self.len_bits() {
-            self.overrun = true;
-        }
         v
     }
 
@@ -163,7 +178,7 @@ impl<'a> BitReader<'a> {
         let top = (self.cache >> 32) as u32;
         if top == 0 {
             // More than 32 leading zeros: malformed. Consume and flag.
-            self.overrun = true;
+            self.bad = true;
             self.skip(32);
             return 0;
         }
@@ -178,10 +193,6 @@ impl<'a> BitReader<'a> {
             let v = ((self.cache >> (64 - n)) as u32) - 1;
             self.cache <<= n;
             self.bits -= n;
-            self.consumed += n as u64;
-            if self.consumed > self.len_bits() {
-                self.overrun = true;
-            }
             return v;
         }
         // Skip the zeros and the terminating one, then read `zeros` bits.
@@ -212,12 +223,12 @@ impl<'a> BitReader<'a> {
 
     /// Whether the reader is at a byte boundary.
     pub fn byte_aligned(&self) -> bool {
-        self.consumed % 8 == 0
+        self.position() % 8 == 0
     }
 
     /// Advance to the next byte boundary (no-op if already aligned).
     pub fn align(&mut self) {
-        let rem = (self.consumed % 8) as u32;
+        let rem = (self.position() % 8) as u32;
         if rem != 0 {
             self.skip(8 - rem);
         }
@@ -225,7 +236,7 @@ impl<'a> BitReader<'a> {
 
     /// The byte offset of the current position (must be byte aligned).
     pub fn byte_position(&self) -> usize {
-        (self.consumed / 8) as usize
+        (self.position() / 8) as usize
     }
 
     /// The remaining bytes from the current (byte-aligned) position.
@@ -239,24 +250,14 @@ impl<'a> BitReader<'a> {
     /// zero bits to the byte boundary (and possibly trailing zero bytes,
     /// which callers strip); so: are there any `1` bits after the current
     /// position other than the last one?
+    #[inline]
     pub fn more_rbsp_data(&self) -> bool {
-        // Position of the last set bit in the data.
-        let mut last = self.data.len();
-        while last > 0 && self.data[last - 1] == 0 {
-            last -= 1;
-        }
-        if last == 0 {
-            return false;
-        }
-        let byte = self.data[last - 1];
-        let tz = byte.trailing_zeros() as u64;
-        let stop_bit_pos = (last as u64) * 8 - 1 - tz;
-        self.consumed < stop_bit_pos
+        self.stop_bit != u64::MAX && self.position() < self.stop_bit
     }
 
     /// Fail with a bitstream error if any read overran the data.
     pub fn finish(&self, what: &str) -> Result<()> {
-        if self.overrun {
+        if self.overrun() {
             Err(Error::bitstream(format!("{what}: truncated (read past the end of the NAL unit)")))
         } else {
             Ok(())

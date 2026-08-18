@@ -883,6 +883,8 @@ pub(crate) struct HevcDecoderImpl<S: Sample> {
     /// `max_in_flight` (back-pressure without blocking any worker).
     in_flight: std::collections::VecDeque<Arc<SharedFrame<S>>>,
     max_in_flight: usize,
+    /// Output buffers, recycled through the pictures handed out.
+    output_pool: crate::picture::OutputPool,
 }
 
 /// What the geometry tables depend on.
@@ -928,6 +930,7 @@ impl<S: Sample> HevcDecoderImpl<S> {
             geometry: None,
             in_flight: std::collections::VecDeque::new(),
             max_in_flight: std::env::var("H26X_INFLIGHT").ok().and_then(|v| v.parse().ok()).unwrap_or(threads.clamp(2, 16)),
+            output_pool: crate::picture::OutputPool::default(),
         }
     }
 
@@ -1006,7 +1009,7 @@ impl<S: Sample> HevcDecoderImpl<S> {
 
     /// The next picture in output order, if any (waits for it to finish).
     pub fn next_picture(&mut self) -> Option<Picture> {
-        let (pic, ok) = self.dpb.output.pop_front()?.into_picture();
+        let (pic, ok) = self.dpb.output.pop_front()?.into_picture(&self.output_pool);
         if !ok {
             self.warnings.fetch_add(1, Ordering::Relaxed);
         }

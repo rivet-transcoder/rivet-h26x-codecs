@@ -674,7 +674,6 @@ fn cbf_ctx_inc(
     by: usize,
     comp: usize,
     blk: usize,
-    chroma_rows: usize,
 ) -> usize {
     let cur_intra = layer.kind.is_intra();
     let p = cat_plane(cat);
@@ -689,18 +688,30 @@ fn cbf_ctx_inc(
     // (categories 5 / 9 / 13, 4:4:4 only) looks at neighbouring 8x8
     // *transform* blocks: a neighbour transformed 4x4 contributes 0.
     let cond_luma = |dx: i32, dy: i32| -> usize {
-        let Some((addr, nblk)) = nb.block(bx as i32 + dx, by as i32 + dy) else {
-            return cur_intra as usize;
-        };
-        if addr == nb.addr {
+        let (nx, ny) = (bx as i32 + dx, by as i32 + dy);
+        if nx >= 0 && ny >= 0 {
             // Current MB: block available iff its 8x8 has cbp set (it has,
             // or we would not be decoding it) — the flag is the count so far.
+            let nblk = (ny * 4 + nx) as usize;
             let b8 = (nblk / 8) * 2 + (nblk % 4) / 2;
             if layer.cbp & (1 << b8) == 0 {
                 return 0;
             }
             return (layer.nz[p][nblk] != 0) as usize;
         }
+        if !cat_8x8 {
+            // A neighbouring macroblock's block, from the gathered counts:
+            // skipped 0, I_PCM 16, an uncoded 8x8 0 — the count is the flag.
+            let side = if nx < 0 { 0 } else { 1 };
+            if !nb.nz_avail[side] {
+                return cur_intra as usize;
+            }
+            let v = if nx < 0 { nb.nz_left[p][ny as usize] } else { nb.nz_top[p][nx as usize] };
+            return (v != 0) as usize;
+        }
+        let Some((addr, nblk)) = nb.block(nx, ny) else {
+            return cur_intra as usize;
+        };
         let m = &info.mbs[addr];
         if cat_8x8 && !m.transform_8x8 && x264_old_444 {
             // Old x264 (before build 151) coded these as if the neighbour
@@ -741,20 +752,17 @@ fn cbf_ctx_inc(
     let cond_chroma_ac = |dx: i32, dy: i32| -> usize {
         // Chroma 2-column grid neighbours (2 rows for 4:2:0, 4 for 4:2:2).
         let (cx, cy) = ((blk % 2) as i32 + dx, (blk / 2) as i32 + dy);
-        let Some((addr, nblk)) = nb.block_c(cx, cy, chroma_rows as i32) else {
+        if cx >= 0 && cy >= 0 {
+            return (layer.chroma_nz[comp][(cy * 2 + cx) as usize] != 0) as usize;
+        }
+        // A neighbouring macroblock's block, from the gathered counts
+        // (skipped or without chroma AC 0, I_PCM 16).
+        let side = if cx < 0 { 0 } else { 1 };
+        if !nb.nz_avail[side] {
             return cur_intra as usize;
-        };
-        if addr == nb.addr {
-            return (layer.chroma_nz[comp][nblk] != 0) as usize;
         }
-        let m = &info.mbs[addr];
-        if m.kind == MbKind::IPcm {
-            return 1;
-        }
-        if m.kind.is_skip() || (m.cbp >> 4) != 2 {
-            return 0;
-        }
-        (info.chroma_nz[addr * 32 + comp * 16 + nblk] != 0) as usize
+        let v = if cx < 0 { nb.nzc_left[comp][cy as usize] } else { nb.nzc_top[comp][cx as usize] };
+        (v != 0) as usize
     };
     match cat {
         // Luma-style DC (Intra_16x16 of the plane): bit p of `dc_cbf`.
@@ -769,26 +777,24 @@ fn cbf_ctx_inc(
     }
 }
 
-/// Decode one residual block's coefficients into `levels` (scan order,
-/// `max_coeff` entries; the caller maps to raster). Returns the number of
-/// nonzero coefficients. `cbf_inc` is `None` when coded_block_flag is not
-/// present (8x8 luma in non-4:4:4), else its ctxIdxInc.
+/// Decode one residual block's coefficients: the levels of scan positions
+/// `0..max_coeff` are written to `out[scan[start + pos]]` (`out` is the
+/// block in raster order, zero where nothing is written — the macroblock
+/// layer's reset guarantees it). Returns the number of nonzero
+/// coefficients. `cbf_inc` is `None` when coded_block_flag is not present
+/// (8x8 luma in non-4:4:4), else its ctxIdxInc.
+#[allow(clippy::too_many_arguments)]
 fn residual_block_cabac(
     c: &mut Cabac,
     st: &mut CabacState,
     field: bool,
     cat: usize,
     cbf_inc: Option<usize>,
-    levels: &mut [i32],
+    out: &mut [i32],
+    scan: &[u8],
+    start: usize,
     max_coeff: usize,
 ) -> Result<usize> {
-    // Chroma DC significance contexts: `Min(i / NumC8x8, 2)`, NumC8x8 = 1 for
-    // 4:2:0 (4 coefficients) and 2 for 4:2:2 (8).
-    let dc_div = if cat == CAT_CHROMA_DC && max_coeff == 8 {
-        2
-    } else {
-        1
-    };
     if let Some(inc) = cbf_inc {
         let trace = super::mb::syntax_trace();
         let pos0 = c.position();
@@ -806,56 +812,47 @@ fn residual_block_cabac(
         LAST_CTX_BASE[f][cat],
         ABS_CTX_BASE[cat],
     );
-    let is_8x8 = max_coeff == 64;
-    // Significance map.
-    let mut sig = [false; 64];
+    // Significance map: the context increments per scan position (Table
+    // 9-43: the position itself for the 4x4 categories, `Min(i / NumC8x8,
+    // 2)` for chroma DC, tables for 8x8), and the significant positions.
+    let (sig_off, last_off): (&[u8], &[u8]) = if max_coeff == 64 {
+        (&SIG_COEFF_8X8_CTX[f][..], &LAST_COEFF_8X8_CTX[..])
+    } else if cat == CAT_CHROMA_DC {
+        if max_coeff == 8 { (&CHROMA_DC_422_SIG_OFF[..], &CHROMA_DC_422_SIG_OFF[..]) } else { (&IDENTITY_OFF[..], &IDENTITY_OFF[..]) }
+    } else {
+        (&IDENTITY_OFF[..], &IDENTITY_OFF[..])
+    };
+    let mut sig_pos = [0u8; 64];
     let mut n_sig = 0usize;
-    let mut last_pos = max_coeff - 1;
     let mut i = 0usize;
-    while i < max_coeff - 1 {
-        let (sig_inc, last_inc) = if is_8x8 {
-            (
-                SIG_COEFF_8X8_CTX[f][i] as usize,
-                LAST_COEFF_8X8_CTX[i] as usize,
-            )
-        } else if cat == CAT_CHROMA_DC {
-            ((i / dc_div).min(2), (i / dc_div).min(2))
-        } else {
-            (i, i)
-        };
-        if bin(c, st, sig_base + sig_inc) != 0 {
-            sig[i] = true;
+    let last = max_coeff - 1;
+    while i < last {
+        if bin(c, st, sig_base + sig_off[i] as usize) != 0 {
+            sig_pos[n_sig] = i as u8;
             n_sig += 1;
-            if bin(c, st, last_base + last_inc) != 0 {
-                last_pos = i;
+            if bin(c, st, last_base + last_off[i] as usize) != 0 {
                 break;
             }
         }
         i += 1;
     }
-    if i == max_coeff - 1 {
+    if i == last {
         // Reached the end without a "last": the final coefficient is significant.
-        sig[max_coeff - 1] = true;
+        sig_pos[n_sig] = last as u8;
         n_sig += 1;
-        last_pos = max_coeff - 1;
     }
-    // Levels, in reverse scan order.
+    // Levels, in reverse scan order (the highest frequency first).
     let mut num_gt1 = 0usize;
     let mut num_eq1 = 0usize;
-    for pos in (0..=last_pos).rev() {
-        if !sig[pos] {
-            continue;
-        }
-        let inc0 = if num_gt1 != 0 {
-            0
-        } else {
-            (1 + num_eq1).min(4)
-        };
+    let inc1_cap = if cat == CAT_CHROMA_DC { 3 } else { 4 };
+    for k in (0..n_sig).rev() {
+        let pos = sig_pos[k] as usize;
+        let inc0 = if num_gt1 != 0 { 0 } else { (1 + num_eq1).min(4) };
         let mut abs_m1: i32;
         if bin(c, st, abs_base + inc0) == 0 {
             abs_m1 = 0;
         } else {
-            let inc1 = 5 + (if cat == CAT_CHROMA_DC { 3 } else { 4 }).min(num_gt1);
+            let inc1 = 5 + inc1_cap.min(num_gt1);
             let mut prefix = 1;
             while prefix < 14 && bin(c, st, abs_base + inc1) != 0 {
                 prefix += 1;
@@ -863,21 +860,21 @@ fn residual_block_cabac(
             abs_m1 = prefix;
             if prefix >= 14 {
                 // UEG0 suffix.
-                let mut k = 0u32;
+                let mut kk = 0u32;
                 loop {
                     if c.bypass() != 0 {
-                        abs_m1 += 1 << k;
-                        k += 1;
-                        if k > 24 {
+                        abs_m1 += 1 << kk;
+                        kk += 1;
+                        if kk > 24 {
                             return Err(Error::bitstream("coeff_abs_level suffix runaway"));
                         }
                     } else {
                         break;
                     }
                 }
-                while k > 0 {
-                    k -= 1;
-                    abs_m1 += (c.bypass() as i32) << k;
+                while kk > 0 {
+                    kk -= 1;
+                    abs_m1 += (c.bypass() as i32) << kk;
                 }
             }
         }
@@ -888,13 +885,20 @@ fn residual_block_cabac(
             num_gt1 += 1;
         }
         let sign = c.bypass();
-        levels[pos] = if sign != 0 { -abs } else { abs };
+        out[scan[start + pos] as usize] = if sign != 0 { -abs } else { abs };
     }
     if c.overrun() {
         return Err(Error::bitstream("CABAC: slice data truncated"));
     }
     Ok(n_sig)
 }
+
+/// The significance-map context increment for a coefficient of a 4x4-class
+/// block: its scan position.
+static IDENTITY_OFF: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+/// The same for 4:2:2 chroma DC (eight coefficients, NumC8x8 = 2):
+/// `Min(i / 2, 2)`.
+static CHROMA_DC_422_SIG_OFF: [u8; 8] = [0, 0, 1, 1, 2, 2, 2, 2];
 
 /// `residual_luma()` (7.3.5.3.1) for CABAC, for colour plane `p`: the luma
 /// plane, or Cb / Cr in 4:4:4 (coded like luma with their own categories,
@@ -914,24 +918,12 @@ fn parse_residual_luma_like_cabac(
     } else {
         (&ZIGZAG4X4, &ZIGZAG8X8)
     };
-    let mut levels = [0i32; 64];
+    let field = ctx.field_pic || layer.field;
     if layer.kind == MbKind::I16x16 {
-        levels[..16].fill(0);
-        let inc = cbf_ctx_inc(info, layer, nb, ctx.x264_old_444, cat_dc, 0, 0, 0, 0, 2);
-        let n = residual_block_cabac(
-            c,
-            st,
-            ctx.field_pic || layer.field,
-            cat_dc,
-            Some(inc),
-            &mut levels[..16],
-            16,
-        )?;
+        let inc = cbf_ctx_inc(info, layer, nb, ctx.x264_old_444, cat_dc, 0, 0, 0, 0);
+        let n = residual_block_cabac(c, st, field, cat_dc, Some(inc), &mut layer.dc[p], scan4, 0, 16)?;
         if n > 0 {
             layer.dc_cbf |= 1 << p;
-            for i in 0..16 {
-                layer.dc[p][scan4[i] as usize] = levels[i];
-            }
         }
     }
     for blk8 in 0..4 {
@@ -940,82 +932,33 @@ fn parse_residual_luma_like_cabac(
             continue;
         }
         if layer.transform_8x8 {
-            levels.fill(0);
             // The 8x8 block's coded_block_flag is only coded in 4:4:4;
             // otherwise it is inferred 1.
             let inc = if ctx.chroma_format_idc == 3 {
-                Some(cbf_ctx_inc(
-                    info,
-                    layer,
-                    nb,
-                    ctx.x264_old_444,
-                    cat_8x8,
-                    bx8,
-                    by8,
-                    0,
-                    0,
-                    2,
-                ))
+                Some(cbf_ctx_inc(info, layer, nb, ctx.x264_old_444, cat_8x8, bx8, by8, 0, 0))
             } else {
                 None
             };
-            let n = residual_block_cabac(
-                c,
-                st,
-                ctx.field_pic || layer.field,
-                cat_8x8,
-                inc,
-                &mut levels,
-                64,
-            )?;
+            let base = blk8 * 64;
+            let n = residual_block_cabac(c, st, field, cat_8x8, inc, &mut layer.coef[p][base..base + 64], scan8, 0, 64)?;
             for sub in 0..4 {
                 let (bx, by) = (bx8 + (sub & 1), by8 + (sub >> 1));
                 layer.nz[p][by * 4 + bx] = n as u8;
-            }
-            if n > 0 {
-                let base = blk8 * 64;
-                for i in 0..64 {
-                    layer.coef[p][base + scan8[i] as usize] = levels[i];
-                }
             }
         } else {
             for sub in 0..4 {
                 let (bx, by) = (bx8 + (sub & 1), by8 + (sub >> 1));
                 let raster = by * 4 + bx;
-                levels[..16].fill(0);
+                let base = raster * 16;
                 let n = if layer.kind == MbKind::I16x16 {
-                    let inc =
-                        cbf_ctx_inc(info, layer, nb, ctx.x264_old_444, cat_ac, bx, by, 0, 0, 2);
+                    let inc = cbf_ctx_inc(info, layer, nb, ctx.x264_old_444, cat_ac, bx, by, 0, 0);
                     // AC: 15 coefficients at scan positions 1..15.
-                    residual_block_cabac(
-                        c,
-                        st,
-                        ctx.field_pic || layer.field,
-                        cat_ac,
-                        Some(inc),
-                        &mut levels[1..16],
-                        15,
-                    )?
+                    residual_block_cabac(c, st, field, cat_ac, Some(inc), &mut layer.coef[p][base..base + 16], scan4, 1, 15)?
                 } else {
-                    let inc =
-                        cbf_ctx_inc(info, layer, nb, ctx.x264_old_444, cat_4x4, bx, by, 0, 0, 2);
-                    residual_block_cabac(
-                        c,
-                        st,
-                        ctx.field_pic || layer.field,
-                        cat_4x4,
-                        Some(inc),
-                        &mut levels[..16],
-                        16,
-                    )?
+                    let inc = cbf_ctx_inc(info, layer, nb, ctx.x264_old_444, cat_4x4, bx, by, 0, 0);
+                    residual_block_cabac(c, st, field, cat_4x4, Some(inc), &mut layer.coef[p][base..base + 16], scan4, 0, 16)?
                 };
                 layer.nz[p][raster] = n as u8;
-                if n > 0 {
-                    let base = raster * 16;
-                    for i in 0..16 {
-                        layer.coef[p][base + scan4[i] as usize] = levels[i];
-                    }
-                }
             }
         }
     }
@@ -1031,12 +974,12 @@ fn parse_residual_cabac(
     nb: &MbNeighbours,
     layer: &mut MbLayer,
 ) -> Result<()> {
-    let mut levels = [0i32; 64];
     let scan4: &[u8; 16] = if ctx.field_pic || layer.field {
         &FIELD_SCAN4X4
     } else {
         &ZIGZAG4X4
     };
+    let field = ctx.field_pic || layer.field;
     parse_residual_luma_like_cabac(c, st, ctx, info, nb, layer, 0)?;
     if ctx.chroma_format_idc == 3 {
         parse_residual_luma_like_cabac(c, st, ctx, info, nb, layer, 1)?;
@@ -1045,50 +988,20 @@ fn parse_residual_cabac(
     if (ctx.chroma_format_idc == 1 || ctx.chroma_format_idc == 2) && layer.cbp & 0x30 != 0 {
         let c422 = ctx.chroma_format_idc == 2;
         let (n_dc, rows) = if c422 { (8usize, 4usize) } else { (4, 2) };
+        let dc_scan: &[u8] = if c422 { &SCAN_CHROMA_DC_422[..] } else { &IDENTITY_OFF[..4] };
         for comp in 0..2 {
-            levels[..n_dc].fill(0);
-            let inc = cbf_ctx_inc(info, layer, nb, false, CAT_CHROMA_DC, 0, 0, comp, 0, rows);
-            let n = residual_block_cabac(
-                c,
-                st,
-                ctx.field_pic || layer.field,
-                CAT_CHROMA_DC,
-                Some(inc),
-                &mut levels[..n_dc],
-                n_dc,
-            )?;
+            let inc = cbf_ctx_inc(info, layer, nb, false, CAT_CHROMA_DC, 0, 0, comp, 0);
+            let n = residual_block_cabac(c, st, field, CAT_CHROMA_DC, Some(inc), &mut layer.chroma_dc[comp], dc_scan, 0, n_dc)?;
             if n > 0 {
                 layer.dc_cbf |= 2 << comp;
-                if c422 {
-                    for i in 0..8 {
-                        layer.chroma_dc[comp][SCAN_CHROMA_DC_422[i] as usize] = levels[i];
-                    }
-                } else {
-                    layer.chroma_dc[comp][..4].copy_from_slice(&levels[..4]);
-                }
             }
         }
         if layer.cbp & 0x20 != 0 {
             for comp in 0..2 {
                 for blk in 0..2 * rows {
-                    levels[..16].fill(0);
-                    let inc =
-                        cbf_ctx_inc(info, layer, nb, false, CAT_CHROMA_AC, 0, 0, comp, blk, rows);
-                    let n = residual_block_cabac(
-                        c,
-                        st,
-                        ctx.field_pic || layer.field,
-                        CAT_CHROMA_AC,
-                        Some(inc),
-                        &mut levels[1..16],
-                        15,
-                    )?;
+                    let inc = cbf_ctx_inc(info, layer, nb, false, CAT_CHROMA_AC, 0, 0, comp, blk);
+                    let n = residual_block_cabac(c, st, field, CAT_CHROMA_AC, Some(inc), &mut layer.chroma_ac[comp][blk], scan4, 1, 15)?;
                     layer.chroma_nz[comp][blk] = n as u8;
-                    if n > 0 {
-                        for i in 1..16 {
-                            layer.chroma_ac[comp][blk][scan4[i] as usize] = levels[i];
-                        }
-                    }
                 }
             }
         }

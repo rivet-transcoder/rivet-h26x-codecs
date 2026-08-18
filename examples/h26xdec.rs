@@ -79,13 +79,16 @@ fn main() {
         if no_md5 && out.is_none() {
             println!("{},{},{},{}x{}", n, pic.poc, pic.decode_index, pic.width, pic.height);
         } else {
-            let mut packed = pic.packed();
-            if pic.chroma == h26x::ChromaFormat::Monochrome {
-                // Like libavcodec's yuv420p output for 4:0:0: grey chroma
-                // planes follow the luma, so the hashes compare.
-                let (cw, ch) = (pic.width.div_ceil(2) as usize, pic.height.div_ceil(2) as usize);
-                let bps = if pic.bit_depth > 8 { 2 } else { 1 };
-                let mid = 1u16 << (pic.bit_depth - 1);
+            let (chroma, width, height, bit_depth) = (pic.chroma, pic.width, pic.height, pic.bit_depth);
+            let (poc, decode_index) = (pic.poc, pic.decode_index);
+            let mut packed = pic.into_packed();
+            if chroma == h26x::ChromaFormat::Monochrome && !hevc {
+                // Like libavcodec's yuv420p output for H.264 4:0:0: grey
+                // chroma planes follow the luma, so the hashes compare
+                // (its HEVC decoder outputs 4:0:0 as `gray`, luma only).
+                let (cw, ch) = (width.div_ceil(2) as usize, height.div_ceil(2) as usize);
+                let bps = if bit_depth > 8 { 2 } else { 1 };
+                let mid = 1u16 << (bit_depth - 1);
                 for _ in 0..2 * cw * ch {
                     if bps == 1 {
                         packed.push(mid as u8);
@@ -94,7 +97,7 @@ fn main() {
                     }
                 }
             }
-            println!("{},{},{},{}x{},{}", n, pic.poc, pic.decode_index, pic.width, pic.height, md5_hex(&packed));
+            println!("{},{},{},{}x{},{}", n, poc, decode_index, width, height, md5_hex(&packed));
             if let Some(f) = out {
                 f.write_all(&packed).unwrap();
             }

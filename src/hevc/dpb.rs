@@ -118,7 +118,7 @@ pub struct PendingOutput<S: Sample = u16> {
 impl<S: Sample> PendingOutput<S> {
     /// Wait for the picture to finish and copy it out. The flag is false when
     /// the picture carried a hash SEI that does not match (verification on).
-    pub fn into_picture(self) -> (Picture, bool) {
+    pub fn into_picture(self, pool: &crate::picture::OutputPool) -> (Picture, bool) {
         let f = self.frame.wait_and_get();
         let mut ok = true;
         if let Some(h) = self.frame.hash.lock().unwrap().take() {
@@ -127,7 +127,7 @@ impl<S: Sample> PendingOutput<S> {
                 ok = false;
             }
         }
-        (f.to_picture(self.crop, self.frame.poc, self.decode_index), ok)
+        (f.to_picture(self.crop, self.frame.poc, self.decode_index, pool), ok)
     }
 }
 

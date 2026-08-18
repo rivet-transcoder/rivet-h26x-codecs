@@ -305,22 +305,31 @@ impl<S: Sample> Frame<S> {
 
     /// Copy the visible, cropped picture out. 8-bit output as bytes, higher
     /// depths as little-endian `u16`.
-    pub fn to_picture(&self, crop: (u32, u32, u32, u32), poc: i32, decode_index: u64) -> Picture {
+    pub fn to_picture(&self, crop: (u32, u32, u32, u32), poc: i32, decode_index: u64, pool: &crate::picture::OutputPool) -> Picture {
         let (l, r, t, b) = (crop.0 as usize, crop.1 as usize, crop.2 as usize, crop.3 as usize);
         let width = self.width.saturating_sub(l + r).max(1);
         let height = self.height.saturating_sub(t + b).max(1);
         let mut planes = Vec::with_capacity(3);
+        let bps = S::BYTES;
+        let (sw, sh) = self.chroma.subsampling();
+        let (sw, sh) = (sw as usize, sh as usize);
+        // One zeroed allocation for every plane: for a picture-sized buffer
+        // that is fresh pages from the OS (already zero, no memset), and
+        // glibc keeps recycling the mapping — a plain `with_capacity` + fill
+        // was measured to take four times the page faults.
+        let total = if self.chroma == ChromaFormat::Monochrome {
+            width * height
+        } else {
+            width * height + 2 * width.div_ceil(sw) * height.div_ceil(sh)
+        } * bps;
+        let mut data = pool.take(total);
+        let mut at = 0usize;
         let mut plane = |p: &Plane16<S>, x0: usize, y0: usize, w: usize, h: usize| {
-            let bps = S::BYTES;
-            // A zeroed allocation: for a picture-sized buffer that is fresh
-            // pages from the OS (already zero, no memset), and glibc keeps
-            // recycling the mapping — a plain `with_capacity` + fill was
-            // measured to take four times the page faults.
-            let mut data = vec![0u8; w * h * bps];
+            let start = at;
             for yy in 0..h {
                 let off = p.offset(x0 as isize, (y0 + yy) as isize);
                 let src = &p.data[off..off + w];
-                let dst = &mut data[yy * w * bps..(yy + 1) * w * bps];
+                let dst = &mut data[start + yy * w * bps..start + (yy + 1) * w * bps];
                 if bps == 1 || cfg!(target_endian = "little") {
                     // Bytes, or little-endian u16 already in memory order.
                     // SAFETY: `src` is `w` samples of `bps` bytes; `dst` is `bps * w` bytes.
@@ -331,16 +340,15 @@ impl<S: Sample> Frame<S> {
                     }
                 }
             }
-            planes.push(Plane { data, width: w as u32, height: h as u32 });
+            planes.push(Plane { offset: start, width: w as u32, height: h as u32 });
+            at = start + w * h * bps;
         };
         plane(&self.y, l, t, width, height);
         if self.chroma != ChromaFormat::Monochrome {
-            let (sw, sh) = self.chroma.subsampling();
-            let (sw, sh) = (sw as usize, sh as usize);
             plane(&self.cb, l / sw, t / sh, width.div_ceil(sw), height.div_ceil(sh));
             plane(&self.cr, l / sw, t / sh, width.div_ceil(sw), height.div_ceil(sh));
         }
-        Picture { width: width as u32, height: height as u32, bit_depth: self.bit_depth, chroma: self.chroma, planes, poc, decode_index }
+        Picture { width: width as u32, height: height as u32, bit_depth: self.bit_depth, chroma: self.chroma, data, planes, poc, decode_index, pool: Some(pool.clone()) }
     }
 }
 

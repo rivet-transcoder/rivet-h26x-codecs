@@ -22,24 +22,11 @@ pub struct DeblockParams {
 }
 
 /// The 16-bit "has coefficients" mask of a macroblock's 4x4 luma blocks
-/// (raster), with an 8x8 transform's four blocks all set when any is.
+/// (raster), with an 8x8 transform's four blocks all set when any is
+/// (kept by reconstruction in [`super::mb::MbInfo::nz_mask`]).
 #[inline]
 fn nz_mask(info: &PicInfo, addr: usize) -> u16 {
-    let base = addr * 16;
-    let mut m = 0u16;
-    for b in 0..16 {
-        m |= ((info.luma_nz[base + b] != 0) as u16) << b;
-    }
-    if info.mbs[addr].transform_8x8 {
-        // Spread each 8x8's bit over its four 4x4s.
-        let q = |bits: u16| -> u16 { if bits != 0 { 0x33 } else { 0 } };
-        let tl = q(m & 0x0033);
-        let tr = q(m & 0x00cc) << 2;
-        let bl = q(m & 0x3300) << 8;
-        let br = q(m & 0xcc00) << 10;
-        m = tl | tr | bl | br;
-    }
-    m
+    info.mbs[addr].nz_mask
 }
 
 /// bS 0 or 1 from motion alone (8.7.2.1, the last three rules), for two
@@ -194,21 +181,52 @@ pub fn deblock_mb_rows<S: Sample>(
                 }
             } else {
                 let nz = nz_mask(info, addr);
-                // Internal edges: coefficients, else motion.
-                for e in 1..4 {
-                    for k in 0..4 {
-                        let (pb, qb) = (k * 4 + e - 1, k * 4 + e);
-                        bs_v[e][k] = if (nz >> pb | nz >> qb) & 1 != 0 {
-                            2
-                        } else {
-                            motion_bs(frame, addr, pb, addr, qb, mvy_limit)
-                        };
-                        let (pb, qb) = ((e - 1) * 4 + k, e * 4 + k);
-                        bs_h[e][k] = if (nz >> pb | nz >> qb) & 1 != 0 {
-                            2
-                        } else {
-                            motion_bs(frame, addr, pb, addr, qb, mvy_limit)
-                        };
+                let [pe_v, pe_h] = m.part_edges;
+                // Internal edges: coefficients, else motion — which only
+                // differs across a partition boundary. The odd edges are
+                // not luma transform edges under the 8x8 transform; only
+                // 4:2:2 chroma still needs their strengths.
+                let need_odd = internal_odd || frame.chroma == crate::picture::ChromaFormat::Yuv422;
+                // A block or its right / lower neighbour has coefficients:
+                // bit `pb` of these for the edge between `pb` and `pb + 1`
+                // (vertical) / `pb + 4` (horizontal).
+                let coef_v = nz | (nz >> 1);
+                let coef_h = nz | (nz >> 4);
+                // Nothing to do at all for the common inter macroblock with
+                // one motion and no coefficients (a skip): every internal
+                // edge is bS 0.
+                if nz != 0 || pe_v != 0 {
+                    for e in 1..4 {
+                        if e % 2 == 1 && !need_odd {
+                            continue;
+                        }
+                        for k in 0..4 {
+                            let pb = k * 4 + e - 1;
+                            bs_v[e][k] = if (coef_v >> pb) & 1 != 0 {
+                                2
+                            } else if (pe_v >> (e * 4 + k)) & 1 != 0 {
+                                motion_bs(frame, addr, pb, addr, pb + 1, mvy_limit)
+                            } else {
+                                0
+                            };
+                        }
+                    }
+                }
+                if nz != 0 || pe_h != 0 {
+                    for e in 1..4 {
+                        if e % 2 == 1 && !need_odd {
+                            continue;
+                        }
+                        for k in 0..4 {
+                            let pb = (e - 1) * 4 + k;
+                            bs_h[e][k] = if (coef_h >> pb) & 1 != 0 {
+                                2
+                            } else if (pe_h >> (e * 4 + k)) & 1 != 0 {
+                                motion_bs(frame, addr, pb, addr, pb + 4, mvy_limit)
+                            } else {
+                                0
+                            };
+                        }
                     }
                 }
                 if filter_left {

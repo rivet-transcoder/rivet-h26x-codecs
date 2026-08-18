@@ -49,7 +49,7 @@ pub mod picture;
 pub mod sample;
 pub mod threading;
 
-pub use picture::{ChromaFormat, Picture, Plane};
+pub use picture::{ChromaFormat, OutputPool, Picture, Plane};
 
 /// Errors a decoder can report.
 #[derive(Debug, thiserror::Error)]
@@ -69,9 +69,16 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
+    // Cold and out of line: an error is built on the failure path of hot
+    // parsing loops, and inlining the String construction there bloats them
+    // (a 10 KB CAVLC residual decoder, with the spills to match).
+    #[cold]
+    #[inline(never)]
     pub(crate) fn bitstream(msg: impl Into<String>) -> Self {
         Error::Bitstream(msg.into())
     }
+    #[cold]
+    #[inline(never)]
     pub(crate) fn unsupported(msg: impl Into<String>) -> Self {
         Error::Unsupported(msg.into())
     }

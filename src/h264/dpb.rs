@@ -969,9 +969,9 @@ pub struct PendingOutput<S: Sample = u8> {
 
 impl<S: Sample> PendingOutput<S> {
     /// Wait for the picture to finish and copy it out.
-    pub fn into_picture(self) -> Picture {
+    pub fn into_picture(self, pool: &crate::picture::OutputPool) -> Picture {
         let f = self.frame.wait_and_get();
-        f.to_picture(self.crop, self.poc, self.decode_index)
+        f.to_picture(self.crop, self.poc, self.decode_index, pool)
     }
 }
 
