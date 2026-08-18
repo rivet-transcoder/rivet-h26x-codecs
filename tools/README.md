@@ -49,6 +49,7 @@ The suites, and what "accepted" means for each:
 |---|---|
 | `ab.py <exeA> <exeB> <stream> [runs]` | Interleaved A/B: alternates the two builds, reports min and median **CPU** seconds and the ratio. Pins to one core and forces a single decoding thread, so the number is about the code and not the scheduler. Interleaving is what makes it survive a machine that is doing something else. |
 | `bench.py <stream[,stream]> [runs]` | This decoder against ffmpeg, single-threaded and multi-threaded, wall and CPU time. `MODE=st` for single-thread only. |
+| `benchmark.py [--runs N] [--streams a,b]` | The published comparison: Markdown tables, one per stream, a row per instruction-set rung and one for libavcodec, naming the processor. Cost in CPU seconds, throughput in frames per wall second. This is what the README's benchmark section is generated from — regenerate it rather than editing numbers by hand. |
 
 A caution learned the hard way: a 1–2% difference measured on a loaded machine
 is noise. If something else is building, either stop it or do not believe the
