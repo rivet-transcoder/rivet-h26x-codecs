@@ -7,9 +7,9 @@ use super::pic::PicInfo;
 
 /// The reference pictures of the current slice, as the predictor needs them.
 pub struct RefCtx<'a, S: Sample = u16> {
-    /// POC of RefPicListX[i].
+    /// POC of `RefPicListX[i]`.
     pub pocs: [Vec<i32>; 2],
-    /// Long-term flags of RefPicListX[i].
+    /// Long-term flags of `RefPicListX[i]`.
     pub long_term: [Vec<bool>; 2],
     /// The collocated picture (`ColPic`), if temporal MVP is on.
     pub col: Option<&'a Frame<S>>,
@@ -41,7 +41,6 @@ pub struct Cand {
 }
 
 impl Cand {
-    const NONE: Cand = Cand { mv: [Mv::ZERO; 2], ref_idx: [-1; 2] };
     fn same_motion(&self, o: &Cand) -> bool {
         self.ref_idx == o.ref_idx && self.mv == o.mv
     }

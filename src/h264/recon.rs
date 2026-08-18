@@ -31,8 +31,8 @@ pub struct SliceRefs<'a, S: Sample = u8> {
     pub shared: [Vec<&'a SharedFrame<S>>; 2],
     /// The colocated picture's progress.
     pub col_shared: Option<&'a SharedFrame<S>>,
-    /// Which picture of the colocated frame RefPicList1[0] is (0 / 1 field,
-    /// [`super::frame::PARITY_FRAME`]).
+    /// Which picture of the colocated frame `RefPicList1[0]` is (0 / 1
+    /// field, [`super::frame::PARITY_FRAME`]).
     pub col_parity: u8,
     /// Per list, per index: the picture's POC (a field's when the entry is
     /// a field).
@@ -44,9 +44,9 @@ pub struct SliceRefs<'a, S: Sample = u8> {
     pub ids: [Vec<u16>; 2],
     /// See `ids`.
     pub parity: [Vec<u8>; 2],
-    /// The colocated picture (RefPicList1[0]) for direct prediction.
+    /// The colocated picture (`RefPicList1[0]`) for direct prediction.
     pub col: Option<&'a Frame<S>>,
-    /// Whether RefPicList1[0] is a long-term reference.
+    /// Whether `RefPicList1[0]` is a long-term reference.
     pub col_long_term: bool,
     /// Explicit weights, when the slice has them.
     pub explicit: Option<&'a PredWeightTable>,

@@ -80,7 +80,6 @@ pub fn predict<S: Sample>(
         corner = v;
     } else {
         // Search from bottom-left for the first available sample.
-        let mut cur: Option<i32> = None;
         // Sequence: left[2n-1] down to left[0], corner, top[0..2n].
         // First pass: find the first available in that order.
         if !avail.left[n2 - 1] {
@@ -104,7 +103,7 @@ pub fn predict<S: Sample>(
             }
             left[n2 - 1] = found.unwrap();
         }
-        cur = Some(left[n2 - 1]);
+        let mut cur = Some(left[n2 - 1]);
         for y in (0..n2 - 1).rev() {
             if !avail.left[y] {
                 left[y] = cur.unwrap();
@@ -198,12 +197,12 @@ pub fn predict<S: Sample>(
                 plane.data[base + y * stride..base + y * stride + n].fill(S::from_i32(dc));
             }
             if boundary_filter && n < 32 {
-                plane.data[base] = S::from_i32(((left[0] + 2 * dc + top[0] + 2) >> 2));
+                plane.data[base] = S::from_i32((left[0] + 2 * dc + top[0] + 2) >> 2);
                 for x in 1..n {
-                    plane.data[base + x] = S::from_i32(((top[x] + 3 * dc + 2) >> 2));
+                    plane.data[base + x] = S::from_i32((top[x] + 3 * dc + 2) >> 2);
                 }
                 for y in 1..n {
-                    plane.data[base + y * stride] = S::from_i32(((left[y] + 3 * dc + 2) >> 2));
+                    plane.data[base + y * stride] = S::from_i32((left[y] + 3 * dc + 2) >> 2);
                 }
             }
         }
@@ -245,7 +244,7 @@ pub fn predict<S: Sample>(
                         let ra = &ref_buf[start..start + n];
                         let rb = &ref_buf[start + 1..start + 1 + n];
                         for ((d, &a), &b) in row.iter_mut().zip(ra).zip(rb) {
-                            *d = S::from_i32((((32 - i_fact) * a + i_fact * b + 16) >> 5));
+                            *d = S::from_i32(((32 - i_fact) * a + i_fact * b + 16) >> 5);
                         }
                     } else {
                         for (d, &a) in row.iter_mut().zip(&ref_buf[start..start + n]) {
@@ -296,7 +295,7 @@ pub fn predict<S: Sample>(
                         let ra = &ref_buf[start..start + n];
                         let rb = &ref_buf[start + 1..start + 1 + n];
                         for ((d, &a), &b) in col.iter_mut().zip(ra).zip(rb) {
-                            d.write(S::from_i32((((32 - i_fact) * a + i_fact * b + 16) >> 5)));
+                            d.write(S::from_i32(((32 - i_fact) * a + i_fact * b + 16) >> 5));
                         }
                     } else {
                         for (d, &a) in col.iter_mut().zip(&ref_buf[start..start + n]) {

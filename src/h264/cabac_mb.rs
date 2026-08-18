@@ -57,13 +57,7 @@ const CTX_PREV_INTRA_PRED_MODE_FLAG: usize = 68;
 const CTX_REM_INTRA_PRED_MODE: usize = 69;
 const CTX_CBP_LUMA: usize = 73;
 const CTX_CBP_CHROMA: usize = 77;
-const CTX_SIG_COEFF: usize = 105;
-const CTX_LAST_COEFF: usize = 166;
-const CTX_COEFF_ABS: usize = 227;
 const CTX_TRANSFORM_8X8: usize = 399;
-const CTX_SIG_COEFF_8X8: usize = 402;
-const CTX_LAST_COEFF_8X8: usize = 417;
-const CTX_COEFF_ABS_8X8: usize = 426;
 
 /// Per-`ctxBlockCat` context bases (Table 9-34's ctxIdxOffset plus Table
 /// 9-40's ctxIdxBlockCatOffset) for the fourteen block categories: luma
@@ -94,13 +88,10 @@ const ABS_CTX_BASE: [usize; 14] = [
     227, 237, 247, 257, 266, 426, 952, 962, 972, 708, 982, 992, 1002, 766,
 ];
 
-/// `ctxBlockCat` values.
-const CAT_LUMA_DC: usize = 0;
-const CAT_LUMA_AC: usize = 1;
-const CAT_LUMA_4X4: usize = 2;
+/// `ctxBlockCat` values of the chroma blocks (the luma-style ones are
+/// [`PLANE_CATS`]).
 const CAT_CHROMA_DC: usize = 3;
 const CAT_CHROMA_AC: usize = 4;
-const CAT_LUMA_8X8: usize = 5;
 /// The luma-style categories `[DC, AC, 4x4, 8x8]` of colour plane `p`
 /// (luma, and Cb / Cr in 4:4:4).
 const PLANE_CATS: [[usize; 4]; 3] = [[0, 1, 2, 5], [6, 7, 8, 9], [10, 11, 12, 13]];

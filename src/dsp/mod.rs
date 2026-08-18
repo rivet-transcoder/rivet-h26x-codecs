@@ -9,18 +9,28 @@
 //! SIMD path is tested against.
 
 pub mod h264;
+pub mod hevc;
+// The SIMD modules wrap their intrinsics in `unsafe {}` blocks: required on
+// the crate's MSRV, redundant (and warned about) on toolchains where
+// target-feature intrinsics became safe to call inside `#[target_feature]`
+// functions.
 #[cfg(target_arch = "x86_64")]
+#[allow(unused_unsafe)]
 pub mod h264_avx2;
 #[cfg(target_arch = "aarch64")]
+#[allow(unused_unsafe)]
 pub mod h264_neon;
-pub mod hevc;
 #[cfg(target_arch = "x86_64")]
+#[allow(unused_unsafe)]
 pub mod hevc_avx2;
 #[cfg(target_arch = "aarch64")]
+#[allow(unused_unsafe)]
 pub mod hevc_neon;
 #[cfg(target_arch = "x86_64")]
+#[allow(unused_unsafe)]
 pub mod hevc_avx2_u8;
 #[cfg(target_arch = "aarch64")]
+#[allow(unused_unsafe)]
 pub mod hevc_neon_u8;
 
 /// What the running CPU can do, detected once.

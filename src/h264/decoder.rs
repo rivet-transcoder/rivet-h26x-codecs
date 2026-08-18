@@ -768,14 +768,6 @@ impl<S: Sample> H264DecoderImpl<S> {
         self.warnings.load(Ordering::Relaxed)
     }
 
-    /// Feed a chunk of Annex-B bytes (whole NAL units).
-    pub fn push_annexb(&mut self, data: &[u8]) -> Result<()> {
-        for nal in annexb_nals(data) {
-            self.push_nal(nal)?;
-        }
-        Ok(())
-    }
-
     /// Feed one NAL unit (with its header byte, without start code).
     pub fn push_nal(&mut self, nal: &[u8]) -> Result<()> {
         let Some(hdr) = H264NalHeader::parse(nal) else {

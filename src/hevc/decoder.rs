@@ -243,7 +243,7 @@ impl<S: Sample> PicShared<S> {
         let wc = info.wc;
         let addr = ry * wc + rx;
         let tile = info.ctb_tile[addr];
-        let mut need = |a: usize| {
+        let need = |a: usize| {
             if info.ctb_tile[a] == tile {
                 self.wait_ctb(a);
             }
@@ -365,7 +365,7 @@ fn run_substream<S: Sample>(pic_arc: &Arc<PicShared<S>>, seg_arc: &Arc<Segment>,
     let Some(&data_start) = seg.substreams.get(sub) else {
         return Err(Error::bitstream("missing entry point"));
     };
-    let mut cabac = Cabac::new(&seg.rbsp[data_start..]);
+    let cabac = Cabac::new(&seg.rbsp[data_start..]);
     let init_type = match ind.slice_type {
         SliceType::I => 0,
         SliceType::P => {
@@ -896,13 +896,6 @@ struct GeoKey {
 }
 
 impl<S: Sample> HevcDecoderImpl<S> {
-    /// A decoder with one worker per hardware thread (capped), or as
-    /// `H26X_THREADS` says.
-    pub fn new() -> Self {
-        let n = std::env::var("H26X_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(default_threads);
-        Self::with_threads(n)
-    }
-
     /// A decoder with `threads` workers; 0 or 1 decodes on the caller's thread.
     pub fn with_threads(threads: usize) -> Self {
         // Substream tasks block on their neighbours and references while
@@ -941,14 +934,6 @@ impl<S: Sample> HevcDecoderImpl<S> {
     /// Non-fatal problems seen so far.
     pub fn warnings(&self) -> u64 {
         self.warnings.load(Ordering::Relaxed) + self.dpb.warnings
-    }
-
-    /// Feed a chunk of Annex-B bytes (whole NAL units).
-    pub fn push_annexb(&mut self, data: &[u8]) -> Result<()> {
-        for nal in annexb_nals(data) {
-            self.push_nal(nal)?;
-        }
-        Ok(())
     }
 
     /// Feed one NAL unit (with its two header bytes, without start code).

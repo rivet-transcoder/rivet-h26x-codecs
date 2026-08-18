@@ -1165,7 +1165,7 @@ impl<'a, S: Sample> SliceDec<'a, S> {
         // the below-left n-block: z-scan order decides for the whole block)
         // as long as it lies inside the picture — one check per half.
         let (pw, ph) = (self.frame.width as i32, self.frame.height as i32);
-        let mut side = |vertical: bool, av_side: &mut [bool; 64]| {
+        let side = |vertical: bool, av_side: &mut [bool; 64]| {
             // Along this edge: the subsampling and the luma span of the block.
             let scale = if vertical { sh } else { sw };
             let unit = 4 / scale; // samples per 4x4 luma block along the edge

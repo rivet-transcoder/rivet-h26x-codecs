@@ -182,7 +182,7 @@ fn qpel_avx2<const XF: usize, const YF: usize>(dst: &mut [u8], src: &[u8], strid
 }
 
 #[target_feature(enable = "avx2")]
-unsafe fn qpel_impl<const XF: usize, const YF: usize>(dst: &mut [u8], src: &[u8], stride: usize, w: usize, h: usize) {
+unsafe fn qpel_impl<const XF: usize, const YF: usize>(dst: &mut [u8], src: &[u8], stride: usize, _w: usize, h: usize) {
     unsafe {
         let s = src.as_ptr();
         for y in 0..h {

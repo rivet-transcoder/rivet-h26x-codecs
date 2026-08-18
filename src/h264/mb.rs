@@ -660,7 +660,7 @@ impl MbNeighbours {
     /// index in that macroblock)`. `dx` in `-1..=4`, `dy` in `-1..=3`.
     /// Positions inside the current macroblock come back as the current
     /// address (whether they are decoded yet is the caller's business —
-    /// see [`Self::block_available`]).
+    /// see [`block_available`]).
     #[inline]
     pub fn block(&self, bx: i32, by: i32) -> Option<(usize, usize)> {
         if !self.mbaff {

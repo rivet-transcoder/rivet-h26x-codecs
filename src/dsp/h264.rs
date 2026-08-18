@@ -2,7 +2,7 @@
 //! bilinear interpolation (8.4.2.2.2), sample combination and weighting
 //! (8.4.2.3), generic over the sample type (`u8` for 8-bit streams, `u16`
 //! above). Scalar reference here; SIMD versions for 8-bit planes are
-//! installed by [`super::h264_avx2`] / [`super::h264_neon`].
+//! installed by `super::h264_avx2` (x86-64) / `super::h264_neon` (AArch64).
 //!
 //! Prediction blocks are samples at every stage in H.264 (each interpolation
 //! position rounds and clips to a sample), so kernels produce sample blocks

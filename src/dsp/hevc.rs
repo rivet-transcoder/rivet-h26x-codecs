@@ -1,7 +1,7 @@
 //! H.265 kernels: inverse transforms, residual add, interpolation filters,
 //! sample combination / weighting, SAO. Every kernel has a scalar reference
 //! here; [`HevcDsp::new`] swaps in the SIMD versions from
-//! [`super::hevc_avx2`] / [`super::hevc_neon`] when the CPU has them.
+//! `super::hevc_avx2` (x86-64) / `super::hevc_neon` (AArch64) when the CPU has them.
 //!
 //! Sample planes are `u16` at any bit depth; interpolation intermediates are
 //! `i16` at 14-bit precision (8.5.3.3.3), coefficients and residuals `i16`

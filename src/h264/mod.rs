@@ -38,7 +38,7 @@ pub mod recon;
 pub mod slice;
 pub mod sps;
 pub mod tables;
-#[allow(missing_docs, clippy::all)]
+#[allow(missing_docs, clippy::all, rustdoc::broken_intra_doc_links)]
 pub mod tables_gen;
 pub mod transform;
 
