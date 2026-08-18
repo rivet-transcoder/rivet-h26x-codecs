@@ -4,10 +4,16 @@
 [![docs.rs](https://docs.rs/rivet-h26x/badge.svg)](https://docs.rs/rivet-h26x)
 [![CI](https://github.com/rivet-transcoder/rivet-h26x-codecs/actions/workflows/ci.yml/badge.svg)](https://github.com/rivet-transcoder/rivet-h26x-codecs/actions/workflows/ci.yml)
 
-Native **H.264/AVC** and **H.265/HEVC** decoders in pure Rust: no C, no system
-libraries, nothing to install on a build host. Bit-exact against the JVT and
-JCT-VC conformance suites, frame- and wavefront-threaded, with AVX2, AVX /
-SSE4.1 and NEON kernels chosen at run time.
+Native **H.264/AVC** and **H.265/HEVC** decoders in Rust: no C, no system
+libraries, no build script, nothing to install on a build host. Bit-exact
+against the JVT and JCT-VC conformance suites, frame- and wavefront-threaded,
+with AVX2, AVX / SSE4.1 and NEON kernels chosen at run time.
+
+The SIMD is written in Rust intrinsics, not assembly, with one exception:
+AArch64's `sdot` has no intrinsic on stable Rust yet
+([rust-lang/rust#117224](https://github.com/rust-lang/rust/issues/117224)), so
+that one instruction goes through a stable `asm!` wrapper carrying the
+signature the intrinsic will have. Swapping it back is a one-line change.
 
 Written for the **[rivet](https://github.com/rivet-transcoder/rivet)**
 transcoder, where they are the software decode tier for the two codecs every

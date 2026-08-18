@@ -1,7 +1,10 @@
 //! Native H.264/AVC and H.265/HEVC decoders.
 //!
-//! Pure Rust, no C, no system libraries: the software decode tier for the two
-//! codecs every camera, phone and broadcast chain emits. Written from the
+//! Rust, no C, no system libraries, no build script: the software decode tier
+//! for the two codecs every camera, phone and broadcast chain emits. The SIMD
+//! kernels are intrinsics rather than assembly, with one exception — AArch64's
+//! `sdot`, whose intrinsic is not on stable Rust yet, goes through an `asm!`
+//! wrapper (`dsp::neon_dotprod`, AArch64 only). Written from the
 //! ITU-T specifications (H.264 and H.265, decoding processes in clauses 7–9)
 //! with libavcodec's decoder *architecture* as the model — parameter-set
 //! tables, a slice-driven decode loop over a decoded-picture buffer, entropy
