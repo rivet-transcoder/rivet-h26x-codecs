@@ -145,7 +145,6 @@ fn qpel_neon<const XF: usize, const YF: usize>(dst: &mut [u8], src: &[u8], strid
         for y in 0..h {
             let mut x0 = 0;
             while x0 < w {
-                let n = (w - x0).min(8);
                 let g = |dx: usize, dy: usize| vld1_u8(s.add((y + 2 + dy) * stride + 2 + x0 + dx));
                 let b = || round5(b1_row(s, stride, y + 2, x0));
                 let b_below = || round5(b1_row(s, stride, y + 3, x0));
@@ -191,7 +190,6 @@ fn chroma_neon(dst: &mut [u8], src: &[u8], stride: usize, w: usize, h: usize, xf
         for y in 0..h {
             let mut x0 = 0;
             while x0 < w {
-                let n = (w - x0).min(8);
                 let r0 = s.add(y * stride + x0);
                 let r1 = s.add((y + 1) * stride + x0);
                 let mut v = vdupq_n_s16(32);
