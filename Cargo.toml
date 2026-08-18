@@ -2,7 +2,7 @@
 name = "rivet-h26x"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 license-file = "LICENSE.md"
 readme = "README.md"
 repository = "https://github.com/rivet-transcoder/rivet-h26x-codecs"
