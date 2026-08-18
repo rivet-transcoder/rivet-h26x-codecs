@@ -36,7 +36,7 @@ use super::dpb::{Dpb, DpbPic, RefSets};
 use super::frame::{Frame, FramePool, Sample, SharedFrame};
 use super::inter::McScratch;
 use super::mvpred::RefCtx;
-use super::pic::{Geometry, PicInfo, SliceFilterParams};
+use super::pic::{Geometry, PicInfo, PicInfoPool, SliceFilterParams};
 use super::pps::Pps;
 use super::sao::{sao_ctb_row, SaoBand};
 use super::slice::{SliceHeader, SliceType, nal_type};
@@ -71,6 +71,8 @@ struct Segment {
 struct PicShared<S: Sample> {
     frame: Arc<SharedFrame<S>>,
     info: UnsafeCell<PicInfo>,
+    /// Where the side data goes back to when the picture is dropped.
+    info_pool: PicInfoPool,
     sps: Sps,
     pps: Pps,
     poc: i32,
@@ -136,6 +138,14 @@ struct PicShared<S: Sample> {
 // through the atomics); the row filters take a mutex.
 unsafe impl<S: Sample> Sync for PicShared<S> {}
 unsafe impl<S: Sample> Send for PicShared<S> {}
+
+impl<S: Sample> Drop for PicShared<S> {
+    fn drop(&mut self) {
+        let geo = self.info.get_mut().geo.clone();
+        let info = std::mem::replace(self.info.get_mut(), PicInfo::empty(geo));
+        self.info_pool.give(info);
+    }
+}
 
 impl<S: Sample> PicShared<S> {
     #[allow(clippy::mut_from_ref)]
@@ -885,6 +895,8 @@ pub(crate) struct HevcDecoderImpl<S: Sample> {
     max_in_flight: usize,
     /// Output buffers, recycled through the pictures handed out.
     output_pool: crate::picture::OutputPool,
+    /// Recycled per-picture side data.
+    info_pool: PicInfoPool,
 }
 
 /// What the geometry tables depend on.
@@ -931,6 +943,7 @@ impl<S: Sample> HevcDecoderImpl<S> {
             in_flight: std::collections::VecDeque::new(),
             max_in_flight: std::env::var("H26X_INFLIGHT").ok().and_then(|v| v.parse().ok()).unwrap_or(threads.clamp(2, 16)),
             output_pool: crate::picture::OutputPool::default(),
+            info_pool: PicInfoPool::default(),
         }
     }
 
@@ -1279,7 +1292,7 @@ impl<S: Sample> HevcDecoderImpl<S> {
                 g
             }
         };
-        let info = PicInfo::new(geo);
+        let info = self.info_pool.take(geo);
         let nc = info.wc * info.hc;
         let hc = info.hc;
         let wc = info.wc;
@@ -1287,6 +1300,7 @@ impl<S: Sample> HevcDecoderImpl<S> {
         let pic = Arc::new(PicShared {
             frame: shared_frame,
             info: UnsafeCell::new(info),
+            info_pool: self.info_pool.clone(),
             sps,
             pps,
             poc,
