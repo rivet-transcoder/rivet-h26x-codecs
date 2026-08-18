@@ -9,12 +9,20 @@
 //!
 //! This is the standard's own 9-bit register model — `range` in `[256, 510]`
 //! after renormalisation, `offset` a 9-bit value — with the renormalisation
-//! batched (one shift-and-read per decision, using a leading-zero count for
-//! the LPS path) and the bits pulled from a 64-bit cache. Keeping the model
-//! exact means the engine's bit position is *the* bit position defined by the
-//! standard, which is what the PCM sample and end-of-substream paths need: at
-//! those points the caller reads raw bits from where the arithmetic decoder
-//! stopped.
+//! batched into one shift per decision and the bits pulled from a 64-bit
+//! cache. Keeping the model exact means the engine's bit position is *the*
+//! bit position defined by the standard, which is what the PCM sample and
+//! end-of-substream paths need: at those points the caller reads raw bits
+//! from where the arithmetic decoder stopped.
+//!
+//! Both of the per-bin routines are branchless. A bin carries something close
+//! to a bit of entropy, which is the definition of unpredictable, and there
+//! are millions of them in a frame; a branch on the decoded value mispredicts
+//! often enough to cost more than computing both sides and masking. What the
+//! tables below exist for is to keep that possible — to leave so little work
+//! in either arm that the compiler has nothing worth branching over, and to
+//! keep the chain from one decision's `range` to the next one's as short as
+//! it can be made, since that chain is what the decoder waits on.
 
 use crate::bitreader::BitReader;
 
@@ -48,44 +56,66 @@ pub static NEXT_STATE_LPS: [u8; 64] = [
     33, 33, 34, 34, 35, 35, 35, 36, 36, 36, 37, 37, 37, 38, 38, 63,
 ];
 
-/// `transIdxMps`.
-#[rustfmt::skip]
-/// `LPS_RANGE` flattened: index `(pStateIdx << 2) | qRangeIdx` — i.e.
-/// `(state & !1) * 2 + q` for a context byte `state = pStateIdx << 1 | valMps`.
-pub static LPS_RANGE_FLAT: [u8; 256] = {
-    let mut t = [0u8; 256];
-    let mut p = 0;
-    while p < 64 {
-        let mut q = 0;
-        while q < 4 {
-            t[p * 4 + q] = LPS_RANGE[p][q];
-            q += 1;
+/// The renormalisation shift for a range value: how many left shifts bring it
+/// back into `[256, 510]`. `rangeTabLps` never exceeds 240 and the MPS range
+/// never falls below 128, so one to seven covers both paths.
+const fn norm_shift(v: u16) -> u16 {
+    let mut r = v;
+    let mut n = 0;
+    while r < 256 && n < 8 {
+        r <<= 1;
+        n += 1;
+    }
+    n
+}
+
+/// `rangeTabLps`, each entry carrying everything the LPS arm needs: the LPS
+/// range in the low byte, its renormalisation shift in the second, and the
+/// range already renormalised above those. Indexed `(range & 0xc0) |
+/// pStateIdx`.
+///
+/// Three things are folded in here, and each takes work off the chain from
+/// one decision's range to the next one's. Masking `range` instead of
+/// shifting it right, and letting `qRangeIdx` land in bits 6 and 7 where
+/// `pStateIdx` does not reach, makes the index an `and` and an `or` — and the
+/// `or`'s other half comes from the context byte, which was loaded long
+/// before. Carrying the shift means the LPS arm never counts leading zeros.
+/// Carrying the renormalised range means it does not shift by it either, so
+/// what is left of that arm is three extractions from a single load, all of
+/// them off to the side of the comparison.
+static LPS: [u32; 256] = {
+    let mut t = [0u32; 256];
+    let mut q = 0;
+    while q < 4 {
+        let mut p = 0;
+        while p < 64 {
+            let lps = LPS_RANGE[p][q] as u32;
+            let shift = norm_shift(lps as u16) as u32;
+            t[q * 64 + p] = lps | (shift << 8) | ((lps << shift) << 16);
+            p += 1;
         }
-        p += 1;
+        q += 1;
     }
     t
 };
 
-/// Next context byte after an MPS, indexed by the context byte.
-pub static NEXT_MPS_STATE: [u8; 128] = {
-    let mut t = [0u8; 128];
-    let mut s = 0;
-    while s < 128 {
-        t[s] = (NEXT_STATE_MPS[s >> 1] << 1) | (s as u8 & 1);
-        s += 1;
-    }
-    t
-};
-
-/// Next context byte after an LPS (the MPS flips from state 0).
-pub static NEXT_LPS_STATE: [u8; 128] = {
-    let mut t = [0u8; 128];
+/// Both state transitions in one table: the next context byte after an MPS at
+/// index `state + 128`, and the one after an LPS at index `127 - state`.
+///
+/// The two indices are one XOR apart. Complementing the context byte with the
+/// LPS mask — all ones on the LPS path, all zeros on the MPS path — turns
+/// `state + 128` into `127 - state` in wrapping `u8` arithmetic, so a single
+/// lookup serves both. The same complemented byte carries the decoded bin in
+/// its low bit: `valMps`, or its complement on the LPS path.
+static MLPS_STATE: [u8; 256] = {
+    let mut t = [0u8; 256];
     let mut s = 0;
     while s < 128 {
         let p = s >> 1;
         let mps = s as u8 & 1;
-        let new_mps = if p == 0 { 1 - mps } else { mps };
-        t[s] = (NEXT_STATE_LPS[p] << 1) | new_mps;
+        t[s + 128] = (NEXT_STATE_MPS[p] << 1) | mps;
+        let flipped = if p == 0 { 1 - mps } else { mps };
+        t[127 - s] = (NEXT_STATE_LPS[p] << 1) | flipped;
         s += 1;
     }
     t
@@ -171,19 +201,31 @@ impl<'a> Cabac<'a> {
     /// Append 32 bits (zeros past the end) to `low`.
     #[inline(always)]
     fn refill(&mut self) {
-        let v = if let Some(b) = self.data.get(self.pos..self.pos + 4) {
-            u32::from_be_bytes([b[0], b[1], b[2], b[3]])
-        } else {
-            let mut v = 0u32;
-            for i in 0..4 {
-                v = (v << 8) | self.data.get(self.pos + i).copied().unwrap_or(0) as u32;
-            }
-            v
+        let v = match self.data.get(self.pos..self.pos + 4) {
+            Some(b) => u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+            None => self.refill_end(),
         };
         self.pos += 4;
         self.low = (self.low << 32) | v as u64;
         self.bits += 32;
         self.fetched += 32;
+    }
+
+    /// The same four bytes, assembled one at a time with zeros standing in
+    /// for what is past the end of the slice.
+    ///
+    /// Out of line deliberately. It runs once at the end of a slice and
+    /// inlining it planted its thirty-odd instructions and eight branches in
+    /// the middle of every residual loop in both decoders, where the
+    /// instruction cache has better uses for the space.
+    #[cold]
+    #[inline(never)]
+    fn refill_end(&self) -> u32 {
+        let mut v = 0u32;
+        for i in 0..4 {
+            v = (v << 8) | self.data.get(self.pos + i).copied().unwrap_or(0) as u32;
+        }
+        v
     }
 
     /// Bits consumed by the standard's decoding engine.
@@ -229,52 +271,52 @@ impl<'a> Cabac<'a> {
     }
 
     /// Decode one context-coded bin.
+    ///
+    /// Both arms are computed and then masked together rather than branched
+    /// between. Written as `if`/`else` this is the same program, but the
+    /// compiler reads two arms with a shift in each and decides a branch is
+    /// the cheaper shape — which on a value this unpredictable it is not, by
+    /// five per cent of a whole CABAC decode. Spelling the selection as
+    /// arithmetic settles the question. The one branch left is the refill,
+    /// taken roughly once in twenty bins and predicted.
     #[inline(always)]
     pub fn decision(&mut self, ctx: &mut Ctx) -> u32 {
-        let state = *ctx as usize;
-        let mps = (state & 1) as u32;
-        let lps = LPS_RANGE_FLAT[(state & !1) * 2 + ((self.range >> 6) & 3) as usize] as u32;
-        self.range -= lps;
-        let scaled = (self.range as u64) << self.bits;
-        let bin;
-        if self.low < scaled {
-            // Most probable symbol: at most one renormalisation shift
-            // (branch-free: the shift is 0 or 1).
-            *ctx = NEXT_MPS_STATE[state];
-            let sh = (self.range < 256) as u32;
-            self.range <<= sh;
-            self.bits -= sh;
-            bin = mps;
-        } else {
-            self.low -= scaled;
-            self.range = lps;
-            let shift = self.range.leading_zeros() - 23;
-            self.range <<= shift;
-            self.bits -= shift;
-            *ctx = NEXT_LPS_STATE[state];
-            bin = 1 - mps;
-        }
+        let state = *ctx as u32;
+        debug_assert!(state < 128, "context byte is pStateIdx << 1 | valMps");
+        let entry = LPS[((self.range & 0xc0) | (state >> 1)) as usize];
+        // The MPS sub-interval, and where its top sits in the offset's frame.
+        let mps_range = self.range - (entry & 0xff);
+        let scaled = (mps_range as u64) << self.bits;
+        // All ones when the offset lands in the LPS sub-interval.
+        let take_lps = self.low >= scaled;
+        let mask = 0u32.wrapping_sub(take_lps as u32);
+        // The MPS range never falls below 128, so renormalising it is one
+        // shift at most; the LPS arm reads its own from the table.
+        let mps_shift = (mps_range < 256) as u32;
+        let mps_norm = mps_range << mps_shift;
+        self.low -= scaled & 0u64.wrapping_sub(take_lps as u64);
+        self.range = mps_norm ^ ((mps_norm ^ (entry >> 16)) & mask);
+        self.bits -= mps_shift ^ ((mps_shift ^ ((entry >> 8) & 0xff)) & mask);
+        let next = (state as u8) ^ (mask as u8);
+        *ctx = MLPS_STATE[next.wrapping_add(128) as usize];
         if self.bits < 8 {
             self.refill();
         }
-        bin
+        (next & 1) as u32
     }
 
-    /// Decode one bypass bin (equiprobable).
+    /// Decode one bypass bin — equiprobable, so as unpredictable as a bin
+    /// gets, and masked rather than branched for the same reason.
     #[inline(always)]
     pub fn bypass(&mut self) -> u32 {
         self.bits -= 1;
         let scaled = (self.range as u64) << self.bits;
-        let bin = if self.low >= scaled {
-            self.low -= scaled;
-            1
-        } else {
-            0
-        };
+        let bin = (self.low >= scaled) as u64;
+        self.low -= scaled & 0u64.wrapping_sub(bin);
         if self.bits < 8 {
             self.refill();
         }
-        bin
+        bin as u32
     }
 
     /// Decode `n` bypass bins (`n <= 16`) as an unsigned integer, MSB first.
@@ -513,7 +555,8 @@ pub struct OldCabac<'a> {
             for step in 0..(len * 8 + 40) {
                 let op = lcg() % 10;
                 let (x, y) = if op < 6 { let c = (lcg() % 8) as usize; (a.decision(&mut ca[c]), b.decision(&mut cb[c])) }
-                    else if op < 9 { (a.bypass(), b.bypass()) }
+                    else if op < 8 { (a.bypass(), b.bypass()) }
+                    else if op < 9 { let n = lcg() % 17; (a.bypass_bits(n), b.bypass_bits(n)) }
                     else { (a.terminate(), b.terminate()) };
                 assert_eq!(x, y, "trial {trial} step {step} op {op}");
                 assert_eq!(a.position(), b.position(), "position trial {trial} step {step}");
