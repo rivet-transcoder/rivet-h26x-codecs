@@ -259,6 +259,12 @@ pub fn install_simd_u8(d: &mut HevcDsp<u8>, cpu: Cpu) {
     #[cfg(target_arch = "aarch64")]
     if cpu.neon {
         super::hevc_neon_u8::install(d);
+        // Additive: each rung replaces only the kernels its instructions
+        // actually improve, so a CPU without the extension keeps the ones
+        // below it untouched.
+        if cpu.dotprod {
+            super::hevc_neon_u8::install_dotprod(d);
+        }
     }
 }
 

@@ -18,6 +18,7 @@ use std::arch::aarch64::*;
 
 use super::hevc::HevcDsp;
 use super::hevc_neon as w16;
+use super::neon_dotprod as nd;
 use crate::hevc::tables::{EPEL_FILTERS, QPEL_FILTERS};
 
 /// Replace the scalar entries of `d` with the NEON kernels.
@@ -47,6 +48,24 @@ pub fn install(d: &mut HevcDsp<u8>) {
     d.deblock_luma_h = deblock_luma_h_neon;
     d.deblock_chroma_v = deblock_chroma_v_neon;
     d.deblock_chroma_h = deblock_chroma_h_neon;
+}
+
+/// Replace the luma kernels whose horizontal stage `sdot` can do: the eight
+/// taps are two dot products per four outputs against eight widening
+/// multiplies. Chroma keeps the NEON kernels — four taps already fit one
+/// `umlal` per tap for eight outputs, and the permutes a dot product needs
+/// would cost more than the halved multiply count saves. The vertical
+/// kernels keep them too: a vertical tap's four samples are a row apart, and
+/// gathering them into a lane would cost a transpose. Only install this on a
+/// CPU that has the extension: [`super::Cpu::dotprod`] is what says so.
+///
+/// The fused kernels below hand their whole-sample and vertical-only
+/// fractions back to the NEON rung, so those keep exactly the code they have
+/// today rather than a second copy of it laid out differently.
+pub fn install_dotprod(d: &mut HevcDsp<u8>) {
+    d.qpel_h = qpel_h_dot;
+    d.qpel_uni = qpel_uni_dot;
+    d.qpel_bi = qpel_bi_dot;
 }
 
 // ----------------------------------------------------------------------
@@ -202,12 +221,30 @@ unsafe fn tap8(acc: uint16x8_t, s: uint8x8_t, t: &Taps, k: usize) -> uint16x8_t 
     }
 }
 
-/// Horizontal FIR with `TAPS` taps over bytes.
+/// Horizontal FIR with `TAPS` taps over bytes. `DOT` swaps the eight-tap
+/// luma filter for its `sdot` version, which needs one byte more of the row
+/// than the widening multiplies do — see [`fused`] and [`qpel_h_dot`] for the
+/// bound that pays for it.
 #[inline(always)]
-unsafe fn fir_h<const TAPS: usize, const MODE: u8>(out: &Out, src: *const u8, src_stride: usize, w: usize, h: usize, taps: &[i8], shift: i32) {
+unsafe fn fir_h<const TAPS: usize, const MODE: u8, const DOT: bool>(out: &Out, src: *const u8, src_stride: usize, w: usize, h: usize, taps: &[i8], shift: i32) {
     unsafe {
-        let t = Taps::of(taps);
         let sh = vdupq_n_s16(-(shift as i16));
+        // Only the eight-tap filter: at four taps the byte-wide multiplies
+        // below already produce eight outputs per instruction, and the
+        // permutes a dot product needs cost more than they save.
+        if DOT && TAPS == 8 {
+            let t = nd::Taps::new(taps);
+            for y in 0..h {
+                let s = src.add(y * src_stride);
+                let mut x = 0;
+                while x < w {
+                    emit::<MODE>(out, y, x, vshlq_s16(nd::fir8(s.add(x), &t), sh), (w - x).min(8));
+                    x += 8;
+                }
+            }
+            return;
+        }
+        let t = Taps::of(taps);
         for y in 0..h {
             let s = src.add(y * src_stride);
             let mut x = 0;
@@ -319,7 +356,25 @@ fn qpel_h_neon(dst: &mut [i16], src: &[u8], src_stride: usize, w: usize, h: usiz
         return (HevcDsp::<u8>::SCALAR.qpel_h)(dst, src, src_stride, w, h, frac, shift);
     }
     let out = Out { i16: dst.as_mut_ptr(), u8: std::ptr::null_mut(), stride: 0, other: std::ptr::null(), w };
-    unsafe { fir_h::<8, MODE_I16>(&out, src.as_ptr(), src_stride, w, h, &QPEL_FILTERS[frac][..8], shift) }
+    unsafe { fir_h::<8, MODE_I16, false>(&out, src.as_ptr(), src_stride, w, h, &QPEL_FILTERS[frac][..8], shift) }
+}
+
+/// The dot-product rung of [`qpel_h_neon`]. Its sixteen-byte load reaches one
+/// sample further along the row than the eight taps strictly need, so it asks
+/// `fits` for eight rather than seven and hands back to the NEON kernel — not
+/// to scalar — on the rows where that last byte is not there.
+fn qpel_h_dot(dst: &mut [i16], src: &[u8], src_stride: usize, w: usize, h: usize, frac: usize, shift: i32) {
+    if !fits(src.len(), src_stride, h, w, 8) || dst.len() < w * h {
+        return qpel_h_neon(dst, src, src_stride, w, h, frac, shift);
+    }
+    let out = Out { i16: dst.as_mut_ptr(), u8: std::ptr::null_mut(), stride: 0, other: std::ptr::null(), w };
+    unsafe { qpel_h_dot_tf(&out, src.as_ptr(), src_stride, w, h, &QPEL_FILTERS[frac][..8], shift) }
+}
+
+/// The attribute that lets [`nd::fir8`]'s `sdot` assemble and inline.
+#[target_feature(enable = "dotprod")]
+unsafe fn qpel_h_dot_tf(out: &Out, src: *const u8, src_stride: usize, w: usize, h: usize, taps: &[i8], shift: i32) {
+    unsafe { fir_h::<8, MODE_I16, true>(out, src, src_stride, w, h, taps, shift) }
 }
 
 fn qpel_v_neon(dst: &mut [i16], src: &[u8], src_stride: usize, w: usize, h: usize, frac: usize, shift: i32) {
@@ -335,7 +390,7 @@ fn epel_h_neon(dst: &mut [i16], src: &[u8], src_stride: usize, w: usize, h: usiz
         return (HevcDsp::<u8>::SCALAR.epel_h)(dst, src, src_stride, w, h, frac, shift);
     }
     let out = Out { i16: dst.as_mut_ptr(), u8: std::ptr::null_mut(), stride: 0, other: std::ptr::null(), w };
-    unsafe { fir_h::<4, MODE_I16>(&out, src.as_ptr(), src_stride, w, h, &EPEL_FILTERS[frac], shift) }
+    unsafe { fir_h::<4, MODE_I16, false>(&out, src.as_ptr(), src_stride, w, h, &EPEL_FILTERS[frac], shift) }
 }
 
 fn epel_v_neon(dst: &mut [i16], src: &[u8], src_stride: usize, w: usize, h: usize, frac: usize, shift: i32) {
@@ -378,12 +433,17 @@ unsafe fn copy_rows_u8(dst: *mut u8, dst_stride: usize, src: *const u8, src_stri
     }
 }
 
-/// The fused kernels: `TAPS` (8 luma / 4 chroma), `MODE_UNI` or `MODE_BI`.
+/// The fused kernels: `TAPS` (8 luma / 4 chroma), `MODE_UNI` or `MODE_BI`,
+/// `DOT` for the dot-product rung of the horizontal stage.
 #[allow(clippy::too_many_arguments)]
-fn fused<const TAPS: usize, const MODE: u8>(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], other: &[i16]) {
+#[inline(always)]
+unsafe fn fused_body<const TAPS: usize, const MODE: u8, const DOT: bool>(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], other: &[i16]) {
     let reach = TAPS / 2 - 1;
     let at_block = reach * src_stride + reach;
     let hh = h + TAPS - 1;
+    // The dot-product horizontal stage loads sixteen bytes where the taps
+    // reach fifteen.
+    let along = if DOT { TAPS } else { TAPS - 1 };
     let ok = w >= 2
         && h >= 1
         && (h - 1) * dst_stride + w <= dst.len()
@@ -391,11 +451,15 @@ fn fused<const TAPS: usize, const MODE: u8>(dst: &mut [u8], dst_stride: usize, s
         && tmp.len() >= super::hevc::MC_TMP_LEN
         && match (fx, fy) {
             (0, 0) => (h - 1) * src_stride + w + at_block <= src.len(),
-            (_, 0) => src.len() > reach * src_stride && fits(src.len() - reach * src_stride, src_stride, h, w, TAPS - 1),
+            (_, 0) => src.len() > reach * src_stride && fits(src.len() - reach * src_stride, src_stride, h, w, along),
             (0, _) => src.len() > reach && fits(src.len() - reach, src_stride, hh, w, 0),
-            _ => fits(src.len(), src_stride, hh, w, TAPS - 1) && fits_i16(super::hevc::MC_TMP_LEN, w, hh),
+            _ => fits(src.len(), src_stride, hh, w, along) && fits_i16(super::hevc::MC_TMP_LEN, w, hh),
         };
     if !ok {
+        if DOT {
+            // Only the extra byte is missing: step down one rung, not to scalar.
+            return fused::<TAPS, MODE>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, other);
+        }
         let s = HevcDsp::<u8>::SCALAR;
         return match (TAPS, MODE) {
             (8, MODE_UNI) => (s.qpel_uni)(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, 8),
@@ -418,22 +482,50 @@ fn fused<const TAPS: usize, const MODE: u8>(dst: &mut [u8], dst_stride: usize, s
                     bi_neon(dst, dst_stride, other, pred, w, h, 7, 255);
                 }
             }
-            (_, 0) => fir_h::<TAPS, MODE>(&out, src.as_ptr().add(reach * src_stride), src_stride, w, h, tx, 0),
+            (_, 0) => fir_h::<TAPS, MODE, DOT>(&out, src.as_ptr().add(reach * src_stride), src_stride, w, h, tx, 0),
             (0, _) => fir_v::<TAPS, MODE>(&out, src.as_ptr().add(reach), src_stride, w, h, ty, 0),
             _ => {
                 let mid = Out { i16: tmp.as_mut_ptr(), u8: std::ptr::null_mut(), stride: 0, other: std::ptr::null(), w };
-                fir_h::<TAPS, MODE_I16>(&mid, src.as_ptr(), src_stride, w, hh, tx, 0);
+                fir_h::<TAPS, MODE_I16, DOT>(&mid, src.as_ptr(), src_stride, w, hh, tx, 0);
                 fir_v2::<TAPS, MODE>(&out, tmp.as_ptr(), w, w, h, ty);
             }
         }
     }
 }
 
+/// [`fused_body`] on the baseline NEON rung.
+#[allow(clippy::too_many_arguments)]
+fn fused<const TAPS: usize, const MODE: u8>(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], other: &[i16]) {
+    unsafe { fused_body::<TAPS, MODE, false>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, other) }
+}
+
+/// [`fused_body`] on the dot-product rung; the attribute is what lets
+/// [`nd::fir8`]'s `sdot` assemble and inline.
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "dotprod")]
+unsafe fn fused_dot<const TAPS: usize, const MODE: u8>(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], other: &[i16]) {
+    unsafe { fused_body::<TAPS, MODE, true>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, other) }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn qpel_uni_neon(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], bit_depth: u32) {
     debug_assert_eq!(bit_depth, 8);
     fused::<8, MODE_UNI>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, &[])
 }
 
+#[allow(clippy::too_many_arguments)]
+fn qpel_uni_dot(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], bit_depth: u32) {
+    debug_assert_eq!(bit_depth, 8);
+    // Nothing to filter horizontally: hand straight back, so those fractions
+    // run the kernel they run today rather than a second copy of it that the
+    // register allocator has laid out differently for no gain.
+    if fx == 0 {
+        return qpel_uni_neon(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, bit_depth);
+    }
+    unsafe { fused_dot::<8, MODE_UNI>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, &[]) }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn epel_uni_neon(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], bit_depth: u32) {
     debug_assert_eq!(bit_depth, 8);
     fused::<4, MODE_UNI>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, &[])
@@ -443,6 +535,15 @@ fn epel_uni_neon(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usiz
 fn qpel_bi_neon(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], other: &[i16], bit_depth: u32) {
     debug_assert_eq!(bit_depth, 8);
     fused::<8, MODE_BI>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, other)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qpel_bi_dot(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], other: &[i16], bit_depth: u32) {
+    debug_assert_eq!(bit_depth, 8);
+    if fx == 0 {
+        return qpel_bi_neon(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, other, bit_depth);
+    }
+    unsafe { fused_dot::<8, MODE_BI>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, other) }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -851,6 +952,132 @@ mod tests {
         let mut d = HevcDsp::<u8>::SCALAR;
         install(&mut d);
         d
+    }
+
+    /// The NEON table with the dot-product rung on top, or `None` when the
+    /// CPU has not got the extension — in which case say so, so that a green
+    /// run on a core without it is not mistaken for coverage. Set
+    /// `H26X_REQUIRE_DOTPROD=1` to turn that skip into a failure.
+    fn dotprod() -> Option<HevcDsp<u8>> {
+        let mut d = neon();
+        if !std::arch::is_aarch64_feature_detected!("dotprod") {
+            let required = std::env::var_os("H26X_REQUIRE_DOTPROD").is_some_and(|v| v == "1" || v == "true");
+            assert!(!required, "H26X_REQUIRE_DOTPROD is set but this CPU has no dotprod");
+            eprintln!("skipping: no dotprod on this CPU, the sdot kernels are not covered");
+            return None;
+        }
+        let n = d;
+        install_dotprod(&mut d);
+        // A rung that installed nothing would let every comparison below pass
+        // without running a single `sdot`.
+        assert!(d.qpel_h as usize != n.qpel_h as usize, "install_dotprod left the NEON kernels in place");
+        assert!(d.epel_h as usize == n.epel_h as usize, "chroma stays on the NEON rung");
+        assert!(d.qpel_v as usize == n.qpel_v as usize, "the vertical filters stay on the NEON rung");
+        Some(d)
+    }
+
+    /// Every luma fraction and every block size the standard can ask for, at
+    /// both shifts, against the scalar reference. Trials 1 and 2 are the
+    /// sample extremes, where the eight-tap sum is widest and a wrong bias
+    /// correction would show.
+    #[test]
+    fn dotprod_qpel_h_matches_scalar() {
+        let Some(d) = dotprod() else { return };
+        let s = HevcDsp::<u8>::SCALAR;
+        let mut seed = 31u64;
+        let stride = 96;
+        for trial in 0..3 {
+            let src: Vec<u8> = (0..stride * 96)
+                .map(|_| match trial {
+                    0 => lcg(&mut seed) as u8,
+                    1 => [0u8, 255][(lcg(&mut seed) % 2) as usize],
+                    _ => (lcg(&mut seed) % 4) as u8 * 85,
+                })
+                .collect();
+            for &(w, h) in &[(2usize, 4usize), (2, 8), (4, 4), (4, 8), (4, 3), (6, 8), (8, 4), (8, 8), (8, 5), (12, 16), (16, 16), (24, 32), (32, 8), (48, 64), (64, 64)] {
+                for frac in 1..4 {
+                    for shift in [0, 2] {
+                        let mut a = vec![0i16; w * h];
+                        let mut b = vec![0i16; w * h];
+                        (s.qpel_h)(&mut a, &src, stride, w, h, frac, shift);
+                        (d.qpel_h)(&mut b, &src, stride, w, h, frac, shift);
+                        assert_eq!(a, b, "qpel_h {w}x{h} frac={frac} shift={shift} trial={trial}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The fused luma kernels, over every fraction pair — which covers the
+    /// horizontal-only stage, the two-stage `hv` first pass, and the vertical
+    /// and whole-sample cases the rung deliberately leaves alone.
+    #[test]
+    fn dotprod_fused_matches_scalar() {
+        let Some(d) = dotprod() else { return };
+        let s = HevcDsp::<u8>::SCALAR;
+        let mut seed = 37u64;
+        let stride = 96;
+        let mut tmp1 = vec![0i16; crate::dsp::hevc::MC_TMP_LEN];
+        let mut tmp2 = vec![0i16; crate::dsp::hevc::MC_TMP_LEN];
+        let mut checked = 0;
+        for trial in 0..2 {
+            let src: Vec<u8> = (0..stride * 96).map(|_| if trial == 0 { lcg(&mut seed) as u8 } else { [0u8, 255][(lcg(&mut seed) % 2) as usize] }).collect();
+            for &(w, h) in &[(2usize, 4usize), (2, 8), (4, 4), (4, 8), (4, 3), (6, 8), (8, 4), (8, 8), (8, 5), (12, 16), (16, 16), (24, 32), (32, 8), (48, 64), (64, 64)] {
+                let other: Vec<i16> = (0..w * h).map(|_| (lcg(&mut seed) % 30000) as i16 - 6000).collect();
+                for fx in 0..4 {
+                    for fy in 0..4 {
+                        let dstride = w + 3;
+                        let mut d1 = vec![7u8; dstride * h + 8];
+                        let mut d2 = d1.clone();
+                        let off = 8 * stride + 8;
+                        (s.qpel_uni)(&mut d1, dstride, &src[off..], stride, w, h, fx, fy, &mut tmp1, 8);
+                        (d.qpel_uni)(&mut d2, dstride, &src[off..], stride, w, h, fx, fy, &mut tmp2, 8);
+                        assert_eq!(d1, d2, "uni {w}x{h} fx={fx} fy={fy} trial={trial}");
+                        (s.qpel_bi)(&mut d1, dstride, &src[off..], stride, w, h, fx, fy, &mut tmp1, &other, 8);
+                        (d.qpel_bi)(&mut d2, dstride, &src[off..], stride, w, h, fx, fy, &mut tmp2, &other, 8);
+                        assert_eq!(d1, d2, "bi {w}x{h} fx={fx} fy={fy} trial={trial}");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 2 * 15 * 16);
+    }
+
+    /// The rung reads one byte further along a row than the NEON kernels do,
+    /// and hands back when it is not there. Walk the source length down past
+    /// both thresholds: every step must still equal the scalar reference.
+    #[test]
+    fn dotprod_short_source_falls_back() {
+        let Some(d) = dotprod() else { return };
+        let s = HevcDsp::<u8>::SCALAR;
+        let mut seed = 41u64;
+        let stride = 40;
+        let src: Vec<u8> = (0..stride * 48).map(|_| lcg(&mut seed) as u8).collect();
+        let mut tmp1 = vec![0i16; crate::dsp::hevc::MC_TMP_LEN];
+        let mut tmp2 = vec![0i16; crate::dsp::hevc::MC_TMP_LEN];
+        for &(w, h) in &[(4usize, 4usize), (8, 8), (16, 8), (24, 4)] {
+            let full = (h + 7) * stride + w + 16;
+            for len in full.saturating_sub(20)..=full {
+                for frac in 1..4 {
+                    let mut a = vec![0i16; w * h];
+                    let mut b = vec![0i16; w * h];
+                    (s.qpel_h)(&mut a, &src[..len], stride, w, h, frac, 0);
+                    (d.qpel_h)(&mut b, &src[..len], stride, w, h, frac, 0);
+                    assert_eq!(a, b, "qpel_h {w}x{h} frac={frac} len={len}");
+                }
+                for fx in 1..4 {
+                    for fy in 0..4 {
+                        let dstride = w + 3;
+                        let mut d1 = vec![7u8; dstride * h + 8];
+                        let mut d2 = d1.clone();
+                        (s.qpel_uni)(&mut d1, dstride, &src[..len], stride, w, h, fx, fy, &mut tmp1, 8);
+                        (d.qpel_uni)(&mut d2, dstride, &src[..len], stride, w, h, fx, fy, &mut tmp2, 8);
+                        assert_eq!(d1, d2, "uni {w}x{h} fx={fx} fy={fy} len={len}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
