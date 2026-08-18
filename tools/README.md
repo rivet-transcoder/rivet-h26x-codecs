@@ -24,7 +24,8 @@ decoder without writing the YUV out.
 
 | | |
 |---|---|
-| `verify.sh [decoder]` | Everything that has to hold before a change lands: every fixture against its recorded MD5, then all four conformance suites. Prints one tally per suite and `ALL GREEN` or not. |
+| `verify.sh [--baseline FILE] [decoder]` | Everything that has to hold before a change lands: every fixture against its recorded MD5, then all four conformance suites. Prints one tally per suite and `ALL GREEN` or not. Safe to run concurrently with another copy of itself. |
+| `verify.sh --baseline FILE` | Also records `<suite> <stream> <md5>` for every stream that decodes, and diffs against `FILE` when it already exists. For a refactor that must not change output this is the stricter question — not "does it still pass" but "does every one of 412 streams decode to the same bytes", including the ones no reference data covers. |
 | `check.sh <file...>` | One or more fixtures against libavcodec's per-frame MD5s (`<name>.framemd5`, generated on first use), reporting the first mismatching frame. |
 | `cmp2.py ref mine W H fmt bps [frames]` | Where two YUVs differ, per plane and per frame — for when `check.sh` says a frame is wrong and you need to know which samples. |
 | `conformance/run_all.sh` | All four suites at once, each running its streams in parallel (`JOBS`, default 6). About ninety seconds on a 16-core machine. |
@@ -59,8 +60,16 @@ two streams for the same change. Two habits that fix it:
 **Know your floor before you trust a number.** Run `ab.py` with the *same
 binary as both arguments*. Whatever spread that reports is the smallest
 difference the machine can currently resolve; a change smaller than it has not
-been measured, it has been guessed at. `AFFINITY` picks the core (default
-`0x40000`, a high one — the low cores are where everything else lands).
+been measured, it has been guessed at.
+
+`ab.py` picks the core itself, sampling per-processor load at start-up and
+taking the quieter half of the quietest SMT *pair* — a sibling shares the
+execution units, so pinning to an idle logical processor whose sibling is busy
+measures the sibling. It prints what it chose and warns when nothing is idle.
+It does this because the previous fixed default became self-defeating: the
+moment a good core is written down, everyone pins to it, and a same-binary
+control on the documented "good" core read a **15%** spread — worse than the
+contention the default was introduced to avoid. `AFFINITY` still overrides.
 
 **Give the clock something to measure.** Process CPU time comes in ~15.6 ms
 steps on Windows, so a clip that decodes in a fifth of a second is quantised to
@@ -85,10 +94,13 @@ hand-laid-out — so that is a several-thousand-line diff sitting on top of
 whatever you were doing. To format one file, run `rustfmt --edition 2024
 <file>`, and check `git diff --stat` before committing either way.
 
-The conformance runners work from a frozen copy of the decoder
-(`h26xdec_conf`), so rebuilding mid-run cannot disturb a suite — but it also
-means **a suite run tests the copy, not your latest build**. `verify.sh` makes
-the copy itself; if you invoke a runner directly, refresh the copy first.
+The conformance runners work from a frozen copy of the decoder, so rebuilding
+mid-run cannot disturb a suite — but it also means **a suite run tests the
+copy, not your latest build**. `verify.sh` makes its own copy under a private
+name and gives each suite a private scratch directory, so two people can run it
+at once; invoke a runner directly and you get the shared defaults, where a
+concurrent run can swap the binary underneath you. The failure mode is the
+nasty one: a **green** run that tested somebody else's build.
 
 ## Profiling
 

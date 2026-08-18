@@ -6,13 +6,18 @@
 # refuses. Streams run JOBS at a time (default 8), THREADS per decoder (4).
 # Usage: run_conf.sh [name-filter]
 cd "$(dirname "$0")"
-DEC=$(cd ../../../release/examples && pwd)/h26xdec_conf.exe
+DEC=${DEC:-$(cd ../../../release/examples && pwd)/h26xdec_conf.exe}
 JOBS=${JOBS:-8}
-export DEC H26X_VERIFY_HASH=1 H26X_THREADS=${THREADS:-4}
-mkdir -p out md5
+# Two callers running at once must not share a scratch directory or a
+# decoder copy: a run that quietly tested somebody else's binary still
+# reports green.
+OUT=${OUT:-out}
+export DEC OUT H26X_VERIFY_HASH=1 H26X_THREADS=${THREADS:-4}
+mkdir -p "$OUT" md5
 one() {
   d=$1
   name=$(basename "$d")
+  MD5REC="$OUT/md5parts-$$.tmp"
   bs=$(find "$d" -maxdepth 1 -type f \( -iname "*.264" -o -iname "*.bits" -o -iname "*.jsv" -o -iname "*.h264" \) | head -1)
   [ -z "$bs" ] && { echo "NOSTREAM $name"; return; }
   # Reference: JM ldecod per-frame MD5s (jm/<name>.md5, "i md5" lines) where
@@ -27,11 +32,11 @@ one() {
       ffmpeg -v error -y -i "$bs" -fps_mode passthrough -f framemd5 "$ref" 2>/dev/null
     fi
   fi
-  mine="out/$name.mine"
-  "$DEC" "$bs" > "$mine" 2> "out/$name.err"
+  mine="$OUT/$name.mine"
+  "$DEC" "$bs" > "$mine" 2> "$OUT/$name.err"
   st=$?
   if [ $st -ne 0 ]; then
-    msg=$(tail -1 "out/$name.err")
+    msg=$(tail -1 "$OUT/$name.err")
     case "$msg" in
       *unsupported*) echo "UNSUPPORTED $name: $msg"; return ;;
       *) echo "FAIL $name: $msg"; return ;;
@@ -44,9 +49,11 @@ one() {
   else
     echo "FAIL $name: frames ref=$nref mine=$nmine mismatching=$bad"
   fi
+  echo "$name $(md5sum < "$mine" | cut -c1-32)" >> "$MD5REC"
 }
 export -f one
 ls -d streams/*/ | { if [ -n "$1" ]; then grep -i -- "$1"; else cat; fi; } \
-  | xargs -P "$JOBS" -I{} bash -c 'one "$1"' _ {} | sort > out/results.txt
-cat out/results.txt
-echo "pass=$(grep -c '^PASS' out/results.txt) fail=$(grep -c '^FAIL' out/results.txt) unsupported=$(grep -c '^UNSUPPORTED' out/results.txt)"
+  | xargs -P "$JOBS" -I{} bash -c 'one "$1"' _ {} | sort > $OUT/results.txt
+cat "$OUT"/md5parts-*.tmp 2>/dev/null | sort > "$OUT/md5s.txt"; rm -f "$OUT"/md5parts-*.tmp
+cat $OUT/results.txt
+echo "pass=$(grep -c '^PASS' $OUT/results.txt) fail=$(grep -c '^FAIL' $OUT/results.txt) unsupported=$(grep -c '^UNSUPPORTED' $OUT/results.txt)"
