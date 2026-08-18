@@ -120,9 +120,14 @@ def main():
     args = ap.parse_args()
 
     null = "NUL" if WINDOWS else "/dev/null"
+    # Long enough that the clock is not the instrument: process CPU time comes
+    # in ~15.6 ms steps on Windows, so a clip that decodes in a fifth of a
+    # second is quantised to within a few per cent of itself and every
+    # comparison reads 1.000. These are the short clips repeated.
     streams = [s for s in args.streams.split(",") if s] or [
-        f for f in ("bbb_720p_cabac.264", "bbb_720p_cavlc.264",
-                    "bbb_720p_hevc.265", "bbb_720p_wpp.265") if os.path.exists(f)]
+        f for f in ("cabac3.264", "cavlc3.264", "hevc6.265", "wpp10.265",
+                    "bbb_720p_cabac.264", "bbb_720p_cavlc.264",
+                    "bbb_720p_hevc.265", "bbb_720p_wpp.265") if os.path.exists(f)][:4]
     threads = cpu_threads()
 
     print(f"**{cpu_name()}**, {threads} hardware threads. Best of {args.runs}. "

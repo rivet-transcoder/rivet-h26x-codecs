@@ -62,6 +62,14 @@ difference the machine can currently resolve; a change smaller than it has not
 been measured, it has been guessed at. `AFFINITY` picks the core (default
 `0x40000`, a high one — the low cores are where everything else lands).
 
+**Give the clock something to measure.** Process CPU time comes in ~15.6 ms
+steps on Windows, so a clip that decodes in a fifth of a second is quantised to
+within a few per cent of itself and every comparison reads exactly 1.000 —
+which is indistinguishable from "no change" and is how a real 2% improvement
+went unnoticed here. Concatenate a short clip until the run takes a second or
+two (`cat x.265 x.265 ... > long.265` works: each copy carries its own
+parameter sets and IDR).
+
 **Measure the function, not the program,** when the change is a few per cent of
 one hot function. Wrapping that function in `rdtsc` and reporting cycles per
 macroblock row separated variants that whole-program wall clock could not see
