@@ -12,11 +12,12 @@
 //! 16-bit ones' deblocking filters, `store_n` / `load_n` and inverse
 //! transform, exactly as the AVX2 pair does. The whole set is written once
 //! and instantiated twice — SSE4.1 and AVX — by the `kernels_u16!` and
-//! `kernels_u8!` macros; see [`super::h264_avx`] for why the second
+//! `kernels_u8!` macros; see [`super::h264_x86_128`] for why the second
 //! instantiation is worth its code size.
 
 #![cfg(target_arch = "x86_64")]
 
+use super::Cpu;
 use super::hevc::HevcDsp;
 use crate::hevc::tables::TRANSFORM32;
 
@@ -88,17 +89,187 @@ pub(crate) fn pair_row(n: usize, j: usize) -> &'static [i16] {
     }
 }
 
+/// The two level-dependent shapes that are particular to H.265: the byte FIR
+/// the interpolation filters run on 8-bit planes, and the SAO edge-offset
+/// lookup. Everything else level-dependent is in the `x86_compat` module.
+macro_rules! codec_compat_hevc {
+    ($feat:literal, sse2) => {
+        /// The taps of a byte FIR, in the form this level multiplies by: one
+        /// broadcast per tap, for `pmullw` on widened samples.
+        struct Taps([__m128i; 8], usize);
+
+        /// `taps[..n]` prepared for [`fir8`] / [`fir16`].
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn taps_load(taps: &[i8], n: usize) -> Taps {
+            unsafe {
+                let mut v = [_mm_setzero_si128(); 8];
+                for k in 0..n {
+                    v[k] = _mm_set1_epi16(taps[k] as i16);
+                }
+                Taps(v, n)
+            }
+        }
+
+        /// Eight consecutive FIR outputs from the u8 window at `p`, stepping
+        /// `step` bytes per tap, as eight i16.
+        ///
+        /// `pmullw` keeps the low 16 bits, which is exact here: a single
+        /// product is at most 255 · 58 = 14790 and no running sum of the
+        /// HEVC luma or chroma taps leaves i16 for 8-bit input.
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn fir8(p: *const u8, step: usize, t: &Taps) -> __m128i {
+            unsafe {
+                let mut acc = _mm_setzero_si128();
+                for k in 0..t.1 {
+                    let v = _mm_loadl_epi64(p.add(k * step) as *const __m128i);
+                    acc = _mm_add_epi16(acc, _mm_mullo_epi16(zx8(v), t.0[k]));
+                }
+                acc
+            }
+        }
+
+        /// Sixteen consecutive FIR outputs, as (low eight, high eight) i16.
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn fir16(p: *const u8, step: usize, t: &Taps) -> (__m128i, __m128i) {
+            unsafe {
+                let mut lo = _mm_setzero_si128();
+                let mut hi = _mm_setzero_si128();
+                for k in 0..t.1 {
+                    let v = _mm_loadu_si128(p.add(k * step) as *const __m128i);
+                    lo = _mm_add_epi16(lo, _mm_mullo_epi16(zx8(v), t.0[k]));
+                    hi = _mm_add_epi16(hi, _mm_mullo_epi16(zx8h(v), t.0[k]));
+                }
+                (lo, hi)
+            }
+        }
+
+        /// The five SAO edge offsets, in the form this level looks them up.
+        struct EdgeTab([__m128i; 5]);
+
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn edge_tab(off: &[i16; 5]) -> EdgeTab {
+            unsafe { EdgeTab(std::array::from_fn(|i| _mm_set1_epi8(off[i] as i8))) }
+        }
+
+        /// `off[e]` per byte lane, for `e` in 0..=4.
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn edge_lut(t: &EdgeTab, e: __m128i) -> __m128i {
+            unsafe {
+                let mut o = _mm_setzero_si128();
+                for i in 0..5 {
+                    o = sel(o, t.0[i], _mm_cmpeq_epi8(e, _mm_set1_epi8(i as i8)));
+                }
+                o
+            }
+        }
+    };
+
+    // SSSE3 and above: `pmaddubsw` takes a pair of taps per instruction and
+    // needs no widening, and `pshufb` is the offset table lookup.
+    ($feat:literal, $lvl:tt) => {
+        /// A pair of taps `(a, b)` as one 16-bit lane `a | b << 8` (the low
+        /// byte multiplies the even sample of an interleaved pair).
+        #[inline(always)]
+        fn pair8(a: i8, b: i8) -> i16 {
+            (a as u8 as i16) | ((b as i16) << 8)
+        }
+
+        /// The taps of a byte FIR as the tap pairs `pmaddubsw` wants, and how
+        /// many pairs there are.
+        struct Taps([__m128i; 4], usize);
+
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn taps_load(taps: &[i8], n: usize) -> Taps {
+            unsafe {
+                let mut v = [_mm_setzero_si128(); 4];
+                for k in 0..n / 2 {
+                    v[k] = _mm_set1_epi16(pair8(taps[2 * k], taps[2 * k + 1]));
+                }
+                Taps(v, n / 2)
+            }
+        }
+
+        /// Eight consecutive FIR outputs from the u8 window at `p`, stepping
+        /// `step` bytes per tap, as eight i16.
+        ///
+        /// `pmaddubsw` saturates its own pair sum, but no pair of HEVC taps
+        /// can reach i16 for 8-bit input, and neither can the total.
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn fir8(p: *const u8, step: usize, t: &Taps) -> __m128i {
+            unsafe {
+                let mut acc = _mm_setzero_si128();
+                for k in 0..t.1 {
+                    let a = _mm_loadl_epi64(p.add(2 * k * step) as *const __m128i);
+                    let b = _mm_loadl_epi64(p.add((2 * k + 1) * step) as *const __m128i);
+                    acc = _mm_add_epi16(acc, _mm_maddubs_epi16(_mm_unpacklo_epi8(a, b), t.0[k]));
+                }
+                acc
+            }
+        }
+
+        /// Sixteen consecutive FIR outputs, as (low eight, high eight) i16.
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn fir16(p: *const u8, step: usize, t: &Taps) -> (__m128i, __m128i) {
+            unsafe {
+                let mut lo = _mm_setzero_si128();
+                let mut hi = _mm_setzero_si128();
+                for k in 0..t.1 {
+                    let a = _mm_loadu_si128(p.add(2 * k * step) as *const __m128i);
+                    let b = _mm_loadu_si128(p.add((2 * k + 1) * step) as *const __m128i);
+                    lo = _mm_add_epi16(lo, _mm_maddubs_epi16(_mm_unpacklo_epi8(a, b), t.0[k]));
+                    hi = _mm_add_epi16(hi, _mm_maddubs_epi16(_mm_unpackhi_epi8(a, b), t.0[k]));
+                }
+                (lo, hi)
+            }
+        }
+
+        /// The five SAO edge offsets as a `pshufb` table.
+        struct EdgeTab(__m128i);
+
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn edge_tab(off: &[i16; 5]) -> EdgeTab {
+            unsafe {
+                let o = |i: usize| off[i] as i8;
+                EdgeTab(_mm_setr_epi8(o(0), o(1), o(2), o(3), o(4), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+            }
+        }
+
+        /// `off[e]` per byte lane, for `e` in 0..=4.
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn edge_lut(t: &EdgeTab, e: __m128i) -> __m128i {
+            unsafe { _mm_shuffle_epi8(t.0, e) }
+        }
+    };
+}
+
 /// The 16-bit-sample kernels, plus everything the 8-bit ones share.
 macro_rules! kernels_u16 {
-    ($feat:literal) => {
+    ($feat:literal, $lvl:tt) => {
         use std::arch::x86_64::*;
 
         use crate::dsp::hevc::HevcDsp;
-        use crate::dsp::hevc_avx::pair_row;
+        use crate::dsp::hevc_x86_128::pair_row;
         use crate::hevc::tables::{EPEL_FILTERS, QPEL_FILTERS, TRANSFORM32};
 
-        /// Replace the scalar entries of `d` with these kernels.
-        pub fn install_u16(d: &mut HevcDsp<u16>) {
+        crate::dsp::x86_compat::compat_core!($feat, $lvl);
+        codec_compat_hevc!($feat, $lvl);
+
+        // Install groups, split so a rung can replace only what it
+        // changes; a rung that improves none of a group's primitives simply
+        // does not call it and the rung below stays installed.
+
+        /// Every 16-bit-sample kernel — the bottom rung, and the top one.
+        pub(crate) fn install_all_u16(d: &mut HevcDsp<u16>) {
             d.idct = [idct::<4>, idct::<8>, idct::<16>, idct::<32>];
             d.add_residual = add_residual;
             d.qpel_copy = copy_u16;
@@ -113,8 +284,18 @@ macro_rules! kernels_u16 {
             d.bi = bi;
             d.weighted_uni = weighted_uni;
             d.weighted_bi = weighted_bi;
+            install_sao_u16(d);
+            install_deblock_u16(d);
+        }
+
+        /// SAO band and edge offset (lane selects).
+        pub(crate) fn install_sao_u16(d: &mut HevcDsp<u16>) {
             d.sao_band = sao_band;
             d.sao_edge = sao_edge;
+        }
+
+        /// The four loop-filter entries (`|x|`, lane selects, 32-bit min/max).
+        pub(crate) fn install_deblock_u16(d: &mut HevcDsp<u16>) {
             d.deblock_luma_v = deblock_luma_v;
             d.deblock_luma_h = deblock_luma_h;
             d.deblock_chroma_v = deblock_chroma_v;
@@ -129,6 +310,14 @@ macro_rules! kernels_u16 {
         #[inline(always)]
         fn pair(a: i8, b: i8) -> i32 {
             (a as i16 as u16 as i32) | ((b as i16 as u16 as i32) << 16)
+        }
+
+        /// The same for 16-bit multiplicands: `pmaddwd` against `(x, y)`
+        /// turns two interleaved i16 streams into `a·x + b·y` in i32 lanes,
+        /// which is how the weighted combiners multiply without `pmulld`.
+        #[inline(always)]
+        fn pair16(a: i16, b: i16) -> i32 {
+            (a as u16 as i32) | ((b as u16 as i32) << 16)
         }
 
         /// Store the first `n` (≤ 8) lanes of `v` to `dst`.
@@ -357,17 +546,18 @@ macro_rules! kernels_u16 {
                 let round = _mm_set1_epi32(1 << (shift - 1));
                 let sh = _mm_cvtsi32_si128(shift);
                 let maxv = _mm_set1_epi16(max as i16);
+                // a + b can exceed i16, so the sum has to be 32-bit — but
+                // `pmaddwd` against (1, 1) on the interleaved predictions is
+                // exactly that sum, in one instruction and without widening.
+                let ones = _mm_set1_epi32(pair16(1, 1));
                 for y in 0..h {
                     let mut x = 0;
                     while x < w {
                         let n = (w - x).min(8);
                         let va = load_n(a.as_ptr().add(y * w + x), w - x);
                         let vb = load_n(b.as_ptr().add(y * w + x), w - x);
-                        // Sum in 32 bits (a + b can exceed i16), shift, pack.
-                        let wide = |v: __m128i, hi: bool| if hi { _mm_cvtepi16_epi32(_mm_srli_si128(v, 8)) } else { _mm_cvtepi16_epi32(v) };
-                        let lo = _mm_add_epi32(_mm_add_epi32(wide(va, false), wide(vb, false)), round);
-                        let hi = _mm_add_epi32(_mm_add_epi32(wide(va, true), wide(vb, true)), round);
-                        let p = _mm_packs_epi32(_mm_sra_epi32(lo, sh), _mm_sra_epi32(hi, sh));
+                        let quad = |v: __m128i| _mm_sra_epi32(_mm_add_epi32(_mm_madd_epi16(v, ones), round), sh);
+                        let p = _mm_packs_epi32(quad(_mm_unpacklo_epi16(va, vb)), quad(_mm_unpackhi_epi16(va, vb)));
                         store_n_u16(dst.as_mut_ptr().add(y * stride + x), clip_u16(p, maxv), n);
                         x += 8;
                     }
@@ -377,6 +567,11 @@ macro_rules! kernels_u16 {
 
         #[allow(clippy::too_many_arguments)]
         fn weighted_uni(dst: &mut [u16], stride: usize, src: &[i16], w: usize, h: usize, log2_wd: i32, wt: i32, o: i32, max: i32) {
+            // The `pmaddwd` form needs the weight as an i16 lane. HEVC bounds
+            // it far inside that; anything else is the scalar reference's.
+            if i16::try_from(wt).is_err() {
+                return (HevcDsp::<u16>::SCALAR.weighted_uni)(dst, stride, src, w, h, log2_wd, wt, o, max);
+            }
             unsafe { weighted_uni_impl(dst, stride, src, w, h, log2_wd, wt, o, max) }
         }
 
@@ -386,18 +581,19 @@ macro_rules! kernels_u16 {
             unsafe {
                 let round = _mm_set1_epi32(if log2_wd >= 1 { 1 << (log2_wd - 1) } else { 0 });
                 let sh = _mm_cvtsi32_si128(log2_wd.max(0));
-                let wv = _mm_set1_epi32(wt);
+                // (wt, 0) against (s, 0) lanes: `pmaddwd` is the widening
+                // multiply, so neither `pmulld` nor a sign-extension is needed.
+                let wv = _mm_set1_epi32(pair16(wt as i16, 0));
                 let ov = _mm_set1_epi32(o);
                 let maxv = _mm_set1_epi16(max as i16);
+                let zero = _mm_setzero_si128();
                 for y in 0..h {
                     let mut x = 0;
                     while x < w {
                         let n = (w - x).min(8);
                         let s = load_n(src.as_ptr().add(y * w + x), w - x);
-                        let quad = |v: __m128i| _mm_add_epi32(_mm_sra_epi32(_mm_add_epi32(_mm_mullo_epi32(v, wv), round), sh), ov);
-                        let lo = quad(_mm_cvtepi16_epi32(s));
-                        let hi = quad(_mm_cvtepi16_epi32(_mm_srli_si128(s, 8)));
-                        let p = _mm_packs_epi32(lo, hi);
+                        let quad = |v: __m128i| _mm_add_epi32(_mm_sra_epi32(_mm_add_epi32(_mm_madd_epi16(v, wv), round), sh), ov);
+                        let p = _mm_packs_epi32(quad(_mm_unpacklo_epi16(s, zero)), quad(_mm_unpackhi_epi16(s, zero)));
                         store_n_u16(dst.as_mut_ptr().add(y * stride + x), clip_u16(p, maxv), n);
                         x += 8;
                     }
@@ -407,6 +603,9 @@ macro_rules! kernels_u16 {
 
         #[allow(clippy::too_many_arguments)]
         fn weighted_bi(dst: &mut [u16], stride: usize, a: &[i16], b: &[i16], w: usize, h: usize, log2_wd: i32, w0: i32, w1: i32, o0: i32, o1: i32, max: i32) {
+            if i16::try_from(w0).is_err() || i16::try_from(w1).is_err() {
+                return (HevcDsp::<u16>::SCALAR.weighted_bi)(dst, stride, a, b, w, h, log2_wd, w0, w1, o0, o1, max);
+            }
             unsafe { weighted_bi_impl(dst, stride, a, b, w, h, log2_wd, w0, w1, o0, o1, max) }
         }
 
@@ -416,8 +615,10 @@ macro_rules! kernels_u16 {
             unsafe {
                 let round = _mm_set1_epi32((o0 + o1 + 1) << log2_wd);
                 let sh = _mm_cvtsi32_si128(log2_wd + 1);
-                let w0v = _mm_set1_epi32(w0);
-                let w1v = _mm_set1_epi32(w1);
+                // (w0, w1) against the two interleaved predictions: one
+                // `pmaddwd` is `a·w0 + b·w1`, replacing two `pmulld` and an
+                // add, and needing nothing above SSE2.
+                let wv = _mm_set1_epi32(pair16(w0 as i16, w1 as i16));
                 let maxv = _mm_set1_epi16(max as i16);
                 for y in 0..h {
                     let mut x = 0;
@@ -425,12 +626,8 @@ macro_rules! kernels_u16 {
                         let n = (w - x).min(8);
                         let va = load_n(a.as_ptr().add(y * w + x), w - x);
                         let vb = load_n(b.as_ptr().add(y * w + x), w - x);
-                        let quad = |pa: __m128i, pb: __m128i| {
-                            _mm_sra_epi32(_mm_add_epi32(_mm_add_epi32(_mm_mullo_epi32(pa, w0v), _mm_mullo_epi32(pb, w1v)), round), sh)
-                        };
-                        let lo = quad(_mm_cvtepi16_epi32(va), _mm_cvtepi16_epi32(vb));
-                        let hi = quad(_mm_cvtepi16_epi32(_mm_srli_si128(va, 8)), _mm_cvtepi16_epi32(_mm_srli_si128(vb, 8)));
-                        let p = _mm_packs_epi32(lo, hi);
+                        let quad = |v: __m128i| _mm_sra_epi32(_mm_add_epi32(_mm_madd_epi16(v, wv), round), sh);
+                        let p = _mm_packs_epi32(quad(_mm_unpacklo_epi16(va, vb)), quad(_mm_unpackhi_epi16(va, vb)));
                         store_n_u16(dst.as_mut_ptr().add(y * stride + x), clip_u16(p, maxv), n);
                         x += 8;
                     }
@@ -596,7 +793,7 @@ macro_rules! kernels_u16 {
                         let band = _mm_srl_epi16(v, sh);
                         let mut off = _mm_setzero_si128();
                         for i in 0..k {
-                            off = _mm_blendv_epi8(off, ov[i], _mm_cmpeq_epi16(band, bv[i]));
+                            off = sel(off, ov[i], _mm_cmpeq_epi16(band, bv[i]));
                         }
                         let r = clip_u16(_mm_add_epi16(v, off), maxv);
                         store_n_u16(dst.as_mut_ptr().add(y * dst_stride + x), r, n);
@@ -653,10 +850,10 @@ macro_rules! kernels_u16 {
                         let sb = _mm_sub_epi16(_mm_and_si128(_mm_cmpgt_epi16(v, b), one), _mm_and_si128(_mm_cmpgt_epi16(b, v), one));
                         let e = _mm_add_epi16(_mm_add_epi16(sa, sb), two);
                         let mut o = _mm_setzero_si128();
-                        o = _mm_blendv_epi8(o, o0, _mm_cmpeq_epi16(e, _mm_setzero_si128()));
-                        o = _mm_blendv_epi8(o, o1, _mm_cmpeq_epi16(e, one));
-                        o = _mm_blendv_epi8(o, o3, _mm_cmpeq_epi16(e, three));
-                        o = _mm_blendv_epi8(o, o4, _mm_cmpeq_epi16(e, four));
+                        o = sel(o, o0, _mm_cmpeq_epi16(e, _mm_setzero_si128()));
+                        o = sel(o, o1, _mm_cmpeq_epi16(e, one));
+                        o = sel(o, o3, _mm_cmpeq_epi16(e, three));
+                        o = sel(o, o4, _mm_cmpeq_epi16(e, four));
                         let r = clip_u16(_mm_add_epi16(v, o), maxv);
                         store_n_u16(dst.as_mut_ptr().add(i), r, n);
                         x += 8;
@@ -681,14 +878,21 @@ macro_rules! kernels_u16 {
         #[target_feature(enable = $feat)]
         #[inline]
         pub(super) unsafe fn widen_u16(v: __m128i) -> (__m128i, __m128i) {
-            unsafe { (_mm_cvtepu16_epi32(v), _mm_cvtepu16_epi32(_mm_srli_si128(v, 8))) }
+            unsafe { (zx16(v), zx16h(v)) }
         }
 
-        /// Two vectors of 4 x i32 (each within u16) back to eight u16.
+        /// Two vectors of 4 x i32 back to eight u16.
+        ///
+        /// Signed saturation, not `packusdw`: every lane the deblocking
+        /// filters produce is a sample in `0..=max` — the untouched positions
+        /// are originals, the weak filter clips explicitly, and the strong
+        /// filter's `Clip3(p ± 2tc, avg)` cannot leave the range because
+        /// `avg` is in it — and `max` is at most 4095, so the two saturations
+        /// agree and this one needs only SSE2.
         #[target_feature(enable = $feat)]
         #[inline]
         pub(super) unsafe fn pack8_u16(lo: __m128i, hi: __m128i) -> __m128i {
-            unsafe { _mm_packus_epi32(lo, hi) }
+            unsafe { _mm_packs_epi32(lo, hi) }
         }
 
         /// Transpose eight 8-lane u16 rows.
@@ -735,10 +939,10 @@ macro_rules! kernels_u16 {
                 let add = |a, b| _mm_add_epi32(a, b);
                 let sub = |a, b| _mm_sub_epi32(a, b);
                 let dbl = |a| _mm_slli_epi32(a, 1);
-                let absd = |a, b| _mm_abs_epi32(_mm_sub_epi32(a, b));
+                let absd = |a, b| abs32(_mm_sub_epi32(a, b));
                 // Lane-wise measures.
-                let dpv = _mm_abs_epi32(add(sub(p2, dbl(p1)), p0));
-                let dqv = _mm_abs_epi32(add(sub(q2, dbl(q1)), q0));
+                let dpv = abs32(add(sub(p2, dbl(p1)), p0));
+                let dqv = abs32(add(sub(q2, dbl(q1)), q0));
                 let ev = add(absd(p3, p0), absd(q0, q3));
                 let fv = absd(p0, q0);
                 let mut dp = [0i32; 4];
@@ -771,9 +975,11 @@ macro_rules! kernels_u16 {
                 let tcv = _mm_set1_epi32(tc);
                 let tc2 = dbl(tcv);
                 let tch = _mm_srai_epi32(tcv, 1);
-                let tc10 = _mm_mullo_epi32(tcv, _mm_set1_epi32(10));
+                // 10·tc, 9·x and 3·x as shifts and adds: SSE2, and shorter
+                // latency than `pmulld` on the CPUs that have it.
+                let tc10 = _mm_add_epi32(_mm_slli_epi32(tcv, 3), _mm_slli_epi32(tcv, 1));
                 let maxv = _mm_set1_epi32(max);
-                let clamp = |x, lo, hi| _mm_min_epi32(_mm_max_epi32(x, lo), hi);
+                let clamp = |x, lo, hi| min32(max32(x, lo), hi);
                 let two = _mm_set1_epi32(2);
                 let four = _mm_set1_epi32(4);
                 // Strong.
@@ -785,10 +991,12 @@ macro_rules! kernels_u16 {
                 let sq1 = clamp(_mm_srai_epi32(add(add(p0q0, q1), add(q2, two)), 2), sub(q1, tc2), add(q1, tc2));
                 let sq2 = clamp(_mm_srai_epi32(add(add(p0q0, q1), add(add(q2, dbl(q2)), add(dbl(q3), four))), 3), sub(q2, tc2), add(q2, tc2));
                 // Weak.
-                let nine = _mm_set1_epi32(9);
-                let three = _mm_set1_epi32(3);
-                let delta = _mm_srai_epi32(add(sub(_mm_mullo_epi32(sub(q0, p0), nine), _mm_mullo_epi32(sub(q1, p1), three)), _mm_set1_epi32(8)), 4);
-                let w_m = _mm_cmpgt_epi32(tc10, _mm_abs_epi32(delta));
+                let d0 = sub(q0, p0);
+                let d1 = sub(q1, p1);
+                let d0x9 = add(_mm_slli_epi32(d0, 3), d0);
+                let d1x3 = add(_mm_slli_epi32(d1, 1), d1);
+                let delta = _mm_srai_epi32(add(sub(d0x9, d1x3), _mm_set1_epi32(8)), 4);
+                let w_m = _mm_cmpgt_epi32(tc10, abs32(delta));
                 let delta = clamp(delta, sub(zero, tcv), tcv);
                 let wp0 = clamp(add(p0, delta), zero, maxv);
                 let wq0 = clamp(sub(q0, delta), zero, maxv);
@@ -798,18 +1006,18 @@ macro_rules! kernels_u16 {
                 let wp1 = clamp(add(p1, dpv2), zero, maxv);
                 let wq1 = clamp(add(q1, dqv2), zero, maxv);
                 // Combine: strong wins over weak; weak needs its per-line test.
-                let np0 = _mm_blendv_epi8(_mm_blendv_epi8(p0, wp0, w_m), sp0, strong_m);
-                let nq0 = _mm_blendv_epi8(_mm_blendv_epi8(q0, wq0, w_m), sq0, strong_m);
-                let np1 = _mm_blendv_epi8(_mm_blendv_epi8(p1, wp1, _mm_and_si128(w_m, dep_m)), sp1, strong_m);
-                let nq1 = _mm_blendv_epi8(_mm_blendv_epi8(q1, wq1, _mm_and_si128(w_m, deq_m)), sq1, strong_m);
-                let np2 = _mm_blendv_epi8(p2, sp2, strong_m);
-                let nq2 = _mm_blendv_epi8(q2, sq2, strong_m);
-                v[1] = _mm_blendv_epi8(p2, np2, wp_m);
-                v[2] = _mm_blendv_epi8(p1, np1, wp_m);
-                v[3] = _mm_blendv_epi8(p0, np0, wp_m);
-                v[4] = _mm_blendv_epi8(q0, nq0, wq_m);
-                v[5] = _mm_blendv_epi8(q1, nq1, wq_m);
-                v[6] = _mm_blendv_epi8(q2, nq2, wq_m);
+                let np0 = sel(sel(p0, wp0, w_m), sp0, strong_m);
+                let nq0 = sel(sel(q0, wq0, w_m), sq0, strong_m);
+                let np1 = sel(sel(p1, wp1, _mm_and_si128(w_m, dep_m)), sp1, strong_m);
+                let nq1 = sel(sel(q1, wq1, _mm_and_si128(w_m, deq_m)), sq1, strong_m);
+                let np2 = sel(p2, sp2, strong_m);
+                let nq2 = sel(q2, sq2, strong_m);
+                v[1] = sel(p2, np2, wp_m);
+                v[2] = sel(p1, np1, wp_m);
+                v[3] = sel(p0, np0, wp_m);
+                v[4] = sel(q0, nq0, wq_m);
+                v[5] = sel(q1, nq1, wq_m);
+                v[6] = sel(q2, nq2, wq_m);
             }
         }
 
@@ -833,11 +1041,11 @@ macro_rules! kernels_u16 {
                     _mm_add_epi32(_mm_add_epi32(_mm_slli_epi32(_mm_sub_epi32(q0, p0), 2), _mm_sub_epi32(p1, q1)), _mm_set1_epi32(4)),
                     3,
                 );
-                let d = _mm_min_epi32(_mm_max_epi32(d, _mm_sub_epi32(zero, tcv)), tcv);
-                let np0 = _mm_min_epi32(_mm_max_epi32(_mm_add_epi32(p0, d), zero), maxv);
-                let nq0 = _mm_min_epi32(_mm_max_epi32(_mm_sub_epi32(q0, d), zero), maxv);
-                v[1] = _mm_blendv_epi8(p0, np0, wp);
-                v[2] = _mm_blendv_epi8(q0, nq0, wq);
+                let d = min32(max32(d, _mm_sub_epi32(zero, tcv)), tcv);
+                let np0 = min32(max32(_mm_add_epi32(p0, d), zero), maxv);
+                let nq0 = min32(max32(_mm_sub_epi32(q0, d), zero), maxv);
+                v[1] = sel(p0, np0, wp);
+                v[2] = sel(q0, nq0, wq);
             }
         }
 
@@ -895,8 +1103,8 @@ macro_rules! kernels_u16 {
                 let mut v1 = [_mm_setzero_si128(); 8];
                 for k in 0..8 {
                     let p = data.offset((k as isize - 4) * stride as isize);
-                    v0[k] = _mm_cvtepu16_epi32(_mm_loadl_epi64(p as *const __m128i));
-                    v1[k] = _mm_cvtepu16_epi32(_mm_loadl_epi64(p.add(4) as *const __m128i));
+                    v0[k] = zx16(_mm_loadl_epi64(p as *const __m128i));
+                    v1[k] = zx16(_mm_loadl_epi64(p.add(4) as *const __m128i));
                 }
                 luma_filter4(&mut v0, beta[0], tc[0], no_p[0], no_q[0], max);
                 luma_filter4(&mut v1, beta[1], tc[1], no_p[1], no_q[1], max);
@@ -929,7 +1137,7 @@ macro_rules! kernels_u16 {
                 let b1 = _mm_unpackhi_epi32(a0, a1); // q0 r0..3 | q1 r0..3
                 let b2 = _mm_unpacklo_epi32(a2, a3); // rows 4..7
                 let b3 = _mm_unpackhi_epi32(a2, a3);
-                let col = |v: __m128i, hi: bool| if hi { _mm_cvtepu16_epi32(_mm_srli_si128(v, 8)) } else { _mm_cvtepu16_epi32(v) };
+                let col = |v: __m128i, hi: bool| if hi { zx16h(v) } else { zx16(v) };
                 let mut v0 = [col(b0, false), col(b0, true), col(b1, false), col(b1, true)];
                 let mut v1 = [col(b2, false), col(b2, true), col(b3, false), col(b3, true)];
                 chroma_filter4(&mut v0, [tc[0], tc[1]], [no_p[0], no_p[1]], [no_q[0], no_q[1]], max);
@@ -960,7 +1168,7 @@ macro_rules! kernels_u16 {
         unsafe fn deblock_chroma_h_impl(data: *mut u16, stride: usize, tc: [i32; 4], no_p: [bool; 4], no_q: [bool; 4], max: i32) {
             unsafe {
                 let ld = |p: *const u16| -> (__m128i, __m128i) {
-                    (_mm_cvtepu16_epi32(_mm_loadl_epi64(p as *const __m128i)), _mm_cvtepu16_epi32(_mm_loadl_epi64(p.add(4) as *const __m128i)))
+                    (zx16(_mm_loadl_epi64(p as *const __m128i)), zx16(_mm_loadl_epi64(p.add(4) as *const __m128i)))
                 };
                 let (a0, a1) = ld(data.sub(2 * stride));
                 let (b0, b1) = ld(data.sub(stride));
@@ -982,30 +1190,61 @@ macro_rules! kernels_u16 {
 /// deblocking filters they share — exactly as `hevc_avx2_u8` shares
 /// `hevc_avx2`'s.
 macro_rules! kernels_u8 {
-    ($feat:literal) => {
-        /// Replace the scalar entries of `d` with these kernels.
-        pub fn install_u8(d: &mut HevcDsp<u8>) {
+    ($feat:literal, $lvl:tt) => {
+        /// Every 8-bit-sample kernel — the bottom rung, and the top one.
+        pub(crate) fn install_all_u8(d: &mut HevcDsp<u8>) {
             d.idct = [idct::<4>, idct::<8>, idct::<16>, idct::<32>];
-            d.add_residual = add_residual_u8;
-            d.qpel_copy = copy_u8;
-            d.qpel_h = qpel_h_u8;
-            d.qpel_v = qpel_v_u8;
             d.qpel_v2 = qpel_v2;
-            d.epel_copy = copy_u8;
-            d.epel_h = epel_h_u8;
-            d.epel_v = epel_v_u8;
             d.epel_v2 = epel_v2;
             d.uni = uni_u8;
             d.bi = bi_u8;
             d.weighted_uni = weighted_uni_u8;
             d.weighted_bi = weighted_bi_u8;
+            install_fir_u8(d);
+            install_fused_u8(d);
+            install_residual_u8(d);
+            install_sao_band_u8(d);
+            install_sao_edge_u8(d);
+            install_deblock_u8(d);
+        }
+
+        /// The two-pass byte interpolation filters (the byte FIR).
+        pub(crate) fn install_fir_u8(d: &mut HevcDsp<u8>) {
+            d.qpel_h = qpel_h_u8;
+            d.qpel_v = qpel_v_u8;
+            d.epel_h = epel_h_u8;
+            d.epel_v = epel_v_u8;
+        }
+
+        /// The fused interpolate-and-predict kernels, and the widening copy
+        /// they and the two-pass path share.
+        pub(crate) fn install_fused_u8(d: &mut HevcDsp<u8>) {
+            d.qpel_copy = copy_u8;
+            d.epel_copy = copy_u8;
             d.qpel_uni = qpel_uni_u8;
             d.epel_uni = epel_uni_u8;
             d.qpel_bi = qpel_bi_u8;
             d.epel_bi = epel_bi_u8;
             d.fused_mc = true;
+        }
+
+        /// Residual add (widening load).
+        pub(crate) fn install_residual_u8(d: &mut HevcDsp<u8>) {
+            d.add_residual = add_residual_u8;
+        }
+
+        /// SAO band offset (lane selects, signed byte max).
+        pub(crate) fn install_sao_band_u8(d: &mut HevcDsp<u8>) {
             d.sao_band = sao_band_u8;
+        }
+
+        /// SAO edge offset (the offset table lookup).
+        pub(crate) fn install_sao_edge_u8(d: &mut HevcDsp<u8>) {
             d.sao_edge = sao_edge_u8;
+        }
+
+        /// The four loop-filter entries.
+        pub(crate) fn install_deblock_u8(d: &mut HevcDsp<u8>) {
             d.deblock_luma_v = deblock_luma_v_u8;
             d.deblock_luma_h = deblock_luma_h_u8;
             d.deblock_chroma_v = deblock_chroma_v_u8;
@@ -1015,13 +1254,6 @@ macro_rules! kernels_u8 {
         // ------------------------------------------------------------------
         // Helpers
         // ------------------------------------------------------------------
-
-        /// A pair of taps `(a, b)` as one 16-bit lane `a | b << 8` (the low
-        /// byte multiplies the even sample of an interleaved pair).
-        #[inline(always)]
-        fn pair8(a: i8, b: i8) -> i16 {
-            (a as u8 as i16) | ((b as i16) << 8)
-        }
 
         /// Store the first `n` (≤ 8) bytes of `v`.
         #[target_feature(enable = $feat)]
@@ -1178,21 +1410,12 @@ macro_rules! kernels_u8 {
         #[inline]
         unsafe fn fir_h_u8<const TAPS: usize, const MODE: u8>(out: &Out, src: *const u8, src_stride: usize, w: usize, h: usize, taps: &[i8], shift: i32) {
             unsafe {
-                let mut c = [_mm_setzero_si128(); 4];
-                for k in 0..TAPS / 2 {
-                    c[k] = _mm_set1_epi16(pair8(taps[2 * k], taps[2 * k + 1]));
-                }
+                let t = taps_load(taps, TAPS);
                 let sh = _mm_cvtsi32_si128(shift);
                 if w <= 8 {
                     // Narrow blocks: 8-byte loads, one vector per row.
                     for y in 0..h {
-                        let s = src.add(y * src_stride);
-                        let mut acc = _mm_setzero_si128();
-                        for k in 0..TAPS / 2 {
-                            let a = _mm_loadl_epi64(s.add(2 * k) as *const __m128i);
-                            let b = _mm_loadl_epi64(s.add(2 * k + 1) as *const __m128i);
-                            acc = _mm_add_epi16(acc, _mm_maddubs_epi16(_mm_unpacklo_epi8(a, b), c[k]));
-                        }
+                        let acc = fir8(src.add(y * src_stride), 1, &t);
                         emit::<MODE>(out, y, 0, _mm_sra_epi16(acc, sh), w);
                     }
                     return;
@@ -1201,14 +1424,7 @@ macro_rules! kernels_u8 {
                     let s = src.add(y * src_stride);
                     let mut x = 0;
                     while x < w {
-                        let mut lo = _mm_setzero_si128();
-                        let mut hi = _mm_setzero_si128();
-                        for k in 0..TAPS / 2 {
-                            let a = _mm_loadu_si128(s.add(x + 2 * k) as *const __m128i);
-                            let b = _mm_loadu_si128(s.add(x + 2 * k + 1) as *const __m128i);
-                            lo = _mm_add_epi16(lo, _mm_maddubs_epi16(_mm_unpacklo_epi8(a, b), c[k]));
-                            hi = _mm_add_epi16(hi, _mm_maddubs_epi16(_mm_unpackhi_epi8(a, b), c[k]));
-                        }
+                        let (lo, hi) = fir16(s.add(x), 1, &t);
                         let n = w - x;
                         emit::<MODE>(out, y, x, _mm_sra_epi16(lo, sh), n.min(8));
                         if n > 8 {
@@ -1225,20 +1441,12 @@ macro_rules! kernels_u8 {
         #[inline]
         unsafe fn fir_v_u8<const TAPS: usize, const MODE: u8>(out: &Out, src: *const u8, src_stride: usize, w: usize, h: usize, taps: &[i8], shift: i32) {
             unsafe {
-                let mut c = [_mm_setzero_si128(); 4];
-                for k in 0..TAPS / 2 {
-                    c[k] = _mm_set1_epi16(pair8(taps[2 * k], taps[2 * k + 1]));
-                }
+                let t = taps_load(taps, TAPS);
                 let sh = _mm_cvtsi32_si128(shift);
                 let row = |r: usize| src.add(r * src_stride);
                 if w <= 8 {
                     for y in 0..h {
-                        let mut acc = _mm_setzero_si128();
-                        for k in 0..TAPS / 2 {
-                            let a = _mm_loadl_epi64(row(y + 2 * k) as *const __m128i);
-                            let b = _mm_loadl_epi64(row(y + 2 * k + 1) as *const __m128i);
-                            acc = _mm_add_epi16(acc, _mm_maddubs_epi16(_mm_unpacklo_epi8(a, b), c[k]));
-                        }
+                        let acc = fir8(row(y), src_stride, &t);
                         emit::<MODE>(out, y, 0, _mm_sra_epi16(acc, sh), w);
                     }
                     return;
@@ -1246,14 +1454,7 @@ macro_rules! kernels_u8 {
                 for y in 0..h {
                     let mut x = 0;
                     while x < w {
-                        let mut lo = _mm_setzero_si128();
-                        let mut hi = _mm_setzero_si128();
-                        for k in 0..TAPS / 2 {
-                            let a = _mm_loadu_si128(row(y + 2 * k).add(x) as *const __m128i);
-                            let b = _mm_loadu_si128(row(y + 2 * k + 1).add(x) as *const __m128i);
-                            lo = _mm_add_epi16(lo, _mm_maddubs_epi16(_mm_unpacklo_epi8(a, b), c[k]));
-                            hi = _mm_add_epi16(hi, _mm_maddubs_epi16(_mm_unpackhi_epi8(a, b), c[k]));
-                        }
+                        let (lo, hi) = fir16(row(y).add(x), src_stride, &t);
                         let n = w - x;
                         emit::<MODE>(out, y, x, _mm_sra_epi16(lo, sh), n.min(8));
                         if n > 8 {
@@ -1312,7 +1513,7 @@ macro_rules! kernels_u8 {
                     let d = dst.as_mut_ptr().add(y * w);
                     let mut x = 0;
                     while x < w {
-                        let v = _mm_cvtepu8_epi16(_mm_loadl_epi64(s.add(x) as *const __m128i));
+                        let v = zx8(_mm_loadl_epi64(s.add(x) as *const __m128i));
                         store_n(d.add(x), _mm_sll_epi16(v, sh), (w - x).min(8));
                         x += 8;
                     }
@@ -1541,6 +1742,9 @@ macro_rules! kernels_u8 {
         #[allow(clippy::too_many_arguments)]
         fn weighted_uni_u8(dst: &mut [u8], stride: usize, src: &[i16], w: usize, h: usize, log2_wd: i32, wt: i32, o: i32, max: i32) {
             debug_assert_eq!(max, 255);
+            if i16::try_from(wt).is_err() {
+                return (HevcDsp::<u8>::SCALAR.weighted_uni)(dst, stride, src, w, h, log2_wd, wt, o, max);
+            }
             unsafe { weighted_uni_u8_impl(dst, stride, src, w, h, log2_wd, wt, o) }
         }
 
@@ -1550,13 +1754,12 @@ macro_rules! kernels_u8 {
             unsafe {
                 let round = _mm_set1_epi32(if log2_wd >= 1 { 1 << (log2_wd - 1) } else { 0 });
                 let sh = _mm_cvtsi32_si128(log2_wd.max(0));
-                let wv = _mm_set1_epi32(wt);
+                let wv = _mm_set1_epi32(pair16(wt as i16, 0));
                 let ov = _mm_set1_epi32(o);
+                let zero = _mm_setzero_si128();
                 let weigh = |s: __m128i| -> __m128i {
-                    let quad = |v: __m128i| _mm_add_epi32(_mm_sra_epi32(_mm_add_epi32(_mm_mullo_epi32(v, wv), round), sh), ov);
-                    let lo = quad(_mm_cvtepi16_epi32(s));
-                    let hi = quad(_mm_cvtepi16_epi32(_mm_srli_si128(s, 8)));
-                    pack8(_mm_packs_epi32(lo, hi))
+                    let quad = |v: __m128i| _mm_add_epi32(_mm_sra_epi32(_mm_add_epi32(_mm_madd_epi16(v, wv), round), sh), ov);
+                    pack8(_mm_packs_epi32(quad(_mm_unpacklo_epi16(s, zero)), quad(_mm_unpackhi_epi16(s, zero))))
                 };
                 if narrow(w) {
                     let total = w * h;
@@ -1584,6 +1787,9 @@ macro_rules! kernels_u8 {
         #[allow(clippy::too_many_arguments)]
         fn weighted_bi_u8(dst: &mut [u8], stride: usize, a: &[i16], b: &[i16], w: usize, h: usize, log2_wd: i32, w0: i32, w1: i32, o0: i32, o1: i32, max: i32) {
             debug_assert_eq!(max, 255);
+            if i16::try_from(w0).is_err() || i16::try_from(w1).is_err() {
+                return (HevcDsp::<u8>::SCALAR.weighted_bi)(dst, stride, a, b, w, h, log2_wd, w0, w1, o0, o1, max);
+            }
             unsafe { weighted_bi_u8_impl(dst, stride, a, b, w, h, log2_wd, w0, w1, o0, o1) }
         }
 
@@ -1593,15 +1799,10 @@ macro_rules! kernels_u8 {
             unsafe {
                 let round = _mm_set1_epi32((o0 + o1 + 1) << log2_wd);
                 let sh = _mm_cvtsi32_si128(log2_wd + 1);
-                let w0v = _mm_set1_epi32(w0);
-                let w1v = _mm_set1_epi32(w1);
+                let wv = _mm_set1_epi32(pair16(w0 as i16, w1 as i16));
                 let weigh = |va: __m128i, vb: __m128i| -> __m128i {
-                    let quad = |pa: __m128i, pb: __m128i| {
-                        _mm_sra_epi32(_mm_add_epi32(_mm_add_epi32(_mm_mullo_epi32(pa, w0v), _mm_mullo_epi32(pb, w1v)), round), sh)
-                    };
-                    let lo = quad(_mm_cvtepi16_epi32(va), _mm_cvtepi16_epi32(vb));
-                    let hi = quad(_mm_cvtepi16_epi32(_mm_srli_si128(va, 8)), _mm_cvtepi16_epi32(_mm_srli_si128(vb, 8)));
-                    pack8(_mm_packs_epi32(lo, hi))
+                    let quad = |v: __m128i| _mm_sra_epi32(_mm_add_epi32(_mm_madd_epi16(v, wv), round), sh);
+                    pack8(_mm_packs_epi32(quad(_mm_unpacklo_epi16(va, vb)), quad(_mm_unpackhi_epi16(va, vb))))
                 };
                 if narrow(w) {
                     let total = w * h;
@@ -1645,7 +1846,7 @@ macro_rules! kernels_u8 {
                     let d = dst.as_mut_ptr();
                     for y in (0..4).step_by(2) {
                         let rd = |k: usize| std::ptr::read_unaligned(d.add(k * stride) as *const u32) as i32;
-                        let p = _mm_cvtepu8_epi16(_mm_setr_epi32(rd(y), rd(y + 1), 0, 0));
+                        let p = zx8(_mm_setr_epi32(rd(y), rd(y + 1), 0, 0));
                         let r = _mm_loadu_si128(res.as_ptr().add(y * 4) as *const __m128i);
                         let v = _mm_packus_epi16(_mm_add_epi16(p, r), _mm_setzero_si128());
                         let mut t = [0u32; 4];
@@ -1659,7 +1860,7 @@ macro_rules! kernels_u8 {
                     let mut x = 0;
                     while x < n {
                         let d = dst.as_mut_ptr().add(y * stride + x);
-                        let p = _mm_cvtepu8_epi16(_mm_loadl_epi64(d as *const __m128i));
+                        let p = zx8(_mm_loadl_epi64(d as *const __m128i));
                         let r = _mm_loadu_si128(res.as_ptr().add(y * n + x) as *const __m128i);
                         _mm_storel_epi64(d as *mut __m128i, _mm_packus_epi16(_mm_add_epi16(p, r), _mm_setzero_si128()));
                         x += 8;
@@ -1678,8 +1879,8 @@ macro_rules! kernels_u8 {
         unsafe fn add_offset_u8(v: __m128i, off: __m128i) -> __m128i {
             unsafe {
                 let zero = _mm_setzero_si128();
-                let pos = _mm_max_epi8(off, zero);
-                let neg = _mm_max_epi8(_mm_sub_epi8(zero, off), zero);
+                let pos = maxb0(off);
+                let neg = maxb0(_mm_sub_epi8(zero, off));
                 _mm_subs_epu8(_mm_adds_epu8(v, pos), neg)
             }
         }
@@ -1719,7 +1920,7 @@ macro_rules! kernels_u8 {
                         let band = _mm_and_si128(v, mask);
                         let mut off = _mm_setzero_si128();
                         for i in 0..k {
-                            off = _mm_blendv_epi8(off, ov[i], _mm_cmpeq_epi8(band, bv[i]));
+                            off = sel(off, ov[i], _mm_cmpeq_epi8(band, bv[i]));
                         }
                         store_bytes16(dst.as_mut_ptr().add(y * dst_stride + x), add_offset_u8(v, off), n);
                         x += 16;
@@ -1742,9 +1943,8 @@ macro_rules! kernels_u8 {
         unsafe fn sao_edge_u8_impl(dst: &mut [u8], src: &[u8], origin: usize, stride: usize, w: usize, h: usize, na: isize, nb: isize, off: &[i16; 5]) {
             unsafe {
                 // edgeIdx = 2 + sign(v-a) + sign(v-b) in 0..=4 indexes the
-                // offsets through a byte shuffle.
-                let o = |i: usize| off[i] as i8;
-                let tab = _mm_setr_epi8(o(0), o(1), o(2), o(3), o(4), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                // offsets: one `pshufb` where there is one, else five selects.
+                let tab = edge_tab(off);
                 let two = _mm_set1_epi8(2);
                 let lo_reach = na.min(nb).min(0);
                 let hi_reach = na.max(nb).max(0);
@@ -1778,7 +1978,7 @@ macro_rules! kernels_u8 {
                         let lt_a = _mm_xor_si128(ge_a, ones);
                         let lt_b = _mm_xor_si128(ge_b, ones);
                         let e = _mm_add_epi8(_mm_sub_epi8(_mm_sub_epi8(two, gt_a), gt_b), _mm_add_epi8(lt_a, lt_b));
-                        let o = _mm_shuffle_epi8(tab, e);
+                        let o = edge_lut(&tab, e);
                         store_bytes16(dst.as_mut_ptr().add(i), add_offset_u8(v, o), n);
                         x += 16;
                     }
@@ -1796,7 +1996,7 @@ macro_rules! kernels_u8 {
         unsafe fn ld8_u8(p: *const u8) -> (__m128i, __m128i) {
             unsafe {
                 let v = _mm_loadl_epi64(p as *const __m128i);
-                (_mm_cvtepu8_epi32(v), _mm_cvtepu8_epi32(_mm_srli_si128(v, 4)))
+                (zx8d(v), zx8dh(v))
             }
         }
 
@@ -1825,7 +2025,7 @@ macro_rules! kernels_u8 {
             unsafe {
                 let mut r = [_mm_setzero_si128(); 8];
                 for i in 0..8 {
-                    r[i] = _mm_cvtepu8_epi16(_mm_loadl_epi64(data.add(i * stride).sub(4) as *const __m128i));
+                    r[i] = zx8(_mm_loadl_epi64(data.add(i * stride).sub(4) as *const __m128i));
                 }
                 transpose8_u16(&mut r);
                 let mut v0 = [_mm_setzero_si128(); 8];
@@ -1889,7 +2089,7 @@ macro_rules! kernels_u8 {
                 let mut r = [_mm_setzero_si128(); 8];
                 for i in 0..8 {
                     let q = std::ptr::read_unaligned(data.add(i * stride).sub(2) as *const u32);
-                    r[i] = _mm_cvtepu8_epi16(_mm_cvtsi32_si128(q as i32));
+                    r[i] = zx8(_mm_cvtsi32_si128(q as i32));
                 }
                 let a0 = _mm_unpacklo_epi16(r[0], r[1]);
                 let a1 = _mm_unpacklo_epi16(r[2], r[3]);
@@ -1899,7 +2099,7 @@ macro_rules! kernels_u8 {
                 let b1 = _mm_unpackhi_epi32(a0, a1); // q0 r0..3 | q1 r0..3
                 let b2 = _mm_unpacklo_epi32(a2, a3); // rows 4..7
                 let b3 = _mm_unpackhi_epi32(a2, a3);
-                let col = |v: __m128i, hi: bool| if hi { _mm_cvtepu16_epi32(_mm_srli_si128(v, 8)) } else { _mm_cvtepu16_epi32(v) };
+                let col = |v: __m128i, hi: bool| if hi { zx16h(v) } else { zx16(v) };
                 let mut v0 = [col(b0, false), col(b0, true), col(b1, false), col(b1, true)];
                 let mut v1 = [col(b2, false), col(b2, true), col(b3, false), col(b3, true)];
                 chroma_filter4(&mut v0, [tc[0], tc[1]], [no_p[0], no_p[1]], [no_q[0], no_q[1]], max);
@@ -1942,36 +2142,87 @@ macro_rules! kernels_u8 {
     };
 }
 
-/// The kernels compiled for SSE4.1 (legacy two-operand encoding).
-pub mod sse41 {
-    kernels_u16!("sse4.1");
-    kernels_u8!("sse4.1");
+// Each rung is a full compilation of the kernels, but the ladder calls only
+// the install groups that rung improves, so the kernels it did not change
+// are unreachable and are dropped. Nothing here is public: were these
+// modules part of the crate's API, every rung would be retained in full.
+// `dead_code` is allowed because "unused" is the intended state for most
+// of three of the four rungs, not because anything is unreachable by
+// mistake.
+
+/// SSE2: baseline on x86-64, so this rung is the one that makes the scalar
+/// kernels unreachable on this architecture.
+pub(crate) mod sse2 {
+    #![allow(dead_code)]
+    kernels_u16!("sse2", sse2);
+    kernels_u8!("sse2", sse2);
 }
 
-/// The kernels compiled for AVX: identical algorithms, VEX-encoded.
-pub mod avx {
-    kernels_u16!("avx");
-    kernels_u8!("avx");
+/// SSSE3: `pmaddubsw` for the byte interpolation filters, `pshufb` for the
+/// SAO edge table, `pabsd` for the loop filters' lane-wise measures.
+pub(crate) mod ssse3 {
+    #![allow(dead_code)]
+    kernels_u16!("ssse3", ssse3);
+    kernels_u8!("ssse3", ssse3);
 }
 
-/// Replace the scalar entries of `d` with the SSE4.1 kernels (16-bit samples).
-pub fn install_sse41_u16(d: &mut HevcDsp<u16>) {
-    sse41::install_u16(d);
+/// SSE4.1: `pblendvb` for lane selects, `pminsd` / `pmaxsd` for the loop
+/// filters' clamps, `pmovzx` for the widening loads.
+pub(crate) mod sse41 {
+    #![allow(dead_code)]
+    kernels_u16!("sse4.1", sse41);
+    kernels_u8!("sse4.1", sse41);
 }
 
-/// Replace the scalar entries of `d` with the AVX kernels (16-bit samples).
-pub fn install_avx_u16(d: &mut HevcDsp<u16>) {
-    avx::install_u16(d);
+/// AVX: the SSE4.1 algorithms, VEX-encoded.
+pub(crate) mod avx {
+    #![allow(dead_code)]
+    kernels_u16!("avx", sse41);
+    kernels_u8!("avx", sse41);
 }
 
-/// Replace the scalar entries of `d` with the SSE4.1 kernels (8-bit samples).
-pub fn install_sse41_u8(d: &mut HevcDsp<u8>) {
-    sse41::install_u8(d);
+/// Install the best 16-bit-sample kernels `cpu` can run, one rung at a time.
+pub fn install_u16(d: &mut HevcDsp<u16>, cpu: Cpu) {
+    if cpu.sse2 {
+        sse2::install_all_u16(d);
+    }
+    if cpu.ssse3 {
+        ssse3::install_deblock_u16(d);
+    }
+    if cpu.sse41 {
+        sse41::install_deblock_u16(d);
+        sse41::install_sao_u16(d);
+    }
+    if cpu.avx {
+        avx::install_all_u16(d);
+    }
 }
 
-/// Replace the scalar entries of `d` with the AVX kernels (8-bit samples).
-pub fn install_avx_u8(d: &mut HevcDsp<u8>) {
-    avx::install_u8(d);
+/// Install the best 8-bit-sample kernels `cpu` can run, one rung at a time.
+///
+/// Note what SSE4.1 does *not* re-install: the byte FIR is `pmaddubsw` from
+/// SSSE3 up and SSE4.1 adds nothing it can use, so an SSE4.1 CPU keeps the
+/// SSSE3 interpolation and takes SSE4.1 only where it is better.
+pub fn install_u8(d: &mut HevcDsp<u8>, cpu: Cpu) {
+    if cpu.sse2 {
+        sse2::install_all_u8(d);
+    }
+    if cpu.ssse3 {
+        ssse3::install_fir_u8(d);
+        ssse3::install_fused_u8(d);
+        ssse3::install_sao_edge_u8(d);
+        ssse3::install_deblock_u8(d);
+    }
+    if cpu.sse41 {
+        sse41::install_fused_u8(d);
+        sse41::install_residual_u8(d);
+        sse41::install_sao_band_u8(d);
+        sse41::install_sao_edge_u8(d);
+        sse41::install_deblock_u8(d);
+    }
+    if cpu.avx {
+        avx::install_all_u8(d);
+    }
 }
 
 #[cfg(test)]
@@ -1984,35 +2235,43 @@ mod tests {
         (*seed >> 33) as u32
     }
 
-    /// Both installs, skipped when the CPU cannot run them.
+    /// Every rung the host can run, built the way `install_*` builds it in
+    /// the field: cumulatively, so each table is exactly what a CPU of that
+    /// generation would get.
+    fn rungs() -> Vec<(&'static str, Cpu)> {
+        let base = Cpu::SCALAR;
+        [
+            ("sse2", Cpu { sse2: true, ..base }, std::is_x86_feature_detected!("sse2")),
+            ("ssse3", Cpu { sse2: true, ssse3: true, ..base }, std::is_x86_feature_detected!("ssse3")),
+            ("sse4.1", Cpu { sse2: true, ssse3: true, sse41: true, ..base }, std::is_x86_feature_detected!("sse4.1")),
+            ("avx", Cpu { sse2: true, ssse3: true, sse41: true, avx: true, ..base }, std::is_x86_feature_detected!("avx")),
+        ]
+        .into_iter()
+        .filter(|&(_, _, have)| have)
+        .map(|(n, c, _)| (n, c))
+        .collect()
+    }
+
     fn tables_u16() -> Vec<(&'static str, HevcDsp<u16>)> {
-        let mut v = Vec::new();
-        if std::is_x86_feature_detected!("sse4.1") {
-            let mut d = HevcDsp::<u16>::SCALAR;
-            install_sse41_u16(&mut d);
-            v.push(("sse4.1", d));
-        }
-        if std::is_x86_feature_detected!("avx") {
-            let mut d = HevcDsp::<u16>::SCALAR;
-            install_avx_u16(&mut d);
-            v.push(("avx", d));
-        }
-        v
+        rungs()
+            .into_iter()
+            .map(|(name, cpu)| {
+                let mut d = HevcDsp::<u16>::SCALAR;
+                install_u16(&mut d, cpu);
+                (name, d)
+            })
+            .collect()
     }
 
     fn tables_u8() -> Vec<(&'static str, HevcDsp<u8>)> {
-        let mut v = Vec::new();
-        if std::is_x86_feature_detected!("sse4.1") {
-            let mut d = HevcDsp::<u8>::SCALAR;
-            install_sse41_u8(&mut d);
-            v.push(("sse4.1", d));
-        }
-        if std::is_x86_feature_detected!("avx") {
-            let mut d = HevcDsp::<u8>::SCALAR;
-            install_avx_u8(&mut d);
-            v.push(("avx", d));
-        }
-        v
+        rungs()
+            .into_iter()
+            .map(|(name, cpu)| {
+                let mut d = HevcDsp::<u8>::SCALAR;
+                install_u8(&mut d, cpu);
+                (name, d)
+            })
+            .collect()
     }
 
     const SIZES: [(usize, usize); 9] = [(2, 4), (4, 4), (4, 8), (8, 4), (8, 8), (12, 16), (16, 16), (32, 8), (64, 16)];

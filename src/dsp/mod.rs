@@ -2,7 +2,9 @@
 //! SAO edges — the loops a decoder spends its time in.
 //!
 //! Every kernel exists as a scalar reference implementation, and the hot ones
-//! also as SIMD (x86-64 AVX2, AArch64 NEON). Which runs is decided once per process
+//! also as SIMD: on x86-64 a ladder from SSE2 up through SSSE3, SSE4.1, AVX
+//! and AVX2, and on AArch64 NEON with the dot product extension above it.
+//! Which runs is decided once per process
 //! by [`Cpu::detect`] and threaded through as function pointers, the way
 //! libavcodec's `*dsp_init` tables work, so the decoders never branch on the
 //! CPU themselves and the scalar path stays the executable specification the
@@ -15,8 +17,10 @@ pub mod hevc;
 // target-feature intrinsics became safe to call inside `#[target_feature]`
 // functions.
 #[cfg(target_arch = "x86_64")]
+pub(crate) mod x86_compat;
+#[cfg(target_arch = "x86_64")]
 #[allow(unused_unsafe)]
-pub mod h264_avx;
+pub mod h264_x86_128;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_unsafe)]
 pub mod h264_avx2;
@@ -25,7 +29,7 @@ pub mod h264_avx2;
 pub mod h264_neon;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_unsafe)]
-pub mod hevc_avx;
+pub mod hevc_x86_128;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_unsafe)]
 pub mod hevc_avx2;
@@ -49,8 +53,13 @@ pub struct Cpu {
     pub avx2: bool,
     /// x86-64 with AVX: the 128-bit kernels, VEX-encoded.
     pub avx: bool,
-    /// x86-64 with SSE4.1 (a superset of the SSSE3 kernels need).
+    /// x86-64 with SSE4.1 (`pblendvb`, `pmovzx`, `pminsd` / `pmaxsd`, `ptest`).
     pub sse41: bool,
+    /// x86-64 with SSSE3 (`pmaddubsw`, `pshufb`, `pabsw` / `pabsd`).
+    pub ssse3: bool,
+    /// x86-64 with SSE2 — baseline on every x86-64 CPU, so on this
+    /// architecture the scalar kernels are a reference, never a fallback.
+    pub sse2: bool,
     /// AArch64 NEON (baseline on every AArch64 CPU).
     pub neon: bool,
     /// AArch64 with the ARMv8.2-A dot product extension (`sdot` / `udot`):
@@ -72,7 +81,10 @@ impl Cpu {
             let avx2 = std::is_x86_feature_detected!("avx2");
             let avx = std::is_x86_feature_detected!("avx");
             let sse41 = std::is_x86_feature_detected!("sse4.1");
-            return Self { avx2, avx, sse41, ..Self::SCALAR };
+            let ssse3 = std::is_x86_feature_detected!("ssse3");
+            // Guaranteed by the target, but ask anyway rather than assert it.
+            let sse2 = std::is_x86_feature_detected!("sse2");
+            return Self { avx2, avx, sse41, ssse3, sse2, ..Self::SCALAR };
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -86,23 +98,45 @@ impl Cpu {
 
     /// Scalar only — the reference paths. What the SIMD kernels are checked
     /// against, and what a `H26X_NO_SIMD=1` environment asks for.
-    pub const SCALAR: Self =
-        Self { avx2: false, avx: false, sse41: false, neon: false, dotprod: false, i8mm: false };
+    pub const SCALAR: Self = Self {
+        avx2: false,
+        avx: false,
+        sse41: false,
+        ssse3: false,
+        sse2: false,
+        neon: false,
+        dotprod: false,
+        i8mm: false,
+    };
 
     /// [`Self::detect`], with what it found capped by the environment.
     ///
     /// `H26X_NO_SIMD=1` asks for the scalar reference paths. `H26X_MAX_SIMD`
-    /// caps the x86 install level — `avx2` (no cap), `avx`, `sse41` or `none`
-    /// — so the 128-bit and scalar paths can be exercised for bit-exactness
-    /// on a machine whose CPU would otherwise always take the widest one.
-    /// An unrecognised value is ignored rather than silently downgrading.
+    /// caps the x86 install level — `avx2` (no cap), `avx`, `sse41`, `ssse3`,
+    /// `sse2` or `none` — so every rung of the ladder can be exercised for
+    /// bit-exactness on a machine whose CPU would otherwise always take the
+    /// top one. An unrecognised value is ignored rather than silently
+    /// downgrading.
     pub fn detect_honouring_env() -> Self {
         if std::env::var_os("H26X_NO_SIMD").is_some_and(|v| v == "1" || v == "true") {
             return Self::SCALAR;
         }
         let mut cpu = Self::detect();
+        // Each arm falls through the ones above it: capping at `ssse3` also
+        // clears sse41, avx and avx2.
         match std::env::var("H26X_MAX_SIMD").as_deref() {
             Ok("none") | Ok("scalar") => cpu = Self::SCALAR,
+            Ok("sse2") => {
+                cpu.avx2 = false;
+                cpu.avx = false;
+                cpu.sse41 = false;
+                cpu.ssse3 = false;
+            }
+            Ok("ssse3") => {
+                cpu.avx2 = false;
+                cpu.avx = false;
+                cpu.sse41 = false;
+            }
             Ok("sse41") | Ok("sse4.1") => {
                 cpu.avx2 = false;
                 cpu.avx = false;

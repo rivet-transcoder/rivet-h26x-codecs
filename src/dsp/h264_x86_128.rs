@@ -1,4 +1,4 @@
-//! 128-bit SIMD versions of the H.264 kernels (x86-64), for CPUs without AVX2.
+//! 128-bit SIMD versions of the H.264 kernels (x86-64), from SSE2 up.
 //!
 //! Eight 16-bit lanes per vector: half the width of [`super::h264_avx2`], and
 //! the same arithmetic. A block row of up to sixteen samples is one or two
@@ -8,33 +8,184 @@
 //! `ceil(w / 8)` chunks, so the gap on small blocks is smaller than the
 //! vector width suggests.
 //!
-//! The kernels are written once and instantiated twice by the `kernels!`
-//! macro: once for SSE4.1 and once for AVX. AVX adds no 256-bit *integer*
-//! op — that is AVX2 — so the second instantiation runs exactly the same
-//! algorithm; what it buys is VEX encoding, whose three-operand form lets the
-//! register allocator drop the `movdqa` copies that the destructive
-//! two-operand SSE encoding forces before every non-commutative op. Each
-//! function carries `#[target_feature]` in its own right rather than relying
-//! on a body being inlined into a wrapper that has it, so neither
-//! instantiation can silently decay to the other's encoding.
+//! The kernels are written once and compiled four times, one per rung of the
+//! x86 ladder, by the `kernels!` macro. SSE2 is baseline on x86-64, so that
+//! rung is what makes the scalar reference kernels unreachable on this
+//! architecture; the rungs above it swap in better instructions for a few
+//! recurring operations (see the `x86_compat` module) and for the two shapes
+//! that are specific to this codec:
+//!
+//! - the six-tap luma filter, which SSSE3 does as three `pmaddubsw` on
+//!   interleaved neighbour pairs instead of six widening loads and a
+//!   shift-and-add chain — the taps 1, −5, 20 are all `i8` and every partial
+//!   sum fits `i16` for 8-bit input, so it is exact;
+//! - chroma bilinear, likewise two `pmaddubsw` instead of four `pmullw` and
+//!   three adds (the four weights sum to 64, so 255 · 64 = 16320 bounds the
+//!   result).
+//!
+//! [`install`] applies the rungs in order and each one replaces only the
+//! kernels it actually improves, so a CPU ends up with the best available
+//! version of every kernel and no rung pays for code it did not change.
+//! AVX adds no 256-bit *integer* operation — that is AVX2 — so its rung runs
+//! the SSE4.1 algorithms recompiled for VEX, whose three-operand form lets
+//! the register allocator drop the `movdqa` copies the destructive
+//! two-operand encoding forces before every non-commutative op.
 
 #![cfg(target_arch = "x86_64")]
 
+use super::Cpu;
 use super::h264::H264Dsp;
 
-/// The whole kernel set, parameterised by the x86 feature it is compiled for.
-///
-/// Everything here is 128-bit and needs nothing above SSE4.1 (`pblendvb`,
-/// `pmovzxbw`, `pmovzxbd`, `pmulld`, `ptest`); `"avx"` compiles the identical
-/// code VEX-encoded.
+/// The two level-dependent shapes that are particular to H.264: the six-tap
+/// luma filter and chroma bilinear. Everything else level-dependent is in
+/// [`super::x86_compat`].
+macro_rules! codec_compat {
+    ($feat:literal, sse2) => {
+        /// Six-tap `a - 5b + 20c + 20d - 5e + f` over the eight u8 samples at
+        /// `p`, `p + step`, … `p + 5 * step`, as eight i16.
+        ///
+        /// `t = c + d <= 510` so `20t <= 10200`, `5u <= 2550` and the running
+        /// value stays inside i16 throughout.
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn tap6_u8(p: *const u8, step: usize) -> __m128i {
+            unsafe {
+                let ld = |k: usize| zx8(_mm_loadl_epi64(p.add(k * step) as *const __m128i));
+                let (a, b, c, d, e, f) = (ld(0), ld(1), ld(2), ld(3), ld(4), ld(5));
+                let t = _mm_add_epi16(c, d);
+                let u = _mm_add_epi16(b, e);
+                let v = _mm_add_epi16(a, f);
+                // v + 20t - 5u = v + (t << 4) + (t << 2) - (u << 2) - u
+                let t20 = _mm_add_epi16(_mm_slli_epi16(t, 4), _mm_slli_epi16(t, 2));
+                let u5 = _mm_add_epi16(_mm_slli_epi16(u, 2), u);
+                _mm_sub_epi16(_mm_add_epi16(v, t20), u5)
+            }
+        }
+
+        /// The four bilinear weights, in the form this level multiplies by.
+        struct ChromaW([__m128i; 4]);
+
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn chroma_w(xf: i32, yf: i32) -> ChromaW {
+            unsafe {
+                ChromaW([
+                    _mm_set1_epi16(((8 - xf) * (8 - yf)) as i16),
+                    _mm_set1_epi16((xf * (8 - yf)) as i16),
+                    _mm_set1_epi16(((8 - xf) * yf) as i16),
+                    _mm_set1_epi16((xf * yf) as i16),
+                ])
+            }
+        }
+
+        /// `A·w0 + B·w1 + C·w2 + D·w3` over eight samples, where A/B are the
+        /// row at `r0` and the one sample to its right and C/D the same at
+        /// `r1`. The weights sum to 64, so the result is at most 16320.
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn chroma_row(w: &ChromaW, r0: *const u8, r1: *const u8) -> __m128i {
+            unsafe {
+                let ld = |p: *const u8| zx8(_mm_loadl_epi64(p as *const __m128i));
+                _mm_add_epi16(
+                    _mm_add_epi16(_mm_mullo_epi16(ld(r0), w.0[0]), _mm_mullo_epi16(ld(r0.add(1)), w.0[1])),
+                    _mm_add_epi16(_mm_mullo_epi16(ld(r1), w.0[2]), _mm_mullo_epi16(ld(r1.add(1)), w.0[3])),
+                )
+            }
+        }
+    };
+
+    // SSSE3 and everything above it: `pmaddubsw` on interleaved neighbour
+    // pairs, which is one instruction per tap pair and needs no widening.
+    ($feat:literal, $lvl:tt) => {
+        /// A pair of taps `(a, b)` as one 16-bit lane `a | b << 8` (the low
+        /// byte multiplies the even sample of an interleaved pair).
+        #[inline(always)]
+        fn pair8(a: i8, b: i8) -> i16 {
+            (a as u8 as i16) | ((b as i16) << 8)
+        }
+
+        /// Six-tap `a - 5b + 20c + 20d - 5e + f` over the eight u8 samples at
+        /// `p`, `p + step`, … `p + 5 * step`, as eight i16.
+        ///
+        /// Each `pmaddubsw` saturates its own pair sum, but for 8-bit input
+        /// none can reach it: `a - 5b` is in −1275..255, `20c + 20d` in
+        /// 0..10200, `-5e + f` in −1275..255, and the total in −2550..10710.
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn tap6_u8(p: *const u8, step: usize) -> __m128i {
+            unsafe {
+                let ld = |k: usize| _mm_loadl_epi64(p.add(k * step) as *const __m128i);
+                let pr = |k: usize| _mm_unpacklo_epi8(ld(k), ld(k + 1));
+                let m = |v, t| _mm_maddubs_epi16(v, _mm_set1_epi16(t));
+                _mm_add_epi16(
+                    _mm_add_epi16(m(pr(0), pair8(1, -5)), m(pr(2), pair8(20, 20))),
+                    m(pr(4), pair8(-5, 1)),
+                )
+            }
+        }
+
+        /// The four bilinear weights, as the two tap pairs `pmaddubsw` wants.
+        struct ChromaW([__m128i; 2]);
+
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn chroma_w(xf: i32, yf: i32) -> ChromaW {
+            unsafe {
+                // Each weight is at most 64, so all four fit i8.
+                ChromaW([
+                    _mm_set1_epi16(pair8(((8 - xf) * (8 - yf)) as i8, (xf * (8 - yf)) as i8)),
+                    _mm_set1_epi16(pair8(((8 - xf) * yf) as i8, (xf * yf) as i8)),
+                ])
+            }
+        }
+
+        /// `A·w0 + B·w1 + C·w2 + D·w3` over eight samples. The weights sum to
+        /// 64, so neither `pmaddubsw` nor their sum can leave i16.
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn chroma_row(w: &ChromaW, r0: *const u8, r1: *const u8) -> __m128i {
+            unsafe {
+                let pr = |p: *const u8| {
+                    _mm_unpacklo_epi8(_mm_loadl_epi64(p as *const __m128i), _mm_loadl_epi64(p.add(1) as *const __m128i))
+                };
+                _mm_add_epi16(_mm_maddubs_epi16(pr(r0), w.0[0]), _mm_maddubs_epi16(pr(r1), w.0[1]))
+            }
+        }
+    };
+}
+
+/// The whole kernel set, parameterised by the feature it is compiled for and
+/// the primitive set that feature makes available.
 macro_rules! kernels {
-    ($feat:literal) => {
+    ($feat:literal, $lvl:tt) => {
         use std::arch::x86_64::*;
 
         use crate::dsp::h264::{H264Dsp, NO_DC, PRED_STRIDE};
 
-        /// Replace the scalar entries of `d` with these kernels.
-        pub fn install(d: &mut H264Dsp<u8>) {
+        crate::dsp::x86_compat::compat_core!($feat, $lvl);
+        codec_compat!($feat, $lvl);
+
+        // ------------------------------------------------------------------
+        // Install groups
+        // ------------------------------------------------------------------
+        //
+        // Split so a rung can replace only what it changes: `interp` is the
+        // kernels the six-tap and bilinear shapes reach, `deblock` the loop
+        // filters, `rest` the transforms, residuals and weighting. A rung
+        // that changes none of a group's primitives simply does not call it,
+        // and the level below stays installed.
+
+        /// Every kernel — the bottom rung, and the top one.
+        pub(crate) fn install_all(d: &mut H264Dsp<u8>) {
+            install_interp(d);
+            install_deblock(d);
+            install_rest(d);
+            d.copy = copy;
+            d.avg = avg;
+        }
+
+        /// Luma quarter-sample interpolation and chroma bilinear.
+        pub(crate) fn install_interp(d: &mut H264Dsp<u8>) {
             d.qpel = [
                 qpel::<0, 0>,
                 qpel::<1, 0>,
@@ -54,10 +205,10 @@ macro_rules! kernels {
                 qpel::<3, 3>,
             ];
             d.chroma = chroma;
-            d.copy = copy;
-            d.avg = avg;
-            d.weighted_uni = weighted_uni;
-            d.weighted_bi = weighted_bi;
+        }
+
+        /// The eight loop-filter entries.
+        pub(crate) fn install_deblock(d: &mut H264Dsp<u8>) {
             d.deblock_luma_v = deblock_luma_v;
             d.deblock_luma_h = deblock_luma_h;
             d.deblock_luma_v_intra = deblock_luma_v_intra;
@@ -66,6 +217,12 @@ macro_rules! kernels {
             d.deblock_chroma_h = deblock_chroma_h;
             d.deblock_chroma_v_intra = deblock_chroma_v_intra;
             d.deblock_chroma_h_intra = deblock_chroma_h_intra;
+        }
+
+        /// Weighting, inverse transforms and the residual paths.
+        pub(crate) fn install_rest(d: &mut H264Dsp<u8>) {
+            d.weighted_uni = weighted_uni;
+            d.weighted_bi = weighted_bi;
             d.idct4_add = idct4_add;
             d.idct8_add = idct8_add;
             d.idct4_dc_add = idct4_dc_add;
@@ -101,7 +258,7 @@ macro_rules! kernels {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn load8(p: *const u8) -> __m128i {
-            unsafe { _mm_cvtepu8_epi16(_mm_loadl_epi64(p as *const __m128i)) }
+            unsafe { zx8(_mm_loadl_epi64(p as *const __m128i)) }
         }
 
         /// Store 8 × i16 as 8 bytes, saturating to `0..=255`.
@@ -109,21 +266,6 @@ macro_rules! kernels {
         #[inline]
         unsafe fn store8(p: *mut u8, v: __m128i) {
             unsafe { _mm_storel_epi64(p as *mut __m128i, _mm_packus_epi16(v, v)) }
-        }
-
-        /// Six-tap sum over six i16 vectors: `a - 5b + 20c + 20d - 5e + f`.
-        #[target_feature(enable = $feat)]
-        #[inline]
-        unsafe fn tap6_16(a: __m128i, b: __m128i, c: __m128i, d: __m128i, e: __m128i, f: __m128i) -> __m128i {
-            unsafe {
-                let t = _mm_add_epi16(c, d);
-                let u = _mm_add_epi16(b, e);
-                let v = _mm_add_epi16(a, f);
-                // v + 20t - 5u = v + (t << 4) + (t << 2) - (u << 2) - u
-                let t20 = _mm_add_epi16(_mm_slli_epi16(t, 4), _mm_slli_epi16(t, 2));
-                let u5 = _mm_add_epi16(_mm_slli_epi16(u, 2), u);
-                _mm_sub_epi16(_mm_add_epi16(v, t20), u5)
-            }
         }
 
         /// `clip((v + 16) >> 5)` of 8 i16 lanes packed to 8 u8 (low 64 bits).
@@ -136,6 +278,12 @@ macro_rules! kernels {
             }
         }
 
+        /// A tap pair as one i32 lane, for `pmaddwd`.
+        #[inline(always)]
+        fn pair(a: i16, b: i16) -> i32 {
+            (a as u16 as i32) | ((b as u16 as i32) << 16)
+        }
+
         // ------------------------------------------------------------------
         // Luma interpolation
         // ------------------------------------------------------------------
@@ -145,33 +293,14 @@ macro_rules! kernels {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn b1_row(src: *const u8, stride: usize, row: usize, x: usize) -> __m128i {
-            unsafe {
-                let p = src.add(row * stride + x);
-                tap6_16(load8(p), load8(p.add(1)), load8(p.add(2)), load8(p.add(3)), load8(p.add(4)), load8(p.add(5)))
-            }
+            unsafe { tap6_u8(src.add(row * stride + x), 1) }
         }
 
         /// Vertical half-sample intermediate (i16) at window column `col`, block row `y`.
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn h1_row(src: *const u8, stride: usize, col: usize, y: usize) -> __m128i {
-            unsafe {
-                let p = src.add(y * stride + col);
-                tap6_16(
-                    load8(p),
-                    load8(p.add(stride)),
-                    load8(p.add(2 * stride)),
-                    load8(p.add(3 * stride)),
-                    load8(p.add(4 * stride)),
-                    load8(p.add(5 * stride)),
-                )
-            }
-        }
-
-        /// A tap pair as one i32 lane, for `pmaddwd`.
-        #[inline(always)]
-        fn pair(a: i16, b: i16) -> i32 {
-            (a as u16 as i32) | ((b as u16 as i32) << 16)
+            unsafe { tap6_u8(src.add(y * stride + col), stride) }
         }
 
         /// Centre position, eight columns from `x` of block row `y`: vertical
@@ -277,27 +406,14 @@ macro_rules! kernels {
         unsafe fn chroma_impl(dst: &mut [u8], src: &[u8], stride: usize, w: usize, h: usize, xf: i32, yf: i32) {
             unsafe {
                 // Chroma blocks are at most 8 wide: eight i16 lanes.
-                let a = _mm_set1_epi16(((8 - xf) * (8 - yf)) as i16);
-                let b = _mm_set1_epi16((xf * (8 - yf)) as i16);
-                let c = _mm_set1_epi16(((8 - xf) * yf) as i16);
-                let d = _mm_set1_epi16((xf * yf) as i16);
+                let _ = w;
+                let cw = chroma_w(xf, yf);
                 let round = _mm_set1_epi16(32);
                 let s = src.as_ptr();
-                let _ = w;
-                let mut r0v = load8(s);
-                let mut r0v1 = load8(s.add(1));
                 for y in 0..h {
-                    let r1 = s.add((y + 1) * stride);
-                    let r1v = load8(r1);
-                    let r1v1 = load8(r1.add(1));
-                    let v = _mm_add_epi16(
-                        _mm_add_epi16(_mm_mullo_epi16(r0v, a), _mm_mullo_epi16(r0v1, b)),
-                        _mm_add_epi16(_mm_mullo_epi16(r1v, c), _mm_mullo_epi16(r1v1, d)),
-                    );
+                    let v = chroma_row(&cw, s.add(y * stride), s.add((y + 1) * stride));
                     let v = _mm_srli_epi16(_mm_add_epi16(v, round), 6);
                     _mm_storel_epi64(dst.as_mut_ptr().add(y * PRED_STRIDE) as *mut __m128i, _mm_packus_epi16(v, v));
-                    r0v = r1v;
-                    r0v1 = r1v1;
                 }
             }
         }
@@ -371,9 +487,11 @@ macro_rules! kernels {
         #[allow(clippy::too_many_arguments)]
         unsafe fn weighted_bi_impl(dst: &mut [u8], stride: usize, a: &[u8], b: &[u8], w: usize, h: usize, log_wd: i32, w0: i32, w1: i32, o0: i32, o1: i32) {
             unsafe {
-                // a * w0 + b * w1 can reach 2 * 255 * 128 = 65280: use 32-bit lanes.
-                let w0v = _mm_set1_epi32(w0);
-                let w1v = _mm_set1_epi32(w1);
+                // a * w0 + b * w1 reaches 2 * 255 * 128 = 65280, so it needs
+                // 32-bit lanes — but `pmaddwd` on the two predictions
+                // interleaved produces exactly that sum in one instruction,
+                // for weights in the spec's -128..127 and samples in 0..255.
+                let wv = _mm_set1_epi32(pair(w0 as i16, w1 as i16));
                 let round = _mm_set1_epi32(1 << log_wd);
                 let off = _mm_set1_epi32((o0 + o1 + 1) >> 1);
                 let sh = _mm_cvtsi32_si128(log_wd + 1);
@@ -382,14 +500,11 @@ macro_rules! kernels {
                     let pb = b.as_ptr().add(y * PRED_STRIDE);
                     // Eight samples from `x` as one vector of eight i16.
                     let eight = |x: usize| -> __m128i {
-                        let va = _mm_loadl_epi64(pa.add(x) as *const __m128i);
-                        let vb = _mm_loadl_epi64(pb.add(x) as *const __m128i);
-                        let quad = |va: __m128i, vb: __m128i| {
-                            let prod = _mm_add_epi32(_mm_mullo_epi32(_mm_cvtepu8_epi32(va), w0v), _mm_mullo_epi32(_mm_cvtepu8_epi32(vb), w1v));
-                            _mm_add_epi32(_mm_sra_epi32(_mm_add_epi32(prod, round), sh), off)
-                        };
-                        let lo = quad(va, vb);
-                        let hi = quad(_mm_srli_si128(va, 4), _mm_srli_si128(vb, 4));
+                        let va = load8(pa.add(x));
+                        let vb = load8(pb.add(x));
+                        let quad = |v: __m128i| _mm_add_epi32(_mm_sra_epi32(_mm_add_epi32(_mm_madd_epi16(v, wv), round), sh), off);
+                        let lo = quad(_mm_unpacklo_epi16(va, vb));
+                        let hi = quad(_mm_unpackhi_epi16(va, vb));
                         _mm_packs_epi32(lo, hi)
                     };
                     let v0 = eight(0);
@@ -413,7 +528,7 @@ macro_rules! kernels {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn diff_lt(a: __m128i, b: __m128i, t: __m128i) -> __m128i {
-            unsafe { _mm_cmpgt_epi16(t, _mm_abs_epi16(_mm_sub_epi16(a, b))) }
+            unsafe { _mm_cmpgt_epi16(t, abs16(_mm_sub_epi16(a, b))) }
         }
 
         /// The eight positions of eight luma lines: `[p3, p2, p1, p0, q0, q1, q2, q3]`.
@@ -454,10 +569,10 @@ macro_rules! kernels {
                 let nq1 = _mm_add_epi16(q1, _mm_and_si128(dq1, aq));
                 // Clip to 8 bits (p1'/q1' cannot leave the range; p0'/q0' can).
                 let clip = |x: __m128i| _mm_min_epi16(_mm_max_epi16(x, zero), _mm_set1_epi16(255));
-                v[2] = _mm_blendv_epi8(p1, np1, mask);
-                v[3] = _mm_blendv_epi8(p0, clip(np0), mask);
-                v[4] = _mm_blendv_epi8(q0, clip(nq0), mask);
-                v[5] = _mm_blendv_epi8(q1, nq1, mask);
+                v[2] = sel(p1, np1, mask);
+                v[3] = sel(p0, clip(np0), mask);
+                v[4] = sel(q0, clip(nq0), mask);
+                v[5] = sel(q1, nq1, mask);
             }
         }
 
@@ -489,18 +604,18 @@ macro_rules! kernels {
                 let sq0 = _mm_srai_epi16(add(add(p1, dbl(add(p0q0, q1))), add(q2, four)), 3);
                 let sq1 = _mm_srai_epi16(add(add(p0q0, q1), add(q2, two)), 2);
                 let sq2 = _mm_srai_epi16(add(add(dbl(q3), add(q2, dbl(q2))), add(add(q1, p0q0), four)), 3);
-                let np0 = _mm_blendv_epi8(wp0, sp0, ap);
-                let np1 = _mm_blendv_epi8(p1, sp1, ap);
-                let np2 = _mm_blendv_epi8(p2, sp2, ap);
-                let nq0 = _mm_blendv_epi8(wq0, sq0, aq);
-                let nq1 = _mm_blendv_epi8(q1, sq1, aq);
-                let nq2 = _mm_blendv_epi8(q2, sq2, aq);
-                v[1] = _mm_blendv_epi8(p2, np2, mask);
-                v[2] = _mm_blendv_epi8(p1, np1, mask);
-                v[3] = _mm_blendv_epi8(p0, np0, mask);
-                v[4] = _mm_blendv_epi8(q0, nq0, mask);
-                v[5] = _mm_blendv_epi8(q1, nq1, mask);
-                v[6] = _mm_blendv_epi8(q2, nq2, mask);
+                let np0 = sel(wp0, sp0, ap);
+                let np1 = sel(p1, sp1, ap);
+                let np2 = sel(p2, sp2, ap);
+                let nq0 = sel(wq0, sq0, aq);
+                let nq1 = sel(q1, sq1, aq);
+                let nq2 = sel(q2, sq2, aq);
+                v[1] = sel(p2, np2, mask);
+                v[2] = sel(p1, np1, mask);
+                v[3] = sel(p0, np0, mask);
+                v[4] = sel(q0, nq0, mask);
+                v[5] = sel(q1, nq1, mask);
+                v[6] = sel(q2, nq2, mask);
             }
         }
 
@@ -539,17 +654,7 @@ macro_rules! kernels {
                 let c1 = _mm_unpackhi_epi32(b0, b2); // col2 | col3
                 let c2 = _mm_unpacklo_epi32(b1, b3); // col4 | col5
                 let c3 = _mm_unpackhi_epi32(b1, b3); // col6 | col7
-                let hi = |v: __m128i| _mm_cvtepu8_epi16(_mm_srli_si128(v, 8));
-                [
-                    _mm_cvtepu8_epi16(c0),
-                    hi(c0),
-                    _mm_cvtepu8_epi16(c1),
-                    hi(c1),
-                    _mm_cvtepu8_epi16(c2),
-                    hi(c2),
-                    _mm_cvtepu8_epi16(c3),
-                    hi(c3),
-                ]
+                [zx8(c0), zx8h(c0), zx8(c1), zx8h(c1), zx8(c2), zx8h(c2), zx8(c3), zx8h(c3)]
             }
         }
 
@@ -684,8 +789,8 @@ macro_rules! kernels {
                 let d = _mm_srai_epi16(_mm_add_epi16(_mm_add_epi16(_mm_slli_epi16(_mm_sub_epi16(q0, p0), 2), _mm_sub_epi16(p1, q1)), _mm_set1_epi16(4)), 3);
                 let d = _mm_min_epi16(_mm_max_epi16(d, _mm_sub_epi16(zero, tc)), tc);
                 let clip = |x: __m128i| _mm_min_epi16(_mm_max_epi16(x, zero), _mm_set1_epi16(255));
-                v[1] = _mm_blendv_epi8(p0, clip(_mm_add_epi16(p0, d)), mask);
-                v[2] = _mm_blendv_epi8(q0, clip(_mm_sub_epi16(q0, d)), mask);
+                v[1] = sel(p0, clip(_mm_add_epi16(p0, d)), mask);
+                v[2] = sel(q0, clip(_mm_sub_epi16(q0, d)), mask);
             }
         }
 
@@ -700,8 +805,8 @@ macro_rules! kernels {
                 let two = _mm_set1_epi16(2);
                 let np0 = _mm_srai_epi16(_mm_add_epi16(_mm_add_epi16(_mm_slli_epi16(p1, 1), p0), _mm_add_epi16(q1, two)), 2);
                 let nq0 = _mm_srai_epi16(_mm_add_epi16(_mm_add_epi16(_mm_slli_epi16(q1, 1), q0), _mm_add_epi16(p1, two)), 2);
-                v[1] = _mm_blendv_epi8(p0, np0, mask);
-                v[2] = _mm_blendv_epi8(q0, nq0, mask);
+                v[1] = sel(p0, np0, mask);
+                v[2] = sel(q0, nq0, mask);
             }
         }
 
@@ -733,12 +838,7 @@ macro_rules! kernels {
                 let b1 = _mm_unpacklo_epi16(a2, a3); // rows 4..7
                 let c0 = _mm_unpacklo_epi32(b0, b1); // p1 r0..7 | p0 r0..7
                 let c1 = _mm_unpackhi_epi32(b0, b1); // q0 r0..7 | q1 r0..7
-                [
-                    _mm_cvtepu8_epi16(c0),
-                    _mm_cvtepu8_epi16(_mm_srli_si128(c0, 8)),
-                    _mm_cvtepu8_epi16(c1),
-                    _mm_cvtepu8_epi16(_mm_srli_si128(c1, 8)),
-                ]
+                [zx8(c0), zx8h(c0), zx8(c1), zx8h(c1)]
             }
         }
 
@@ -840,11 +940,11 @@ macro_rules! kernels {
             unsafe {
                 let r = _mm_srai_epi16(_mm_add_epi16(v, _mm_set1_epi16(32)), 6);
                 if n == 4 {
-                    let p = _mm_cvtepu8_epi16(_mm_cvtsi32_si128(std::ptr::read_unaligned(dst as *const i32)));
+                    let p = zx8(_mm_cvtsi32_si128(std::ptr::read_unaligned(dst as *const i32)));
                     let s = _mm_packus_epi16(_mm_add_epi16(p, r), _mm_setzero_si128());
                     std::ptr::write_unaligned(dst as *mut i32, _mm_cvtsi128_si32(s));
                 } else {
-                    let p = _mm_cvtepu8_epi16(_mm_loadl_epi64(dst as *const __m128i));
+                    let p = load8(dst);
                     let s = _mm_packus_epi16(_mm_add_epi16(p, r), _mm_setzero_si128());
                     _mm_storel_epi64(dst as *mut __m128i, s);
                 }
@@ -1026,7 +1126,7 @@ macro_rules! kernels {
                 }
                 // Any AC nonzero? Zero lane 0, compare the rest with zero.
                 let ac = _mm_or_si128(_mm_andnot_si128(_mm_setr_epi16(-1, 0, 0, 0, 0, 0, 0, 0), c0), c1);
-                if _mm_testz_si128(ac, ac) != 0 {
+                if is_zero(ac) {
                     let d = _mm_extract_epi16(c0, 0) as i16 as i32;
                     if d != 0 {
                         dc_add_impl(dst, stride, d, 4);
@@ -1056,7 +1156,7 @@ macro_rules! kernels {
                     let masked = if k == 0 { _mm_andnot_si128(_mm_setr_epi16(-1, 0, 0, 0, 0, 0, 0, 0), c) } else { c };
                     ac = _mm_or_si128(ac, masked);
                 }
-                if _mm_testz_si128(ac, ac) != 0 {
+                if is_zero(ac) {
                     let d = coeffs[0] as i32;
                     if d != 0 {
                         dc_add_impl(dst, stride, d, 8);
@@ -1069,24 +1169,62 @@ macro_rules! kernels {
     };
 }
 
-/// The kernels compiled for SSE4.1 (legacy two-operand encoding).
-pub mod sse41 {
-    kernels!("sse4.1");
+// Each rung is a full compilation of the kernels, but the ladder calls only
+// the install groups that rung improves, so the kernels it did not change
+// are unreachable and are dropped. Nothing here is public: were these
+// modules part of the crate's API, every rung would be retained in full.
+// `dead_code` is allowed because "unused" is the intended state for most
+// of three of the four rungs, not because anything is unreachable by
+// mistake.
+
+/// SSE2: baseline on x86-64, so this rung is the one that makes the scalar
+/// kernels unreachable on this architecture.
+pub(crate) mod sse2 {
+    #![allow(dead_code)]
+    kernels!("sse2", sse2);
 }
 
-/// The kernels compiled for AVX: identical algorithms, VEX-encoded.
-pub mod avx {
-    kernels!("avx");
+/// SSSE3: `pmaddubsw` for the six-tap and bilinear filters, `pabsw` for the
+/// loop filters' `|p - q|`.
+pub(crate) mod ssse3 {
+    #![allow(dead_code)]
+    kernels!("ssse3", ssse3);
 }
 
-/// Replace the scalar entries of `d` with the SSE4.1 kernels.
-pub fn install_sse41(d: &mut H264Dsp<u8>) {
-    sse41::install(d);
+/// SSE4.1: `pblendvb` for the loop filters' lane selects, `pmovzxbw` for the
+/// widening loads, `ptest` for the all-zero residual test.
+pub(crate) mod sse41 {
+    #![allow(dead_code)]
+    kernels!("sse4.1", sse41);
 }
 
-/// Replace the scalar entries of `d` with the AVX kernels.
-pub fn install_avx(d: &mut H264Dsp<u8>) {
-    avx::install(d);
+/// AVX: the SSE4.1 algorithms, VEX-encoded.
+pub(crate) mod avx {
+    #![allow(dead_code)]
+    kernels!("avx", sse41);
+}
+
+/// Install the best kernels `cpu` can run, one rung at a time.
+///
+/// Each rung replaces only the kernels whose code it changes, so the table
+/// ends up with the best available version of every kernel: an SSE4.1 CPU,
+/// for instance, keeps the SSSE3 interpolation (SSE4.1 adds nothing the
+/// six-tap filter can use) and takes the SSE4.1 loop filters and transforms.
+pub fn install(d: &mut H264Dsp<u8>, cpu: Cpu) {
+    if cpu.sse2 {
+        sse2::install_all(d);
+    }
+    if cpu.ssse3 {
+        ssse3::install_interp(d);
+        ssse3::install_deblock(d);
+    }
+    if cpu.sse41 {
+        sse41::install_deblock(d);
+        sse41::install_rest(d);
+    }
+    if cpu.avx {
+        avx::install_all(d);
+    }
 }
 
 #[cfg(test)]
@@ -1099,18 +1237,31 @@ mod tests {
         (*seed >> 33) as u32
     }
 
-    /// Both installs, skipped when the CPU cannot run them.
+    /// Every rung the host can run, as it would be installed in the field:
+    /// cumulatively, so each table is exactly what a CPU of that generation
+    /// would get.
     fn tables() -> Vec<(&'static str, H264Dsp<u8>)> {
         let mut v = Vec::new();
-        if std::is_x86_feature_detected!("sse4.1") {
+        let base = Cpu::SCALAR;
+        for (name, cpu) in [
+            ("sse2", Cpu { sse2: true, ..base }),
+            ("ssse3", Cpu { sse2: true, ssse3: true, ..base }),
+            ("sse4.1", Cpu { sse2: true, ssse3: true, sse41: true, ..base }),
+            ("avx", Cpu { sse2: true, ssse3: true, sse41: true, avx: true, ..base }),
+        ] {
+            // Skip rungs this host cannot execute.
+            let have = match name {
+                "sse2" => std::is_x86_feature_detected!("sse2"),
+                "ssse3" => std::is_x86_feature_detected!("ssse3"),
+                "sse4.1" => std::is_x86_feature_detected!("sse4.1"),
+                _ => std::is_x86_feature_detected!("avx"),
+            };
+            if !have {
+                continue;
+            }
             let mut d = H264Dsp::<u8>::SCALAR;
-            install_sse41(&mut d);
-            v.push(("sse4.1", d));
-        }
-        if std::is_x86_feature_detected!("avx") {
-            let mut d = H264Dsp::<u8>::SCALAR;
-            install_avx(&mut d);
-            v.push(("avx", d));
+            install(&mut d, cpu);
+            v.push((name, d));
         }
         v
     }
