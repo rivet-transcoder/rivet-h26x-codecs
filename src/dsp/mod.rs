@@ -198,6 +198,10 @@ impl Cpu {
                 cpu.avx2 = false;
             }
             Ok("avx2") => cpu.avx512 = false,
+            // The top of the ladder: recognised so that it is documented and
+            // so `verify.sh` can name every rung uniformly, but there is
+            // nothing above it to switch off.
+            Ok("avx512") => {}
             // AArch64: cap at baseline NEON.
             Ok("neon") => {
                 cpu.dotprod = false;

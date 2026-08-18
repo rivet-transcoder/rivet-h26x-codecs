@@ -94,7 +94,10 @@ def job_cpu_seconds(job):
     return (info.TotalUserTime + info.TotalKernelTime) / 1e7
 
 
-def run_once(cmd, env):
+PIN_MASK = None
+
+
+def run_once(cmd, env, pin=False):
     """(CPU seconds of the whole process tree, wall seconds)."""
     if not WINDOWS:
         t = time.perf_counter()
@@ -115,6 +118,9 @@ def run_once(cmd, env):
                              stderr=subprocess.DEVNULL,
                              creationflags=HIGH_PRIORITY)
         k32.AssignProcessToJobObject(job, wintypes.HANDLE(int(p._handle)))
+        if pin and PIN_MASK:
+            k32.SetProcessAffinityMask(wintypes.HANDLE(int(p._handle)),
+                                       ctypes.c_size_t(PIN_MASK))
         p.wait()
         wall = time.perf_counter() - t
         return job_cpu_seconds(job), wall
@@ -136,7 +142,7 @@ def run_best(cmd, env_extra, runs):
     single = env.get("H26X_THREADS") == "1" or "-threads" in cmd
     best_cpu, best_wall = float("inf"), float("inf")
     for _ in range(runs):
-        cpu, wall = run_once(cmd, env)
+        cpu, wall = run_once(cmd, env, pin=single)
         if single and wall > 0.3 and cpu < 0.5 * wall:
             raise SystemExit(
                 f"refusing to report {cpu:.3f} CPU s against {wall:.3f} wall s"
@@ -205,6 +211,70 @@ def check_ladder(name, rows, tol=0.05):
     return not bad
 
 
+def quietest_core():
+    """A (mask, index) for the quieter half of the least busy SMT pair.
+
+    Single-threaded rows are pinned to it, both this decoder's and ffmpeg's,
+    so that the column the ladder comparison rests on survives a machine that
+    is doing other things. It is the same reasoning as tools/ab.py: picking
+    the quietest logical processor is not enough, because a busy SMT sibling
+    shares the execution units and costs as much as a busy core.
+
+    The all-threads rows are deliberately NOT pinned — pinning them would
+    measure something other than what they claim to. That column is the one
+    an ambient load distorts, which is why the load is printed in the header.
+    """
+    n = os.cpu_count() or 1
+    if os.environ.get("AFFINITY"):
+        m = int(os.environ["AFFINITY"], 0)
+        return m, m.bit_length() - 1
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-Counter '\\Processor(*)\\% Processor Time' -SampleInterval 1"
+             " -MaxSamples 1).CounterSamples | "
+             "% { \"$($_.InstanceName) $($_.CookedValue)\" }"],
+            capture_output=True, text=True, timeout=90).stdout
+        load = {}
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0].isdigit():
+                load[int(parts[0])] = float(parts[1])
+        if load:
+            pairs = [(load.get(i, 0.0) + load.get(i + 1, 0.0), i)
+                     for i in range(0, n, 2)]
+            _, i = min(pairs)
+            j = i if load.get(i, 0.0) <= load.get(i + 1, 0.0) else i + 1
+            return 1 << j, j
+    except Exception:
+        pass
+    return 1 << (n - 1), n - 1
+
+
+def ambient_load():
+    """Percentage of the machine already busy, sampled before the run.
+
+    Printed with the table because it is the single fact most likely to
+    explain a number somebody cannot reproduce. The all-threads column is the
+    one it distorts: a single-threaded run on a 32-thread box can find an idle
+    core, a run that wants every thread is competing for them.
+    """
+    if not WINDOWS:
+        try:
+            return os.getloadavg()[0] / (os.cpu_count() or 1) * 100
+        except OSError:
+            return None
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-Counter '\Processor(_Total)\% Processor Time' "
+             "-SampleInterval 2 -MaxSamples 1).CounterSamples.CookedValue"],
+            capture_output=True, text=True, timeout=90).stdout.strip()
+        return float(out.replace(",", "."))
+    except Exception:
+        return None
+
+
 def selected_rung(dec):
     """The rung the decoder picks when nothing caps it — what a user gets."""
     try:
@@ -237,8 +307,13 @@ def main():
     picked = selected_rung(args.dec)
     selected = next((i for i, (n, _) in enumerate(tiers) if n == picked), -1)
 
+    global PIN_MASK
+    PIN_MASK, pin_core = quietest_core()
+    load = ambient_load()
+    busy = f" Machine {load:.0f}% busy before the run." if load is not None else ""
     print(f"**{cpu_name()}**, {threads} hardware threads, "
-          f"selecting **{picked or 'unknown'}**. Best of {args.runs}. "
+          f"selecting **{picked or 'unknown'}**.{busy} Single-threaded rows "
+          f"are pinned to core {pin_core} (both decoders). Best of {args.runs}. "
           f"Cost is CPU seconds, throughput is frames per wall second.\n")
 
     clean = True

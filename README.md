@@ -92,24 +92,33 @@ above AVX2 as a supplement rather than a rung: it replaces the handful of
 H.265 kernels whose block shape genuinely fits 512-bit lanes and leaves the
 rest of the AVX2 table alone.
 
-Measured on one core against the scalar reference, SSE2 alone is worth
-2.1–2.8x and is nearly all of the total; SSSE3 (`pmaddubsw` for the six-tap
-and bilinear filters), SSE4.1 (`pblendvb`, `pminsd` / `pmaxsd`) and AVX (VEX's
-three-operand encoding — AVX adds no 256-bit *integer* operation, that is
-AVX2) are worth low single digits each on a modern out-of-order core, and
-AVX2's second 128 bits another 2–5%. The upper rungs should be worth more than
-that on the processors that actually need them, which have far less slack to
-hide the extra instructions the rung below spends. On AArch64, `sdot` is worth
-having for the one kernel whose shape it fits, HEVC's eight-tap horizontal
-luma filter, and measurably not worth it for H.264's six-tap, whose taps LLVM
-already folds into `umlal` pairs.
+Measured on one core against the scalar reference, **SSE2 alone is worth
+2.5–3.2x and is nearly all of the total.** What the rungs above it add depends
+on the codec, and the split is large: everything from SSSE3 to AVX-512
+together is worth about **5% on H.264** but **13–17% on H.265**. Block width
+is the reason. H.264's blocks are at most sixteen samples wide, so a 256-bit
+vector spans a row at best and pays cross-lane permutes to undo per-lane
+packing that 128-bit code never does; H.265 has 32- and 64-wide blocks, and
+its x86 kernels already put two rows in a vector. So the individual rungs —
+SSSE3 (`pmaddubsw` for the six-tap and bilinear filters), SSE4.1
+(`pblendvb`, `pminsd` / `pmaxsd`), AVX (VEX's three-operand encoding; AVX adds
+no 256-bit *integer* operation, that is AVX2) — are worth low single digits
+each on a modern out-of-order core, and should be worth more on the processors
+that actually need them, which have far less slack to hide the extra
+instructions the rung below spends. On AArch64, `sdot` is worth having for the
+one kernel whose shape it fits, HEVC's eight-tap horizontal luma filter, and
+measurably not worth it for H.264's six-tap, whose taps LLVM already folds
+into `umlal` pairs.
 
 `H26X_NO_SIMD=1` forces the scalar kernels and
-`H26X_MAX_SIMD=avx | sse41 | ssse3 | sse2 | neon | none` caps the ladder one
-rung at a time, which is how one machine checks that every rung decodes to the
-same bytes. Every SIMD kernel is checked bit-exact against the scalar
-reference by the crate's tests, on both architectures in CI. `H26X_PROF=1`
-prints where the time went.
+`H26X_MAX_SIMD=avx512 | avx2 | avx | sse41 | ssse3 | sse2 | neon | none` caps
+the ladder one rung at a time, which is how one machine checks that every rung
+decodes to the same bytes — `tools/verify.sh` does exactly that on every run
+and fails if any two rungs disagree. Every SIMD kernel is also checked
+bit-exact against the scalar reference by the crate's tests, on both
+architectures in CI. `h26xdec --rung` (or [`dsp::Cpu::rung`]) prints which rung
+was selected, which is worth knowing before quoting a number from this
+machine or any other. `H26X_PROF=1` prints where the time went.
 
 ## Performance
 

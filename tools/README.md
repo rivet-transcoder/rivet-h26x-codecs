@@ -57,6 +57,18 @@ is noise, and it is worse than that — measurements taken on a *contended core*
 were not merely noisy but systematically misleading, giving opposite signs on
 two streams for the same change. Two habits that fix it:
 
+**The ladder is its own control.** `benchmark.py` checks that no rung comes
+out ahead of the rung above it, and says so above any table where one does
+rather than printing it as a result. Best-of-N defends against a brief
+interruption; it cannot defend against something running for the whole
+benchmark, which shifts every row together and leaves a table that looks
+entirely plausible. That happened here — a run put SSE4.1 20% ahead of AVX2 on
+a CAVLC clip — and the check is what caught it. It also prints how busy the
+machine was before the run started, because that is the fact most likely to
+explain a number nobody can reproduce, and it is the all-threads column it
+distorts: a single-threaded run on a 32-thread box can find an idle core, a
+run that wants every thread is competing for them.
+
 **Measure the process tree, not the process.** `benchmark.py` puts each run in
 a Windows job object and reads the job's accounting, because asking a process
 how much CPU it used misses anything it spawned. `ffmpeg` on this machine is a
