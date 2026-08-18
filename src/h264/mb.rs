@@ -134,6 +134,17 @@ pub struct MbLayer {
     /// `QP_Y` of the macroblock (the previous macroblock's for one without
     /// `mb_qp_delta`), set by the parser (or the skip path).
     pub qp: i32,
+    /// Set by [`super::recon::derive()`] for reconstruction: `QP'Y` and
+    /// `QP'C` (the primed values the scaling uses), and whether the
+    /// macroblock is lossless (transform bypass).
+    pub qp_prime: i32,
+    /// See `qp_prime`.
+    pub qpc_prime: [i32; 2],
+    /// See `qp_prime`.
+    pub bypass: bool,
+    /// The motion-compensation jobs of an inter macroblock, derived by
+    /// [`super::recon::derive()`] and run by [`super::recon::reconstruct`].
+    pub jobs: Jobs,
     /// MBAFF: the pair's `mb_field_decoding_flag` (a field macroblock).
     pub field: bool,
     /// Luma-style coefficients per colour plane (`[0]` luma; `[1]`, `[2]`
@@ -171,6 +182,10 @@ impl MbLayer {
         MbLayer {
             kind,
             qp: 0,
+            qp_prime: 0,
+            qpc_prime: [0; 2],
+            bypass: false,
+            jobs: Jobs::default(),
             transform_8x8: false,
             intra16_mode: 0,
             intra_modes: [2; 16],
@@ -268,6 +283,33 @@ impl MbLayer {
     /// with the chroma bits and I16x16.
     pub fn has_residual(&self) -> bool {
         self.cbp != 0 || self.kind == MbKind::I16x16
+    }
+}
+
+/// One motion-compensation job: `(x, y, w, h, ref0, mv0, ref1, mv1)` in
+/// macroblock coordinates (a reference index of -1 = the list is unused).
+pub type Job = (usize, usize, usize, usize, i8, Mv, i8, Mv);
+
+/// The motion-compensation jobs of one macroblock (at most sixteen 4x4s).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Jobs {
+    /// The jobs; `len` are valid.
+    pub items: [Job; 16],
+    /// How many.
+    pub len: usize,
+}
+
+impl Jobs {
+    /// Append one.
+    #[inline(always)]
+    pub fn push(&mut self, j: Job) {
+        self.items[self.len] = j;
+        self.len += 1;
+    }
+    /// The valid jobs.
+    #[inline(always)]
+    pub fn as_slice(&self) -> &[Job] {
+        &self.items[..self.len]
     }
 }
 

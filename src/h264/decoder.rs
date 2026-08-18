@@ -27,7 +27,7 @@ use super::dpb::{DecodedPic, Dpb, PocState, RefEntry, RefMark, build_ref_lists, 
 use super::frame::{Frame, FramePool, PARITY_FRAME, SharedFrame};
 use super::mb::{InfoPool, MbKind, MbLayer, MbNeighbours, PicInfo, SliceCtx};
 use super::pps::Pps;
-use super::recon::{QpState, Scratch, SliceRefs, reconstruct};
+use super::recon::{DeriveScratch, QpState, ReconScratch, SliceRefs, derive, reconstruct};
 use super::slice::{Mmco, SliceHeader, SliceType};
 use super::sps::{ScalingLists, Sps};
 use super::transform::Dequant;
@@ -224,7 +224,8 @@ impl<S: Sample> PictureDecoder<S> {
                 pps.second_chroma_qp_index_offset,
             ],
         };
-        let mut scratch = Scratch::<S>::default();
+        let mut dscratch = DeriveScratch::default();
+        let mut rscratch = ReconScratch::<S>::default();
         let total_mbs = cur_main.mb_width * cur_main.mb_height;
         let mbw = cur_main.mb_width;
         // `addr` counts macroblocks in decoding order: raster, or in an MBAFF
@@ -404,7 +405,8 @@ impl<S: Sample> PictureDecoder<S> {
                     parse_mb_cabac(&mut cabac, &mut st, &ctx, info, &nb, &cur.motion, &mut layer, dq, &mut qps)?;
                 }
                 layer.field = pair_field;
-                reconstruct(&ctx, &qps, dq, cur, info, &nb, &layer, &refs, &mut scratch)?;
+                derive(&ctx, &qps, cur, info, &nb, &mut layer, &refs, &mut dscratch)?;
+                reconstruct(&ctx, dq, cur, info, &nb, &layer, &refs, &mut rscratch)?;
                 mb_done!();
                 // No end_of_slice_flag after the top macroblock of an MBAFF
                 // pair (7.3.4): a slice holds whole pairs.
@@ -459,7 +461,8 @@ impl<S: Sample> PictureDecoder<S> {
                         layer.reset(kind, false);
                         layer.qp = qps.prev_qp;
                         layer.field = pair_field;
-                        reconstruct(&ctx, &qps, dq, cur, info, &nb, &layer, &refs, &mut scratch)?;
+                        derive(&ctx, &qps, cur, info, &nb, &mut layer, &refs, &mut dscratch)?;
+                reconstruct(&ctx, dq, cur, info, &nb, &layer, &refs, &mut rscratch)?;
                         mb_done!();
                     }
                     prev_skipped = run > 0;
@@ -485,7 +488,8 @@ impl<S: Sample> PictureDecoder<S> {
                 let t = r.ue();
                 layer.field = pair_field;
                 parse_mb_cavlc(&mut r, &ctx, info, &nb, t, &mut layer, dq, &mut qps)?;
-                reconstruct(&ctx, &qps, dq, cur, info, &nb, &layer, &refs, &mut scratch)?;
+                derive(&ctx, &qps, cur, info, &nb, &mut layer, &refs, &mut dscratch)?;
+                reconstruct(&ctx, dq, cur, info, &nb, &layer, &refs, &mut rscratch)?;
                 mb_done!();
                 if r.overrun() {
                     return Err(Error::bitstream("CAVLC slice data exhausted"));

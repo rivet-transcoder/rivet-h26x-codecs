@@ -11,7 +11,7 @@ use super::frame::{BlockMotion, Frame, Mv, PARITY_FRAME, SharedFrame};
 use super::inter::{MbGeom, Weighting, predict_partition};
 use super::intra::{IntraAvail, predict_4x4, predict_8x8, predict_16x16, predict_chroma};
 use super::mb::{
-    MbKind, MbLayer, MbNeighbours, MotionCache, PicInfo, SliceCtx, SubMbShape, block_available,
+    Jobs, MbKind, MbLayer, MbNeighbours, MotionCache, PicInfo, SliceCtx, SubMbShape, block_available,
     colocated_block, colocated_motion, fill_motion, median_mvp, p_skip_mv, predict_mv,
     prediction_neighbours, spatial_direct_ref_idx,
 };
@@ -253,27 +253,13 @@ fn intra_ok(info: &PicInfo, ctx: &SliceCtx, addr: Option<usize>) -> bool {
     }
 }
 
-/// Reconstruct one parsed macroblock into the current picture and record
-/// what later macroblocks need to know about it.
-#[allow(clippy::too_many_arguments)]
-pub fn reconstruct<S: Sample>(
-    ctx: &SliceCtx,
-    qps: &QpState,
-    dq: &Dequant,
-    cur: &mut Frame<S>,
-    info: &mut PicInfo,
-    nb: &MbNeighbours,
-    layer: &MbLayer,
-    refs: &SliceRefs<S>,
-    scratch: &mut Scratch<S>,
-) -> Result<()> {
+/// Where a macroblock's samples go. A field macroblock of an MBAFF frame
+/// (storage row `2 * pair_row + parity`) covers every other line of its
+/// pair's 32 rows and works in field coordinates for motion compensation.
+fn mb_geom<S: Sample>(ctx: &SliceCtx, cur: &Frame<S>, info: &PicInfo, nb: &MbNeighbours, layer: &MbLayer, refs: &SliceRefs<S>) -> MbGeom {
     let addr = nb.addr;
     let mbx = addr % info.mb_width;
     let mby = addr / info.mb_width;
-    // Where the macroblock's samples go. A field macroblock of an MBAFF
-    // frame (storage row `2 * pair_row + parity`) covers every other line
-    // of its pair's 32 rows and works in field coordinates for motion
-    // compensation.
     let field_mb = ctx.mbaff && layer.field;
     let geom = if field_mb {
         let (pr, parity) = (mby / 2, mby % 2);
@@ -295,11 +281,31 @@ pub fn reconstruct<S: Sample>(
             parity: refs.cur_parity,
         }
     };
-    let (px, py) = (geom.x, geom.y_dst);
-    let step = geom.step;
-    let bit_depth = cur.bit_depth;
-    let max = (1i32 << bit_depth) - 1;
+    geom
+}
 
+/// The parse-side completion of a macroblock, run in decoding order right
+/// after its syntax was parsed (or, for a skipped one, inferred): the QPs
+/// (into the layer, for reconstruction), the motion of every partition
+/// (8.4.1 — into the picture, for the neighbours' prediction, the direct
+/// modes of later pictures and the deblocking filter, and into the layer's
+/// job list for motion compensation), and the per-macroblock information
+/// the following macroblocks and the deblocking filter read. Everything
+/// [`reconstruct`] then needs is in the layer and the picture info; the
+/// pixels it produces are the only thing left.
+#[allow(clippy::too_many_arguments)]
+pub fn derive<S: Sample>(
+    ctx: &SliceCtx,
+    qps: &QpState,
+    cur: &mut Frame<S>,
+    info: &mut PicInfo,
+    nb: &MbNeighbours,
+    layer: &mut MbLayer,
+    refs: &SliceRefs<S>,
+    scratch: &mut DeriveScratch,
+) -> Result<()> {
+    let addr = nb.addr;
+    let geom = mb_geom(ctx, cur, info, nb, layer, refs);
     // QP (7.4.5): QPY wraps in −QpBdOffsetY..=51; the dequantiser takes
     // QP'Y = QPY + QpBdOffsetY (and QP'C likewise); the deblocking filter
     // reads the unshifted values.
@@ -319,9 +325,12 @@ pub fn reconstruct<S: Sample>(
     let qp = qp + bd_off;
     let qpc = [qpc_raw[0] + bd_off, qpc_raw[1] + bd_off];
 
+    layer.qp_prime = qp;
+    layer.qpc_prime = qpc;
+    layer.bypass = ctx.transform_bypass && qp == 0;
+
     let intra = layer.kind.is_intra();
     cur.mb_intra[addr] = intra;
-    let dsp = &refs.dsp;
     // `H26X_TRACE=<mbaddr>`, read once: getenv per macroblock was measurable.
     static TRACE_MB: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     let trace_mb = *TRACE_MB.get_or_init(|| {
@@ -355,18 +364,8 @@ pub fn reconstruct<S: Sample>(
         }
     }
 
-    // The planes coded luma-style: luma alone, or all three in 4:4:4 (Cb
-    // and Cr then use the luma prediction modes, transforms and scaling
-    // lists, at their own QP).
-    let planes = if cur.chroma == ChromaFormat::Yuv444 {
-        3
-    } else {
-        1
-    };
-    // TransformBypassModeFlag (7.4.5): lossless macroblocks at QP'Y 0.
-    let bypass = ctx.transform_bypass && qp == 0;
-    let plane_qp = [qp, qpc[0], qpc[1]];
-
+    // The planes coded luma-style: luma alone, or all three in 4:4:4.
+    let planes = if cur.chroma == ChromaFormat::Yuv444 { 3 } else { 1 };
     // Partition boundaries inside the macroblock (inter): see MbInfo::part_edges.
     let mut part_edges = [0u16; 2];
     if intra {
@@ -376,6 +375,124 @@ pub fn reconstruct<S: Sample>(
                 cur.motion[l][addr * 16 + b] = BlockMotion::default();
             }
         }
+        // Intra prediction modes are validated here so reconstruction
+        // cannot fail on them.
+        if matches!(layer.kind, MbKind::I4x4 | MbKind::I8x8) && layer.intra_modes.iter().any(|&m| m > 8) {
+            return Err(Error::bitstream("intra prediction mode out of range"));
+        }
+        if layer.kind == MbKind::I16x16 && layer.intra16_mode > 3 {
+            return Err(Error::bitstream("Intra_16x16 prediction mode out of range"));
+        }
+        if layer.chroma_mode > 3 {
+            return Err(Error::bitstream("intra chroma prediction mode out of range"));
+        }
+    } else {
+        part_edges = derive_motion(ctx, cur, info, nb, layer, refs, geom, scratch)?;
+    }
+
+    // Bookkeeping.
+    let m = &mut info.mbs[addr];
+    m.part_edges = part_edges;
+    m.nz_mask = if layer.kind == MbKind::IPcm {
+        0xffff
+    } else {
+        let mut nzm = 0u16;
+        for b in 0..16 {
+            nzm |= ((layer.nz[0][b] != 0) as u16) << b;
+        }
+        if layer.transform_8x8 {
+            // Spread each 8x8's bit over its four 4x4s.
+            let q = |bits: u16| -> u16 { if bits != 0 { 0x33 } else { 0 } };
+            q(nzm & 0x0033) | (q(nzm & 0x00cc) << 2) | (q(nzm & 0x3300) << 8) | (q(nzm & 0xcc00) << 10)
+        } else {
+            nzm
+        }
+    };
+    m.kind = layer.kind;
+    m.slice = ctx.slice_num;
+    m.decoded = true;
+    m.qp = deblock_qp as i8;
+    m.qpc = [deblock_qpc[0] as i8, deblock_qpc[1] as i8];
+    m.cbp = layer.cbp;
+    m.transform_8x8 = layer.transform_8x8;
+    m.chroma_mode = layer.chroma_mode;
+    m.qp_delta_nonzero = layer.has_residual() && layer.qp_delta != 0;
+    m.dc_cbf = layer.dc_cbf;
+    m.sub_direct = if layer.kind == MbKind::Inter8x8 {
+        (0..4)
+            .map(|p| ((layer.sub_shape[p] == SubMbShape::Direct) as u8) << p)
+            .sum()
+    } else {
+        0
+    };
+    m.field = geom.step == 2 || ctx.field_pic;
+    if ctx.mbaff {
+        cur.mb_field[addr] = geom.step == 2;
+    }
+    let base = addr * 16;
+    if layer.kind == MbKind::IPcm {
+        info.luma_nz[base..base + 16].fill(16);
+        info.chroma_nz[addr * 32..addr * 32 + 32].fill(16);
+    } else {
+        info.luma_nz[base..base + 16].copy_from_slice(&layer.nz[0]);
+        if planes == 3 {
+            info.chroma_nz[addr * 32..addr * 32 + 16].copy_from_slice(&layer.nz[1]);
+            info.chroma_nz[addr * 32 + 16..addr * 32 + 32].copy_from_slice(&layer.nz[2]);
+        } else {
+            for comp in 0..2 {
+                info.chroma_nz[addr * 32 + comp * 16..addr * 32 + comp * 16 + 8]
+                    .copy_from_slice(&layer.chroma_nz[comp]);
+            }
+        }
+    }
+    if matches!(layer.kind, MbKind::I4x4 | MbKind::I8x8) {
+        info.intra_modes[base..base + 16].copy_from_slice(&layer.intra_modes);
+    } else {
+        info.intra_modes[base..base + 16].fill(2);
+    }
+    // Only CABAC reads the neighbours' mvds (context selection).
+    if ctx.cabac {
+        for l in 0..2 {
+            for b in 0..16 {
+                info.mvd[l][base + b] = layer.mvd[b].mvd[l];
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The pixels of a derived macroblock: prediction — intra from the
+/// neighbouring samples, inter from the layer's motion-compensation jobs
+/// (waiting for the reference rows they read) — plus the residual, in
+/// place. Needs the neighbouring macroblocks' samples (left, above,
+/// above-right, above-left) reconstructed, and their info derived.
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct<S: Sample>(
+    ctx: &SliceCtx,
+    dq: &Dequant,
+    cur: &mut Frame<S>,
+    info: &PicInfo,
+    nb: &MbNeighbours,
+    layer: &MbLayer,
+    refs: &SliceRefs<S>,
+    scratch: &mut ReconScratch<S>,
+) -> Result<()> {
+    let geom = mb_geom(ctx, cur, info, nb, layer, refs);
+    let (px, py) = (geom.x, geom.y_dst);
+    let step = geom.step;
+    let bit_depth = cur.bit_depth;
+    let max = (1i32 << bit_depth) - 1;
+    let dsp = &refs.dsp;
+    let qp = layer.qp_prime;
+    let qpc = layer.qpc_prime;
+    let bypass = layer.bypass;
+    let intra = layer.kind.is_intra();
+    // The planes coded luma-style: luma alone, or all three in 4:4:4 (Cb
+    // and Cr then use the luma prediction modes, transforms and scaling
+    // lists, at their own QP).
+    let planes = if cur.chroma == ChromaFormat::Yuv444 { 3 } else { 1 };
+    let plane_qp = [qp, qpc[0], qpc[1]];
+    if intra {
         match layer.kind {
             MbKind::IPcm => {
                 let stride = cur.y.stride * step;
@@ -541,7 +658,7 @@ pub fn reconstruct<S: Sample>(
             _ => unreachable!(),
         }
     } else {
-        part_edges = derive_motion_and_predict(ctx, cur, info, nb, layer, refs, geom, scratch)?;
+        predict_jobs(cur, layer, refs, geom, &mut scratch.mc);
         // Residual.
         for p in 0..planes {
             let plane = plane_mut(cur, p);
@@ -591,76 +708,7 @@ pub fn reconstruct<S: Sample>(
         {
             add_chroma_residual(dsp, cur, layer, geom, qpc, dq, false, bypass);
         }
-    }
-
-    // Bookkeeping.
-    let m = &mut info.mbs[addr];
-    m.part_edges = part_edges;
-    m.nz_mask = if layer.kind == MbKind::IPcm {
-        0xffff
-    } else {
-        let mut nzm = 0u16;
-        for b in 0..16 {
-            nzm |= ((layer.nz[0][b] != 0) as u16) << b;
         }
-        if layer.transform_8x8 {
-            // Spread each 8x8's bit over its four 4x4s.
-            let q = |bits: u16| -> u16 { if bits != 0 { 0x33 } else { 0 } };
-            q(nzm & 0x0033) | (q(nzm & 0x00cc) << 2) | (q(nzm & 0x3300) << 8) | (q(nzm & 0xcc00) << 10)
-        } else {
-            nzm
-        }
-    };
-    m.kind = layer.kind;
-    m.slice = ctx.slice_num;
-    m.decoded = true;
-    m.qp = deblock_qp as i8;
-    m.qpc = [deblock_qpc[0] as i8, deblock_qpc[1] as i8];
-    m.cbp = layer.cbp;
-    m.transform_8x8 = layer.transform_8x8;
-    m.chroma_mode = layer.chroma_mode;
-    m.qp_delta_nonzero = layer.has_residual() && layer.qp_delta != 0;
-    m.dc_cbf = layer.dc_cbf;
-    m.sub_direct = if layer.kind == MbKind::Inter8x8 {
-        (0..4)
-            .map(|p| ((layer.sub_shape[p] == SubMbShape::Direct) as u8) << p)
-            .sum()
-    } else {
-        0
-    };
-    m.field = field_mb || ctx.field_pic;
-    if ctx.mbaff {
-        cur.mb_field[addr] = field_mb;
-    }
-    let base = addr * 16;
-    if layer.kind == MbKind::IPcm {
-        info.luma_nz[base..base + 16].fill(16);
-        info.chroma_nz[addr * 32..addr * 32 + 32].fill(16);
-    } else {
-        info.luma_nz[base..base + 16].copy_from_slice(&layer.nz[0]);
-        if planes == 3 {
-            info.chroma_nz[addr * 32..addr * 32 + 16].copy_from_slice(&layer.nz[1]);
-            info.chroma_nz[addr * 32 + 16..addr * 32 + 32].copy_from_slice(&layer.nz[2]);
-        } else {
-            for comp in 0..2 {
-                info.chroma_nz[addr * 32 + comp * 16..addr * 32 + comp * 16 + 8]
-                    .copy_from_slice(&layer.chroma_nz[comp]);
-            }
-        }
-    }
-    if matches!(layer.kind, MbKind::I4x4 | MbKind::I8x8) {
-        info.intra_modes[base..base + 16].copy_from_slice(&layer.intra_modes);
-    } else {
-        info.intra_modes[base..base + 16].fill(2);
-    }
-    // Only CABAC reads the neighbours' mvds (context selection).
-    if ctx.cabac {
-        for l in 0..2 {
-            for b in 0..16 {
-                info.mvd[l][base + b] = layer.mvd[b].mvd[l];
-            }
-        }
-    }
     Ok(())
 }
 
@@ -898,53 +946,35 @@ fn add_chroma_residual<S: Sample>(
     }
 }
 
-/// One prediction to run: `(x, y, w, h, ref0, mv0, ref1, mv1)` in
-/// macroblock coordinates.
-type Job = (usize, usize, usize, usize, i8, Mv, i8, Mv);
-
-/// The predictions of one macroblock (at most sixteen 4x4s).
+/// Per-slice-decoder scratch that [`derive()`] reuses from macroblock to
+/// macroblock instead of building on the stack each time.
 #[derive(Default)]
-struct Jobs {
-    items: [Job; 16],
-    len: usize,
-}
-
-impl Jobs {
-    #[inline(always)]
-    fn push(&mut self, j: Job) {
-        self.items[self.len] = j;
-        self.len += 1;
-    }
-    #[inline(always)]
-    fn as_slice(&self) -> &[Job] {
-        &self.items[..self.len]
-    }
-}
-
-/// Per-slice-decoder scratch that reconstruction reuses from macroblock to
-/// macroblock instead of building on the stack each time (which cost a
-/// memset / memcpy of a few KB per macroblock or partition).
-#[derive(Default)]
-pub struct Scratch<S: Sample> {
-    mc: super::inter::McScratch<S>,
-    jobs: Jobs,
+pub struct DeriveScratch {
     motion: MotionCache,
 }
 
-/// Derive every partition's motion (8.4.1), store it, and motion-compensate
-/// the whole macroblock.
-fn derive_motion_and_predict<S: Sample>(
+/// The same for [`reconstruct`]: the motion-compensation prediction blocks
+/// and gather window (clearing 2.5 KB per partition was measurable).
+#[derive(Default)]
+pub struct ReconScratch<S: Sample> {
+    mc: super::inter::McScratch<S>,
+}
+
+/// Derive every partition's motion (8.4.1): into the picture's motion arrays
+/// and the layer's job list; the partition-boundary edges for the deblocking
+/// filter come back.
+#[allow(clippy::too_many_arguments)]
+fn derive_motion<S: Sample>(
     ctx: &SliceCtx,
     cur: &mut Frame<S>,
     info: &PicInfo,
     nb: &MbNeighbours,
-    layer: &MbLayer,
+    layer: &mut MbLayer,
     refs: &SliceRefs<S>,
     geom: MbGeom,
-    scratch: &mut Scratch<S>,
+    scratch: &mut DeriveScratch,
 ) -> Result<[u16; 2]> {
     let addr = nb.addr;
-    let py = geom.y_pic;
     // An MBAFF field macroblock: reference indices name fields of the
     // frame list (twice as many entries).
     let field_mb = geom.step == 2;
@@ -953,9 +983,10 @@ fn derive_motion_and_predict<S: Sample>(
     // Blocks of the current MB whose motion is final (for neighbour prediction).
     let mut done: u16 = 0;
     // The predictions to run: (x, y, w, h, ref0, mv0, ref1, mv1) in MB coords.
-    let Scratch { mc, jobs, motion: cache } = scratch;
+    let jobs = &mut layer.jobs;
     jobs.len = 0;
     // The neighbouring motion every partition predicts from, gathered once.
+    let cache = &mut scratch.motion;
     cache.gather(nb, cur, info);
     let cache = &*cache;
 
@@ -1089,11 +1120,17 @@ fn derive_motion_and_predict<S: Sample>(
         }
     }
 
-    // Motion compensation: wait for the reference rows the filters reach
-    // (six-tap luma: 2 above / 3 below; bilinear chroma: 1 below, in luma
-    // rows), then predict. A field macroblock of an MBAFF frame reads the
-    // fields of the frame list (index >> 1, parity from index & 1) in field
-    // coordinates.
+    Ok(part_edges)
+}
+
+/// Motion-compensate a derived macroblock from its job list: wait for the
+/// reference rows the filters reach (six-tap luma: 2 above / 3 below;
+/// bilinear chroma: 1 below, in luma rows), then predict. A field
+/// macroblock of an MBAFF frame reads the fields of the frame list (index
+/// >> 1, parity from index & 1) in field coordinates.
+fn predict_jobs<S: Sample>(cur: &mut Frame<S>, layer: &MbLayer, refs: &SliceRefs<S>, geom: MbGeom, mc: &mut super::inter::McScratch<S>) {
+    let py = geom.y_pic;
+    let jobs = &layer.jobs;
     let field_mb = geom.step == 2;
     let pic_h = (cur.mb_height * 16 / if field_mb { 2 } else { 1 }) as i32;
     for &(x, y, w, h, r0, mv0, r1, mv1) in jobs.as_slice() {
@@ -1117,7 +1154,6 @@ fn derive_motion_and_predict<S: Sample>(
         let weighting = refs.weighting(r0, r1, field_mb, geom.parity);
         predict_partition(&refs.dsp, cur, geom, x, y, w, h, fr[0], fr[1], weighting, mc);
     }
-    Ok(part_edges)
 }
 
 /// How the colocated vertical vector relates to the current picture's
