@@ -196,14 +196,39 @@ pub fn install_simd_u8(d: &mut H264Dsp<u8>, cpu: Cpu) {
     super::h264_x86_128::install(d, cpu);
     #[cfg(target_arch = "x86_64")]
     if cpu.avx2 {
-        // No AVX-512 here on purpose. An H.264 block is at most sixteen
-        // samples wide, so 512-bit lanes buy rows per vector and nothing
-        // else; the four kernels that can use them (chroma, avg, the two
-        // weighted combiners) do come out 1.1-2.2x faster in isolation, but
-        // they are together about a twenty-fifth of decode time, so the
-        // ceiling is around one percent — and repeated A/B inside a decode
-        // could not find it, landing between -1% and +3%. See the module
-        // docs of `hevc_avx512_u8` for where the width does pay.
+        // No AVX-512 here, and this is a measurement rather than an
+        // omission. H.264 blocks are at most sixteen samples wide, so 512-bit
+        // lanes buy rows per vector and nothing else, and the whole x86
+        // ladder from SSSE3 upwards is worth 7-9% on this codec against
+        // 20-60% on H.265 — the profile is entropy decoding and per-block
+        // bookkeeping, not pixels.
+        //
+        // Chroma was the one kernel with a real argument: it is the top
+        // kernel of a CABAC profile at ~6.3% self time, and the AVX2 version
+        // runs one row of an eight-wide block per 128-bit vector, so the
+        // lanes rather than the block are the constraint and four rows fit a
+        // 512-bit one. Written, bit-exact over every block shape and
+        // eighth-sample position, and 1.2-1.5x faster than the AVX2 kernel
+        // measured on its own — against a hot source, a half-megabyte cold
+        // one read at scattered offsets, and a cold destination walked in
+        // macroblock order.
+        //
+        // It did not survive a decode. Same binary, rungs selected by
+        // `H26X_MAX_SIMD` so the code layout is identical on both sides,
+        // randomised order within each round, with a same-rung control row
+        // saying what the floor is: cabac3 1.004 against a 0.991 control,
+        // bbb_720p_cabac 1.016 against 0.987, bbb_720p_main 1.016 against
+        // 0.999. Three clips, every one at or above parity. A kernel that is
+        // half again as fast and is a sixteenth of decode time cannot be
+        // found at this resolution, which is the answer for H.264 generally
+        // and not just for chroma.
+        //
+        // Two things that cost a day and are worth knowing before trying
+        // again: a masked byte load is several times a plain one on Zen 5
+        // (see `Cpu::avx512`), and a guard in a kernel installed over AVX2
+        // must fall back to AVX2 and not to the scalar reference — reaching
+        // for scalar is invisible in a benchmark, where guards never trip,
+        // and cost about 2.5% of decode where they did.
         super::h264_avx2::install(d);
     }
     #[cfg(target_arch = "aarch64")]
