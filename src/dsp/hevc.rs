@@ -247,6 +247,11 @@ pub fn install_simd_u16(d: &mut HevcDsp<u16>, cpu: Cpu) {
     #[cfg(target_arch = "x86_64")]
     if cpu.avx2 {
         super::hevc_avx2::install(d);
+        // Over the top, never instead of: a kernel AVX-512 does not carry
+        // keeps the AVX2 one it just replaced.
+        if cpu.avx512 {
+            super::hevc_avx512::install(d);
+        }
     }
     #[cfg(target_arch = "aarch64")]
     if cpu.neon {
@@ -262,6 +267,9 @@ pub fn install_simd_u8(d: &mut HevcDsp<u8>, cpu: Cpu) {
     #[cfg(target_arch = "x86_64")]
     if cpu.avx2 {
         super::hevc_avx2_u8::install(d);
+        if cpu.avx512 {
+            super::hevc_avx512_u8::install(d);
+        }
     }
     #[cfg(target_arch = "aarch64")]
     if cpu.neon {

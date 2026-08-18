@@ -196,6 +196,14 @@ pub fn install_simd_u8(d: &mut H264Dsp<u8>, cpu: Cpu) {
     super::h264_x86_128::install(d, cpu);
     #[cfg(target_arch = "x86_64")]
     if cpu.avx2 {
+        // No AVX-512 here on purpose. An H.264 block is at most sixteen
+        // samples wide, so 512-bit lanes buy rows per vector and nothing
+        // else; the four kernels that can use them (chroma, avg, the two
+        // weighted combiners) do come out 1.1-2.2x faster in isolation, but
+        // they are together about a twenty-fifth of decode time, so the
+        // ceiling is around one percent — and repeated A/B inside a decode
+        // could not find it, landing between -1% and +3%. See the module
+        // docs of `hevc_avx512_u8` for where the width does pay.
         super::h264_avx2::install(d);
     }
     #[cfg(target_arch = "aarch64")]

@@ -46,7 +46,7 @@ pub fn install(d: &mut HevcDsp<u16>) {
 
 /// A pair of taps `(a, b)` broadcast as 32-bit lanes `a | b << 16`.
 #[inline(always)]
-fn pair(a: i8, b: i8) -> i32 {
+pub(super) fn pair(a: i8, b: i8) -> i32 {
     (a as i16 as u16 as i32) | ((b as i16 as u16 as i32) << 16)
 }
 
@@ -525,7 +525,7 @@ const fn build_pairs() -> PairRows {
 static PAIRS: PairRows = build_pairs();
 
 #[inline(always)]
-fn pair_row(n: usize, j: usize) -> &'static [i16] {
+pub(super) fn pair_row(n: usize, j: usize) -> &'static [i16] {
     match n {
         32 => &PAIRS.rows32[j],
         16 => &PAIRS.rows16[j],

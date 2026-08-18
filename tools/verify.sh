@@ -47,7 +47,7 @@ echo
 echo "== SIMD rungs (all fixtures, every rung must agree) =="
 case "$(uname -m)" in
   aarch64 | arm64) RUNGS="neon none" ;;
-  *) RUNGS="avx2 avx sse41 ssse3 sse2 none" ;;
+  *) RUNGS="avx512 avx2 avx sse41 ssse3 sse2 none" ;;
 esac
 ref=""
 for r in $RUNGS; do

@@ -3,8 +3,9 @@
 //!
 //! Every kernel exists as a scalar reference implementation, and the hot ones
 //! also as SIMD: on x86-64 a ladder from SSE2 up through SSSE3, SSE4.1, AVX
-//! and AVX2, and on AArch64 NEON with the dot product extension above it.
-//! Which runs is decided once per process
+//! and AVX2, with AVX-512 over the top of AVX2 for the few shapes where
+//! 512-bit lanes pay for themselves, and on AArch64 NEON with the dot
+//! product extension above it. Which runs is decided once per process
 //! by [`Cpu::detect`] and threaded through as function pointers, the way
 //! libavcodec's `*dsp_init` tables work, so the decoders never branch on the
 //! CPU themselves and the scalar path stays the executable specification the
@@ -33,12 +34,18 @@ pub(crate) mod hevc_x86_128;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_unsafe)]
 pub(crate) mod hevc_avx2;
+#[cfg(target_arch = "x86_64")]
+#[allow(unused_unsafe)]
+pub(crate) mod hevc_avx512;
 #[cfg(target_arch = "aarch64")]
 #[allow(unused_unsafe)]
 pub(crate) mod hevc_neon;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_unsafe)]
 pub(crate) mod hevc_avx2_u8;
+#[cfg(target_arch = "x86_64")]
+#[allow(unused_unsafe)]
+pub(crate) mod hevc_avx512_u8;
 #[cfg(target_arch = "aarch64")]
 #[allow(unused_unsafe)]
 pub(crate) mod hevc_neon_u8;
@@ -51,6 +58,12 @@ pub(crate) mod neon_dotprod;
 pub struct Cpu {
     /// x86-64 with AVX2 (implies AVX / SSE4.1 / SSSE3).
     pub avx2: bool,
+    /// x86-64 with AVX-512 F + BW + VL: 512-bit vectors, byte and word
+    /// lanes, and masked stores narrower than the vector. Unlike the rungs
+    /// below it this one is a *supplement*, not a replacement — the AVX-512
+    /// modules install over a finished AVX2 table and leave every kernel and
+    /// block shape they do not carry alone.
+    pub avx512: bool,
     /// x86-64 with AVX: the 128-bit kernels, VEX-encoded.
     pub avx: bool,
     /// x86-64 with SSE4.1 (`pblendvb`, `pmovzx`, `pminsd` / `pmaxsd`, `ptest`).
@@ -84,7 +97,14 @@ impl Cpu {
             let ssse3 = std::is_x86_feature_detected!("ssse3");
             // Guaranteed by the target, but ask anyway rather than assert it.
             let sse2 = std::is_x86_feature_detected!("sse2");
-            return Self { avx2, avx, sse41, ssse3, sse2, ..Self::SCALAR };
+            // BW for the byte and word lanes the sample arithmetic runs in,
+            // VL for the masked stores that write a partial row without a
+            // branch. F alone would leave both out.
+            let avx512 = avx2
+                && std::is_x86_feature_detected!("avx512f")
+                && std::is_x86_feature_detected!("avx512bw")
+                && std::is_x86_feature_detected!("avx512vl");
+            return Self { avx2, avx512, avx, sse41, ssse3, sse2, ..Self::SCALAR };
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -100,6 +120,7 @@ impl Cpu {
     /// against, and what a `H26X_NO_SIMD=1` environment asks for.
     pub const SCALAR: Self = Self {
         avx2: false,
+        avx512: false,
         avx: false,
         sse41: false,
         ssse3: false,
@@ -115,7 +136,9 @@ impl Cpu {
     /// two, so a user who cannot ask which one they got cannot make sense of
     /// a measurement. `h26xdec --rung` prints this.
     pub fn rung(&self) -> &'static str {
-        if self.avx2 {
+        if self.avx512 {
+            "AVX-512"
+        } else if self.avx2 {
             "AVX2"
         } else if self.avx {
             "AVX (VEX-128)"
@@ -137,8 +160,9 @@ impl Cpu {
     /// [`Self::detect`], with what it found capped by the environment.
     ///
     /// `H26X_NO_SIMD=1` asks for the scalar reference paths. `H26X_MAX_SIMD`
-    /// caps the x86 install level — `avx2` (no cap), `avx`, `sse41`, `ssse3`,
-    /// `sse2` or `none` — so every rung of the ladder can be exercised for
+    /// caps the x86 install level — `avx512` (no cap), `avx2`, `avx`,
+    /// `sse41`, `ssse3`, `sse2` or `none` — so every rung of the ladder,
+    /// including the AVX-512 kernels layered over AVX2, can be exercised for
     /// bit-exactness on a machine whose CPU would otherwise always take the
     /// top one. An unrecognised value is ignored rather than silently
     /// downgrading.
@@ -152,21 +176,28 @@ impl Cpu {
         match std::env::var("H26X_MAX_SIMD").as_deref() {
             Ok("none") | Ok("scalar") => cpu = Self::SCALAR,
             Ok("sse2") => {
+                cpu.avx512 = false;
                 cpu.avx2 = false;
                 cpu.avx = false;
                 cpu.sse41 = false;
                 cpu.ssse3 = false;
             }
             Ok("ssse3") => {
+                cpu.avx512 = false;
                 cpu.avx2 = false;
                 cpu.avx = false;
                 cpu.sse41 = false;
             }
             Ok("sse41") | Ok("sse4.1") => {
+                cpu.avx512 = false;
                 cpu.avx2 = false;
                 cpu.avx = false;
             }
-            Ok("avx") => cpu.avx2 = false,
+            Ok("avx") => {
+                cpu.avx512 = false;
+                cpu.avx2 = false;
+            }
+            Ok("avx2") => cpu.avx512 = false,
             // AArch64: cap at baseline NEON.
             Ok("neon") => {
                 cpu.dotprod = false;

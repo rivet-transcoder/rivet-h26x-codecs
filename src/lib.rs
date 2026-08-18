@@ -10,7 +10,7 @@
 //! tables, a slice-driven decode loop over a decoded-picture buffer, entropy
 //! decoding into per-block syntax, then prediction, inverse transform,
 //! reconstruction and the in-loop filters, with the pixel kernels behind a
-//! runtime-dispatched DSP layer ([`dsp`]) so AVX2 and NEON kernels can
+//! runtime-dispatched DSP layer ([`dsp`]) so AVX2, AVX-512 and NEON kernels can
 //! replace the scalar reference paths without the decoders knowing.
 //!
 //! Both decoders are **bit-exact**: the standards define the decoding process

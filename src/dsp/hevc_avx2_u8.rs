@@ -56,7 +56,7 @@ pub fn install(d: &mut HevcDsp<u8>) {
 /// A pair of taps `(a, b)` as one 16-bit lane `a | b << 8` (the low byte
 /// multiplies the even sample of an interleaved pair).
 #[inline(always)]
-fn pair8(a: i8, b: i8) -> i16 {
+pub(super) fn pair8(a: i8, b: i8) -> i16 {
     (a as u8 as i16) | ((b as i16) << 8)
 }
 
@@ -162,7 +162,7 @@ unsafe fn scatter_rows(dst: *mut u8, stride: usize, w: usize, p: __m128i, rows: 
 /// `rows` rows, plus `extra` samples along, stays inside `len` for the
 /// vector width the kernels use at that block width.
 #[inline(always)]
-fn fits(len: usize, stride: usize, rows: usize, w: usize, extra: usize) -> bool {
+pub(super) fn fits(len: usize, stride: usize, rows: usize, w: usize, extra: usize) -> bool {
     let (vec, last_x) = if w <= 8 {
         (8, 0)
     } else if w <= 16 {
@@ -232,25 +232,25 @@ unsafe fn copy_impl(dst: &mut [i16], src: &[u8], src_stride: usize, w: usize, h:
 
 /// What a FIR stage produces, per output kind (`MODE_*`).
 #[derive(Clone, Copy)]
-struct Out {
+pub(super) struct Out {
     /// `MODE_I16`: 14-bit predictions, stride `w`.
-    i16: *mut i16,
+    pub(super) i16: *mut i16,
     /// `MODE_UNI` / `MODE_BI`: samples, stride `stride`.
-    u8: *mut u8,
+    pub(super) u8: *mut u8,
     /// Sample stride.
-    stride: usize,
+    pub(super) stride: usize,
     /// `MODE_BI`: the other list's 14-bit prediction, stride `w`.
-    other: *const i16,
+    pub(super) other: *const i16,
     /// Block width (the stride of `i16` and `other`).
-    w: usize,
+    pub(super) w: usize,
 }
 
 /// 14-bit predictions (the two-pass path and the first stage of hv).
-const MODE_I16: u8 = 0;
+pub(super) const MODE_I16: u8 = 0;
 /// Default-weighted uni-prediction samples: `(v + 32) >> 6`.
-const MODE_UNI: u8 = 1;
+pub(super) const MODE_UNI: u8 = 1;
 /// Default-weighted bi-prediction samples: `(v + other + 64) >> 7`.
-const MODE_BI: u8 = 2;
+pub(super) const MODE_BI: u8 = 2;
 
 /// Emit 16 lanes of a stage's output (`v`, 14-bit) at (`row`, `x`), the
 /// first `n` lanes.
@@ -277,7 +277,7 @@ unsafe fn emit<const MODE: u8>(out: &Out, row: usize, x: usize, v: __m256i, n: u
 /// Horizontal FIR with `TAPS` taps over bytes.
 #[target_feature(enable = "avx2")]
 #[inline]
-unsafe fn fir_h<const TAPS: usize, const MODE: u8>(out: &Out, src: *const u8, src_stride: usize, w: usize, h: usize, taps: &[i8], shift: i32) {
+pub(super) unsafe fn fir_h<const TAPS: usize, const MODE: u8>(out: &Out, src: *const u8, src_stride: usize, w: usize, h: usize, taps: &[i8], shift: i32) {
     unsafe {
         let mut c = [_mm256_setzero_si256(); 4];
         for k in 0..TAPS / 2 {
@@ -359,7 +359,7 @@ unsafe fn fir_h<const TAPS: usize, const MODE: u8>(out: &Out, src: *const u8, sr
 /// Vertical FIR with `TAPS` taps over byte rows.
 #[target_feature(enable = "avx2")]
 #[inline]
-unsafe fn fir_v<const TAPS: usize, const MODE: u8>(out: &Out, src: *const u8, src_stride: usize, w: usize, h: usize, taps: &[i8], shift: i32) {
+pub(super) unsafe fn fir_v<const TAPS: usize, const MODE: u8>(out: &Out, src: *const u8, src_stride: usize, w: usize, h: usize, taps: &[i8], shift: i32) {
     unsafe {
         let mut c = [_mm256_setzero_si256(); 4];
         for k in 0..TAPS / 2 {
@@ -483,7 +483,7 @@ unsafe fn fir_v2<const TAPS: usize, const MODE: u8>(out: &Out, src: *const i16, 
 
 /// A pair of taps `(a, b)` as one 32-bit lane `a | b << 16` (for `pmaddwd`).
 #[inline(always)]
-fn pair16(a: i8, b: i8) -> i32 {
+pub(super) fn pair16(a: i8, b: i8) -> i32 {
     (a as i16 as u16 as i32) | ((b as i16 as u16 as i32) << 16)
 }
 
@@ -496,7 +496,7 @@ fn fits_i16(len: usize, w: usize, rows: usize) -> bool {
     (rows - 1) * w + last_x + vec <= len
 }
 
-fn qpel_h_avx2(dst: &mut [i16], src: &[u8], src_stride: usize, w: usize, h: usize, frac: usize, shift: i32) {
+pub(super) fn qpel_h_avx2(dst: &mut [i16], src: &[u8], src_stride: usize, w: usize, h: usize, frac: usize, shift: i32) {
     if !fits(src.len(), src_stride, h, w, 7) || dst.len() < w * h {
         return (HevcDsp::<u8>::SCALAR.qpel_h)(dst, src, src_stride, w, h, frac, shift);
     }
@@ -504,7 +504,7 @@ fn qpel_h_avx2(dst: &mut [i16], src: &[u8], src_stride: usize, w: usize, h: usiz
     unsafe { fir_h::<8, MODE_I16>(&out, src.as_ptr(), src_stride, w, h, &QPEL_FILTERS[frac][..8], shift) }
 }
 
-fn qpel_v_avx2(dst: &mut [i16], src: &[u8], src_stride: usize, w: usize, h: usize, frac: usize, shift: i32) {
+pub(super) fn qpel_v_avx2(dst: &mut [i16], src: &[u8], src_stride: usize, w: usize, h: usize, frac: usize, shift: i32) {
     if !fits(src.len(), src_stride, h + 7, w, 0) || dst.len() < w * h {
         return (HevcDsp::<u8>::SCALAR.qpel_v)(dst, src, src_stride, w, h, frac, shift);
     }
@@ -512,7 +512,7 @@ fn qpel_v_avx2(dst: &mut [i16], src: &[u8], src_stride: usize, w: usize, h: usiz
     unsafe { fir_v::<8, MODE_I16>(&out, src.as_ptr(), src_stride, w, h, &QPEL_FILTERS[frac][..8], shift) }
 }
 
-fn epel_h_avx2(dst: &mut [i16], src: &[u8], src_stride: usize, w: usize, h: usize, frac: usize, shift: i32) {
+pub(super) fn epel_h_avx2(dst: &mut [i16], src: &[u8], src_stride: usize, w: usize, h: usize, frac: usize, shift: i32) {
     if !fits(src.len(), src_stride, h, w, 3) || dst.len() < w * h {
         return (HevcDsp::<u8>::SCALAR.epel_h)(dst, src, src_stride, w, h, frac, shift);
     }
@@ -520,7 +520,7 @@ fn epel_h_avx2(dst: &mut [i16], src: &[u8], src_stride: usize, w: usize, h: usiz
     unsafe { fir_h::<4, MODE_I16>(&out, src.as_ptr(), src_stride, w, h, &EPEL_FILTERS[frac], shift) }
 }
 
-fn epel_v_avx2(dst: &mut [i16], src: &[u8], src_stride: usize, w: usize, h: usize, frac: usize, shift: i32) {
+pub(super) fn epel_v_avx2(dst: &mut [i16], src: &[u8], src_stride: usize, w: usize, h: usize, frac: usize, shift: i32) {
     if !fits(src.len(), src_stride, h + 3, w, 0) || dst.len() < w * h {
         return (HevcDsp::<u8>::SCALAR.epel_v)(dst, src, src_stride, w, h, frac, shift);
     }
@@ -615,24 +615,24 @@ fn fused<const TAPS: usize, const MODE: u8>(dst: &mut [u8], dst_stride: usize, s
     }
 }
 
-fn qpel_uni_avx2(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], bit_depth: u32) {
+pub(super) fn qpel_uni_avx2(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], bit_depth: u32) {
     debug_assert_eq!(bit_depth, 8);
     fused::<8, MODE_UNI>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, &[])
 }
 
-fn epel_uni_avx2(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], bit_depth: u32) {
+pub(super) fn epel_uni_avx2(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], bit_depth: u32) {
     debug_assert_eq!(bit_depth, 8);
     fused::<4, MODE_UNI>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, &[])
 }
 
 #[allow(clippy::too_many_arguments)]
-fn qpel_bi_avx2(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], other: &[i16], bit_depth: u32) {
+pub(super) fn qpel_bi_avx2(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], other: &[i16], bit_depth: u32) {
     debug_assert_eq!(bit_depth, 8);
     fused::<8, MODE_BI>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, other)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn epel_bi_avx2(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], other: &[i16], bit_depth: u32) {
+pub(super) fn epel_bi_avx2(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], other: &[i16], bit_depth: u32) {
     debug_assert_eq!(bit_depth, 8);
     fused::<4, MODE_BI>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, other)
 }

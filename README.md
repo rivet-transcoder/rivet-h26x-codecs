@@ -7,7 +7,8 @@
 Native **H.264/AVC** and **H.265/HEVC** decoders in Rust: no C, no system
 libraries, no build script, nothing to install on a build host. Bit-exact
 against the JVT and JCT-VC conformance suites, frame- and wavefront-threaded,
-with a run-time ladder of SSE2-through-AVX2 and NEON kernels.
+with a run-time ladder of SSE2-through-AVX2 and NEON kernels, and a
+supplementary AVX-512 tier over AVX2 for the shapes where 512-bit lanes pay.
 
 The SIMD is written in Rust intrinsics, not assembly, with one exception:
 AArch64's `sdot` has no intrinsic on stable Rust yet
@@ -86,7 +87,10 @@ the best available version of every kernel. SSE2 is baseline on x86-64, so the
 bottom rung always applies: no x86-64 machine runs the scalar kernels, which
 are the executable specification the others are tested against and not a
 fallback. AArch64 has **NEON**, likewise baseline, with the ARMv8.2-A **dot
-product** extension above it where present.
+product** extension above it where present. **AVX-512** (F + BW + VL) sits
+above AVX2 as a supplement rather than a rung: it replaces the handful of
+H.265 kernels whose block shape genuinely fits 512-bit lanes and leaves the
+rest of the AVX2 table alone.
 
 Measured on one core against the scalar reference, SSE2 alone is worth
 2.1–2.8x and is nearly all of the total; SSSE3 (`pmaddubsw` for the six-tap
