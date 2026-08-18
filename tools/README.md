@@ -57,6 +57,17 @@ is noise, and it is worse than that — measurements taken on a *contended core*
 were not merely noisy but systematically misleading, giving opposite signs on
 two streams for the same change. Two habits that fix it:
 
+**Measure the process tree, not the process.** `benchmark.py` puts each run in
+a Windows job object and reads the job's accounting, because asking a process
+how much CPU it used misses anything it spawned. `ffmpeg` on this machine is a
+136 KB scoop shim that runs the real binary as a child: timed as a process it
+reported **0.03 CPU seconds for 1.29 seconds of wall-clock work**, a 46x
+understatement, and since it was the thing being compared against, the error
+pointed the only direction that flatters us. It also refuses to report a
+single-threaded run whose CPU time is under half its wall time, which is what
+that failure looks like from the inside — a measurement that cannot be right
+should stop the tool, not quietly become a row in a table.
+
 **Know your floor before you trust a number.** Run `ab.py` with the *same
 binary as both arguments*. Whatever spread that reports is the smallest
 difference the machine can currently resolve; a change smaller than it has not

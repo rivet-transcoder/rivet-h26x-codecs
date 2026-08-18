@@ -33,6 +33,11 @@ import time
 from ctypes import wintypes
 
 WINDOWS = os.name == "nt"
+# The tables are Markdown destined for a UTF-8 README, and Windows
+# consoles still default to a code page that cannot hold an em dash;
+# redirected to a file that silently becomes a replacement character.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 HIGH_PRIORITY = 0x00000080 if WINDOWS else 0
 
 
@@ -60,32 +65,85 @@ def cpu_threads():
     return os.cpu_count() or 1
 
 
-def process_cpu_seconds(handle):
-    """CPU time of a finished process."""
-    if WINDOWS:
-        c, e, k, u = (wintypes.FILETIME() for _ in range(4))
-        ctypes.windll.kernel32.GetProcessTimes(
-            wintypes.HANDLE(handle), ctypes.byref(c), ctypes.byref(e),
-            ctypes.byref(k), ctypes.byref(u))
-        ft = lambda f: (f.dwHighDateTime << 32 | f.dwLowDateTime) / 1e7
-        return ft(k) + ft(u)
-    r = os.wait4(handle, 0)[2]
-    return r.ru_utime + r.ru_stime
+class JobAccounting(ctypes.Structure):
+    """`JOBOBJECT_BASIC_ACCOUNTING_INFORMATION`."""
+    _fields_ = [("TotalUserTime", ctypes.c_int64),
+                ("TotalKernelTime", ctypes.c_int64),
+                ("ThisPeriodTotalUserTime", ctypes.c_int64),
+                ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+                ("TotalPageFaultCount", wintypes.DWORD),
+                ("TotalProcesses", wintypes.DWORD),
+                ("ActiveProcesses", wintypes.DWORD),
+                ("TotalTerminatedProcesses", wintypes.DWORD)]
+
+
+def job_cpu_seconds(job):
+    """CPU time of every process that ran in `job`, finished or not.
+
+    A process is the wrong unit to measure. `ffmpeg` on this machine is a
+    136 KB scoop shim that spawns the real binary as a child, so asking the
+    process we launched how much CPU it used answered 0.03 seconds for work
+    that took 1.44 — a 46x understatement that reads as a spectacular win for
+    whatever it is being compared against. A job object catches the children.
+    """
+    info = JobAccounting()
+    ok = ctypes.windll.kernel32.QueryInformationJobObject(
+        job, 1, ctypes.byref(info), ctypes.sizeof(info), None)
+    if not ok:
+        raise OSError("QueryInformationJobObject failed")
+    return (info.TotalUserTime + info.TotalKernelTime) / 1e7
+
+
+def run_once(cmd, env):
+    """(CPU seconds of the whole process tree, wall seconds)."""
+    if not WINDOWS:
+        t = time.perf_counter()
+        p = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        _, _, r = os.wait4(p.pid, 0)
+        wall = time.perf_counter() - t
+        # ru_children is not available per-call here; the direct child's own
+        # usage is what os.wait4 reports, which is right when nothing wraps it.
+        return r.ru_utime + r.ru_stime, wall
+    k32 = ctypes.windll.kernel32
+    job = k32.CreateJobObjectW(None, None)
+    if not job:
+        raise OSError("CreateJobObjectW failed")
+    try:
+        t = time.perf_counter()
+        p = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL,
+                             creationflags=HIGH_PRIORITY)
+        k32.AssignProcessToJobObject(job, wintypes.HANDLE(int(p._handle)))
+        p.wait()
+        wall = time.perf_counter() - t
+        return job_cpu_seconds(job), wall
+    finally:
+        k32.CloseHandle(job)
 
 
 def run_best(cmd, env_extra, runs):
-    """(best CPU seconds, best wall seconds) over `runs` runs."""
+    """(best CPU seconds, best wall seconds) over `runs` runs.
+
+    Refuses a result whose CPU time is far below its wall time on a run that
+    should be CPU-bound: that means work escaped the measurement rather than
+    that the program was fast, and a table built from it is worse than no
+    table. Single-threaded runs are the check, because a threaded one can
+    legitimately spend its wall time waiting.
+    """
     env = dict(os.environ)
     env.update(env_extra)
+    single = env.get("H26X_THREADS") == "1" or "-threads" in cmd
     best_cpu, best_wall = float("inf"), float("inf")
     for _ in range(runs):
-        t = time.perf_counter()
-        kw = {"creationflags": HIGH_PRIORITY} if WINDOWS else {}
-        p = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, **kw)
-        p.wait()
-        wall = time.perf_counter() - t
-        cpu = process_cpu_seconds(p._handle if WINDOWS else p.pid)
+        cpu, wall = run_once(cmd, env)
+        if single and wall > 0.3 and cpu < 0.5 * wall:
+            raise SystemExit(
+                f"refusing to report {cpu:.3f} CPU s against {wall:.3f} wall s"
+                f" for a single-threaded run of: {' '.join(map(str, cmd))}."
+                " Work escaped the measurement — the usual cause is a launcher"
+                " or shim that runs the real program as a child. Point --ffmpeg"
+                " or --dec at the real executable.")
         best_cpu, best_wall = min(best_cpu, cpu), min(best_wall, wall)
     return best_cpu, best_wall
 
