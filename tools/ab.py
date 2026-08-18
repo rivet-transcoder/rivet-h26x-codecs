@@ -18,6 +18,9 @@ import sys
 import time
 from ctypes import wintypes
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
 kernel32 = ctypes.windll.kernel32
 HIGH_PRIORITY_CLASS = 0x00000080
 
@@ -89,6 +92,17 @@ a, b, f = sys.argv[1], sys.argv[2], sys.argv[3]
 n = int(sys.argv[4]) if len(sys.argv) > 4 else 7
 if not MT:
     where = f"core {CORE}" + (f" (its SMT pair {LOAD:.0f}% busy)" if LOAD is not None else " (AFFINITY)")
+    # Refuse rather than warn. A warning is a line of output that a batch run
+    # scrolls past and a tired reader takes for a caveat rather than a verdict;
+    # when the quietest pair on the machine is this busy there is no statistic
+    # that rescues the run, so the useful thing to produce is no number at all.
+    if LOAD is not None and LOAD > 50 and os.environ.get("AB_FORCE") != "1":
+        sys.exit(
+            f"refusing to measure: the quietest SMT pair on this machine is "
+            f"{LOAD:.0f}% busy. Nothing measured now will mean anything — a "
+            f"same-binary control on a machine this loaded has read 1.120 and "
+            f"0.862 in consecutive rounds. Wait for it to drop, or set "
+            f"AB_FORCE=1 if you have a reason to want the numbers anyway.")
     if LOAD is not None and LOAD > 15:
         where += ("\n  WARNING: the quietest pair on this machine is already busy."
                   "\n  Run the same binary against itself first, and do not believe"
