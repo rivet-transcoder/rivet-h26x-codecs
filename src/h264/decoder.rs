@@ -362,6 +362,7 @@ impl<S: Sample> PictureDecoder<S> {
                             MbKind::PSkip
                         };
                         layer.reset(kind, true);
+                        layer.qp = qps.prev_qp;
                         st.prev_qp_delta_nonzero = false;
                         skipped = true;
                         if mbaff && is_top {
@@ -400,18 +401,10 @@ impl<S: Sample> PictureDecoder<S> {
                         neighbours!(nb, info, sa, pair_field);
                     }
                     layer.field = pair_field;
-                    parse_mb_cabac(
-                        &mut cabac,
-                        &mut st,
-                        &ctx,
-                        info,
-                        &nb,
-                        &cur.motion,
-                        &mut layer,
-                    )?;
+                    parse_mb_cabac(&mut cabac, &mut st, &ctx, info, &nb, &cur.motion, &mut layer, dq, &mut qps)?;
                 }
                 layer.field = pair_field;
-                reconstruct(&ctx, &mut qps, dq, cur, info, &nb, &layer, &refs, &mut scratch)?;
+                reconstruct(&ctx, &qps, dq, cur, info, &nb, &layer, &refs, &mut scratch)?;
                 mb_done!();
                 // No end_of_slice_flag after the top macroblock of an MBAFF
                 // pair (7.3.4): a slice holds whole pairs.
@@ -464,8 +457,9 @@ impl<S: Sample> PictureDecoder<S> {
                             MbKind::PSkip
                         };
                         layer.reset(kind, false);
+                        layer.qp = qps.prev_qp;
                         layer.field = pair_field;
-                        reconstruct(&ctx, &mut qps, dq, cur, info, &nb, &layer, &refs, &mut scratch)?;
+                        reconstruct(&ctx, &qps, dq, cur, info, &nb, &layer, &refs, &mut scratch)?;
                         mb_done!();
                     }
                     prev_skipped = run > 0;
@@ -490,8 +484,8 @@ impl<S: Sample> PictureDecoder<S> {
                 neighbours!(nb, info, sa, pair_field);
                 let t = r.ue();
                 layer.field = pair_field;
-                parse_mb_cavlc(&mut r, &ctx, info, &nb, t, &mut layer)?;
-                reconstruct(&ctx, &mut qps, dq, cur, info, &nb, &layer, &refs, &mut scratch)?;
+                parse_mb_cavlc(&mut r, &ctx, info, &nb, t, &mut layer, dq, &mut qps)?;
+                reconstruct(&ctx, &qps, dq, cur, info, &nb, &layer, &refs, &mut scratch)?;
                 mb_done!();
                 if r.overrun() {
                     return Err(Error::bitstream("CAVLC slice data exhausted"));

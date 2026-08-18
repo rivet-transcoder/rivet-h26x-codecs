@@ -131,6 +131,9 @@ pub struct MbLayer {
     pub mvd: [MvdEntry; 16],
     /// `mb_qp_delta`.
     pub qp_delta: i32,
+    /// `QP_Y` of the macroblock (the previous macroblock's for one without
+    /// `mb_qp_delta`), set by the parser (or the skip path).
+    pub qp: i32,
     /// MBAFF: the pair's `mb_field_decoding_flag` (a field macroblock).
     pub field: bool,
     /// Luma-style coefficients per colour plane (`[0]` luma; `[1]`, `[2]`
@@ -167,6 +170,7 @@ impl MbLayer {
     pub fn new(kind: MbKind) -> Self {
         MbLayer {
             kind,
+            qp: 0,
             transform_8x8: false,
             intra16_mode: 0,
             intra_modes: [2; 16],
@@ -197,6 +201,11 @@ impl MbLayer {
     /// are cleared here and every untouched block is still zero.
     pub fn reset(&mut self, kind: MbKind, cabac: bool) {
         for p in 0..3 {
+            // Nothing coded in this plane (always so for Cb / Cr outside
+            // 4:4:4): one word test instead of sixteen.
+            if u128::from_ne_bytes(self.nz[p]) == 0 {
+                continue;
+            }
             if self.transform_8x8 || self.kind == MbKind::I8x8 {
                 for blk8 in 0..4 {
                     let (bx, by) = ((blk8 & 1) * 2, (blk8 >> 1) * 2);
@@ -219,11 +228,18 @@ impl MbLayer {
         if self.kind == MbKind::I16x16 {
             self.dc = [[0; 16]; 3];
         }
-        self.chroma_dc = [[0; 8]; 2];
-        for comp in 0..2 {
-            for b in 0..8 {
-                if self.chroma_nz[comp][b] != 0 {
-                    self.chroma_ac[comp][b] = [0; 16];
+        // Chroma DC / AC were written only with the chroma cbp bits set (or
+        // for I_PCM, which fills every count).
+        if self.cbp & 0x30 != 0 || self.kind == MbKind::IPcm {
+            self.chroma_dc = [[0; 8]; 2];
+            for comp in 0..2 {
+                if u64::from_ne_bytes(self.chroma_nz[comp]) == 0 {
+                    continue;
+                }
+                for b in 0..8 {
+                    if self.chroma_nz[comp][b] != 0 {
+                        self.chroma_ac[comp][b] = [0; 16];
+                    }
                 }
             }
         }
@@ -1236,6 +1252,75 @@ pub fn colocated_motion<S: Sample>(col: &Frame<S>, addr: usize, blk: usize) -> (
 #[inline]
 pub fn raster_of_blk(blk: usize) -> usize {
     (BLK4X4_Y[blk] as usize) * 4 + BLK4X4_X[blk] as usize
+}
+
+/// `QPC` from `QPY` and the chroma QP offset (8.5.8 / Table 8-15): `qPI`
+/// clips at `-QpBdOffsetC` below (a negative `qPI` maps to itself).
+pub(crate) fn chroma_qp(qp: i32, offset: i32, qp_bd_offset: i32) -> i32 {
+    let qpi = (qp + offset).clamp(-qp_bd_offset, 51);
+    if qpi < 0 {
+        qpi
+    } else {
+        super::tables::CHROMA_QP[qpi as usize] as i32
+    }
+}
+
+/// `QP_Y` of a macroblock from the previous one's and its `mb_qp_delta`
+/// (7.4.5: wraps in `-QpBdOffsetY..=51`).
+#[inline]
+pub(crate) fn next_qp(prev_qp: i32, qp_delta: i32, bit_depth: u32) -> i32 {
+    let bd_off = 6 * (bit_depth as i32 - 8);
+    ((prev_qp + qp_delta + 52 + 2 * bd_off) % (52 + bd_off)) - bd_off
+}
+
+/// The scaling a coded macroblock's parser applies to each coefficient as
+/// it is written (8.5.12.1 / 8.5.13.1 folded into one multiply, add and
+/// shift: `(c * LevelScale << shift + 32) >> 6`, exact for every QP): per
+/// colour plane the 4x4 and 8x8 tables (raster) and shifts. Plane 0 is
+/// luma (or the plane a separate-colour-plane picture is decoding), 1 / 2
+/// are Cb / Cr — the 4:4:4 planes coded like luma, or the 4:2:0 / 4:2:2
+/// chroma AC blocks. `None` for a lossless (transform bypass) macroblock,
+/// whose levels are the residual.
+pub struct MbDequant<'a> {
+    /// `(table, shift)` per plane for 4x4 blocks.
+    pub q4: [(&'a [i32; 16], u32); 3],
+    /// The same for 8x8 blocks.
+    pub q8: [(&'a [i32; 64], u32); 3],
+}
+
+impl<'a> MbDequant<'a> {
+    /// The tables for a macroblock of `kind` at `QP_Y = qp` in a slice with
+    /// `chroma_offset` (the PPS chroma QP offsets); `None` when it is
+    /// lossless.
+    pub fn for_mb(dq: &'a super::transform::Dequant, ctx: &SliceCtx, chroma_offset: [i32; 2], kind: MbKind, qp: i32) -> Option<Self> {
+        let bd_off = 6 * (ctx.bit_depth as i32 - 8);
+        // The primed QPs the scaling uses.
+        let qps = [qp + bd_off, chroma_qp(qp, chroma_offset[0], bd_off) + bd_off, chroma_qp(qp, chroma_offset[1], bd_off) + bd_off];
+        if ctx.transform_bypass && qps[0] == 0 {
+            return None;
+        }
+        let inter = !kind.is_intra();
+        let mut q4 = [(&dq.scale4[0][0], 0u32); 3];
+        let mut q8 = [(&dq.scale8[0][0], 0u32); 3];
+        // Only the luma-like plane exists for monochrome and for a colour
+        // plane coded on its own (whose scaling lists are picked by
+        // `scaling_plane`); the chroma entries stay dummies then.
+        let planes = if ctx.chroma_format_idc == 0 { 1 } else { 3 };
+        for p in 0..planes {
+            let q = qps[p];
+            let list = p + ctx.scaling_plane;
+            q4[p] = (&dq.scale4[list + if inter { 3 } else { 0 }][(q % 6) as usize], (q / 6 + 2) as u32);
+            q8[p] = (&dq.scale8[2 * list + inter as usize][(q % 6) as usize], (q / 6) as u32);
+        }
+        Some(MbDequant { q4, q8 })
+    }
+}
+
+/// One coefficient scaled: `(level * table << shift + 32) >> 6` (wrapping,
+/// so a malformed level cannot panic; a conforming stream stays in range).
+#[inline(always)]
+pub(crate) fn dequant_level(level: i32, table: i32, shift: u32) -> i32 {
+    (level.wrapping_mul(table).wrapping_shl(shift).wrapping_add(32)) >> 6
 }
 
 /// `H26X_TRACE_IPM`: trace syntax elements (macroblock starts, intra

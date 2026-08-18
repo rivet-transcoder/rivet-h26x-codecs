@@ -16,7 +16,7 @@ use super::mb::{
     prediction_neighbours, spatial_direct_ref_idx,
 };
 use super::slice::PredWeightTable;
-use super::tables::{BLK4X4_FROM_RASTER, CHROMA_QP};
+use super::tables::BLK4X4_FROM_RASTER;
 use super::transform::{
     Dequant, chroma_dc_transform_420, chroma_dc_transform_422, luma_dc_transform,
 };
@@ -242,16 +242,7 @@ pub struct QpState {
     pub chroma_offset: [i32; 2],
 }
 
-/// `QPC` from `QPY` and the chroma QP offset (8.5.8 / Table 8-15): `qPI`
-/// clips at `-QpBdOffsetC` below (a negative `qPI` maps to itself).
-fn chroma_qp(qp: i32, offset: i32, qp_bd_offset: i32) -> i32 {
-    let qpi = (qp + offset).clamp(-qp_bd_offset, 51);
-    if qpi < 0 {
-        qpi
-    } else {
-        CHROMA_QP[qpi as usize] as i32
-    }
-}
+use super::mb::chroma_qp;
 
 /// Whether the macroblock at `addr` may supply intra prediction samples
 /// (available, and intra when constrained_intra_pred is on).
@@ -267,7 +258,7 @@ fn intra_ok(info: &PicInfo, ctx: &SliceCtx, addr: Option<usize>) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub fn reconstruct<S: Sample>(
     ctx: &SliceCtx,
-    qps: &mut QpState,
+    qps: &QpState,
     dq: &Dequant,
     cur: &mut Frame<S>,
     info: &mut PicInfo,
@@ -313,12 +304,8 @@ pub fn reconstruct<S: Sample>(
     // QP'Y = QPY + QpBdOffsetY (and QP'C likewise); the deblocking filter
     // reads the unshifted values.
     let bd_off = 6 * (ctx.bit_depth as i32 - 8);
-    let qp = if layer.kind.is_skip() || layer.kind == MbKind::IPcm || !layer.has_residual() {
-        qps.prev_qp
-    } else {
-        ((qps.prev_qp + layer.qp_delta + 52 + 2 * bd_off) % (52 + bd_off)) - bd_off
-    };
-    qps.prev_qp = qp;
+    // QP_Y as the parser (or the skip path) left it in the layer.
+    let qp = layer.qp;
     let deblock_qp = if layer.kind == MbKind::IPcm { 0 } else { qp };
     let qpc_raw = [
         chroma_qp(qp, qps.chroma_offset[0], bd_off),
@@ -442,7 +429,6 @@ pub fn reconstruct<S: Sample>(
                     let stride = plane.stride * step;
                     predict_16x16(plane, off, stride, layer.intra16_mode, av, bit_depth)?;
                     let qp = plane_qp[p];
-                    let scale = &dq.scale4[p + ctx.scaling_plane][(qp % 6) as usize];
                     if bypass {
                         // The whole 16x16 residual at once: DC into position
                         // 0 of each block, then 8.5.15's DPCM for the
@@ -469,20 +455,11 @@ pub fn reconstruct<S: Sample>(
                     } else {
                         // Residual: DC transform then per-4x4 blocks.
                         let mut dc = layer.dc[p];
-                        luma_dc_transform(&mut dc, scale[0], qp);
+                        luma_dc_transform(&mut dc, dq.scale4[p + ctx.scaling_plane][(qp % 6) as usize][0], qp);
                         for blk in 0..16 {
                             let (bx, by) = (blk % 4, blk / 4);
                             let boff = off + by * 4 * stride + bx * 4;
-                            residual4(
-                                dsp,
-                                &mut plane.data[boff..],
-                                stride,
-                                &layer.coef[p][blk * 16..blk * 16 + 16],
-                                scale,
-                                qp,
-                                Some(dc[blk]),
-                                max,
-                            );
+                            residual4(dsp, &mut plane.data[boff..], stride, &layer.coef[p][blk * 16..blk * 16 + 16], Some(dc[blk]), max);
                         }
                     }
                 }
@@ -495,8 +472,6 @@ pub fn reconstruct<S: Sample>(
                     let plane = plane_mut(cur, p);
                     let stride = plane.stride * step;
                     let off = plane.offset(px as isize, py as isize);
-                    let qp = plane_qp[p];
-                    let scale = &dq.scale4[p + ctx.scaling_plane][(qp % 6) as usize];
                     for blk_idx in 0..16 {
                         let raster = super::mb::raster_of_blk(blk_idx);
                         let (bx, by) = (raster % 4, raster / 4);
@@ -517,16 +492,7 @@ pub fn reconstruct<S: Sample>(
                                     max,
                                 );
                             } else {
-                                residual4(
-                                    dsp,
-                                    &mut plane.data[boff..],
-                                    stride,
-                                    &layer.coef[p][raster * 16..raster * 16 + 16],
-                                    scale,
-                                    qp,
-                                    None,
-                                    max,
-                                );
+                                residual4(dsp, &mut plane.data[boff..], stride, &layer.coef[p][raster * 16..raster * 16 + 16], None, max);
                             }
                         }
                     }
@@ -540,8 +506,6 @@ pub fn reconstruct<S: Sample>(
                     let plane = plane_mut(cur, p);
                     let stride = plane.stride * step;
                     let off = plane.offset(px as isize, py as isize);
-                    let qp = plane_qp[p];
-                    let scale = &dq.scale8[2 * (p + ctx.scaling_plane)][(qp % 6) as usize];
                     for blk8 in 0..4 {
                         let (bx, by) = ((blk8 & 1) * 2, (blk8 >> 1) * 2);
                         let av = intra_avail_8x8(info, ctx, nb, blk8);
@@ -565,15 +529,7 @@ pub fn reconstruct<S: Sample>(
                                     max,
                                 );
                             } else {
-                                residual8(
-                                    dsp,
-                                    &mut plane.data[boff..],
-                                    stride,
-                                    &layer.coef[p][blk8 * 64..blk8 * 64 + 64],
-                                    scale,
-                                    qp,
-                                    max,
-                                );
+                                residual8(dsp, &mut plane.data[boff..], stride, &layer.coef[p][blk8 * 64..blk8 * 64 + 64], max);
                             }
                         }
                     }
@@ -591,9 +547,7 @@ pub fn reconstruct<S: Sample>(
             let plane = plane_mut(cur, p);
             let stride = plane.stride * step;
             let off = plane.offset(px as isize, py as isize);
-            let qp = plane_qp[p];
             if layer.transform_8x8 {
-                let scale = &dq.scale8[2 * (p + ctx.scaling_plane) + 1][(qp % 6) as usize];
                 for blk8 in 0..4 {
                     if layer.cbp & (1 << blk8) == 0 {
                         continue;
@@ -612,19 +566,10 @@ pub fn reconstruct<S: Sample>(
                         r.copy_from_slice(&layer.coef[p][blk8 * 64..blk8 * 64 + 64]);
                         add_bypass(&mut plane.data[boff..], stride, &mut r, 8, None, max);
                     } else {
-                        residual8(
-                            dsp,
-                            &mut plane.data[boff..],
-                            stride,
-                            &layer.coef[p][blk8 * 64..blk8 * 64 + 64],
-                            scale,
-                            qp,
-                            max,
-                        );
+                        residual8(dsp, &mut plane.data[boff..], stride, &layer.coef[p][blk8 * 64..blk8 * 64 + 64], max);
                     }
                 }
             } else {
-                let scale = &dq.scale4[3 + p + ctx.scaling_plane][(qp % 6) as usize];
                 for raster in 0..16 {
                     if layer.nz[p][raster] == 0 {
                         continue;
@@ -636,16 +581,7 @@ pub fn reconstruct<S: Sample>(
                         r.copy_from_slice(&layer.coef[p][raster * 16..raster * 16 + 16]);
                         add_bypass(&mut plane.data[boff..], stride, &mut r, 4, None, max);
                     } else {
-                        residual4(
-                            dsp,
-                            &mut plane.data[boff..],
-                            stride,
-                            &layer.coef[p][raster * 16..raster * 16 + 16],
-                            scale,
-                            qp,
-                            None,
-                            max,
-                        );
+                        residual4(dsp, &mut plane.data[boff..], stride, &layer.coef[p][raster * 16..raster * 16 + 16], None, max);
                     }
                 }
             }
@@ -957,16 +893,7 @@ fn add_chroma_residual<S: Sample>(
         for blk in 0..(mbh_c / 4) * 2 {
             let (bx, by) = (blk % 2, blk / 2);
             let boff = coff + by * 4 * cstride + bx * 4;
-            residual4(
-                dsp,
-                &mut plane.data[boff..],
-                cstride,
-                &layer.chroma_ac[comp][blk],
-                &dq.scale4[list][(qp % 6) as usize],
-                qp,
-                Some(dc[blk]),
-                max,
-            );
+            residual4(dsp, &mut plane.data[boff..], cstride, &layer.chroma_ac[comp][blk], Some(dc[blk]), max);
         }
     }
 }
@@ -1622,18 +1549,9 @@ fn direct_partitions<S: Sample>(
 /// (`dc`: an already-scaled DC replacing position 0, or `NO_DC`).
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn residual4<S: Sample>(
-    dsp: &H264Dsp<S>,
-    dst: &mut [S],
-    stride: usize,
-    levels: &[i32],
-    scale: &[i32; 16],
-    qp: i32,
-    dc: Option<i32>,
-    max: i32,
-) {
-    let levels: &[i32; 16] = levels.try_into().expect("16 levels");
-    (dsp.residual4)(dst, stride, levels, scale, qp, dc.unwrap_or(NO_DC), max);
+fn residual4<S: Sample>(dsp: &H264Dsp<S>, dst: &mut [S], stride: usize, coefs: &[i32], dc: Option<i32>, max: i32) {
+    let coefs: &[i32; 16] = coefs.try_into().expect("16 coefficients");
+    (dsp.residual4)(dst, stride, coefs, dc.unwrap_or(NO_DC), max);
 }
 
 /// The colour plane `p` of a frame (0 luma, 1 Cb, 2 Cr).
@@ -1711,15 +1629,7 @@ fn add_bypass_rect<S: Sample>(
 
 /// Add the inverse transform of a dequantised 8x8 block of `levels` to `dst`.
 #[inline(always)]
-fn residual8<S: Sample>(
-    dsp: &H264Dsp<S>,
-    dst: &mut [S],
-    stride: usize,
-    levels: &[i32],
-    scale: &[i32; 64],
-    qp: i32,
-    max: i32,
-) {
-    let levels: &[i32; 64] = levels.try_into().expect("64 levels");
-    (dsp.residual8)(dst, stride, levels, scale, qp, max);
+fn residual8<S: Sample>(dsp: &H264Dsp<S>, dst: &mut [S], stride: usize, coefs: &[i32], max: i32) {
+    let coefs: &[i32; 64] = coefs.try_into().expect("64 coefficients");
+    (dsp.residual8)(dst, stride, coefs, max);
 }

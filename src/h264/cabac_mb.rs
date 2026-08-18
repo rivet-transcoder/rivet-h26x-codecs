@@ -9,7 +9,7 @@ use super::cavlc::{
     sub_partition_rect,
 };
 use super::frame::Mv;
-use super::mb::{
+use super::mb::{MbDequant, 
     MbKind, MbLayer, MbNeighbours, PRED_BI, PRED_L0, PRED_L1, PicInfo, SliceCtx, SubMbShape,
 };
 use super::slice::SliceType;
@@ -794,6 +794,7 @@ fn residual_block_cabac(
     scan: &[u8],
     start: usize,
     max_coeff: usize,
+    dq: Option<(&[i32], u32)>,
 ) -> Result<usize> {
     if let Some(inc) = cbf_inc {
         let trace = super::mb::syntax_trace();
@@ -885,7 +886,12 @@ fn residual_block_cabac(
             num_gt1 += 1;
         }
         let sign = c.bypass();
-        out[scan[start + pos] as usize] = if sign != 0 { -abs } else { abs };
+        let level = if sign != 0 { -abs } else { abs };
+        let idx = scan[start + pos] as usize;
+        out[idx] = match dq {
+            Some((table, shift)) => super::mb::dequant_level(level, table[idx], shift),
+            None => level,
+        };
     }
     if c.overrun() {
         return Err(Error::bitstream("CABAC: slice data truncated"));
@@ -911,7 +917,10 @@ fn parse_residual_luma_like_cabac(
     nb: &MbNeighbours,
     layer: &mut MbLayer,
     p: usize,
+    dq: Option<&MbDequant>,
 ) -> Result<()> {
+    let dq4: Option<(&[i32], u32)> = dq.map(|d| (&d.q4[p].0[..], d.q4[p].1));
+    let dq8: Option<(&[i32], u32)> = dq.map(|d| (&d.q8[p].0[..], d.q8[p].1));
     let [cat_dc, cat_ac, cat_4x4, cat_8x8] = PLANE_CATS[p];
     let (scan4, scan8): (&[u8; 16], &[u8; 64]) = if ctx.field_pic || layer.field {
         (&FIELD_SCAN4X4, &FIELD_SCAN8X8)
@@ -921,7 +930,7 @@ fn parse_residual_luma_like_cabac(
     let field = ctx.field_pic || layer.field;
     if layer.kind == MbKind::I16x16 {
         let inc = cbf_ctx_inc(info, layer, nb, ctx.x264_old_444, cat_dc, 0, 0, 0, 0);
-        let n = residual_block_cabac(c, st, field, cat_dc, Some(inc), &mut layer.dc[p], scan4, 0, 16)?;
+        let n = residual_block_cabac(c, st, field, cat_dc, Some(inc), &mut layer.dc[p], scan4, 0, 16, None)?;
         if n > 0 {
             layer.dc_cbf |= 1 << p;
         }
@@ -940,7 +949,7 @@ fn parse_residual_luma_like_cabac(
                 None
             };
             let base = blk8 * 64;
-            let n = residual_block_cabac(c, st, field, cat_8x8, inc, &mut layer.coef[p][base..base + 64], scan8, 0, 64)?;
+            let n = residual_block_cabac(c, st, field, cat_8x8, inc, &mut layer.coef[p][base..base + 64], scan8, 0, 64, dq8)?;
             for sub in 0..4 {
                 let (bx, by) = (bx8 + (sub & 1), by8 + (sub >> 1));
                 layer.nz[p][by * 4 + bx] = n as u8;
@@ -953,10 +962,10 @@ fn parse_residual_luma_like_cabac(
                 let n = if layer.kind == MbKind::I16x16 {
                     let inc = cbf_ctx_inc(info, layer, nb, ctx.x264_old_444, cat_ac, bx, by, 0, 0);
                     // AC: 15 coefficients at scan positions 1..15.
-                    residual_block_cabac(c, st, field, cat_ac, Some(inc), &mut layer.coef[p][base..base + 16], scan4, 1, 15)?
+                    residual_block_cabac(c, st, field, cat_ac, Some(inc), &mut layer.coef[p][base..base + 16], scan4, 1, 15, dq4)?
                 } else {
                     let inc = cbf_ctx_inc(info, layer, nb, ctx.x264_old_444, cat_4x4, bx, by, 0, 0);
-                    residual_block_cabac(c, st, field, cat_4x4, Some(inc), &mut layer.coef[p][base..base + 16], scan4, 0, 16)?
+                    residual_block_cabac(c, st, field, cat_4x4, Some(inc), &mut layer.coef[p][base..base + 16], scan4, 0, 16, dq4)?
                 };
                 layer.nz[p][raster] = n as u8;
             }
@@ -973,6 +982,7 @@ fn parse_residual_cabac(
     info: &PicInfo,
     nb: &MbNeighbours,
     layer: &mut MbLayer,
+    dq: Option<&MbDequant>,
 ) -> Result<()> {
     let scan4: &[u8; 16] = if ctx.field_pic || layer.field {
         &FIELD_SCAN4X4
@@ -980,10 +990,10 @@ fn parse_residual_cabac(
         &ZIGZAG4X4
     };
     let field = ctx.field_pic || layer.field;
-    parse_residual_luma_like_cabac(c, st, ctx, info, nb, layer, 0)?;
+    parse_residual_luma_like_cabac(c, st, ctx, info, nb, layer, 0, dq)?;
     if ctx.chroma_format_idc == 3 {
-        parse_residual_luma_like_cabac(c, st, ctx, info, nb, layer, 1)?;
-        parse_residual_luma_like_cabac(c, st, ctx, info, nb, layer, 2)?;
+        parse_residual_luma_like_cabac(c, st, ctx, info, nb, layer, 1, dq)?;
+        parse_residual_luma_like_cabac(c, st, ctx, info, nb, layer, 2, dq)?;
     }
     if (ctx.chroma_format_idc == 1 || ctx.chroma_format_idc == 2) && layer.cbp & 0x30 != 0 {
         let c422 = ctx.chroma_format_idc == 2;
@@ -991,7 +1001,7 @@ fn parse_residual_cabac(
         let dc_scan: &[u8] = if c422 { &SCAN_CHROMA_DC_422[..] } else { &IDENTITY_OFF[..4] };
         for comp in 0..2 {
             let inc = cbf_ctx_inc(info, layer, nb, false, CAT_CHROMA_DC, 0, 0, comp, 0);
-            let n = residual_block_cabac(c, st, field, CAT_CHROMA_DC, Some(inc), &mut layer.chroma_dc[comp], dc_scan, 0, n_dc)?;
+            let n = residual_block_cabac(c, st, field, CAT_CHROMA_DC, Some(inc), &mut layer.chroma_dc[comp], dc_scan, 0, n_dc, None)?;
             if n > 0 {
                 layer.dc_cbf |= 2 << comp;
             }
@@ -1000,7 +1010,7 @@ fn parse_residual_cabac(
             for comp in 0..2 {
                 for blk in 0..2 * rows {
                     let inc = cbf_ctx_inc(info, layer, nb, false, CAT_CHROMA_AC, 0, 0, comp, blk);
-                    let n = residual_block_cabac(c, st, field, CAT_CHROMA_AC, Some(inc), &mut layer.chroma_ac[comp][blk], scan4, 1, 15)?;
+                    let n = residual_block_cabac(c, st, field, CAT_CHROMA_AC, Some(inc), &mut layer.chroma_ac[comp][blk], scan4, 1, 15, dq.map(|d| (&d.q4[1 + comp].0[..], d.q4[1 + comp].1)))?;
                     layer.chroma_nz[comp][blk] = n as u8;
                 }
             }
@@ -1020,6 +1030,8 @@ pub fn parse_mb_cabac(
     nb: &MbNeighbours,
     frame_motion: &[Vec<super::frame::BlockMotion>; 2],
     layer: &mut MbLayer,
+    dq: &super::transform::Dequant,
+    qps: &mut super::recon::QpState,
 ) -> Result<()> {
     if super::mb::syntax_trace() {
         eprintln!("mbstart addr={} pos={}", nb.addr, c.position());
@@ -1249,9 +1261,13 @@ pub fn parse_mb_cabac(
             return Err(Error::bitstream("mb_qp_delta out of range"));
         }
         st.prev_qp_delta_nonzero = layer.qp_delta != 0;
-        parse_residual_cabac(c, st, ctx, info, nb, layer)?;
+        layer.qp = super::mb::next_qp(qps.prev_qp, layer.qp_delta, ctx.bit_depth);
+        qps.prev_qp = layer.qp;
+        let mbdq = MbDequant::for_mb(dq, ctx, qps.chroma_offset, layer.kind, layer.qp);
+        parse_residual_cabac(c, st, ctx, info, nb, layer, mbdq.as_ref())?;
     } else {
         st.prev_qp_delta_nonzero = false;
+        layer.qp = qps.prev_qp;
     }
     if c.overrun() {
         return Err(Error::bitstream("slice data truncated in macroblock"));

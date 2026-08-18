@@ -6,7 +6,7 @@ use crate::bitreader::BitReader;
 use crate::{Error, Result};
 
 use super::frame::Mv;
-use super::mb::{
+use super::mb::{MbDequant, 
     MbKind, MbLayer, MbNeighbours, PRED_BI, PRED_L0, PRED_L1, PicInfo, SliceCtx, SubMbShape,
 };
 use super::slice::SliceType;
@@ -231,6 +231,10 @@ fn read_coeff_token(r: &mut BitReader, t: &VlcTables, nc: i32) -> Result<(usize,
 /// `out[scan[i]]` for scan positions `i` in `start_idx..=end_idx` — `out` is
 /// the block in raster order and must be zero where nothing is written (the
 /// macroblock layer's reset guarantees it). Returns `TotalCoeff`.
+/// `dq` is the `(table, shift)` scaling applied to each level as it is
+/// written (see [`super::mb::MbDequant`]), or `None` for the DC blocks and
+/// lossless macroblocks (levels as parsed).
+#[allow(clippy::too_many_arguments)]
 fn residual_block(
     r: &mut BitReader,
     t: &VlcTables,
@@ -240,17 +244,22 @@ fn residual_block(
     start_idx: usize,
     end_idx: usize,
     max_num_coeff: usize,
+    dq: Option<(&[i32], u32)>,
 ) -> Result<usize> {
     // Work on a local copy of the reader so its fields live in registers
     // through the many small reads below, then hand the position back.
     let mut rd = r.clone();
-    let res = residual_block_inner(&mut rd, t, nc, out, scan, start_idx, end_idx, max_num_coeff);
+    let res = match dq {
+        Some((table, shift)) => residual_block_inner::<true>(&mut rd, t, nc, out, scan, start_idx, end_idx, max_num_coeff, table, shift),
+        None => residual_block_inner::<false>(&mut rd, t, nc, out, scan, start_idx, end_idx, max_num_coeff, &[], 0),
+    };
     *r = rd;
     res
 }
 
 #[inline(always)]
-fn residual_block_inner(
+#[allow(clippy::too_many_arguments)]
+fn residual_block_inner<const DQ: bool>(
     r: &mut BitReader,
     t: &VlcTables,
     nc: i32,
@@ -259,7 +268,13 @@ fn residual_block_inner(
     start_idx: usize,
     end_idx: usize,
     max_num_coeff: usize,
+    dq_table: &[i32],
+    dq_shift: u32,
 ) -> Result<usize> {
+    // Write one level to its raster position, scaled when the block is.
+    let put = |out: &mut [i32], idx: usize, level: i32| {
+        out[idx] = if DQ { super::mb::dequant_level(level, dq_table[idx], dq_shift) } else { level };
+    };
     let (total_coeff, trailing_ones) = read_coeff_token(r, t, nc)?;
     if total_coeff > end_idx - start_idx + 1 {
         return Err(Error::bitstream("CAVLC: TotalCoeff larger than the block"));
@@ -373,7 +388,7 @@ fn residual_block_inner(
     if start_idx + coeff_num > end_idx {
         return Err(Error::bitstream("CAVLC: coefficient position past the block"));
     }
-    out[scan[start_idx + coeff_num] as usize] = level_val[0];
+    put(out, scan[start_idx + coeff_num] as usize, level_val[0]);
     let mut i = 1;
     while i < total_coeff && zeros_left > 0 {
         let run = if zeros_left > 6 {
@@ -405,13 +420,13 @@ fn residual_block_inner(
         }
         zeros_left -= run;
         coeff_num -= 1 + run;
-        out[scan[start_idx + coeff_num] as usize] = level_val[i];
+        put(out, scan[start_idx + coeff_num] as usize, level_val[i]);
         i += 1;
     }
     // No zeros left: the rest are consecutive.
     while i < total_coeff {
         coeff_num -= 1;
-        out[scan[start_idx + coeff_num] as usize] = level_val[i];
+        put(out, scan[start_idx + coeff_num] as usize, level_val[i]);
         i += 1;
     }
     if r.overrun() {
@@ -712,6 +727,8 @@ pub fn parse_mb_cavlc(
     nb: &MbNeighbours,
     mb_type_raw: u32,
     layer: &mut MbLayer,
+    dq: &super::transform::Dequant,
+    qps: &mut super::recon::QpState,
 ) -> Result<()> {
     if super::mb::syntax_trace() {
         eprintln!(
@@ -940,7 +957,12 @@ pub fn parse_mb_cavlc(
         if !(-26..=25).contains(&layer.qp_delta) {
             return Err(Error::bitstream("mb_qp_delta out of range"));
         }
-        parse_residual_cavlc(r, ctx, nb, layer)?;
+        layer.qp = super::mb::next_qp(qps.prev_qp, layer.qp_delta, ctx.bit_depth);
+        qps.prev_qp = layer.qp;
+        let mbdq = MbDequant::for_mb(dq, ctx, qps.chroma_offset, layer.kind, layer.qp);
+        parse_residual_cavlc(r, ctx, nb, layer, mbdq.as_ref())?;
+    } else {
+        layer.qp = qps.prev_qp;
     }
     if r.overrun() {
         return Err(Error::bitstream("slice data truncated in macroblock"));
@@ -1007,8 +1029,11 @@ fn parse_residual_luma_like(
     nb: &MbNeighbours,
     layer: &mut MbLayer,
     p: usize,
+    dq: Option<&MbDequant>,
 ) -> Result<()> {
     let t = tables();
+    let dq4: Option<(&[i32], u32)> = dq.map(|d| (&d.q4[p].0[..], d.q4[p].1));
+    let dq8: Option<(&[i32], u32)> = dq.map(|d| (&d.q8[p].0[..], d.q8[p].1));
     let trace = super::mb::syntax_trace();
     // Field pictures (and field macroblocks) use the field scans.
     let (scan4, scan8sub): (&[u8; 16], &[[u8; 16]; 4]) = if ctx.field_pic || layer.field {
@@ -1018,7 +1043,7 @@ fn parse_residual_luma_like(
     };
     if layer.kind == MbKind::I16x16 {
         let nc = plane_nc(layer, nb, p, 0, 0);
-        residual_block(r, t, nc, &mut layer.dc[p], scan4, 0, 15, 16)?;
+        residual_block(r, t, nc, &mut layer.dc[p], scan4, 0, 15, 16, None)?;
     }
     for blk8 in 0..4 {
         let (bx8, by8) = ((blk8 & 1) * 2, (blk8 >> 1) * 2);
@@ -1033,9 +1058,9 @@ fn parse_residual_luma_like(
                 let base = raster * 16;
                 let pos0 = r.position();
                 let n = if layer.kind == MbKind::I16x16 {
-                    residual_block(r, t, nc, &mut layer.coef[p][base..base + 16], scan4, 1, 15, 15)?
+                    residual_block(r, t, nc, &mut layer.coef[p][base..base + 16], scan4, 1, 15, 15, dq4)?
                 } else {
-                    residual_block(r, t, nc, &mut layer.coef[p][base..base + 16], scan4, 0, 15, 16)?
+                    residual_block(r, t, nc, &mut layer.coef[p][base..base + 16], scan4, 0, 15, 16, dq4)?
                 };
                 if trace {
                     eprintln!(
@@ -1061,6 +1086,7 @@ fn parse_residual_luma_like(
                     0,
                     15,
                     16,
+                    dq8,
                 )?;
                 layer.nz[p][raster] = n as u8;
             }
@@ -1074,13 +1100,14 @@ fn parse_residual_cavlc(
     ctx: &SliceCtx,
     nb: &MbNeighbours,
     layer: &mut MbLayer,
+    dq: Option<&MbDequant>,
 ) -> Result<()> {
     let t = tables();
     // Luma, then (4:4:4) Cb and Cr coded the same way.
-    parse_residual_luma_like(r, ctx, nb, layer, 0)?;
+    parse_residual_luma_like(r, ctx, nb, layer, 0, dq)?;
     if ctx.chroma_format_idc == 3 {
-        parse_residual_luma_like(r, ctx, nb, layer, 1)?;
-        parse_residual_luma_like(r, ctx, nb, layer, 2)?;
+        parse_residual_luma_like(r, ctx, nb, layer, 1, dq)?;
+        parse_residual_luma_like(r, ctx, nb, layer, 2, dq)?;
     }
     let scan4: &[u8; 16] = if ctx.field_pic || layer.field {
         &FIELD_SCAN4X4
@@ -1103,6 +1130,7 @@ fn parse_residual_cavlc(
                     0,
                     7,
                     8,
+                    None,
                 )?;
             } else {
                 residual_block(
@@ -1114,6 +1142,7 @@ fn parse_residual_cavlc(
                     0,
                     3,
                     4,
+                    None,
                 )?;
             }
         }
@@ -1124,7 +1153,7 @@ fn parse_residual_cavlc(
                     let (bx, by) = (blk & 1, blk >> 1);
                     let nc = chroma_nc(layer, nb, comp, bx, by);
                     let n =
-                        residual_block(r, t, nc, &mut layer.chroma_ac[comp][blk], scan4, 1, 15, 15)?;
+                        residual_block(r, t, nc, &mut layer.chroma_ac[comp][blk], scan4, 1, 15, 15, dq.map(|d| (&d.q4[1 + comp].0[..], d.q4[1 + comp].1)))?;
                     layer.chroma_nz[comp][blk] = n as u8;
                 }
             }

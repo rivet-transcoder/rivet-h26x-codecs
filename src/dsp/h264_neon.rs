@@ -811,31 +811,22 @@ fn idct8_dc_add_neon(dst: &mut [u8], stride: usize, dc: i32, _max: i32) {
     }
 }
 
-/// Dequantise sixteen levels to sixteen i16 (two vectors), saturating.
+/// Sixteen dequantised coefficients as sixteen i16 (two vectors), saturating.
 #[inline(always)]
-unsafe fn dequant16(levels: *const i32, scale: *const i32, up: bool, sh: i32, round: i32) -> (int16x8_t, int16x8_t) {
+unsafe fn pack16(coefs: *const i32) -> (int16x8_t, int16x8_t) {
     unsafe {
         let mut out = [vdup_n_s16(0); 4];
         for k in 0..4 {
-            let l = vld1q_s32(levels.add(4 * k));
-            let s = vld1q_s32(scale.add(4 * k));
-            let v = vmulq_s32(l, s);
-            let v = if up { vshlq_s32(v, vdupq_n_s32(sh)) } else { vshlq_s32(vaddq_s32(v, vdupq_n_s32(round)), vdupq_n_s32(-sh)) };
-            out[k] = vqmovn_s32(v);
+            out[k] = vqmovn_s32(vld1q_s32(coefs.add(4 * k)));
         }
         (vcombine_s16(out[0], out[1]), vcombine_s16(out[2], out[3]))
     }
 }
 
-fn residual4_neon(dst: &mut [u8], stride: usize, levels: &[i32; 16], scale: &[i32; 16], qp: i32, dc: i32, _max: i32) {
+fn residual4_neon(dst: &mut [u8], stride: usize, coefs: &[i32; 16], dc: i32, _max: i32) {
     assert!(3 * stride + 4 <= dst.len());
     unsafe {
-        let q6 = qp / 6;
-        let (mut lo, hi) = if qp >= 24 {
-            dequant16(levels.as_ptr(), scale.as_ptr(), true, q6 - 4, 0)
-        } else {
-            dequant16(levels.as_ptr(), scale.as_ptr(), false, 4 - q6, 1 << (3 - q6))
-        };
+        let (mut lo, hi) = pack16(coefs.as_ptr());
         if dc != NO_DC {
             lo = vsetq_lane_s16::<0>(dc as i16, lo);
         }
@@ -854,15 +845,13 @@ fn residual4_neon(dst: &mut [u8], stride: usize, levels: &[i32; 16], scale: &[i3
     }
 }
 
-fn residual8_neon(dst: &mut [u8], stride: usize, levels: &[i32; 64], scale: &[i32; 64], qp: i32, _max: i32) {
+fn residual8_neon(dst: &mut [u8], stride: usize, coefs: &[i32; 64], _max: i32) {
     assert!(7 * stride + 8 <= dst.len());
     unsafe {
-        let q6 = qp / 6;
-        let (up, sh, round) = if qp >= 36 { (true, q6 - 6, 0) } else { (false, 6 - q6, 1 << (5 - q6)) };
         let mut coeffs = [0i16; 64];
         let mut ac = vdupq_n_s16(0);
         for k in 0..4 {
-            let (lo, hi) = dequant16(levels.as_ptr().add(16 * k), scale.as_ptr().add(16 * k), up, sh, round);
+            let (lo, hi) = pack16(coefs.as_ptr().add(16 * k));
             vst1q_s16(coeffs.as_mut_ptr().add(16 * k), lo);
             vst1q_s16(coeffs.as_mut_ptr().add(16 * k + 8), hi);
             let lo_ac = if k == 0 { vsetq_lane_s16::<0>(0, lo) } else { lo };
@@ -1037,37 +1026,27 @@ mod tests {
             (s.idct8_dc_add)(&mut a, stride, dc, 255);
             (d.idct8_dc_add)(&mut b, stride, dc, 255);
             assert_eq!(a, b, "dc8 trial {trial}");
-            // Fused dequantisation: levels, a scale table, a QP.
-            let qp = (lcg(&mut seed) % 52) as i32;
-            let mut lv4 = [0i32; 16];
-            let mut lv8 = [0i32; 64];
-            let mut sc4 = [0i32; 16];
-            let mut sc8 = [0i32; 64];
+            // Dequantised coefficients (i16 range), a DC-only block now and then.
+            let mut cf4 = [0i32; 16];
+            let mut cf8 = [0i32; 64];
             let dc_only = trial % 4 == 1;
-            // Levels sized so the dequantised values stay in the range a
-            // conforming stream keeps them in (an encoder quantises harder at
-            // high QP): |level * scale << shift| well inside 16 bits.
-            let lmax = ((2000i32 >> (qp / 6 - 4).max(0)) / 480).max(1) as u32;
-            let lmax8 = ((800i32 >> (qp / 6 - 6).max(0)) / 480).max(1) as u32;
             for i in 0..16 {
-                lv4[i] = if dc_only && i != 0 { 0 } else { (lcg(&mut seed) % (2 * lmax + 1)) as i32 - lmax as i32 };
-                sc4[i] = 16 * (10 + (lcg(&mut seed) % 20) as i32);
+                cf4[i] = if dc_only && i != 0 { 0 } else { (lcg(&mut seed) % 4001) as i32 - 2000 };
             }
             for i in 0..64 {
-                lv8[i] = if dc_only && i != 0 { 0 } else { (lcg(&mut seed) % (2 * lmax8 + 1)) as i32 - lmax8 as i32 };
-                sc8[i] = 16 * (10 + (lcg(&mut seed) % 20) as i32);
+                cf8[i] = if dc_only && i != 0 { 0 } else { (lcg(&mut seed) % 2001) as i32 - 1000 };
             }
             let dcv = if trial % 2 == 0 { NO_DC } else { (lcg(&mut seed) % 4001) as i32 - 2000 };
             let mut a = base.clone();
             let mut b = base.clone();
-            (s.residual4)(&mut a, stride, &lv4, &sc4, qp, dcv, 255);
-            (d.residual4)(&mut b, stride, &lv4, &sc4, qp, dcv, 255);
-            assert_eq!(a, b, "residual4 trial {trial} qp {qp}");
+            (s.residual4)(&mut a, stride, &cf4, dcv, 255);
+            (d.residual4)(&mut b, stride, &cf4, dcv, 255);
+            assert_eq!(a, b, "residual4 trial {trial}");
             let mut a = base.clone();
             let mut b = base.clone();
-            (s.residual8)(&mut a, stride, &lv8, &sc8, qp, 255);
-            (d.residual8)(&mut b, stride, &lv8, &sc8, qp, 255);
-            assert_eq!(a, b, "residual8 trial {trial} qp {qp}");
+            (s.residual8)(&mut a, stride, &cf8, 255);
+            (d.residual8)(&mut b, stride, &cf8, 255);
+            assert_eq!(a, b, "residual8 trial {trial}");
         }
     }
 }

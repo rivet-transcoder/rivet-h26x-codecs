@@ -58,13 +58,14 @@ pub type Idct4AddFn<S> = fn(dst: &mut [S], stride: usize, coeffs: &[i16; 16], ma
 pub type Idct8AddFn<S> = fn(dst: &mut [S], stride: usize, coeffs: &[i16; 64], max: i32);
 /// A DC-only block: `(dc + 32) >> 6` added to every sample of the 4x4 / 8x8.
 pub type DcAddFn<S> = fn(dst: &mut [S], stride: usize, dc: i32, max: i32);
-/// The whole residual path of one 4x4 block: dequantise `levels` (raster)
-/// with `scale` at `qp` (8.5.12.1), replace position 0 by `dc` when
-/// `dc != NO_DC` (an Intra_16x16 / chroma DC already scaled), inverse
-/// transform and add to `dst`. Blocks with no AC take the DC-only path.
-pub type Residual4Fn<S> = fn(dst: &mut [S], stride: usize, levels: &[i32; 16], scale: &[i32; 16], qp: i32, dc: i32, max: i32);
+/// The residual path of one 4x4 block: `coefs` (raster) are the scaled
+/// transform coefficients (dequantised as they were parsed, 8.5.12.1);
+/// position 0 is replaced by `dc` when `dc != NO_DC` (an Intra_16x16 /
+/// chroma DC already scaled); inverse transform and add to `dst`. Blocks
+/// with no AC take the DC-only path.
+pub type Residual4Fn<S> = fn(dst: &mut [S], stride: usize, coefs: &[i32; 16], dc: i32, max: i32);
 /// The same for an 8x8 block (8.5.13.1); no separate DC.
-pub type Residual8Fn<S> = fn(dst: &mut [S], stride: usize, levels: &[i32; 64], scale: &[i32; 64], qp: i32, max: i32);
+pub type Residual8Fn<S> = fn(dst: &mut [S], stride: usize, coefs: &[i32; 64], max: i32);
 /// `dc` value of [`Residual4Fn`] meaning "position 0 is a level like the rest".
 pub const NO_DC: i32 = i32::MIN;
 
@@ -621,29 +622,16 @@ fn dc_add_scalar<S: Sample>(dst: &mut [S], stride: usize, dc: i32, n: usize, max
     }
 }
 
-/// Scalar dequantisation of a 4x4 block into i16 (saturating: a conforming
-/// stream stays within 16 bits, and the SIMD versions saturate too); returns
-/// whether any AC coefficient is nonzero.
+/// Sixteen dequantised coefficients narrowed to i16 (saturating, as the
+/// SIMD kernels pack them; a conforming stream never exceeds the range),
+/// with the DC substituted; whether any AC coefficient is nonzero.
 #[inline]
-pub(crate) fn dequant4_scalar(levels: &[i32; 16], scale: &[i32; 16], qp: i32, dc: i32, out: &mut [i16; 16]) -> bool {
-    let q6 = qp / 6;
-    let start = if dc != NO_DC { 1 } else { 0 };
+fn narrow4(coefs: &[i32; 16], dc: i32, out: &mut [i16; 16]) -> bool {
     let mut ac = 0i32;
-    if qp >= 24 {
-        let sh = q6 - 4;
-        for i in start..16 {
-            let v = (levels[i] * scale[i]) << sh;
-            out[i] = v.clamp(-32768, 32767) as i16;
-            ac |= v & (-((i != 0) as i32));
-        }
-    } else {
-        let sh = 4 - q6;
-        let round = 1 << (3 - q6);
-        for i in start..16 {
-            let v = (levels[i] * scale[i] + round) >> sh;
-            out[i] = v.clamp(-32768, 32767) as i16;
-            ac |= v & (-((i != 0) as i32));
-        }
+    for i in 0..16 {
+        let v = coefs[i];
+        out[i] = v.clamp(-32768, 32767) as i16;
+        ac |= v & (-((i != 0) as i32));
     }
     if dc != NO_DC {
         out[0] = dc as i16;
@@ -651,37 +639,28 @@ pub(crate) fn dequant4_scalar(levels: &[i32; 16], scale: &[i32; 16], qp: i32, dc
     ac != 0
 }
 
-/// Scalar dequantisation of an 8x8 block into i16; returns whether any AC
+/// Sixty-four dequantised coefficients narrowed to i16; whether any AC
 /// coefficient is nonzero.
 #[inline]
-pub(crate) fn dequant8_scalar(levels: &[i32; 64], scale: &[i32; 64], qp: i32, out: &mut [i16; 64]) -> bool {
-    let q6 = qp / 6;
+fn narrow8(coefs: &[i32; 64], out: &mut [i16; 64]) -> bool {
     let mut ac = 0i32;
-    if qp >= 36 {
-        let sh = q6 - 6;
-        for i in 0..64 {
-            let v = (levels[i] * scale[i]) << sh;
-            out[i] = v.clamp(-32768, 32767) as i16;
-            ac |= v & (-((i != 0) as i32));
-        }
-    } else {
-        let sh = 6 - q6;
-        let round = 1 << (5 - q6);
-        for i in 0..64 {
-            let v = (levels[i] * scale[i] + round) >> sh;
-            out[i] = v.clamp(-32768, 32767) as i16;
-            ac |= v & (-((i != 0) as i32));
-        }
+    for i in 0..64 {
+        let v = coefs[i];
+        out[i] = v.clamp(-32768, 32767) as i16;
+        ac |= v & (-((i != 0) as i32));
     }
     ac != 0
 }
 
-fn residual4_scalar<S: Sample>(dst: &mut [S], stride: usize, levels: &[i32; 16], scale: &[i32; 16], qp: i32, dc: i32, max: i32) {
+fn residual4_scalar<S: Sample>(dst: &mut [S], stride: usize, coefs: &[i32; 16], dc: i32, max: i32) {
     if S::BYTES != 1 {
         // Deeper samples: scaled coefficients do not fit i16 — the whole
         // path in i32.
-        let mut c = [0i32; 16];
-        if dequant4_i32(levels, scale, qp, dc, &mut c) {
+        let mut c = *coefs;
+        if dc != NO_DC {
+            c[0] = dc;
+        }
+        if c[1..].iter().any(|&v| v != 0) {
             idct4_add_i32(dst, stride, &c, max);
         } else if c[0] != 0 {
             dc_add_scalar(dst, stride, c[0], 4, max);
@@ -689,80 +668,26 @@ fn residual4_scalar<S: Sample>(dst: &mut [S], stride: usize, levels: &[i32; 16],
         return;
     }
     let mut c = [0i16; 16];
-    if dequant4_scalar(levels, scale, qp, dc, &mut c) {
+    if narrow4(coefs, dc, &mut c) {
         idct4_add_scalar(dst, stride, &c, max);
     } else if c[0] != 0 {
         dc_add_scalar(dst, stride, c[0] as i32, 4, max);
     }
 }
 
-fn residual8_scalar<S: Sample>(dst: &mut [S], stride: usize, levels: &[i32; 64], scale: &[i32; 64], qp: i32, max: i32) {
+fn residual8_scalar<S: Sample>(dst: &mut [S], stride: usize, coefs: &[i32; 64], max: i32) {
     if S::BYTES != 1 {
-        let mut c = [0i32; 64];
-        if dequant8_i32(levels, scale, qp, &mut c) {
-            idct8_add_i32(dst, stride, &c, max);
-        } else if c[0] != 0 {
-            dc_add_scalar(dst, stride, c[0], 8, max);
+        if coefs[1..].iter().any(|&v| v != 0) {
+            idct8_add_i32(dst, stride, coefs, max);
+        } else if coefs[0] != 0 {
+            dc_add_scalar(dst, stride, coefs[0], 8, max);
         }
         return;
     }
     let mut c = [0i16; 64];
-    if dequant8_scalar(levels, scale, qp, &mut c) {
+    if narrow8(coefs, &mut c) {
         idct8_add_scalar(dst, stride, &c, max);
     } else if c[0] != 0 {
         dc_add_scalar(dst, stride, c[0] as i32, 8, max);
     }
-}
-
-/// Dequantisation of a 4x4 block into i32 (deeper samples); returns whether
-/// any AC coefficient is nonzero.
-#[inline]
-fn dequant4_i32(levels: &[i32; 16], scale: &[i32; 16], qp: i32, dc: i32, out: &mut [i32; 16]) -> bool {
-    let q6 = qp / 6;
-    let start = if dc != NO_DC { 1 } else { 0 };
-    let mut ac = 0i32;
-    if qp >= 24 {
-        let sh = q6 - 4;
-        for i in start..16 {
-            let v = (levels[i] * scale[i]) << sh;
-            out[i] = v;
-            ac |= v & (-((i != 0) as i32));
-        }
-    } else {
-        let sh = 4 - q6;
-        let round = 1 << (3 - q6);
-        for i in start..16 {
-            let v = (levels[i] * scale[i] + round) >> sh;
-            out[i] = v;
-            ac |= v & (-((i != 0) as i32));
-        }
-    }
-    if dc != NO_DC {
-        out[0] = dc;
-    }
-    ac != 0
-}
-
-/// Dequantisation of an 8x8 block into i32 (deeper samples).
-#[inline]
-fn dequant8_i32(levels: &[i32; 64], scale: &[i32; 64], qp: i32, out: &mut [i32; 64]) -> bool {
-    let q6 = qp / 6;
-    let mut ac = 0i32;
-    if qp >= 36 {
-        let sh = q6 - 6;
-        for i in 0..64 {
-            let v = (levels[i] * scale[i]) << sh;
-            out[i] = v;
-            ac |= v & (-((i != 0) as i32));
-        }
-    } else {
-        let sh = 6 - q6;
-        let round = 1 << (5 - q6);
-        for i in 0..64 {
-            let v = (levels[i] * scale[i] + round) >> sh;
-            out[i] = v;
-            ac |= v & (-((i != 0) as i32));
-        }
-    }
-    ac != 0
 }
