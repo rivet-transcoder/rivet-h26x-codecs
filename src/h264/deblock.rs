@@ -5,24 +5,40 @@
 
 //! Where the time in here goes, measured by pricing each part at zero — the
 //! kernels made no-ops, the dispatch skipped with the derived thresholds fed
-//! through `black_box`, and the whole stage skipped — against a same-rung
-//! control reading 1.000. Two CABAC clips at the AVX2 rung, as a share of
-//! whole-decode time:
+//! through `black_box`, each half of the strength derivation skipped in turn,
+//! and the whole stage skipped — against a same-rung control reading 1.000.
+//! Two CABAC clips at the AVX2 rung, as a share of whole-decode time:
 //!
 //! | | cabac3 | bbb_720p_cabac |
 //! |---|---|---|
-//! | boundary strengths and thresholds | 5.9% | 6.7% |
+//! | the per-macroblock walk, thresholds, filter-call entry | ~3.6% | |
+//! | macroblock-edge strengths (of which motion ~1.5%) | ~2.9% | |
+//! | internal-edge strengths | ~0% | |
 //! | the filter kernels | 4.4% | 4.6% |
 //! | dispatch: `tc4` on the stack, indirect call | 0.7% | 0.1% |
 //! | **the stage** | **11.0%** | **11.4%** |
 //!
-//! The reason to write that down is that the obvious optimisation is the
-//! wrong one. Collapsing the six-to-eight per-macroblock calls into a single
-//! "filter every internal edge" entry point targets the bottom row, which is
-//! under one percent and below what this machine can measure — and it would
-//! cost a `H264Dsp` signature change across four architecture files. The room
-//! is in the top row: deriving boundary strengths costs more than all the
-//! filtering, and more than eight times the dispatch it is usually blamed on.
+//! The first three rows are cabac3 only, and the first is by difference
+//! rather than measured directly; the rest were each measured against their
+//! own control. Two of them are worth knowing before optimising this file:
+//!
+//! **The internal edges are already free.** Deriving strengths for the twelve
+//! internal edges of a macroblock — the mask-driven path with `nz_mask`,
+//! `part_edges` and the run-caching in `edge_motion` — did not measure above
+//! the noise floor at all. There is nothing left there.
+//!
+//! **The dispatch is not the problem either.** Collapsing the six-to-eight
+//! per-macroblock kernel calls into one "filter every internal edge" entry
+//! point targets a row worth 0.1-0.7%, which is its ceiling, in exchange for
+//! a `H264Dsp` signature change across four architecture files.
+//!
+//! What is left is diffuse. The macroblock-edge motion comparison is ~1.5%,
+//! and a cache that settles 52% of those edges was built and measured at 0.3%
+//! end to end (see `perf/deblock-motion-key` and the note further down). The
+//! neighbour `MbInfo` loads, which look like they should miss cache for the
+//! row above, cost nothing measurable — substituting the current macroblock's
+//! info for the neighbour's changed the time by 0.0%. The largest single row
+//! is the per-macroblock walk itself, and it has no hot spot in it.
 
 use crate::dsp::h264::{H264Dsp, LumaDeblockFn, LumaDeblockIntraFn};
 use crate::sample::Sample;
