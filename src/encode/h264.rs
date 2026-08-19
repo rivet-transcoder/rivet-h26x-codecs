@@ -436,19 +436,36 @@ mod tests {
             assert!(out[0].keyframe, "{entropy:?}: the first picture is an IDR");
         }
 
-        let mut e =
-            H264Encoder::new(Config { gop: 8, ..cfg(64, 64, ChromaFormat::Yuv420, 8) }).unwrap();
+        // Inter through CAVLC codes; inter through CABAC is the hole that
+        // remains, and it must name itself as CABAC rather than as inter,
+        // because inter is not what is missing.
         let frame = vec![0u8; 64 * 64 * 3 / 2];
+        let mut e = H264Encoder::new(Config {
+            gop: 8,
+            entropy: Entropy::Cavlc,
+            ..cfg(64, 64, ChromaFormat::Yuv420, 8)
+        })
+        .unwrap();
+        for i in 0..4 {
+            e.push(&frame).unwrap_or_else(|e| panic!("CAVLC inter picture {i}: {e}"));
+        }
+
+        let mut e = H264Encoder::new(Config {
+            gop: 8,
+            entropy: Entropy::Cabac,
+            ..cfg(64, 64, ChromaFormat::Yuv420, 8)
+        })
+        .unwrap();
         let mut named = false;
         for _ in 0..4 {
             if let Err(err) = e.push(&frame) {
                 let s = format!("{err}");
-                assert!(s.contains("inter prediction"), "{s}");
+                assert!(s.contains("CABAC inter"), "{s}");
                 named = true;
                 break;
             }
         }
-        assert!(named, "a GOP longer than one should have reached inter prediction");
+        assert!(named, "a CABAC GOP longer than one should have reached the CABAC inter hole");
     }
 
     /// Every picture offered must be codable exactly once, whatever the GOP
@@ -478,7 +495,7 @@ mod tests {
                         "gop={gop} b={bframes} picture {i}: {s}"
                     );
                     assert!(
-                        s.contains("inter prediction"),
+                        s.contains("CABAC inter"),
                         "gop={gop} b={bframes} picture {i}: {s}"
                     );
                 }
