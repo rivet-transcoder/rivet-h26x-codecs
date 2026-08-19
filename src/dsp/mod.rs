@@ -12,6 +12,7 @@
 //! SIMD path is tested against.
 
 pub mod h264;
+pub mod h264_enc;
 pub mod hevc;
 // The SIMD modules wrap their intrinsics in `unsafe {}` blocks: required on
 // the crate's MSRV, redundant (and warned about) on toolchains where
