@@ -3,11 +3,14 @@
 //! the luma and chroma edge filters, macroblock by macroblock in raster
 //! order — vertical edges first, then horizontal, luma then chroma.
 
-//! Where the time in here goes, measured by pricing each part at zero — the
-//! kernels made no-ops, the dispatch skipped with the derived thresholds fed
-//! through `black_box`, each half of the strength derivation skipped in turn,
-//! and the whole stage skipped — against a same-rung control reading 1.000.
-//! Two CABAC clips at the AVX2 rung, as a share of whole-decode time:
+//! Where the time in here goes, on cabac3 at the AVX2 rung. Two instruments,
+//! because they disagree and the disagreement is the useful part.
+//!
+//! **Free-in-turn** — each part made free and the whole decode remeasured,
+//! same binary with the parts selected by environment variable so the code
+//! layout is identical on every side, randomised order within each round, and
+//! a same-rung control row reading 1.000 [0.993, 1.014]. As a share of
+//! whole-decode time:
 //!
 //! | | cabac3 | bbb_720p_cabac |
 //! |---|---|---|
@@ -18,27 +21,43 @@
 //! | dispatch: `tc4` on the stack, indirect call | 0.7% | 0.1% |
 //! | **the stage** | **11.0%** | **11.4%** |
 //!
-//! The first three rows are cabac3 only, and the first is by difference
-//! rather than measured directly; the rest were each measured against their
-//! own control. Two of them are worth knowing before optimising this file:
+//! **An `rdtsc` window** around `deblock_mb_rows` and around the derivation
+//! inside it, `lfence`d and accumulated without a lock prefix: the filter is
+//! 11.8% of decode and the derivation **34.6% of the filter**, or 4.1% of
+//! decode. The two instruments agree on the filter's total share — 11.0%
+//! against 11.8% — and disagree on the derivation's, 2.9% against 4.1%.
 //!
-//! **The internal edges are already free.** Deriving strengths for the twelve
-//! internal edges of a macroblock — the mask-driven path with `nz_mask`,
-//! `part_edges` and the run-caching in `edge_motion` — did not measure above
-//! the noise floor at all. There is nothing left there.
+//! Neither is wrong. A window charges its region for the stalls the region
+//! *starts*, and the derivation starts the one that matters: the first touch
+//! of `frame.motion`. Free-in-turn charges only what is actually recovered by
+//! removing the work, which is less whenever the stall was overlapping
+//! something else. **For sizing an optimisation, the free-in-turn number is
+//! the one that predicts what you get**; the window is an upper bound on it.
 //!
-//! **The dispatch is not the problem either.** Collapsing the six-to-eight
-//! per-macroblock kernel calls into one "filter every internal edge" entry
-//! point targets a row worth 0.1-0.7%, which is its ceiling, in exchange for
-//! a `H264Dsp` signature change across four architecture files.
+//! What that leaves, in the order anyone should reconsider it:
 //!
-//! What is left is diffuse. The macroblock-edge motion comparison is ~1.5%,
-//! and a cache that settles 52% of those edges was built and measured at 0.3%
-//! end to end (see `perf/deblock-motion-key` and the note further down). The
-//! neighbour `MbInfo` loads, which look like they should miss cache for the
-//! row above, cost nothing measurable — substituting the current macroblock's
-//! info for the neighbour's changed the time by 0.0%. The largest single row
-//! is the per-macroblock walk itself, and it has no hot spot in it.
+//! - **The per-macroblock walk is the largest row and has no hot spot.**
+//! - **The macroblock-edge motion is ~1.5%**, and a digest settling 52% of
+//!   those edges is built, green and parked on `perf/deblock-motion-key` at
+//!   0.3% end to end. Read it rather than rederiving it.
+//! - **`ThrTable` is 0.15% of decode** — 410 cycles a build, one build per
+//!   macroblock row, 32,535 of them. Measured, replacing an estimate of
+//!   ~1.7% of the filter with 1.3%. Holding the table across calls is a
+//!   contained change and buys a sixth of a percent.
+//! - **The internal edges are free.** Skipping their derivation entirely did
+//!   not measure above the floor: the mask-driven path with `nz_mask`,
+//!   `part_edges` and the run-caching in `edge_motion` has finished the job.
+//! - **The neighbour `MbInfo` loads are free**, which is the one that looks
+//!   wrong — the row above is a different cache line per macroblock. Reading
+//!   the current macroblock's info in the neighbour's place, for identical
+//!   instruction count and perfect locality, changed the time by 0.0%.
+//! - **The dispatch is 0.1-0.7%**, so a multi-edge entry point collapsing the
+//!   six-to-eight calls per macroblock is buying that at most, against a
+//!   `H264Dsp` signature change across four architecture files.
+//!
+//! Which is to say: this stage has been examined, and what is left in it is
+//! diffuse. Sizing anything here at more than about a percent needs a new
+//! measurement, not a new estimate.
 
 use crate::dsp::h264::{H264Dsp, LumaDeblockFn, LumaDeblockIntraFn};
 use crate::sample::Sample;
