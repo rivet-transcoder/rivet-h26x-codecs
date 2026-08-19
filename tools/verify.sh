@@ -21,11 +21,34 @@
 cd "${H26X_WORK:-$(dirname "$0")}"
 BASE=""
 if [ "$1" = "--baseline" ]; then BASE=$2; shift 2; fi
-DEC=${1:-../release/examples/h26xdec.exe}
-DEC=$(cd "$(dirname "$DEC")" && pwd)/$(basename "$DEC")
 # `golden.txt`: "<fixture> <md5>" per line, the MD5 each fixture must decode
 # to. Regenerate deliberately, never to make a red run go green.
 GOLD=${GOLD:-golden.txt}
+DEC=${1:-../release/examples/h26xdec.exe}
+DEC=$(cd "$(dirname "$DEC")" && pwd)/$(basename "$DEC")
+# Prove the decoder exists and produces output before anything is compared.
+#
+# This script cd's to H26X_WORK first, so a relative path given from anywhere
+# else resolves to nothing — and a decoder that cannot run produces empty
+# output for every fixture and every rung. The fixture check notices, because
+# it compares against recorded hashes. The rung sweep does not: it compares
+# the rungs against each other, and seven empty outputs agree perfectly. A
+# sweep that passes on a decoder that never ran is worse than no sweep, so it
+# gets an anchor.
+if [ ! -x "$DEC" ] && [ ! -f "$DEC" ]; then
+  echo "verify.sh: no decoder at $DEC" >&2
+  echo "  (this script cd's to ${H26X_WORK:-its own directory} first, so give an absolute path)" >&2
+  exit 2
+fi
+_probe=$(head -1 "${GOLD:-golden.txt}" | cut -d' ' -f1)
+if [ -n "$_probe" ] && [ -f "$_probe" ]; then
+  if [ -z "$("$DEC" "$_probe" 2>/dev/null | head -c 1)" ]; then
+    echo "verify.sh: $DEC produced no output for $_probe" >&2
+    echo "  Refusing to run: every comparison below would be between empty files," >&2
+    echo "  and the rung sweep would report all rungs identical because they are." >&2
+    exit 2
+  fi
+fi
 TAG=$$
 fail=0
 

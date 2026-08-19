@@ -147,7 +147,7 @@ mod tests {
             let mut a = [0i16; N * N];
             for y in 0..=max_y {
                 for x in 0..=max_x {
-                    a[y * N + x] = (lcg(&mut seed) % (2 * range + 1)) as i16 - range as i16;
+                    a[y * N + x] = ((lcg(&mut seed) % (2 * range + 1)) as i32 - range as i32) as i16;
                 }
             }
             let mut b = a;

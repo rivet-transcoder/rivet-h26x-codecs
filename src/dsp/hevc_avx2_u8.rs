@@ -1261,8 +1261,8 @@ mod tests {
         let max = 255;
         for &(w, h) in &[(2usize, 4usize), (4, 4), (6, 8), (8, 8), (12, 16), (16, 8), (24, 4), (32, 32), (64, 64)] {
             for range in [16000i32, 22500] {
-                let a: Vec<i16> = (0..w * h).map(|_| (lcg(&mut seed) % (2 * range as u32)) as i16 - range as i16).collect();
-                let b: Vec<i16> = (0..w * h).map(|_| (lcg(&mut seed) % (2 * range as u32)) as i16 - range as i16).collect();
+                let a: Vec<i16> = (0..w * h).map(|_| ((lcg(&mut seed) % (2 * range as u32)) as i32 - range) as i16).collect();
+                let b: Vec<i16> = (0..w * h).map(|_| ((lcg(&mut seed) % (2 * range as u32)) as i32 - range) as i16).collect();
                 let stride = w + 5;
                 let mut d1 = vec![0u8; stride * h];
                 let mut d2 = vec![0u8; stride * h];

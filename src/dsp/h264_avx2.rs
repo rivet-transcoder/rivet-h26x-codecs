@@ -64,7 +64,12 @@ unsafe fn store_u8_n(dst: *mut u8, v: __m128i, n: usize) {
         } else if n == 8 {
             _mm_storel_epi64(dst as *mut __m128i, v);
         } else if n == 4 {
-            *(dst as *mut i32) = _mm_cvtsi128_si32(v);
+            // write_unaligned, not a plain store: `dst` is a row of a picture
+            // and is aligned to nothing in particular. A `*mut i32` store
+            // promises 4-byte alignment, which is UB when it is not true —
+            // x86 tolerates it and release builds do not check, so this was
+            // invisible until a debug test run aborted on it.
+            std::ptr::write_unaligned(dst as *mut i32, _mm_cvtsi128_si32(v));
         } else {
             let mut t = [0u8; 16];
             _mm_storeu_si128(t.as_mut_ptr() as *mut __m128i, v);
