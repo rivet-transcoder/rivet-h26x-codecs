@@ -297,7 +297,7 @@ pub fn quant_offset(qbits: u32, intra: bool) -> i32 {
 }
 
 /// `MF4x4[list][qP % 6][raster]` and `MF8x8[list][qP % 6][raster]`, the
-/// forward counterpart of [`crate::h264::transform::Dequant`] and built
+/// forward counterpart of `h264::transform::Dequant` and built
 /// from the same scaling lists and the same `normAdjust` tables, so the
 /// two cannot drift apart.
 pub struct Quant {

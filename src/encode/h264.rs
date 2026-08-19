@@ -21,8 +21,10 @@
 //! as ENCODE-FAIL with the reason, which is the honest state: the plumbing is
 //! proven and the hole has a name.
 
-use super::{Access, Config, Entropy, RateControl};
 use super::gop::{Coded, Kind, Scheduler};
+use super::h264_syntax as syn;
+use super::{Access, Config, Entropy, RateControl};
+use crate::bitwriter::BitWriter;
 use crate::{Error, Result};
 
 /// H.264 encoder. See the module documentation for what is and is not built.
@@ -41,7 +43,19 @@ pub struct H264Encoder {
     /// with every picture an IDR it is empty on every call, and inferring
     /// would hand picture two the index of picture one.
     next_display: u64,
+    geom: syn::Geometry,
+    /// `frame_num`, which counts *reference* pictures and wraps.
+    frame_num: u32,
+    idr_pic_id: u32,
+    /// Plane sizes of one source picture, derived once.
+    plane_dims: Vec<(u32, u32)>,
 }
+
+/// The exponents the SPS declares. Fixed rather than derived: 16 bits of
+/// `frame_num` and of POC LSB is more than any GOP this encoder produces
+/// needs, and a wrap that never happens is a class of bug that never happens.
+const LOG2_MAX_FRAME_NUM: u32 = 16;
+const LOG2_MAX_POC_LSB: u32 = 16;
 
 impl H264Encoder {
     /// Fails rather than starting if the configuration cannot produce a legal
@@ -62,6 +76,14 @@ impl H264Encoder {
         };
         let bps = if cfg.bit_depth > 8 { 2 } else { 1 };
         let sched = Scheduler::new(cfg.gop, cfg.bframes);
+        let geom = syn::Geometry::new(&cfg);
+        let mut plane_dims = vec![(cfg.width, cfg.height)];
+        if cfg.chroma != crate::ChromaFormat::Monochrome {
+            let cw = (cfg.width as usize).div_ceil(sw as usize) as u32;
+            let chh = (cfg.height as usize).div_ceil(sh as usize) as u32;
+            plane_dims.push((cw, chh));
+            plane_dims.push((cw, chh));
+        }
         Ok(Self {
             cfg,
             sched,
@@ -69,6 +91,10 @@ impl H264Encoder {
             recon: Vec::new(),
             frame_bytes: (luma + chroma) * bps,
             next_display: 0,
+            geom,
+            frame_num: 0,
+            idr_pic_id: 0,
+            plane_dims,
         })
     }
 
@@ -122,16 +148,115 @@ impl H264Encoder {
         Ok(out)
     }
 
-    /// Where the bits would be written.
-    fn code_picture(&mut self, c: Coded, _src: &[u8]) -> Result<Access> {
-        let _ = (&self.cfg.rate, &self.cfg.entropy, c.kind, c.reference);
-        // The hole, named. Everything above this line is exercised by
-        // verify_encode.sh already: configuration, geometry, picture typing,
-        // coding order, and the access-unit envelope.
-        Err(Error::unsupported(match self.cfg.entropy {
-            Entropy::Cabac => "H.264 encode: CABAC slice writing (encoder in progress)",
-            Entropy::Cavlc => "H.264 encode: CAVLC slice writing (encoder in progress)",
-        }))
+    /// Code one picture.
+    ///
+    /// Every macroblock is `I_PCM` for now: samples carried raw, no
+    /// prediction, no transform, no residual. That is a legal H.264 stream
+    /// and an exactly lossless one, which is what makes it the right first
+    /// output — it proves the parameter sets, the slice header, the
+    /// macroblock layer, NAL framing and emulation prevention against a real
+    /// decoder before any question of quality exists.
+    fn code_picture(&mut self, c: Coded, src: &[u8]) -> Result<Access> {
+        if self.cfg.entropy == Entropy::Cabac {
+            // I_PCM through CABAC needs the mb_type binarisation and an
+            // engine re-initialisation after each PCM block. Worth doing, and
+            // not yet done; saying so beats emitting a stream that is subtly
+            // wrong.
+            return Err(Error::unsupported(
+                "H.264 encode: CABAC slice writing (encoder in progress; --cavlc works)",
+            ));
+        }
+        let g = self.geom;
+        let idr = c.kind == Kind::Idr;
+        if !idr {
+            // Inter prediction is the next thing built. Until then only the
+            // all-intra configurations produce a stream.
+            return Err(Error::unsupported(
+                "H.264 encode: inter prediction (encoder in progress; --gop 0 works)",
+            ));
+        }
+
+        // Source planes, laid out consecutively as the caller supplies them.
+        let mut planes = Vec::with_capacity(self.plane_dims.len());
+        let mut off = 0usize;
+        for &(w, h) in &self.plane_dims {
+            let n = (w * h) as usize;
+            planes.push(syn::Plane {
+                data: &src[off..off + n],
+                stride: w as usize,
+                width: w,
+                height: h,
+            });
+            off += n;
+        }
+
+        // Reconstruction at coded size; cropped to display size afterwards,
+        // because that is what a decoder emits and therefore what the SELF
+        // check compares against.
+        let (cw, ch) = g.chroma_mb();
+        let mut recon: Vec<syn::PaddedPlane> = vec![syn::PaddedPlane::new(g.coded_width, g.coded_height)];
+        if cw != 0 {
+            recon.push(syn::PaddedPlane::new(g.mbs_wide * cw, g.mbs_high * ch));
+            recon.push(syn::PaddedPlane::new(g.mbs_wide * cw, g.mbs_high * ch));
+        }
+
+        let qp = self.picture_qp(c.kind);
+        let mut out = Vec::new();
+        out.extend_from_slice(&syn::annexb(
+            syn::NAL_SPS,
+            3,
+            &syn::write_sps(&self.cfg, &g, LOG2_MAX_FRAME_NUM, LOG2_MAX_POC_LSB),
+        ));
+        out.extend_from_slice(&syn::annexb(syn::NAL_PPS, 3, &syn::write_pps(&self.cfg, qp)));
+
+        let mut w = BitWriter::with_capacity(self.frame_bytes + 256);
+        syn::write_slice_header(
+            &syn::SliceHeader {
+                kind: c.kind,
+                frame_num: self.frame_num,
+                idr_pic_id: self.idr_pic_id,
+                poc_lsb: (c.poc as u32) & ((1 << LOG2_MAX_POC_LSB) - 1),
+                qp,
+                log2_max_frame_num: LOG2_MAX_FRAME_NUM,
+                log2_max_poc_lsb: LOG2_MAX_POC_LSB,
+                reference: c.reference,
+            },
+            qp,
+            &mut w,
+        );
+        for mb_y in 0..g.mbs_high {
+            for mb_x in 0..g.mbs_wide {
+                syn::write_pcm_macroblock(&mut w, &g, mb_x, mb_y, &planes, &mut recon);
+            }
+        }
+        w.rbsp_trailing_bits();
+        out.extend_from_slice(&syn::annexb(
+            if idr { syn::NAL_IDR } else { syn::NAL_SLICE },
+            if c.reference { 3 } else { 0 },
+            &w.into_nal(),
+        ));
+
+        let mut cropped = Vec::with_capacity(self.frame_bytes);
+        recon[0].crop_into(g.width, g.height, &mut cropped);
+        for (i, p) in recon.iter().enumerate().skip(1) {
+            let (dw, dh) = self.plane_dims[i];
+            p.crop_into(dw, dh, &mut cropped);
+        }
+        self.recon.push(cropped);
+
+        if c.reference {
+            self.frame_num = (self.frame_num + 1) & ((1 << LOG2_MAX_FRAME_NUM) - 1);
+        }
+        if idr {
+            self.frame_num = 0;
+            self.idr_pic_id ^= 1;
+        }
+        Ok(Access {
+            data: out,
+            keyframe: idr,
+            poc: c.poc,
+            encode_index: c.encode,
+        })
     }
 
     /// The quantiser this picture is coded at, before any adaptive

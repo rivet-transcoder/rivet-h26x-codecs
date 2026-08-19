@@ -80,6 +80,11 @@ fn main() {
     let mut n = 0usize;
     // H26XDEC_NOMD5=1 skips hashing (and packing) to time the decoder alone.
     let no_md5 = std::env::var_os("H26XDEC_NOMD5").is_some();
+    // H.264 4:0:0 is padded with grey chroma so the output matches
+    // libavcodec's yuv420p, which is what the conformance runners compare
+    // against. An encoder gate wants the opposite: the samples the codec
+    // actually produced, matching ffmpeg -pix_fmt gray. Hence the switch.
+    let no_chroma_pad = std::env::var_os("H26XDEC_NO_CHROMA_PAD").is_some();
     let mut emit = |pic: h26x::Picture, out: &mut Option<std::fs::File>| {
         if no_md5 && out.is_none() {
             println!("{},{},{},{}x{}", n, pic.poc, pic.decode_index, pic.width, pic.height);
@@ -87,7 +92,7 @@ fn main() {
             let (chroma, width, height, bit_depth) = (pic.chroma, pic.width, pic.height, pic.bit_depth);
             let (poc, decode_index) = (pic.poc, pic.decode_index);
             let mut packed = pic.into_packed();
-            if chroma == h26x::ChromaFormat::Monochrome && !hevc {
+            if chroma == h26x::ChromaFormat::Monochrome && !hevc && !no_chroma_pad {
                 // Like libavcodec's yuv420p output for H.264 4:0:0: grey
                 // chroma planes follow the luma, so the hashes compare
                 // (its HEVC decoder outputs 4:0:0 as `gray`, luma only).

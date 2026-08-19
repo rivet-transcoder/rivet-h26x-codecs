@@ -86,7 +86,10 @@ one() {
 
   # 1. SELF.
   ours="$OUT/$base.$name.ours.yuv"
-  if ! "$DEC" "$bs" "$ours" > /dev/null 2> "$OUT/$base.$name.dec.log"; then
+  # H.264 4:0:0: ask the decoder for the samples the codec produced rather
+  # than the grey-chroma padding it adds to match libavcodec yuv420p, since
+  # the CROSS check below asks ffmpeg for gray.
+  if ! H26XDEC_NO_CHROMA_PAD=1 "$DEC" "$bs" "$ours" > /dev/null 2> "$OUT/$base.$name.dec.log"; then
     echo "SELF-FAIL   $tag: our decoder rejected our bitstream: $(tail -1 "$OUT/$base.$name.dec.log" | head -c 80)"
     return 1
   fi
@@ -97,7 +100,15 @@ one() {
 
   # 2. CROSS.
   theirs="$OUT/$base.$name.ff.yuv"
-  if ! "$FFMPEG" -v error -y -i "$bs" -f rawvideo -pix_fmt "$(ffpix "$fmt")" "$theirs" \
+  # 4:0:0 needs extractplanes, not -pix_fmt gray. libavcodec emits H.264
+  # monochrome as yuv420p with grey chroma, so asking swscale for gray makes
+  # it convert — and it treats yuv420p as limited range and gray as full, so
+  # every luma sample comes out expanded: 68 becomes 61. That is an artefact
+  # of the comparison, not a difference in the bitstream, and it cost a false
+  # CROSS failure to find.
+  ffargs="-pix_fmt $(ffpix "$fmt")"
+  case "$fmt" in 400|gray) ffargs="-vf extractplanes=y -pix_fmt gray" ;; esac
+  if ! "$FFMPEG" -v error -y -i "$bs" -f rawvideo $ffargs "$theirs" \
        > "$OUT/$base.$name.ff.log" 2>&1; then
     echo "CROSS-FAIL  $tag: libavcodec rejected our bitstream: $(tail -1 "$OUT/$base.$name.ff.log" | head -c 80)"
     return 1

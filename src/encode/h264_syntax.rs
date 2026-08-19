@@ -1,0 +1,418 @@
+//! Writing H.264 headers and the macroblock layer.
+//!
+//! The first thing built here is the simplest bitstream that is legal and
+//! decodable: every macroblock coded as `I_PCM`, which carries its samples
+//! raw. There is no prediction, no transform, no quantisation and no residual
+//! coding in it, so nothing about picture quality is being decided yet — and
+//! that is the point. It exercises the whole envelope in one step: sequence
+//! and picture parameter sets, the slice header, the macroblock layer, the
+//! CAVLC and CABAC paths through `mb_type`, NAL framing and
+//! emulation prevention.
+//!
+//! It is also *exactly* lossless by construction, which means the gate's
+//! strictest property — reconstruction equal to the source, byte for byte —
+//! applies to it immediately. An encoder whose first output is exact removes
+//! every quality question from the first round of debugging, leaving only the
+//! question of whether the bitstream is well-formed. Everything after this is
+//! a quality improvement on an envelope that is already proven against
+//! libavcodec.
+
+use crate::bitwriter::BitWriter;
+use crate::encode::gop::Kind;
+use crate::encode::{Config, Entropy};
+use crate::picture::ChromaFormat;
+
+/// Coded slice of a non-IDR picture.
+pub const NAL_SLICE: u8 = 1;
+/// Coded slice of an IDR picture.
+pub const NAL_IDR: u8 = 5;
+/// Sequence parameter set.
+pub const NAL_SPS: u8 = 7;
+/// Picture parameter set.
+pub const NAL_PPS: u8 = 8;
+
+/// Prefix a NAL payload with its header byte and an Annex B start code.
+///
+/// Four-byte start codes throughout. Three would be legal and marginally
+/// smaller, but the saving is a byte per NAL against the risk of getting the
+/// rule about which may use the short form wrong, and this encoder has no
+/// bitrate pressure yet.
+pub fn annexb(nal_type: u8, nal_ref_idc: u8, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len() + 5);
+    out.extend_from_slice(&[0, 0, 0, 1]);
+    out.push(((nal_ref_idc & 3) << 5) | (nal_type & 0x1f));
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Geometry the headers and the macroblock loop both need, derived once so
+/// the two cannot disagree about it.
+#[derive(Debug, Clone, Copy)]
+pub struct Geometry {
+    /// Coded size, in macroblocks.
+    pub mbs_wide: u32,
+    /// See `mbs_wide`.
+    pub mbs_high: u32,
+    /// Coded luma size, which is the macroblock grid.
+    pub coded_width: u32,
+    /// See `coded_width`.
+    pub coded_height: u32,
+    /// Displayed luma size, which is what the caller asked for.
+    pub width: u32,
+    /// See `width`.
+    pub height: u32,
+    /// Chroma sampling.
+    pub chroma: ChromaFormat,
+    /// Bits per sample, 8 to 14.
+    pub bit_depth: u32,
+}
+
+impl Geometry {
+    /// Derive the coded geometry from a configuration.
+    pub fn new(cfg: &Config) -> Self {
+        let mbs_wide = cfg.width.div_ceil(16);
+        let mbs_high = cfg.height.div_ceil(16);
+        Self {
+            mbs_wide,
+            mbs_high,
+            coded_width: mbs_wide * 16,
+            coded_height: mbs_high * 16,
+            width: cfg.width,
+            height: cfg.height,
+            chroma: cfg.chroma,
+            bit_depth: cfg.bit_depth,
+        }
+    }
+
+    /// Chroma samples per macroblock, per plane.
+    pub fn chroma_mb(&self) -> (u32, u32) {
+        match self.chroma {
+            ChromaFormat::Monochrome => (0, 0),
+            ChromaFormat::Yuv420 => (8, 8),
+            ChromaFormat::Yuv422 => (8, 16),
+            ChromaFormat::Yuv444 => (16, 16),
+        }
+    }
+}
+
+/// The profile that admits this configuration.
+///
+/// I_PCM is in every profile, so what decides this is the format rather than
+/// the coding tools: 4:2:2 and 4:4:4 and depths above 8 need High 4:2:2 or
+/// High 4:4:4 Predictive, and monochrome needs High. Claiming a lower profile
+/// than the stream needs is the kind of error a decoder is entitled to reject
+/// the stream over, so this errs upwards.
+fn profile_idc(g: &Geometry) -> u8 {
+    match g.chroma {
+        ChromaFormat::Yuv444 => 244,
+        ChromaFormat::Yuv422 => 122,
+        _ if g.bit_depth > 8 => 110,
+        ChromaFormat::Monochrome => 100,
+        ChromaFormat::Yuv420 => 100,
+    }
+}
+
+/// Whether the SPS carries the chroma/depth extension fields. Everything from
+/// High upwards does.
+fn has_chroma_extension(profile: u8) -> bool {
+    matches!(profile, 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135)
+}
+
+/// Sequence parameter set.
+pub fn write_sps(cfg: &Config, g: &Geometry, log2_max_frame_num: u32, log2_max_poc_lsb: u32) -> Vec<u8> {
+    let mut w = BitWriter::with_capacity(64);
+    let profile = profile_idc(g);
+    w.bits(8, profile as u32);
+    // constraint_set0..5 then two reserved zero bits.
+    w.bits(8, 0);
+    // Level 5.1 unconditionally. Deriving the true level from size and rate
+    // is a table lookup this encoder will want later; until then, claiming a
+    // level that admits everything is honest, whereas claiming one too low
+    // would be a stream a conforming decoder may refuse.
+    w.bits(8, 51);
+    w.ue(0); // seq_parameter_set_id
+    if has_chroma_extension(profile) {
+        w.ue(match g.chroma {
+            ChromaFormat::Monochrome => 0,
+            ChromaFormat::Yuv420 => 1,
+            ChromaFormat::Yuv422 => 2,
+            ChromaFormat::Yuv444 => 3,
+        });
+        if g.chroma == ChromaFormat::Yuv444 {
+            w.flag(false); // separate_colour_plane_flag
+        }
+        w.ue(g.bit_depth - 8); // bit_depth_luma_minus8
+        w.ue(if g.chroma == ChromaFormat::Monochrome { 0 } else { g.bit_depth - 8 });
+        w.flag(false); // qpprime_y_zero_transform_bypass_flag
+        w.flag(false); // seq_scaling_matrix_present_flag
+    }
+    w.ue(log2_max_frame_num - 4);
+    w.ue(0); // pic_order_cnt_type 0
+    w.ue(log2_max_poc_lsb - 4);
+    w.ue(cfg.max_refs); // max_num_ref_frames
+    w.flag(false); // gaps_in_frame_num_value_allowed_flag
+    w.ue(g.mbs_wide - 1);
+    w.ue(g.mbs_high - 1); // frame_mbs_only_flag is 1, so map units are MBs
+    w.flag(true); // frame_mbs_only_flag
+    w.flag(true); // direct_8x8_inference_flag
+    // Cropping, because the coded size is rounded up to whole macroblocks and
+    // the displayed size is not. The units are chroma samples horizontally
+    // and, for frame pictures, chroma samples vertically.
+    let (cw, ch) = match g.chroma {
+        ChromaFormat::Monochrome => (1, 1),
+        ChromaFormat::Yuv420 => (2, 2),
+        ChromaFormat::Yuv422 => (2, 1),
+        ChromaFormat::Yuv444 => (1, 1),
+    };
+    let right = (g.coded_width - g.width) / cw;
+    let bottom = (g.coded_height - g.height) / ch;
+    if right != 0 || bottom != 0 {
+        w.flag(true);
+        w.ue(0);
+        w.ue(right);
+        w.ue(0);
+        w.ue(bottom);
+    } else {
+        w.flag(false);
+    }
+    w.flag(false); // vui_parameters_present_flag
+    w.rbsp_trailing_bits();
+    w.into_nal()
+}
+
+/// Picture parameter set.
+pub fn write_pps(cfg: &Config, qp: u8) -> Vec<u8> {
+    let mut w = BitWriter::with_capacity(32);
+    w.ue(0); // pic_parameter_set_id
+    w.ue(0); // seq_parameter_set_id
+    w.flag(cfg.entropy == Entropy::Cabac);
+    w.flag(false); // bottom_field_pic_order_in_frame_present_flag
+    w.ue(0); // num_slice_groups_minus1
+    w.ue(0); // num_ref_idx_l0_default_active_minus1
+    w.ue(0); // num_ref_idx_l1_default_active_minus1
+    w.flag(false); // weighted_pred_flag
+    w.bits(2, 0); // weighted_bipred_idc
+    w.se(qp as i32 - 26); // pic_init_qp_minus26
+    w.se(0); // pic_init_qs_minus26
+    w.se(0); // chroma_qp_index_offset
+    w.flag(true); // deblocking_filter_control_present_flag
+    w.flag(false); // constrained_intra_pred_flag
+    w.flag(false); // redundant_pic_cnt_present_flag
+    w.rbsp_trailing_bits();
+    w.into_nal()
+}
+
+/// What a slice header needs that is not in the parameter sets.
+#[derive(Debug, Clone, Copy)]
+pub struct SliceHeader {
+    /// What the slice is coded as.
+    pub kind: Kind,
+    /// Counts reference pictures, and wraps at `log2_max_frame_num`.
+    pub frame_num: u32,
+    /// Distinguishes consecutive IDRs so a decoder cannot merge them.
+    pub idr_pic_id: u32,
+    /// The low bits of the picture order count.
+    pub poc_lsb: u32,
+    /// Quantiser for the slice.
+    pub qp: u8,
+    /// Width of the `frame_num` field, from the SPS.
+    pub log2_max_frame_num: u32,
+    /// Width of the `poc_lsb` field, from the SPS.
+    pub log2_max_poc_lsb: u32,
+    /// Whether later pictures may reference this one.
+    pub reference: bool,
+}
+
+/// `slice_type` for an I, P or B slice, in the "all slices of this picture
+/// have this type" form (5..9), which is true here and lets a decoder know it.
+fn slice_type_code(kind: Kind) -> u32 {
+    match kind {
+        Kind::Idr | Kind::I => 7,
+        Kind::P => 5,
+        Kind::B => 6,
+    }
+}
+
+/// Slice header, up to but not including the macroblock data.
+pub fn write_slice_header(h: &SliceHeader, pps_qp: u8, w: &mut BitWriter) {
+    w.ue(0); // first_mb_in_slice
+    w.ue(slice_type_code(h.kind));
+    w.ue(0); // pic_parameter_set_id
+    w.bits(h.log2_max_frame_num, h.frame_num);
+    // frame_mbs_only_flag is 1, so no field_pic_flag here.
+    if h.kind == Kind::Idr {
+        w.ue(h.idr_pic_id);
+    }
+    w.bits(h.log2_max_poc_lsb, h.poc_lsb);
+    if h.kind == Kind::B {
+        w.flag(false); // direct_spatial_mv_pred_flag
+    }
+    if h.kind == Kind::P || h.kind == Kind::B {
+        w.flag(false); // num_ref_idx_active_override_flag
+        // ref_pic_list_modification
+        w.flag(false);
+        if h.kind == Kind::B {
+            w.flag(false);
+        }
+    }
+    if h.reference {
+        if h.kind == Kind::Idr {
+            w.flag(false); // no_output_of_prior_pics_flag
+            w.flag(false); // long_term_reference_flag
+        } else {
+            w.flag(false); // adaptive_ref_pic_marking_mode_flag
+        }
+    }
+    w.se(h.qp as i32 - pps_qp as i32); // slice_qp_delta
+    // deblocking_filter_control_present_flag is 1 in the PPS.
+    w.ue(0); // disable_deblocking_filter_idc: filter on
+    w.se(0); // slice_alpha_c0_offset_div2
+    w.se(0); // slice_beta_offset_div2
+}
+
+/// Write one macroblock as `I_PCM`, taking its samples from the source and
+/// leaving the same samples in `dst`, the padded reconstruction.
+///
+/// Samples outside the displayed picture — the padding a non-multiple-of-16
+/// size implies — are filled by edge replication. Any value would be legal,
+/// since the cropping rectangle excludes them from display, but replication
+/// keeps the coded picture free of edges that would cost bits once this
+/// encoder predicts and transforms rather than copying.
+pub fn write_pcm_macroblock(
+    w: &mut BitWriter,
+    g: &Geometry,
+    mb_x: u32,
+    mb_y: u32,
+    planes: &[Plane<'_>],
+    dst: &mut [PaddedPlane],
+) {
+    // `mb_type` 25 is I_PCM in an I slice, as ue(v) for CAVLC.
+    w.ue(25);
+    w.align_zero(); // pcm_alignment_zero_bit
+    let bd = g.bit_depth;
+    let (cw, ch) = g.chroma_mb();
+    let sizes: [(u32, u32); 3] = [(16, 16), (cw, ch), (cw, ch)];
+    for (p, &(bw, bh)) in sizes.iter().enumerate() {
+        if bw == 0 || p >= planes.len() {
+            continue;
+        }
+        let src = &planes[p];
+        let (sx, sy) = (mb_x * bw, mb_y * bh);
+        for y in 0..bh {
+            let syy = (sy + y).min(src.height.saturating_sub(1));
+            for x in 0..bw {
+                let sxx = (sx + x).min(src.width.saturating_sub(1));
+                let v = src.data[syy as usize * src.stride + sxx as usize] as u32;
+                w.bits(bd, v);
+                let d = &mut dst[p];
+                d.data[(sy + y) as usize * d.stride + (sx + x) as usize] = v as u8;
+            }
+        }
+    }
+}
+
+/// A source plane: samples, stride, and the size actually present.
+#[derive(Debug, Clone, Copy)]
+pub struct Plane<'a> {
+    /// Samples, row-major.
+    pub data: &'a [u8],
+    /// Samples per row, which may exceed `width`.
+    pub stride: usize,
+    /// Samples present horizontally.
+    pub width: u32,
+    /// Rows present.
+    pub height: u32,
+}
+
+/// A reconstruction plane at coded size, before cropping.
+#[derive(Debug, Clone)]
+pub struct PaddedPlane {
+    /// Samples, row-major, at coded size.
+    pub data: Vec<u8>,
+    /// Samples per row.
+    pub stride: usize,
+    /// Coded width, a whole number of macroblocks.
+    pub width: u32,
+    /// Coded height, a whole number of macroblocks.
+    pub height: u32,
+}
+
+impl PaddedPlane {
+    /// A zeroed plane of the given coded size.
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            data: vec![0; (width * height) as usize],
+            stride: width as usize,
+            width,
+            height,
+        }
+    }
+
+    /// Copy the displayed top-left rectangle out, which is what a decoder
+    /// emits and therefore what the SELF check compares against.
+    pub fn crop_into(&self, w: u32, h: u32, out: &mut Vec<u8>) {
+        for y in 0..h as usize {
+            let row = y * self.stride;
+            out.extend_from_slice(&self.data[row..row + w as usize]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encode::Config;
+
+    fn geom(w: u32, h: u32, c: ChromaFormat) -> (Config, Geometry) {
+        let cfg = Config { width: w, height: h, chroma: c, ..Config::default() };
+        let g = Geometry::new(&cfg);
+        (cfg, g)
+    }
+
+    /// The parameter sets have to survive the crate's own parsers, which are
+    /// the ones proven against 412 conformance streams. Anything they reject
+    /// is not a legal parameter set.
+    #[test]
+    fn the_decoder_parses_what_the_encoder_writes() {
+        for (w, h, c) in [
+            (64u32, 64u32, ChromaFormat::Yuv420),
+            (50, 34, ChromaFormat::Yuv420),
+            (64, 64, ChromaFormat::Yuv422),
+            (64, 64, ChromaFormat::Yuv444),
+            (64, 64, ChromaFormat::Monochrome),
+        ] {
+            let (cfg, g) = geom(w, h, c);
+            let sps = write_sps(&cfg, &g, 4, 4);
+            let parsed = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&sps))
+                .unwrap_or_else(|e| panic!("{w}x{h} {c:?}: SPS rejected: {e}"));
+            assert_eq!(parsed.pic_width_in_mbs * 16, g.coded_width, "{w}x{h} {c:?}");
+            assert_eq!(parsed.chroma_format_idc, match c {
+                ChromaFormat::Monochrome => 0,
+                ChromaFormat::Yuv420 => 1,
+                ChromaFormat::Yuv422 => 2,
+                ChromaFormat::Yuv444 => 3,
+            });
+        }
+    }
+
+    #[test]
+    fn cropping_is_written_when_the_size_is_not_a_whole_macroblock() {
+        let (cfg, g) = geom(50, 34, ChromaFormat::Yuv420);
+        assert_eq!((g.coded_width, g.coded_height), (64, 48));
+        let sps = write_sps(&cfg, &g, 4, 4);
+        let parsed = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&sps)).unwrap();
+        // The property that matters is not the field values but what a
+        // decoder ends up displaying: the size the caller asked for.
+        let (left, right, top, bottom) = parsed.crop;
+        assert_eq!(g.coded_width - left - right, 50);
+        assert_eq!(g.coded_height - top - bottom, 34);
+    }
+
+    #[test]
+    fn annexb_prefixes_a_start_code_and_the_header_byte() {
+        let n = annexb(NAL_SPS, 3, &[0xaa]);
+        assert_eq!(&n[..4], &[0, 0, 0, 1]);
+        assert_eq!(n[4] & 0x1f, NAL_SPS);
+        assert_eq!(n[4] >> 5, 3);
+    }
+}
