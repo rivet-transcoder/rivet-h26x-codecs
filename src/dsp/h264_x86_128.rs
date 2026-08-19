@@ -305,19 +305,17 @@ macro_rules! kernels {
             unsafe { tap6_u8(src.add(y * stride + col), stride) }
         }
 
-        /// Centre position, eight columns from `x` of block row `y`: vertical
-        /// six-tap over the b1 rows `y..y+5` with 32-bit accumulation,
-        /// `clip((v + 512) >> 10)`.
+        /// Centre position, eight columns: vertical six-tap over the six
+        /// horizontal intermediates `b1` of window rows `y..y+5`, 32-bit
+        /// accumulation, `clip((v + 512) >> 10)`.
+        ///
+        /// The six are passed in rather than computed here because
+        /// consecutive output rows share five of them — see `qpel_impl`.
         #[target_feature(enable = $feat)]
         #[inline]
-        unsafe fn j_row(src: *const u8, stride: usize, y: usize, x: usize) -> __m128i {
+        unsafe fn j_combine(w: &[__m128i; 6]) -> __m128i {
             unsafe {
-                let r0 = b1_row(src, stride, y, x);
-                let r1 = b1_row(src, stride, y + 1, x);
-                let r2 = b1_row(src, stride, y + 2, x);
-                let r3 = b1_row(src, stride, y + 3, x);
-                let r4 = b1_row(src, stride, y + 4, x);
-                let r5 = b1_row(src, stride, y + 5, x);
+                let (r0, r1, r2, r3, r4, r5) = (w[0], w[1], w[2], w[3], w[4], w[5]);
                 let c01 = _mm_set1_epi32(pair(1, -5));
                 let c23 = _mm_set1_epi32(pair(20, 20));
                 let c45 = _mm_set1_epi32(pair(-5, 1));
@@ -357,6 +355,15 @@ macro_rules! kernels {
 
         #[target_feature(enable = $feat)]
         unsafe fn qpel_impl<const XF: usize, const YF: usize>(dst: &mut [u8], src: &[u8], stride: usize, w: usize, h: usize) {
+            // The five positions whose vertical filter runs over the
+            // *horizontal* intermediates rather than over samples. Their row
+            // y needs `b1` of window rows y..y+5 and their row y+1 needs
+            // y+1..y+6, so five of every six are shared: computed once and
+            // slid down, not recomputed. Sliding needs y innermost, which is
+            // why that kernel nests its loops the other way round.
+            if matches!((XF, YF), (2, 2) | (2, 1) | (2, 3) | (1, 2) | (3, 2)) {
+                return unsafe { qpel_centre_impl::<XF, YF>(dst, src, stride, w, h) };
+            }
             unsafe {
                 let s = src.as_ptr();
                 let chunks = w.div_ceil(8);
@@ -376,18 +383,58 @@ macro_rules! kernels {
                             (0, 1) => _mm_avg_epu8(g_row(s, stride, y, 0, x), hh()),
                             (0, 2) => hh(),
                             (0, 3) => _mm_avg_epu8(_mm_loadl_epi64(s.add((y + 3) * stride + 2 + x) as *const __m128i), hh()),
-                            (2, 2) => j_row(s, stride, y, x),
                             (1, 1) => _mm_avg_epu8(b(), hh()),
                             (3, 1) => _mm_avg_epu8(b(), hh_right()),
                             (1, 3) => _mm_avg_epu8(hh(), b_below()),
                             (3, 3) => _mm_avg_epu8(hh_right(), b_below()),
-                            (2, 1) => _mm_avg_epu8(b(), j_row(s, stride, y, x)),
-                            (2, 3) => _mm_avg_epu8(j_row(s, stride, y, x), b_below()),
-                            (1, 2) => _mm_avg_epu8(hh(), j_row(s, stride, y, x)),
-                            (3, 2) => _mm_avg_epu8(j_row(s, stride, y, x), hh_right()),
                             _ => unreachable!(),
                         };
                         _mm_storel_epi64(d as *mut __m128i, v);
+                    }
+                }
+            }
+        }
+
+        /// The centre positions, over a sliding window of `b1` rows.
+        ///
+        /// `win[k]` holds the horizontal intermediate of window row `y + k`
+        /// for the current output row `y`; after each row the window slides
+        /// down one and only the new bottom row is filtered. Columns are the
+        /// outer loop so that the window belongs to one eight-wide chunk.
+        /// `b` and `b_below`, which the half-and-half positions need, are
+        /// rows y+2 and y+3 of that same window, so they cost a pack rather
+        /// than a filter.
+        #[target_feature(enable = $feat)]
+        unsafe fn qpel_centre_impl<const XF: usize, const YF: usize>(dst: &mut [u8], src: &[u8], stride: usize, w: usize, h: usize) {
+            unsafe {
+                let s = src.as_ptr();
+                for c in 0..w.div_ceil(8) {
+                    let x = c * 8;
+                    let mut win = [
+                        b1_row(s, stride, 0, x),
+                        b1_row(s, stride, 1, x),
+                        b1_row(s, stride, 2, x),
+                        b1_row(s, stride, 3, x),
+                        b1_row(s, stride, 4, x),
+                        b1_row(s, stride, 5, x),
+                    ];
+                    for y in 0..h {
+                        let j = j_combine(&win);
+                        let v: __m128i = match (XF, YF) {
+                            (2, 2) => j,
+                            (2, 1) => _mm_avg_epu8(round5_pack(win[2]), j),
+                            (2, 3) => _mm_avg_epu8(j, round5_pack(win[3])),
+                            (1, 2) => _mm_avg_epu8(round5_pack(h1_row(s, stride, 2 + x, y)), j),
+                            (3, 2) => _mm_avg_epu8(j, round5_pack(h1_row(s, stride, 3 + x, y))),
+                            _ => unreachable!(),
+                        };
+                        _mm_storel_epi64(dst.as_mut_ptr().add(y * PRED_STRIDE + x) as *mut __m128i, v);
+                        // Not on the last row: the caller's bounds check
+                        // covers window rows up to h + 4, and row h + 5 would
+                        // read past the block.
+                        if y + 1 < h {
+                            win = [win[1], win[2], win[3], win[4], win[5], b1_row(s, stride, y + 6, x)];
+                        }
                     }
                 }
             }
