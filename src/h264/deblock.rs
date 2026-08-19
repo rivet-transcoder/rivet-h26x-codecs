@@ -499,7 +499,6 @@ fn filter_chroma_style<S: Sample>(
     }
 }
 
-
 /// Deblock macroblock rows `r0..r1` in raster order (each row's top edges
 /// reach three lines into the row above). Rows must be filtered in order,
 /// and a row only after the row below it is decoded (intra prediction
@@ -1044,6 +1043,40 @@ fn deblock_mbaff_pairs<S: Sample>(
                             // MB, and for a frame MB 2k on even lines (top
                             // field) but 2k - 1 on odd ones (bottom field) —
                             // and that line's p macroblock.
+                            //
+                            // This is the last of the filter that still runs a
+                            // line at a time, and the ceiling for giving it a
+                            // kernel the way luma got one is written down here
+                            // so nobody has to measure it again. Replacing
+                            // this loop with nothing at all — which is the
+                            // most any kernel could win — takes the MBAFF
+                            // filter to 0.814x on CVMA1_TOSHIBA_B and 0.942x
+                            // on CAMP_MOT_MBAFF_L30. So the whole prize is
+                            // ~19% of MBAFF deblocking on a stream dense with
+                            // mixed edges and ~6% on one that is not, of a
+                            // filter that is itself single-digit percent of a
+                            // decode, on a path only MBAFF streams reach.
+                            //
+                            // Two things make the achievable share much less
+                            // than that, and they are why this was left alone
+                            // rather than done. The halves here are four lines
+                            // for 4:2:0, not eight: the chroma lines alternate
+                            // between the two p macroblocks just as the luma
+                            // ones do, but there are half as many of them. Four
+                            // lines of two taps is sixteen bytes of work behind
+                            // a transpose, where luma's eight lines of four
+                            // taps mapped exactly onto `load_transposed_8x8`
+                            // and cost nothing to write. And it would need its
+                            // own signature and its own contract checked across
+                            // the suite, for a kernel whose gain would sit near
+                            // the noise floor of the machine measuring it.
+                            //
+                            // Worth correcting one guess that was made about
+                            // this before it was measured: the call count is
+                            // not half of luma's, it is equal — eight chroma
+                            // lines times two components against luma's
+                            // sixteen. The per-line work is smaller; the number
+                            // of calls is not.
                             for k in 0..mbh_c {
                                 let l = if chroma422 {
                                     k
