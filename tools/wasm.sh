@@ -30,17 +30,30 @@ set -u
 cd "$(dirname "$0")/.."
 
 command -v node > /dev/null || { echo "wasm.sh: needs node"; exit 1; }
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
 rustup target list --installed 2>/dev/null | grep -qx wasm32-unknown-unknown ||
   { echo "wasm.sh: needs the wasm32-unknown-unknown target (rustup target add wasm32-unknown-unknown)"; exit 1; }
 
 build() { # build <rustflags> <dest>
-  RUSTFLAGS="$1" cargo build --release --target wasm32-unknown-unknown --example wasm_probe > /dev/null 2>&1 ||
-    { echo "wasm.sh: build failed ($2)"; exit 1; }
-  cp target/wasm32-unknown-unknown/release/examples/wasm_probe.wasm "$2"
+  # An explicit --target-dir, because this crate is a workspace member when it
+  # is vendored into rivet and the artifact then lands at the *workspace*
+  # root, not under this directory. Asking for a known location beats guessing
+  # a relative one that is right in only one of the two checkouts.
+  #
+  # And the build output is kept: swallowing it turned a compile error into
+  # "no such file", which is a worse message about a different problem.
+  local log="$TMP/build.log"
+  if ! RUSTFLAGS="$1" cargo build --release --target wasm32-unknown-unknown \
+       --example wasm_probe --target-dir "$TMP/target" > "$log" 2>&1; then
+    echo "wasm.sh: build failed ($2)"
+    tail -20 "$log" >&2
+    exit 1
+  fi
+  cp "$TMP/target/wasm32-unknown-unknown/release/examples/wasm_probe.wasm" "$2"
 }
 
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
 echo "== building =="
 build "" "$TMP/scalar.wasm"
 echo "  scalar   $(wc -c < "$TMP/scalar.wasm") bytes"
