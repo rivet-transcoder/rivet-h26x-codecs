@@ -15,6 +15,7 @@ pub mod distortion;
 pub mod h264;
 pub mod h264_enc;
 pub mod hevc;
+pub mod hevc_enc;
 // The SIMD modules wrap their intrinsics in `unsafe {}` blocks: required on
 // the crate's MSRV, redundant (and warned about) on toolchains where
 // target-feature intrinsics became safe to call inside `#[target_feature]`
