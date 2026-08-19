@@ -110,18 +110,14 @@ unsafe fn h1_row(src: *const u8, stride: usize, col: usize, y: usize) -> int16x8
     }
 }
 
-/// Centre position: vertical six-tap over b1 rows y..y+5, `clip((v + 512) >> 10)`.
+/// Centre position: vertical six-tap over the six horizontal intermediates
+/// `b1` of window rows y..y+5, `clip((v + 512) >> 10)`.
+///
+/// The six are passed in rather than computed here because consecutive output
+/// rows share five of them — see `qpel_centre_neon`.
 #[inline(always)]
-unsafe fn j_row(src: *const u8, stride: usize, y: usize, x0: usize) -> uint8x8_t {
+unsafe fn j_combine(r: &[int16x8_t; 6]) -> uint8x8_t {
     unsafe {
-        let r: [int16x8_t; 6] = [
-            b1_row(src, stride, y, x0),
-            b1_row(src, stride, y + 1, x0),
-            b1_row(src, stride, y + 2, x0),
-            b1_row(src, stride, y + 3, x0),
-            b1_row(src, stride, y + 4, x0),
-            b1_row(src, stride, y + 5, x0),
-        ];
         let taps: [i16; 6] = [1, -5, 20, 20, -5, 1];
         let mut lo = vdupq_n_s32(512);
         let mut hi = vdupq_n_s32(512);
@@ -139,6 +135,13 @@ fn qpel_neon<const XF: usize, const YF: usize>(dst: &mut [u8], src: &[u8], strid
     let need = (h + 5 - 1) * stride + w.div_ceil(8) * 8 + 5 + 8;
     if src.len() < need {
         return (H264Dsp::<u8>::SCALAR.qpel[YF * 4 + XF])(dst, src, stride, w, h, 255);
+    }
+    // The five positions whose vertical filter runs over the *horizontal*
+    // intermediates rather than over samples. Their row y needs `b1` of
+    // window rows y..y+5 and their row y+1 needs y+1..y+6, so five of every
+    // six are shared: computed once and slid down, not recomputed.
+    if matches!((XF, YF), (2, 2) | (2, 1) | (2, 3) | (1, 2) | (3, 2)) {
+        return unsafe { qpel_centre_neon::<XF, YF>(dst, src, stride, w, h) };
     }
     unsafe {
         let s = src.as_ptr();
@@ -158,21 +161,60 @@ fn qpel_neon<const XF: usize, const YF: usize>(dst: &mut [u8], src: &[u8], strid
                     (0, 1) => vrhadd_u8(g(0, 0), hh()),
                     (0, 2) => hh(),
                     (0, 3) => vrhadd_u8(g(0, 1), hh()),
-                    (2, 2) => j_row(s, stride, y, x0),
                     (1, 1) => vrhadd_u8(b(), hh()),
                     (3, 1) => vrhadd_u8(b(), hh_right()),
                     (1, 3) => vrhadd_u8(hh(), b_below()),
                     (3, 3) => vrhadd_u8(hh_right(), b_below()),
-                    (2, 1) => vrhadd_u8(b(), j_row(s, stride, y, x0)),
-                    (2, 3) => vrhadd_u8(j_row(s, stride, y, x0), b_below()),
-                    (1, 2) => vrhadd_u8(hh(), j_row(s, stride, y, x0)),
-                    (3, 2) => vrhadd_u8(j_row(s, stride, y, x0), hh_right()),
                     _ => unreachable!(),
                 };
                 // The scratch row is 16 wide whatever `w` is.
                 vst1_u8(dst.as_mut_ptr().add(y * PRED_STRIDE + x0), v);
                 x0 += 8;
             }
+        }
+    }
+}
+
+/// The centre positions, over a sliding window of `b1` rows.
+///
+/// `win[k]` holds the horizontal intermediate of window row `y + k` for the
+/// current output row `y`; after each row the window slides down one and only
+/// the new bottom row is filtered. Columns are the outer loop so that the
+/// window belongs to one eight-lane chunk. `b` and `b_below`, which the
+/// half-and-half positions need, are rows y+2 and y+3 of that same window, so
+/// they cost a narrowing rather than a filter.
+unsafe fn qpel_centre_neon<const XF: usize, const YF: usize>(dst: &mut [u8], src: &[u8], stride: usize, w: usize, h: usize) {
+    unsafe {
+        let s = src.as_ptr();
+        let mut x0 = 0;
+        while x0 < w {
+            let mut win: [int16x8_t; 6] = [
+                b1_row(s, stride, 0, x0),
+                b1_row(s, stride, 1, x0),
+                b1_row(s, stride, 2, x0),
+                b1_row(s, stride, 3, x0),
+                b1_row(s, stride, 4, x0),
+                b1_row(s, stride, 5, x0),
+            ];
+            for y in 0..h {
+                let j = j_combine(&win);
+                let v: uint8x8_t = match (XF, YF) {
+                    (2, 2) => j,
+                    (2, 1) => vrhadd_u8(round5(win[2]), j),
+                    (2, 3) => vrhadd_u8(j, round5(win[3])),
+                    (1, 2) => vrhadd_u8(round5(h1_row(s, stride, 2 + x0, y)), j),
+                    (3, 2) => vrhadd_u8(j, round5(h1_row(s, stride, 3 + x0, y))),
+                    _ => unreachable!(),
+                };
+                vst1_u8(dst.as_mut_ptr().add(y * PRED_STRIDE + x0), v);
+                // Not on the last row: the caller's bounds check covers
+                // window rows up to h + 4, and row h + 5 would read past the
+                // block.
+                if y + 1 < h {
+                    win = [win[1], win[2], win[3], win[4], win[5], b1_row(s, stride, y + 6, x0)];
+                }
+            }
+            x0 += 8;
         }
     }
 }
