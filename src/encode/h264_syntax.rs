@@ -287,7 +287,7 @@ pub fn write_pcm_macroblock(
     mb_x: u32,
     mb_y: u32,
     planes: &[Plane<'_>],
-    dst: &mut [PaddedPlane],
+    dst: &mut [Recon],
 ) {
     // `mb_type` 25 is I_PCM in an I slice, as ue(v) for CAVLC.
     w.ue(25);
@@ -319,7 +319,7 @@ pub fn write_pcm_slice_data_cabac(
     g: &Geometry,
     qp: u8,
     planes: &[Plane<'_>],
-    dst: &mut [PaddedPlane],
+    dst: &mut [Recon],
 ) {
     // `cabac_alignment_one_bit` until the slice data starts on a byte.
     w.align_one();
@@ -375,7 +375,7 @@ fn write_pcm_samples(
     mb_x: u32,
     mb_y: u32,
     planes: &[Plane<'_>],
-    dst: &mut [PaddedPlane],
+    dst: &mut [Recon],
 ) {
     let bd = g.bit_depth;
     let (cw, ch) = g.chroma_mb();
@@ -393,7 +393,8 @@ fn write_pcm_samples(
                 let v = src.data[syy as usize * src.stride + sxx as usize] as u32;
                 w.bits(bd, v);
                 let d = &mut dst[p];
-                d.data[(sy + y) as usize * d.stride + (sx + x) as usize] = v as u8;
+                let i = ((sy + y) as usize + d.pad) * d.stride + (sx + x) as usize + d.pad;
+                d.data[i] = v as u8;
             }
         }
     }
@@ -412,37 +413,28 @@ pub struct Plane<'a> {
     pub height: u32,
 }
 
-/// A reconstruction plane at coded size, before cropping.
-#[derive(Debug, Clone)]
-pub struct PaddedPlane {
-    /// Samples, row-major, at coded size.
-    pub data: Vec<u8>,
-    /// Samples per row.
-    pub stride: usize,
-    /// Coded width, a whole number of macroblocks.
-    pub width: u32,
-    /// Coded height, a whole number of macroblocks.
-    pub height: u32,
+/// The reconstruction plane, which is the *decoder's* padded plane.
+///
+/// Deliberately not a type of the encoder's own. `h264::intra`'s predictors
+/// read their neighbours directly out of the border of this layout, so
+/// sharing the type is what lets the encoder reuse them — and reusing them is
+/// what makes the encoder's reconstruction identical to a decoder's by
+/// construction rather than by care. A second set of predictors would be a
+/// second thing to keep in step, and the drift would show up as a SELF
+/// failure hundreds of macroblocks after the cause.
+pub type Recon = crate::h264::frame::PaddedPlane<u8>;
+
+/// A zeroed reconstruction plane of the given coded size.
+pub fn recon_plane(width: u32, height: u32, pad: usize) -> Recon {
+    Recon::new(width as usize, height as usize, pad)
 }
 
-impl PaddedPlane {
-    /// A zeroed plane of the given coded size.
-    pub fn new(width: u32, height: u32) -> Self {
-        Self {
-            data: vec![0; (width * height) as usize],
-            stride: width as usize,
-            width,
-            height,
-        }
-    }
-
-    /// Copy the displayed top-left rectangle out, which is what a decoder
-    /// emits and therefore what the SELF check compares against.
-    pub fn crop_into(&self, w: u32, h: u32, out: &mut Vec<u8>) {
-        for y in 0..h as usize {
-            let row = y * self.stride;
-            out.extend_from_slice(&self.data[row..row + w as usize]);
-        }
+/// Copy the displayed top-left rectangle out of a padded plane, which is what
+/// a decoder emits and therefore what the SELF check compares against.
+pub fn crop_into(p: &Recon, w: u32, h: u32, out: &mut Vec<u8>) {
+    for y in 0..h as usize {
+        let row = (y + p.pad) * p.stride + p.pad;
+        out.extend_from_slice(&p.data[row..row + w as usize]);
     }
 }
 

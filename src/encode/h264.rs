@@ -52,7 +52,7 @@ pub struct H264Encoder {
     /// A B picture needs one reference on each side of it in display order,
     /// so this holds several and picks by POC rather than keeping only the
     /// most recent.
-    refs: Vec<(i32, Vec<syn::PaddedPlane>)>,
+    refs: Vec<(i32, Vec<syn::Recon>)>,
     /// `frame_num`, which counts *reference* pictures and wraps.
     frame_num: u32,
     idr_pic_id: u32,
@@ -72,8 +72,14 @@ impl H264Encoder {
     /// header describing something it then cannot deliver.
     pub fn new(cfg: Config) -> Result<Self> {
         cfg.validate()?;
-        if cfg.bit_depth > 14 {
-            return Err(Error::unsupported("H.264 encode: bit depth above 14"));
+        if cfg.bit_depth > 8 {
+            // The reconstruction planes are u8, so anything deeper would be
+            // silently truncated. The decoder handles 8 to 14 and this must
+            // too, but a narrowed stream that looks legal is worse than a
+            // refusal that names itself.
+            return Err(Error::unsupported(
+                "H.264 encode: bit depth above 8 (encoder in progress)",
+            ));
         }
         let (sw, sh) = cfg.chroma.subsampling();
         let luma = cfg.width as usize * cfg.height as usize;
@@ -209,10 +215,15 @@ impl H264Encoder {
         // because that is what a decoder emits and therefore what the SELF
         // check compares against.
         let (cw, ch) = g.chroma_mb();
-        let mut recon: Vec<syn::PaddedPlane> = vec![syn::PaddedPlane::new(g.coded_width, g.coded_height)];
+        // The same border the decoder gives its own frames, because these
+        // planes are the decoder's type and its intra predictors read
+        // neighbours out of that border.
+        let mut recon: Vec<syn::Recon> =
+            vec![syn::recon_plane(g.coded_width, g.coded_height, crate::h264::frame::LUMA_PAD)];
         if cw != 0 {
-            recon.push(syn::PaddedPlane::new(g.mbs_wide * cw, g.mbs_high * ch));
-            recon.push(syn::PaddedPlane::new(g.mbs_wide * cw, g.mbs_high * ch));
+            let pad = crate::h264::frame::CHROMA_PAD;
+            recon.push(syn::recon_plane(g.mbs_wide * cw, g.mbs_high * ch, pad));
+            recon.push(syn::recon_plane(g.mbs_wide * cw, g.mbs_high * ch, pad));
         }
 
         // An IDR restarts the count, and the header below carries the reset
@@ -299,10 +310,10 @@ impl H264Encoder {
         ));
 
         let mut cropped = Vec::with_capacity(self.frame_bytes);
-        recon[0].crop_into(g.width, g.height, &mut cropped);
+        syn::crop_into(&recon[0], g.width, g.height, &mut cropped);
         for (i, p) in recon.iter().enumerate().skip(1) {
             let (dw, dh) = self.plane_dims[i];
-            p.crop_into(dw, dh, &mut cropped);
+            syn::crop_into(p, dw, dh, &mut cropped);
         }
         self.recon.push(cropped);
 
@@ -381,17 +392,34 @@ mod tests {
     }
 
     #[test]
-    fn frame_size_matches_every_chroma_format_and_depth() {
+    fn frame_size_matches_every_chroma_format() {
         for (chroma, per_px) in [
             (ChromaFormat::Monochrome, 1.0),
             (ChromaFormat::Yuv420, 1.5),
             (ChromaFormat::Yuv422, 2.0),
             (ChromaFormat::Yuv444, 3.0),
         ] {
-            for depth in [8u32, 10] {
-                let e = H264Encoder::new(cfg(64, 64, chroma, depth)).unwrap();
-                let want = (64.0 * 64.0 * per_px) as usize * if depth > 8 { 2 } else { 1 };
-                assert_eq!(e.frame_bytes(), want, "{chroma:?} {depth}-bit");
+            let e = H264Encoder::new(cfg(64, 64, chroma, 8)).unwrap();
+            let want = (64.0 * 64.0 * per_px) as usize;
+            assert_eq!(e.frame_bytes(), want, "{chroma:?}");
+        }
+    }
+
+    /// The decoder handles 8 to 14 bits and this encoder does not yet, because
+    /// its reconstruction planes are u8 and anything deeper would be silently
+    /// narrowed. It must refuse by name rather than emit a stream whose
+    /// samples were truncated on the way through.
+    #[test]
+    fn deeper_than_eight_bits_refuses_rather_than_truncating() {
+        for depth in [10u32, 12, 14] {
+            // A match, not unwrap_err: the Ok side is the encoder itself,
+            // and making it Debug would print whole reconstruction planes.
+            match H264Encoder::new(cfg(64, 64, ChromaFormat::Yuv420, depth)) {
+                Ok(_) => panic!("{depth}-bit was accepted; samples would be truncated"),
+                Err(err) => {
+                    let s = format!("{err}");
+                    assert!(s.contains("bit depth above 8"), "{depth}-bit: {s}");
+                }
             }
         }
     }

@@ -89,7 +89,15 @@ pub struct PaddedPlane<S: Sample = u8> {
 }
 
 impl<S: Sample> PaddedPlane<S> {
-    fn new(width: usize, height: usize, pad: usize) -> Self {
+    /// A zeroed plane with `pad` samples of border on each side.
+    ///
+    /// Crate-visible rather than private because the *encoder* builds these
+    /// too: its reconstruction has to be the same type the decoder's intra
+    /// predictors read neighbours out of, or the two would need separate
+    /// predictors and the reconstruction could drift. That drift is exactly
+    /// what the encode gate's SELF check exists to catch, so the cheaper
+    /// answer is to share the buffer type.
+    pub(crate) fn new(width: usize, height: usize, pad: usize) -> Self {
         let stride = width + 2 * pad;
         Self {
             data: vec![S::default(); stride * (height + 2 * pad)],
