@@ -142,111 +142,123 @@ rows cannot be — pinning them would measure something other than what they
 claim — so they are the rows to distrust on a busy box, and the header says
 how busy it was.
 
-**AMD Ryzen 9 9950X 16-Core Processor**, 32 hardware threads, selecting **AVX-512**. Machine 19% busy before the run. Single-threaded rows are pinned to core 28 (both decoders). Best of 5. Cost is CPU seconds, throughput is frames per wall second.
+**AMD Ryzen 9 9950X 16-Core Processor**, 32 hardware threads, selecting **AVX-512**. Machine 17% busy before the run. Single-threaded rows are pinned to core 29 (both decoders). Best of 5. Cost is CPU seconds, throughput is frames per wall second.
 
 #### `cabac3.264` — H.264, 1280x720, 723 frames
 
 | instructions | 1 thread: CPU s | vs libav | fps | all threads: CPU s | fps |
 |---|---:|---:|---:|---:|---:|
-| **AVX-512** | 2.250 | 1.52x | 321 | 4.141 | 1799 |
-| AVX2 | 2.359 | 1.59x | 306 | 4.344 | 1797 |
-| AVX (VEX-128) | 2.391 | 1.61x | 302 | 4.359 | 1779 |
-| SSE4.1 | 2.391 | 1.61x | 302 | 4.281 | 1782 |
-| SSSE3 | 2.422 | 1.63x | 299 | 4.453 | 1796 |
-| SSE2 | 2.453 | 1.65x | 295 | 4.156 | 1771 |
-| scalar | 5.703 | 3.84x | 127 | 9.312 | 1114 |
-| libavcodec | 1.484 | 1.00x | 487 | 2.859 | 1844 |
+| **AVX-512** | 2.266 | 1.49x | 319 | 3.766 | 2169 |
+| AVX2 | 2.219 | 1.46x | 326 | 3.766 | 2221 |
+| AVX (VEX-128) | 2.266 | 1.49x | 319 | 3.781 | 2206 |
+| SSE4.1 | 2.266 | 1.49x | 319 | 3.875 | 2123 |
+| SSSE3 | 2.281 | 1.51x | 317 | 3.703 | 2153 |
+| SSE2 | 2.297 | 1.52x | 315 | 3.969 | 2163 |
+| scalar | 5.469 | 3.61x | 132 | 7.734 | 1329 |
+| libavcodec | 1.516 | 1.00x | 477 | 2.625 | 2119 |
 
-Widest rung against libavcodec: **1.52x** its single-threaded CPU time, **1.45x** with every thread; SIMD is worth **2.5x** over the scalar reference.
+Widest rung against libavcodec: **1.49x** its single-threaded CPU time, **1.43x** with every thread; SIMD is worth **2.4x** over the scalar reference.
 
 #### `cavlc3.264` — H.264, 1280x720, 723 frames
 
 | instructions | 1 thread: CPU s | vs libav | fps | all threads: CPU s | fps |
 |---|---:|---:|---:|---:|---:|
-| **AVX-512** | 1.766 | 1.61x | 409 | 3.797 | 2398 |
-| AVX2 | 1.781 | 1.63x | 406 | 4.000 | 2364 |
-| AVX (VEX-128) | 1.812 | 1.66x | 399 | 3.719 | 2356 |
-| SSE4.1 | 1.812 | 1.66x | 399 | 3.797 | 2305 |
-| SSSE3 | 1.859 | 1.70x | 389 | 3.922 | 2316 |
-| SSE2 | 1.891 | 1.73x | 382 | 3.859 | 2300 |
-| scalar | 5.203 | 4.76x | 139 | 8.562 | 1289 |
-| libavcodec | 1.094 | 1.00x | 661 | 2.938 | 2190 |
+| **AVX-512** | 1.672 | 1.55x | 432 | 3.031 | 3116 |
+| AVX2 | 1.656 | 1.54x | 437 | 3.078 | 2997 |
+| AVX (VEX-128) | 1.734 | 1.61x | 417 | 3.344 | 2890 |
+| SSE4.1 | 1.734 | 1.61x | 417 | 3.500 | 2856 |
+| SSSE3 | 1.766 | 1.64x | 409 | 3.594 | 2831 |
+| SSE2 | 1.703 | 1.58x | 425 | 3.062 | 2985 |
+| scalar | 4.906 | 4.55x | 147 | 7.406 | 1550 |
+| libavcodec | 1.078 | 1.00x | 671 | 2.406 | 3063 |
 
-Widest rung against libavcodec: **1.61x** its single-threaded CPU time, **1.29x** with every thread; SIMD is worth **2.9x** over the scalar reference.
+Widest rung against libavcodec: **1.55x** its single-threaded CPU time, **1.26x** with every thread; SIMD is worth **2.9x** over the scalar reference.
 
 #### `hevc6.265` — H.265, 1280x720, 1446 frames
 
 | instructions | 1 thread: CPU s | vs libav | fps | all threads: CPU s | fps |
 |---|---:|---:|---:|---:|---:|
-| **AVX-512** | 3.547 | 1.11x | 408 | 4.828 | 1097 |
-| AVX2 | 3.594 | 1.12x | 402 | 5.141 | 1086 |
-| AVX (VEX-128) | 3.797 | 1.19x | 381 | 5.422 | 1027 |
-| SSE4.1 | 3.906 | 1.22x | 370 | 5.656 | 1042 |
-| SSSE3 | 3.906 | 1.22x | 370 | 5.797 | 940 |
-| SSE2 | 4.266 | 1.33x | 339 | 5.719 | 960 |
-| scalar | 8.953 | 2.80x | 162 | 10.516 | 576 |
-| libavcodec | 3.203 | 1.00x | 451 | 4.719 | 1212 |
+| **AVX-512** | 3.328 | 1.12x | 434 | 4.219 | 1288 |
+| AVX2 | 3.406 | 1.15x | 425 | 4.391 | 1277 |
+| AVX (VEX-128) | 3.656 | 1.23x | 395 | 4.266 | 1241 |
+| SSE4.1 | 3.688 | 1.24x | 392 | 4.562 | 1255 |
+| SSSE3 | 3.734 | 1.26x | 387 | 4.578 | 1228 |
+| SSE2 | 3.844 | 1.29x | 376 | 4.500 | 1220 |
+| scalar | 8.578 | 2.89x | 169 | 9.375 | 693 |
+| libavcodec | 2.969 | 1.00x | 487 | 4.141 | 1387 |
 
-Widest rung against libavcodec: **1.11x** its single-threaded CPU time, **1.02x** with every thread; SIMD is worth **2.5x** over the scalar reference.
+Widest rung against libavcodec: **1.12x** its single-threaded CPU time, **1.02x** with every thread; SIMD is worth **2.6x** over the scalar reference.
 
 #### `wpp10.265` — H.265, 1280x720, 1200 frames
 
 | instructions | 1 thread: CPU s | vs libav | fps | all threads: CPU s | fps |
 |---|---:|---:|---:|---:|---:|
-| **AVX-512** | 2.109 | 0.96x | 569 | 5.547 | 1402 |
-| AVX2 | 2.250 | 1.03x | 533 | 5.797 | 1371 |
-| AVX (VEX-128) | 2.766 | 1.26x | 434 | 6.375 | 914 |
-| SSE4.1 | 3.062 | 1.40x | 392 | 7.547 | 855 |
-| SSSE3 | 3.078 | 1.41x | 390 | 7.188 | 824 |
-| SSE2 | 3.375 | 1.54x | 356 | 7.281 | 892 |
-| scalar | 7.172 | 3.28x | 167 | 11.969 | 608 |
-| libavcodec | 2.188 | 1.00x | 549 | 3.703 | 1375 |
+| **AVX-512** | 1.938 | 1.02x | 619 | 4.656 | 1963 |
+| AVX2 | 1.984 | 1.04x | 605 | 4.062 | 1946 |
+| AVX (VEX-128) | 2.172 | 1.14x | 553 | 4.609 | 1799 |
+| SSE4.1 | 2.203 | 1.16x | 545 | 4.359 | 1913 |
+| SSSE3 | 2.188 | 1.15x | 549 | 4.859 | 1749 |
+| SSE2 | 2.281 | 1.20x | 526 | 4.297 | 1792 |
+| scalar | 5.125 | 2.69x | 234 | 7.984 | 1067 |
+| libavcodec | 1.906 | 1.00x | 630 | 2.656 | 1774 |
 
-Widest rung against libavcodec: **0.96x** its single-threaded CPU time, **1.50x** with every thread; SIMD is worth **3.4x** over the scalar reference.
+Widest rung against libavcodec: **1.02x** its single-threaded CPU time, **1.75x** with every thread; SIMD is worth **2.6x** over the scalar reference.
 
 ### Reading it
 
-**How this machine's own noise floor is visible in the table.** No H.264 kernel
-is AVX-512 — the tier carries H.265 kernels only — so on the two H.264 clips
-the top two rows are running *byte-identical code*. They differ by 4.6% and
-0.8%. That is the resolution limit of this measurement, sitting in the table
-where it can be checked rather than asserted, and it is the number to hold any
-other difference here up against.
+**Two things in the table say how much precision it can carry, and both are
+worth reading before any of the numbers.**
 
-**Single-threaded, against libavcodec, it depends on how much of the work is
-entropy decoding.** H.265 is at parity — 1.11x on the plain clip, and **0.96x
-on the WPP one, which is to say faster**. H.264 is 1.52x on a CABAC stream and
-1.61x on a CAVLC one, and that is the honest number for it. The gap is not in
-the pixel kernels; it is entropy decoding and per-macroblock bookkeeping, which
-is where the remaining work is.
+The first is inside each H.264 table. No H.264 kernel is AVX-512 — the tier
+carries H.265 kernels only — so the top two rows of those two tables run
+*byte-identical code*. They differ by 2.1% and 1.0%. That is the floor within
+a single run.
 
-**With every thread it trades wins with libavcodec**: ahead on CAVLC (2398 vs
-2190 fps) and on WPP (1402 vs 1375), level on CABAC, behind on the H.265 clip
-without wavefronts (1097 vs 1212). Frame threading is the whole of it for
-H.264; H.265 adds wavefront rows, tiles and slice segments inside a picture,
-which is why the WPP clip is where this decoder does best.
+The second is between runs. This table replaced one taken earlier on the same
+machine, and no H.265 code changed in between — yet `wpp10.265` moved from
+0.96x to 1.02x against libavcodec and `hevc6.265` from 1.11x to 1.12x. The
+absolute costs of *both* decoders drift with whatever else the machine has
+been doing, and the ratio inherits it. So **treat the comparison column as
+good to about ±5% between sessions**, and do not read a change of a few per
+cent in these figures as a change in the code. A few per cent in the code is
+measurable, but only by holding everything else fixed — one binary, two code
+paths, switched by an environment variable — which is what
+`tools/verify.sh --baseline` and the per-change measurements in the commit log
+do, and what a table like this cannot.
 
-**Nearly all of the SIMD win is on the bottom rung.** Scalar to SSE2 is worth
-2.5–3.4x. Everything above SSE2 put together adds **7–9% on H.264** — barely
-above the noise floor the table itself reports — but **20% on H.265, and 60%
-on the WPP clip**. Block width is the reason: H.264's blocks are at most
-sixteen samples wide, so a 256-bit vector spans a row at best and pays
-cross-lane permutes to undo per-lane packing that 128-bit code never does,
-while H.265 has 32- and 64-wide blocks and its x86 kernels already put two
-rows in a vector. This is why the low rungs are worth having — a CPU with only
-SSE2 gives up single digits on H.264, not the 2.5x it would give up falling
-back to scalar, and on x86-64 nothing ever falls back to scalar, because SSE2
-is baseline.
+**With that said: single-threaded, H.265 is at parity with libavcodec** (1.02x
+and 1.12x) and H.264 costs about half as much again (1.49x on a CABAC stream,
+1.55x on a CAVLC one). The gap is not in the pixel kernels; it is entropy
+decoding and per-macroblock bookkeeping, which is where the remaining work is.
 
-**AVX-512 is a supplement, not a rung.** It installs over a finished AVX2 table
-and replaces only the H.265 kernels whose shape suits 512-bit lanes: the
+**With every thread it trades wins**: ahead on CAVLC (3116 against 3063 fps),
+on WPP (1963 against 1774) and on CABAC (2169 against 2119), behind on the
+H.265 clip without wavefronts (1288 against 1387). Frame threading is the
+whole of it for H.264; H.265 adds wavefront rows, tiles and slice segments
+inside a picture.
+
+**Nearly all of the SIMD win is on the bottom rung, and on H.264 there is now
+almost nothing above it.** Scalar to SSE2 is worth 2.4–2.9x. Everything above
+SSE2 put together adds **1–2% on H.264** — at or under the floor the table
+itself reports — against **15–18% on H.265**. Block width is why: H.264's
+blocks are at most sixteen samples wide, so a 256-bit vector spans a row at
+best and pays cross-lane permutes to undo per-lane packing that 128-bit code
+never does, while H.265 has 32- and 64-wide blocks and its x86 kernels already
+put two rows in a vector. The H.264 figure has *fallen* as this decoder got
+faster: removing redundant work from the interpolation filters took out the
+part that the wider rungs were helping with, leaving a profile even more
+dominated by entropy decoding than before. On x86-64 nothing ever falls back
+to scalar, since SSE2 is baseline, so the practical reading is that an old
+x86-64 machine gives up almost nothing on H.264 and about a sixth on H.265.
+
+**AVX-512 is a supplement, not a rung.** It installs over a finished AVX2
+table and replaces only the H.265 kernels whose shape suits 512-bit lanes: the
 vertical 14-bit stage of a diagonal interpolation, the wide luma filters at 32
 samples and up, and the 32-point inverse transform, whose row *is* a 512-bit
 vector. Everything it does not carry keeps the AVX2 version — H.265 chroma
-interpolation was written for it, measured worse, and was left behind. End to
-end it is worth 1.3% on the plain H.265 clip and 6.3% on the WPP one; the
-first of those is under this machine's noise floor and the second is only just
-over it, so treat the tier as worth having and not as a step change.
+interpolation was written for it, measured worse, and was left behind, as were
+four H.264 kernels. Its measured end-to-end contribution is small and,
+per the floor above, close to what this table can resolve.
 
 Numbers move with the clip. These are 720p Big Buck Bunny encodes — H.264 High
 profile from x264 at CRF 20 with B-pyramid and the 8x8 transform, H.265 Main
