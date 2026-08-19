@@ -343,6 +343,17 @@ pub struct MbInfo {
     /// `k`, and for horizontal edge `e` at block column `k`. Only these
     /// need the motion comparison of 8.7.2.1; the rest of an inter
     /// macroblock's internal edges are bS 0 without coefficients.
+    ///
+    /// Two things in the deblocking filter rest on `part_edges == [0, 0]`
+    /// meaning exactly "one partition, so one motion for the whole
+    /// macroblock": the run-length derivation that took `motion_bs` from
+    /// 6.17 calls per macroblock to 2.03, and the parked motion digest on
+    /// `perf/deblock-motion-key`. It holds because the prediction jobs tile
+    /// the macroblock, so "no boundary between them" is the same statement
+    /// as "one partition covers it". If that stops being true, or if this
+    /// field comes to mean anything narrower, both break by filtering an
+    /// edge at the wrong strength rather than by failing to compile —
+    /// silently, and only on the streams that reach the case.
     pub part_edges: [u16; 2],
 }
 
