@@ -56,6 +56,8 @@
 use crate::Result;
 use crate::picture::ChromaFormat;
 
+pub mod gop;
+
 /// How lossy, and by what means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RateControl {
