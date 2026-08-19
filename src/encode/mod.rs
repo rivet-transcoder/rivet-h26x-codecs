@@ -1,0 +1,166 @@
+//! The encoding side: H.264 and H.265 bitstreams produced from raw pictures.
+//!
+//! The decoders in this crate are bit-exact against the JVT and JCT-VC
+//! conformance suites, and that shapes how the encoders are built and how they
+//! are verified. An encoder has no conformance suite — there is no set of
+//! reference bitstreams it must reproduce, because a standard constrains what
+//! a *decoder* must do with a bitstream and leaves an encoder free to choose
+//! any legal one. So "is the encoder correct" is not a question with a golden
+//! answer, and the temptation is to answer a weaker question instead and call
+//! it verified.
+//!
+//! # What correctness means here
+//!
+//! Three properties, in the order they are worth checking. Each is exact —
+//! none is a measurement, and none has a noise floor:
+//!
+//! 1. **The bitstream decodes to what the encoder thinks it encoded.** The
+//!    encoder reconstructs every picture as it goes, because prediction
+//!    depends on reconstructed samples; running the decoder over its output
+//!    must produce byte-identical pictures to those reconstructions. A
+//!    mismatch is a desync — the encoder and decoder disagreed about state —
+//!    and it is always a bug, never a quality question. This is the property
+//!    that catches the largest class of encoder faults, and it needs no
+//!    reference data at all.
+//!
+//! 2. **Another decoder agrees.** libavcodec decoding our output must produce
+//!    the same pictures our decoder does. Property 1 is self-consistent and
+//!    would pass happily if both sides shared a misreading of the standard;
+//!    this is what makes the bitstream *legal* rather than merely
+//!    self-compatible. It is also the property that matters commercially,
+//!    since the output has to play elsewhere.
+//!
+//! 3. **The reconstruction is close to the source**, which is the only one of
+//!    the three that is a quality question rather than a correctness one, and
+//!    the only one with a knob attached. Reported as PSNR against the input,
+//!    at a stated bitrate. Lossless mode makes it exact and therefore checkable
+//!    like the other two.
+//!
+//! `tools/verify_encode.sh` gates 1 and 2 and reports 3.
+//!
+//! # Shape
+//!
+//! Deliberately the mirror of the decoders: an `H264Encoder` takes pictures
+//! in and hands NAL units out, the way [`crate::h264::H264Decoder`] takes NAL
+//! units in and hands pictures out. The same pixel kernels serve
+//! both directions — the encoder's reconstruction loop *is* a decoder, and
+//! reusing the conformance-proven inverse transform, prediction and
+//! deblocking there is what makes property 1 achievable rather than
+//! aspirational.
+//!
+//! The encode-only kernels — forward transforms, quantisation, and the
+//! distortion metrics that motion search lives in — sit behind the same
+//! runtime-dispatched table as the decode kernels, so the instruction-set
+//! ladder covers them without a second mechanism.
+
+use crate::Result;
+use crate::picture::ChromaFormat;
+
+/// How lossy, and by what means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateControl {
+    /// Fixed quantiser. The simplest thing that produces a legal stream, and
+    /// the one every other mode is built on top of and compared against.
+    ConstantQp(u8),
+    /// Mathematically lossless: transform bypass where the standard offers it.
+    /// Worth having early and permanently, because it is the one configuration
+    /// whose output can be checked *exactly* against the source rather than
+    /// scored, which turns quality into a pass/fail.
+    Lossless,
+}
+
+/// What a slice may contain, and therefore what the encoder may search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SliceKind {
+    /// Intra only.
+    I,
+    /// One reference list.
+    P,
+    /// Two reference lists.
+    B,
+}
+
+/// Entropy coder, where the standard offers a choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Entropy {
+    /// H.264 only: variable-length coding. Simpler, and the sensible first
+    /// target because it does not need an arithmetic coder to be correct.
+    Cavlc,
+    /// Context-adaptive arithmetic coding. H.265 has nothing else.
+    Cabac,
+}
+
+/// Everything the encoder needs that is not a picture.
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// Luma dimensions. Not required to be a multiple of the coding block
+    /// size; the encoder pads and signals the crop.
+    pub width: u32,
+    /// See `width`.
+    pub height: u32,
+    /// 8 to 14. The decoders handle the whole range and so must these.
+    pub bit_depth: u32,
+    /// 4:0:0 through 4:4:4.
+    pub chroma: ChromaFormat,
+    /// Pictures between IDRs. 0 means every picture is an IDR.
+    pub gop: u32,
+    /// Consecutive B pictures between references. 0 disables B pictures.
+    pub bframes: u32,
+    /// The most a slice may reference.
+    pub max_refs: u32,
+    /// See [`RateControl`].
+    pub rate: RateControl,
+    /// See [`Entropy`]. Ignored by H.265, which is always CABAC.
+    pub entropy: Entropy,
+    /// Worker threads; 0 asks for one per core, matching the decoders.
+    pub threads: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            bit_depth: 8,
+            chroma: ChromaFormat::Yuv420,
+            gop: 250,
+            bframes: 0,
+            max_refs: 1,
+            rate: RateControl::ConstantQp(26),
+            entropy: Entropy::Cabac,
+            threads: 0,
+        }
+    }
+}
+
+impl Config {
+    /// Reject what the encoder cannot legally or sensibly produce, before it
+    /// has written a byte. An encoder that fails late has usually already
+    /// emitted a header describing something it then cannot deliver.
+    pub fn validate(&self) -> Result<()> {
+        if self.width == 0 || self.height == 0 {
+            return Err(crate::Error::unsupported("encode: zero-sized picture"));
+        }
+        if !(8..=14).contains(&self.bit_depth) {
+            return Err(crate::Error::unsupported("encode: bit depth outside 8..=14"));
+        }
+        if self.max_refs == 0 {
+            return Err(crate::Error::unsupported("encode: max_refs must be at least 1"));
+        }
+        Ok(())
+    }
+}
+
+/// One coded picture, and what the caller needs to know about it.
+#[derive(Debug)]
+pub struct Access {
+    /// The Annex B byte stream for this picture: start codes included, ready
+    /// to concatenate.
+    pub data: Vec<u8>,
+    /// Whether a decoder may begin here.
+    pub keyframe: bool,
+    /// Display order.
+    pub poc: i32,
+    /// Coding order.
+    pub encode_index: u64,
+}
