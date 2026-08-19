@@ -44,6 +44,11 @@ pub struct H264Encoder {
     /// would hand picture two the index of picture one.
     next_display: u64,
     geom: syn::Geometry,
+    /// The most recent reference picture, at *coded* size, kept because
+    /// inter prediction reads reconstructed samples rather than source ones —
+    /// that identity is what SELF checks, and predicting from the source
+    /// instead is the classic way to make an encoder that only it can decode.
+    reference: Option<Vec<syn::PaddedPlane>>,
     /// `frame_num`, which counts *reference* pictures and wraps.
     frame_num: u32,
     idr_pic_id: u32,
@@ -92,6 +97,7 @@ impl H264Encoder {
             frame_bytes: (luma + chroma) * bps,
             next_display: 0,
             geom,
+            reference: None,
             frame_num: 0,
             idr_pic_id: 0,
             plane_dims,
@@ -168,11 +174,16 @@ impl H264Encoder {
         }
         let g = self.geom;
         let idr = c.kind == Kind::Idr;
-        if !idr {
-            // Inter prediction is the next thing built. Until then only the
-            // all-intra configurations produce a stream.
+        if c.kind == Kind::B {
+            // B needs two reference lists and the direct modes; P comes
+            // first because it needs one list and no direct prediction.
             return Err(Error::unsupported(
-                "H.264 encode: inter prediction (encoder in progress; --gop 0 works)",
+                "H.264 encode: B pictures (encoder in progress; --bframes 0 works)",
+            ));
+        }
+        if !idr && self.reference.is_none() {
+            return Err(Error::bitstream(
+                "H.264 encode: a P picture with no reference reconstructed",
             ));
         }
 
@@ -200,6 +211,12 @@ impl H264Encoder {
             recon.push(syn::PaddedPlane::new(g.mbs_wide * cw, g.mbs_high * ch));
         }
 
+        // An IDR restarts the count, and the header below carries the reset
+        // value. Doing this after writing would send the *previous* GOP's
+        // frame_num in the one picture that must not carry it.
+        if idr {
+            self.frame_num = 0;
+        }
         let qp = self.picture_qp(c.kind);
         let mut out = Vec::new();
         out.extend_from_slice(&syn::annexb(
@@ -224,9 +241,28 @@ impl H264Encoder {
             qp,
             &mut w,
         );
-        for mb_y in 0..g.mbs_high {
-            for mb_x in 0..g.mbs_wide {
-                syn::write_pcm_macroblock(&mut w, &g, mb_x, mb_y, &planes, &mut recon);
+        if idr {
+            for mb_y in 0..g.mbs_high {
+                for mb_x in 0..g.mbs_wide {
+                    syn::write_pcm_macroblock(&mut w, &g, mb_x, mb_y, &planes, &mut recon);
+                }
+            }
+        } else {
+            // Every macroblock skipped. `P_Skip` carries no motion vector
+            // difference and no residual: the vector is the median prediction
+            // of its neighbours, which in an all-skip picture is zero
+            // everywhere, so the reconstruction is the reference unchanged.
+            //
+            // That is a poor picture and an entirely legal one, and it proves
+            // what this step is for — reference management, frame_num, the P
+            // slice header and the decoded picture buffer — without needing
+            // residual coding to exist first. Deblocking does not disturb it:
+            // every edge has matching motion, the same reference and no
+            // coefficients, so every boundary strength is zero.
+            w.ue(g.mbs_wide * g.mbs_high); // mb_skip_run
+            let reference = self.reference.as_ref().expect("checked above");
+            for (i, r) in reference.iter().enumerate() {
+                recon[i].data.copy_from_slice(&r.data);
             }
         }
         w.rbsp_trailing_bits();
@@ -248,8 +284,10 @@ impl H264Encoder {
             self.frame_num = (self.frame_num + 1) & ((1 << LOG2_MAX_FRAME_NUM) - 1);
         }
         if idr {
-            self.frame_num = 0;
             self.idr_pic_id ^= 1;
+        }
+        if c.reference {
+            self.reference = Some(recon);
         }
         Ok(Access {
             data: out,
