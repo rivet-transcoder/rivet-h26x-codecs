@@ -1,7 +1,8 @@
 //! H.265 kernels: inverse transforms, residual add, interpolation filters,
 //! sample combination / weighting, SAO. Every kernel has a scalar reference
 //! here; [`HevcDsp::new`] swaps in the SIMD versions from
-//! `super::hevc_avx2` (x86-64) / `super::hevc_neon` (AArch64) when the CPU has them.
+//! `super::hevc_avx2` (x86-64) / `super::hevc_neon` (AArch64) /
+//! `super::hevc_wasm128` (wasm32) when the CPU has them.
 //!
 //! Sample planes are `u16` at any bit depth; interpolation intermediates are
 //! `i16` at 14-bit precision (8.5.3.3.3), coefficients and residuals `i16`
@@ -257,6 +258,8 @@ pub fn install_simd_u16(d: &mut HevcDsp<u16>, cpu: Cpu) {
     if cpu.neon {
         super::hevc_neon::install(d);
     }
+    // wasm32 has no 16-bit-sample kernels yet: wasm decode is 8-bit today,
+    // so the 10/12-bit table stays on the scalar reference there.
 }
 
 /// SIMD kernels for 8-bit sample planes.
@@ -280,6 +283,10 @@ pub fn install_simd_u8(d: &mut HevcDsp<u8>, cpu: Cpu) {
         if cpu.dotprod {
             super::hevc_neon_u8::install_dotprod(d);
         }
+    }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    if cpu.simd128 {
+        super::hevc_wasm128::install(d);
     }
 }
 

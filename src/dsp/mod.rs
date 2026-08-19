@@ -54,6 +54,8 @@ pub(crate) mod hevc_avx512_u8;
 #[cfg(target_arch = "aarch64")]
 #[allow(unused_unsafe)]
 pub(crate) mod hevc_neon_u8;
+#[cfg(target_arch = "wasm32")]
+pub(crate) mod hevc_wasm128;
 #[cfg(target_arch = "aarch64")]
 #[allow(unused_unsafe)]
 pub(crate) mod neon_dotprod;
