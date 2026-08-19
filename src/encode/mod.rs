@@ -60,6 +60,7 @@ pub mod gop;
 pub mod h264;
 pub mod h264_cavlc_mb;
 pub mod h264_intra;
+pub mod h264_me;
 pub mod h264_syntax;
 pub mod h265;
 pub mod h265_syntax;
