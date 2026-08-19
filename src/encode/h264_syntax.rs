@@ -21,7 +21,7 @@ use crate::bitwriter::BitWriter;
 use crate::cabac_enc::CabacEncoder;
 use crate::encode::gop::Kind;
 use crate::h264::SliceType;
-use crate::h264::cabac_mb::{CTX_MB_TYPE_I, CabacState};
+use crate::h264::cabac_mb::{CabacState, MB_TYPE_I_PCM, write_mb_type_i_cabac};
 use crate::encode::{Config, Entropy};
 use crate::picture::ChromaFormat;
 
@@ -349,14 +349,15 @@ pub fn write_pcm_slice_data_cabac(
                 // `mb_type` below.
                 e.encode_terminate(0);
             }
-            // `mb_type`: one bin saying "not I_NxN", then the terminate that
-            // says I_PCM. ctxIdxInc counts available neighbours that are not
-            // I_NxN (9.3.3.1.1.3); every macroblock here is I_PCM, so an
-            // available neighbour always contributes one, and with a single
-            // slice per picture "available" is just "inside the picture".
+            // `mb_type`, spelled by the macroblock-layer writer (its
+            // terminate bin of 1 flushes the engine, as I_PCM requires).
+            // The first bin's ctxIdxInc counts available neighbours that
+            // are not I_NxN (9.3.3.1.1.3); every macroblock here is I_PCM,
+            // so an available neighbour always contributes one, and with a
+            // single slice per picture "available" is just "inside the
+            // picture".
             let inc = (idx % g.mbs_wide > 0) as usize + (idx / g.mbs_wide > 0) as usize;
-            e.encode_decision(&mut st.ctx[CTX_MB_TYPE_I + inc], 1);
-            e.encode_terminate(1);
+            write_mb_type_i_cabac(&mut e, &mut st, inc, MB_TYPE_I_PCM);
         }
         // `pcm_alignment_zero_bit`, then the samples as plain bits.
         w.align_zero();
