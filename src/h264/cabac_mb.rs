@@ -2,6 +2,7 @@
 //! (9.3.3.1), binarisations (9.3.2) and the residual block (9.3.3.1.3).
 
 use crate::cabac::{Cabac, Ctx, init_ctx_h264};
+use crate::cabac_enc::CabacEncoder;
 use crate::{Error, Result};
 
 use super::cavlc::{
@@ -935,6 +936,143 @@ fn residual_block_cabac(
     Ok(n_sig)
 }
 
+
+/// Write one residual block's coefficients: the inverse of
+/// [`residual_block_cabac`]. `levels` is the block in raster order, the
+/// layout that function decodes *into*, and `scan` maps scan position to it
+/// the same way. Returns the number of significant coefficients written.
+///
+/// It lives beside the reader on purpose. The two are exact inverses over a
+/// binarisation with a lot of small rules — an inferred last coefficient, a
+/// unary prefix that stops one bin early at its cap, an escape whose length
+/// is implied — and every one of those rules has to be read off the same
+/// lines twice. A change to one that is not made to the other is a desync,
+/// and a desync is invisible until a later macroblock decodes as rubbish, so
+/// the defence worth having is that the two are on the same screen.
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn write_residual_block_cabac(
+    e: &mut CabacEncoder,
+    st: &mut CabacState,
+    field: bool,
+    cat: usize,
+    cbf_inc: Option<usize>,
+    levels: &[i32],
+    scan: &[u8],
+    start: usize,
+    max_coeff: usize,
+) -> usize {
+    // The significant scan positions, in scan order.
+    let mut sig_pos = [0u8; 64];
+    let mut n_sig = 0usize;
+    for pos in 0..max_coeff {
+        if levels[scan[start + pos] as usize] != 0 {
+            sig_pos[n_sig] = pos as u8;
+            n_sig += 1;
+        }
+    }
+
+    if let Some(inc) = cbf_inc {
+        e.encode_decision(&mut st.ctx[CBF_CTX_BASE[cat] + inc], (n_sig != 0) as u32);
+        if n_sig == 0 {
+            return 0;
+        }
+    } else {
+        // No coded_block_flag means it is inferred to be one (8x8 luma
+        // outside 4:4:4), so an all-zero block cannot be spelled here at all
+        // — the caller has to not code the block.
+        debug_assert!(n_sig != 0, "block with an inferred coded_block_flag has no coefficient");
+        if n_sig == 0 {
+            return 0;
+        }
+    }
+
+    let f = field as usize;
+    let (sig_base, last_base, abs_base) =
+        (SIG_CTX_BASE[f][cat], LAST_CTX_BASE[f][cat], ABS_CTX_BASE[cat]);
+    let (sig_off, last_off): (&[u8], &[u8]) = if max_coeff == 64 {
+        (&SIG_COEFF_8X8_CTX[f][..], &LAST_COEFF_8X8_CTX[..])
+    } else if cat == CAT_CHROMA_DC {
+        if max_coeff == 8 {
+            (&CHROMA_DC_422_SIG_OFF[..], &CHROMA_DC_422_SIG_OFF[..])
+        } else {
+            (&IDENTITY_OFF[..], &IDENTITY_OFF[..])
+        }
+    } else {
+        (&IDENTITY_OFF[..], &IDENTITY_OFF[..])
+    };
+
+    // Significance map. The final position is never coded when it is the last
+    // scan position: the reader's loop stops before it and infers it, so
+    // writing anything there would be a bin it never reads.
+    let last = max_coeff - 1;
+    let final_pos = sig_pos[n_sig - 1] as usize;
+    let mut k = 0usize;
+    let mut i = 0usize;
+    while i < last {
+        let is_sig = k < n_sig && sig_pos[k] as usize == i;
+        e.encode_decision(&mut st.ctx[sig_base + sig_off[i] as usize], is_sig as u32);
+        if is_sig {
+            let is_last = i == final_pos;
+            e.encode_decision(&mut st.ctx[last_base + last_off[i] as usize], is_last as u32);
+            if is_last {
+                break;
+            }
+            k += 1;
+        }
+        i += 1;
+    }
+
+    // Levels, highest frequency first.
+    let mut num_gt1 = 0usize;
+    let mut num_eq1 = 0usize;
+    let inc1_cap = if cat == CAT_CHROMA_DC { 3 } else { 4 };
+    for k in (0..n_sig).rev() {
+        let pos = sig_pos[k] as usize;
+        let level = levels[scan[start + pos] as usize];
+        let abs = level.unsigned_abs();
+        let abs_m1 = abs - 1;
+        let inc0 = if num_gt1 != 0 { 0 } else { (1 + num_eq1).min(4) };
+        if abs_m1 == 0 {
+            e.encode_decision(&mut st.ctx[abs_base + inc0], 0);
+        } else {
+            e.encode_decision(&mut st.ctx[abs_base + inc0], 1);
+            let inc1 = 5 + inc1_cap.min(num_gt1);
+            // The reader counts from one and stops at fourteen without
+            // consuming a terminator, so a capped prefix writes ones only.
+            let prefix = abs_m1.min(14);
+            for _ in 1..prefix {
+                e.encode_decision(&mut st.ctx[abs_base + inc1], 1);
+            }
+            if prefix < 14 {
+                e.encode_decision(&mut st.ctx[abs_base + inc1], 0);
+            } else {
+                // UEG0 escape: ones while the remainder covers the next
+                // doubling, a zero, then that many bits of what is left.
+                let mut rem = abs_m1 - 14;
+                let mut kk = 0u32;
+                while rem >= (1 << kk) {
+                    e.encode_bypass(1);
+                    rem -= 1 << kk;
+                    kk += 1;
+                    debug_assert!(kk <= 24, "coeff_abs_level too large to binarise");
+                }
+                e.encode_bypass(0);
+                while kk > 0 {
+                    kk -= 1;
+                    e.encode_bypass((rem >> kk) & 1);
+                }
+            }
+        }
+        if abs == 1 {
+            num_eq1 += 1;
+        } else {
+            num_gt1 += 1;
+        }
+        e.encode_bypass((level < 0) as u32);
+    }
+    n_sig
+}
+
 /// The significance-map context increment for a coefficient of a 4x4-class
 /// block: its scan position.
 static IDENTITY_OFF: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
@@ -1311,3 +1449,174 @@ pub fn parse_mb_cabac(
 /// The value the CAVLC and CABAC parsers agree `PRED_*` on (re-exported so
 /// callers have one import).
 pub const _PRED_CHECK: (u8, u8, u8) = (PRED_L0, PRED_L1, PRED_BI);
+
+
+#[cfg(test)]
+mod residual_round_trip {
+    use super::*;
+    use crate::bitwriter::BitWriter;
+
+    /// Encode a block, decode it with the production reader, and require the
+    /// coefficients, the count and the context states all to come back.
+    ///
+    /// The context comparison is the half that catches a desync: two
+    /// binarisations can spell the same coefficients while leaving the
+    /// probability model in different places, and nothing goes wrong until a
+    /// later block reads a bin against a state the writer never had.
+    fn round_trip(cat: usize, max_coeff: usize, cbf_inc: Option<usize>, field: bool, levels: &[i32]) {
+        let scan: Vec<u8> = (0..64).map(|i| i as u8).collect();
+        let mut enc_st = CabacState::new(SliceType::I, 0, 26);
+        let mut w = BitWriter::new();
+        let n_enc = {
+            let mut e = CabacEncoder::new(&mut w);
+            let n = write_residual_block_cabac(
+                &mut e, &mut enc_st, field, cat, cbf_inc, levels, &scan, 0, max_coeff,
+            );
+            e.encode_terminate(1);
+            n
+        };
+        w.align_zero();
+        let data = w.into_rbsp();
+
+        let mut dec_st = CabacState::new(SliceType::I, 0, 26);
+        let mut c = Cabac::new(&data);
+        let mut out = vec![0i32; max_coeff];
+        let n_dec = residual_block_cabac(
+            &mut c, &mut dec_st, field, cat, cbf_inc, &mut out, &scan, 0, max_coeff, None,
+        )
+        .expect("the reader rejected what the writer produced");
+
+        let want = &levels[..max_coeff];
+        assert_eq!(&out[..], want, "cat={cat} field={field} coefficients differ");
+        assert_eq!(n_dec, n_enc, "cat={cat} field={field} significant count differs");
+        assert_eq!(
+            enc_st.ctx, dec_st.ctx,
+            "cat={cat} field={field} context states diverged"
+        );
+    }
+
+    /// Every category, both field settings, over the level patterns that each
+    /// exercise a different rule of the binarisation.
+    #[test]
+    fn round_trips_every_category() {
+        // (cat, max_coeff, cbf_inc): 8x8 luma outside 4:4:4 has no
+        // coded_block_flag, so it is the one that cannot spell an empty block.
+        let shapes: [(usize, usize, Option<usize>); 5] = [
+            (0, 16, Some(0)),  // Intra16x16 luma DC
+            (2, 16, Some(1)),  // luma 4x4
+            (3, 4, Some(2)),   // chroma DC, 4:2:0
+            (4, 15, Some(3)),  // chroma AC
+            (5, 64, None),     // luma 8x8, flag inferred
+        ];
+        for (cat, max_coeff, cbf_inc) in shapes {
+            for field in [false, true] {
+                let mut cases: Vec<Vec<i32>> = Vec::new();
+                let z = vec![0i32; 64];
+                if cbf_inc.is_some() {
+                    cases.push(z.clone()); // the coded_block_flag = 0 path
+                }
+                // One coefficient, at the front and at the very back: the
+                // back is where the reader infers significance instead of
+                // coding it.
+                for pos in [0usize, max_coeff - 1] {
+                    let mut v = z.clone();
+                    v[pos] = 1;
+                    cases.push(v.clone());
+                    v[pos] = -1;
+                    cases.push(v.clone());
+                    // Magnitudes either side of the unary cap, and past it.
+                    for a in [2, 13, 14, 15, 16, 20, 100, 1000, 32767] {
+                        let mut v = z.clone();
+                        v[pos] = a;
+                        cases.push(v.clone());
+                        v[pos] = -a;
+                        cases.push(v);
+                    }
+                }
+                // Dense: every position significant, alternating sign, which
+                // drives the greater-than-one counters to their caps.
+                let mut dense = z.clone();
+                for (i, v) in dense.iter_mut().enumerate().take(max_coeff) {
+                    *v = if i % 2 == 0 { (i as i32) + 1 } else { -(i as i32) - 1 };
+                }
+                cases.push(dense);
+                // Runs of magnitude one, which is what quantised high
+                // frequencies actually look like, and the only thing that
+                // drives `num_eq1` to its cap of four. Without a run of five
+                // the cap is unreachable and removing it changes nothing —
+                // a mutation that survived until these cases existed.
+                let mut ones = z.clone();
+                for v in ones.iter_mut().take(max_coeff) {
+                    *v = 1;
+                }
+                cases.push(ones.clone());
+                for (i, v) in ones.iter_mut().enumerate().take(max_coeff) {
+                    *v = if i % 2 == 0 { 1 } else { -1 };
+                }
+                cases.push(ones);
+                // A run of ones above one larger value: in reverse scan order
+                // the ones come first, so the counter climbs before anything
+                // greater than one resets it.
+                for run in [4usize, 5, 6, 9] {
+                    if run + 1 > max_coeff {
+                        continue;
+                    }
+                    let mut v = z.clone();
+                    v[0] = 7;
+                    for slot in v.iter_mut().take(run + 1).skip(1) {
+                        *slot = 1;
+                    }
+                    cases.push(v.clone());
+                    // And the same with the run at the very top of the scan,
+                    // so the inferred-last position is one of the ones.
+                    let mut v = z.clone();
+                    v[max_coeff - 1 - run] = 7;
+                    for slot in v.iter_mut().take(max_coeff).skip(max_coeff - run) {
+                        *slot = -1;
+                    }
+                    cases.push(v);
+                }
+                // Pseudo-random, mostly zero, which is what real residual is.
+                let mut seed = 0x243f6a88u32 ^ (cat as u32) << 8;
+                let mut lcg = || {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    seed >> 16
+                };
+                for _ in 0..60 {
+                    let mut v = z.clone();
+                    let mut any = false;
+                    for slot in v.iter_mut().take(max_coeff) {
+                        if lcg() % 4 == 0 {
+                            let m = 1 + (lcg() % 40) as i32;
+                            *slot = if lcg() % 2 == 0 { m } else { -m };
+                            any = true;
+                        }
+                    }
+                    if any || cbf_inc.is_some() {
+                        cases.push(v);
+                    }
+                }
+                for levels in &cases {
+                    round_trip(cat, max_coeff, cbf_inc, field, levels);
+                }
+            }
+        }
+    }
+
+    /// 4:2:2 chroma DC is the one category whose significance increments come
+    /// from a table rather than the scan position, and it caps at two.
+    #[test]
+    fn round_trips_422_chroma_dc() {
+        let mut z = vec![0i32; 64];
+        for pos in 0..8 {
+            let mut v = z.clone();
+            v[pos] = if pos % 2 == 0 { 3 } else { -17 };
+            round_trip(CAT_CHROMA_DC, 8, Some(1), false, &v);
+        }
+        for (i, v) in z.iter_mut().enumerate().take(8) {
+            *v = (i as i32) - 4;
+        }
+        z[4] = 9; // no zero in the middle, so every position is significant
+        round_trip(CAT_CHROMA_DC, 8, Some(0), false, &z);
+    }
+}
