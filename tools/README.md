@@ -72,6 +72,16 @@ moved it by under a point. So: if your change alters what gets written or in
 what order, serialise the instrument or use a relaxed accumulator, and say
 which one you used.
 
+**Every table carries a deliberate control now, per column.** `benchmark.py` runs the
+selected rung a second time, changing nothing, and prints the spread between the two
+runs for each column. This exists because the previous control was accidental: the
+H.264 tables happened to have two byte-identical rows, since no H.264 kernel is
+AVX-512, and the H.265 tables had none at all. Worse, the accidental one was read as a
+single number when it is nothing of the kind — the same binary has disagreed with
+itself by 0.0% in one column of a table and 4.0% in another, and two published
+multi-threaded wins turned out to be inside their own control. Read each figure
+against its own column.
+
 **The ladder is its own control.** `benchmark.py` checks that no rung comes
 out ahead of the rung above it, and says so above any table where one does
 rather than printing it as a result. Best-of-N defends against a brief

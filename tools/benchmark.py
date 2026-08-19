@@ -183,6 +183,45 @@ def available_tiers():
             ("scalar", {"H26X_NO_SIMD": "1"})]
 
 
+def control_line(name, selected_row, control_row, f1, fm, frames):
+    """Per-column spread between two runs of the *same* configuration.
+
+    Every figure in a table is worth exactly as much as the difference
+    between two runs of identical code, and that difference is not one
+    number — it depends on the column. On this machine the same binary has
+    disagreed with itself by 0.0% in all-thread CPU seconds and 4.0% in
+    all-thread frames per second, in the same table. Quoting a 2% win from
+    the second of those is quoting noise, and it happened here: two
+    published multi-threaded comparisons turned out to be inside their own
+    control, which nobody noticed because the control was printed once and
+    applied never.
+
+    So it is printed per column, under every table, including the ones where
+    no two rungs happen to run identical code.
+    """
+    a, b = selected_row, control_row
+    cols = [
+        ("1-thread CPU", a[1], b[1]),
+        ("vs libav", a[1] / f1 if f1 else 0, b[1] / f1 if f1 else 0),
+        ("1-thread fps", a[2], b[2]),
+        ("all-thread CPU", a[3], b[3]),
+        ("all-thread fps", a[4], b[4]),
+    ]
+    parts = []
+    worst = 0.0
+    for label, x, y in cols:
+        lo, hi = min(x, y), max(x, y)
+        d = (hi / lo - 1) * 100 if lo else 0.0
+        worst = max(worst, d)
+        parts.append(f"{label} {d:.1f}%")
+    print(f"\nControl for `{name}`, the selected rung run twice: "
+          + ", ".join(parts)
+          + ". Read each figure against its OWN column here, not against the"
+            " smallest of them: a difference under that column number is noise,"
+            " whatever the other columns say.")
+    return worst
+
+
 def check_ladder(name, rows, tol=0.05):
     """Rungs that beat the rung above them, which cannot happen honestly.
 
@@ -343,6 +382,17 @@ def main():
                   f"{cm:.3f} | {fpsm:.0f} |")
         print(f"| libavcodec | {f1:.3f} | 1.00x | {frames / f1 if f1 else 0:.0f} | "
               f"{fm:.3f} | {frames / fmw if fmw else 0:.0f} |")
+        # The control: the selected rung again, nothing changed.
+        sel = tiers[selected] if 0 <= selected < len(tiers) else tiers[0]
+        ce1 = dict(sel[1], H26X_THREADS="1", H26XDEC_NOMD5="1")
+        cem = dict(sel[1], H26XDEC_NOMD5="1")
+        cc1, _ = run_best([args.dec, path], ce1, args.runs)
+        ccm, ccw = run_best([args.dec, path], cem, args.runs)
+        ctl = ("control", cc1, frames / cc1 if cc1 else 0, ccm,
+               frames / ccw if ccw else 0)
+        control_line(path, rows[selected if 0 <= selected < len(rows) else 0],
+                     ctl, f1, fm, frames)
+
         clean &= check_ladder(path, rows)
         best = rows[0]
         print(f"\nWidest rung against libavcodec: **{best[1] / f1:.2f}x** its "
