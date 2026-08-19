@@ -525,6 +525,16 @@ fn code_chroma(
         } else {
             let mut d = dcs;
             (ctx.enc.hadamard2x4)(&mut d);
+            // 4:2:2 chroma DC is scaled at QP'c,DC = QP'c + 3 (8.5.11.2),
+            // and that raised QP governs the *whole* quantiser — the
+            // multiplier's row and the shift. Splitting them (mf at qp + 3,
+            // shift at qp) leaves the levels a power of two too large
+            // whenever the two QPs fall in different bands of six, and the
+            // reconstruction — the decoder's, which scales at qp + 3
+            // throughout — faithfully doubles the coded DC error. SELF
+            // still passes then; the chroma PSNR is what notices.
+            let qbits = qbits4(qp + 3) + 1;
+            let offset = quant_offset(qbits, true);
             let mf = ctx.quant.mf4[list][((qp + 3) % 6) as usize][0] as i64;
             for i in 0..8 {
                 let v = ((d[i].unsigned_abs() as i64 * mf + offset as i64) >> qbits) as i32;

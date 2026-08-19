@@ -9,17 +9,17 @@
 //!
 //! # State of it
 //!
-//! Everything above entropy coding is here: configuration, picture typing and
-//! coding order, and the access-unit envelope. What is missing is the part
-//! that writes bits, and it is missing deliberately rather than by oversight —
-//! the bitstream writer and the CABAC encoder are being built alongside this,
-//! and wiring a half-written entropy coder in early would mean the gate could
-//! not tell "no encoder yet" from "encoder is wrong".
-//!
-//! So [`H264Encoder::push`] refuses with `Unsupported` at exactly the point
-//! where a coded slice would be written. `tools/verify_encode.sh` reports that
-//! as ENCODE-FAIL with the reason, which is the honest state: the plumbing is
-//! proven and the hole has a name.
+//! Configuration, picture typing and coding order, the access-unit envelope,
+//! and now the first real compression: all-intra CAVLC pictures go through
+//! prediction, transform and quantisation
+//! ([`super::h264_cavlc_mb::write_intra_picture`]). What still codes as
+//! `I_PCM` does so for a stated reason each — lossless, because PCM *is* the
+//! exact mode and the transform path is lossy; 4:4:4, which the intra coder
+//! does not cover yet; and CABAC intra, whose macroblock writer is not built.
+//! Inter pictures are all-skip through CAVLC, and CABAC inter refuses with
+//! `Unsupported` by name. `tools/verify_encode.sh` reports each hole as what
+//! it is, which is the honest state: the plumbing is proven and every hole
+//! has a name.
 
 use super::gop::{Coded, Kind, Scheduler};
 use super::h264_syntax as syn;
@@ -58,6 +58,8 @@ pub struct H264Encoder {
     idr_pic_id: u32,
     /// Plane sizes of one source picture, derived once.
     plane_dims: Vec<(u32, u32)>,
+    /// Kernels and derived tables for the transform intra path, built once.
+    tools: super::h264_cavlc_mb::IntraTools,
 }
 
 /// The exponents the SPS declares. Fixed rather than derived: 16 bits of
@@ -111,6 +113,7 @@ impl H264Encoder {
             frame_num: 0,
             idr_pic_id: 0,
             plane_dims,
+            tools: super::h264_cavlc_mb::IntraTools::new(),
         })
     }
 
@@ -233,6 +236,16 @@ impl H264Encoder {
             self.frame_num = 0;
         }
         let qp = self.picture_qp(c.kind);
+        // Whether this picture takes the transform intra path rather than
+        // I_PCM. Lossless stays PCM because PCM is the exactly-lossless mode
+        // and the transform path quantises; 4:4:4 stays PCM because
+        // `code_macroblock` has no ChromaArrayType 3 path (chroma coded like
+        // luma, a fourth residual layout); CABAC intra stays PCM until its
+        // macroblock writer exists.
+        let transform_intra = idr
+            && self.cfg.entropy == Entropy::Cavlc
+            && matches!(self.cfg.rate, RateControl::ConstantQp(_))
+            && self.cfg.chroma != crate::ChromaFormat::Yuv444;
         let mut out = Vec::new();
         out.extend_from_slice(&syn::annexb(
             syn::NAL_SPS,
@@ -252,6 +265,7 @@ impl H264Encoder {
                 log2_max_frame_num: LOG2_MAX_FRAME_NUM,
                 log2_max_poc_lsb: LOG2_MAX_POC_LSB,
                 reference: c.reference,
+                deblock: !transform_intra,
             },
             qp,
             &mut w,
@@ -262,6 +276,11 @@ impl H264Encoder {
                 // Closes the slice itself: the arithmetic coder flush writes
                 // the stop bit, so there is no `rbsp_trailing_bits` after it.
                 syn::write_pcm_slice_data_cabac(&mut w, &g, qp, &planes, &mut recon);
+            } else if transform_intra {
+                super::h264_cavlc_mb::write_intra_picture(
+                    &mut w, &g, &self.tools, qp, &planes, &mut recon,
+                );
+                w.rbsp_trailing_bits();
             } else {
                 for mb_y in 0..g.mbs_high {
                     for mb_x in 0..g.mbs_wide {

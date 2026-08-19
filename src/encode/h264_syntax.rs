@@ -224,6 +224,16 @@ pub struct SliceHeader {
     pub log2_max_poc_lsb: u32,
     /// Whether later pictures may reference this one.
     pub reference: bool,
+    /// Whether the deblocking filter runs over this slice.
+    ///
+    /// The PCM and all-skip paths leave it on, where it provably does
+    /// nothing (PCM macroblocks average to a qP of zero, all-skip edges
+    /// have boundary strength zero). The transform intra path turns it
+    /// off, because the encoder does not yet run the filter over its own
+    /// reconstruction — a filtered decode against an unfiltered
+    /// reconstruction would fail SELF on every coded edge. When the
+    /// encoder learns to deblock, this flips on for the quality it buys.
+    pub deblock: bool,
 }
 
 /// `slice_type` for an I, P or B slice, in the "all slices of this picture
@@ -267,10 +277,13 @@ pub fn write_slice_header(h: &SliceHeader, pps_qp: u8, w: &mut BitWriter) {
         }
     }
     w.se(h.qp as i32 - pps_qp as i32); // slice_qp_delta
-    // deblocking_filter_control_present_flag is 1 in the PPS.
-    w.ue(0); // disable_deblocking_filter_idc: filter on
-    w.se(0); // slice_alpha_c0_offset_div2
-    w.se(0); // slice_beta_offset_div2
+    // deblocking_filter_control_present_flag is 1 in the PPS. The offsets
+    // are only present while the filter is on (7.3.3).
+    w.ue(if h.deblock { 0 } else { 1 }); // disable_deblocking_filter_idc
+    if h.deblock {
+        w.se(0); // slice_alpha_c0_offset_div2
+        w.se(0); // slice_beta_offset_div2
+    }
 }
 
 /// Write one macroblock as `I_PCM`, taking its samples from the source and

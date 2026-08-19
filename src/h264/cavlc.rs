@@ -1022,8 +1022,10 @@ static SCAN8_SUB: [[u8; 16]; 4] = {
     t
 };
 
-/// Chroma DC scan (identity over the 2x2).
-static SCAN_CHROMA_DC: [u8; 4] = [0, 1, 2, 3];
+/// Chroma DC scan (identity over the 2x2). Crate-visible because the
+/// encoder's macroblock writer hands the same scan to the residual writer
+/// below — one definition, both directions.
+pub(crate) static SCAN_CHROMA_DC: [u8; 4] = [0, 1, 2, 3];
 
 /// `residual_luma()` (7.3.5.3.1) for colour plane `p`: the luma plane, or
 /// Cb / Cr in 4:4:4, which are coded exactly like it.
@@ -1181,7 +1183,6 @@ fn parse_residual_cavlc(
 /// inverses over a pile of small rules, and a change made to one and not the
 /// other is a desync that stays invisible until a later block decodes as
 /// rubbish.
-#[allow(dead_code)]
 pub(crate) fn write_residual_block_cavlc(
     w: &mut BitWriter,
     nc: i32,
@@ -1334,7 +1335,6 @@ pub(crate) fn write_residual_block_cavlc(
 /// The coeff_token VLC class for a `nC` predictor (9.2.1): two of the six are
 /// the chroma DC tables, chosen by the negative sentinels.
 #[inline]
-#[allow(dead_code)]
 fn coeff_token_class(nc: i32) -> usize {
     match nc {
         -2 => 5,
@@ -1348,7 +1348,6 @@ fn coeff_token_class(nc: i32) -> usize {
 
 /// `level_prefix`: that many zero bits, then a one.
 #[inline]
-#[allow(dead_code)]
 fn write_level_prefix(w: &mut BitWriter, prefix: u32) {
     w.zeros(prefix);
     w.bit(1);
@@ -1358,7 +1357,6 @@ fn write_level_prefix(w: &mut BitWriter, prefix: u32) {
 /// fifteen and one bit wider at each higher prefix, and the ranges tile
 /// exactly from `base15`, so the shortest prefix that reaches the value is
 /// the one the reader will read back.
-#[allow(dead_code)]
 fn write_level_escape(w: &mut BitWriter, level_code: u32, base15: u32) {
     let mut prefix = 15u32;
     loop {
@@ -1382,7 +1380,6 @@ fn write_level_escape(w: &mut BitWriter, level_code: u32, base15: u32) {
 /// instead, because peeking and counting leading zeros is faster than a
 /// lookup when decoding; both spellings produce the same bits, which is what
 /// the round trip checks.
-#[allow(dead_code)]
 fn write_run_before(w: &mut BitWriter, run: usize, zeros_left: usize) {
     debug_assert!(run <= zeros_left, "run_before longer than the zeros left");
     let row = zeros_left.min(7) - 1;
