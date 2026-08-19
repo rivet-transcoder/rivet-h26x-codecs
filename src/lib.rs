@@ -52,6 +52,7 @@
 pub(crate) mod bitreader;
 pub(crate) mod bitwriter;
 pub(crate) mod cabac;
+pub(crate) mod cabac_enc;
 pub mod dsp;
 pub mod encode;
 pub mod h264;
