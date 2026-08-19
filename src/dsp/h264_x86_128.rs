@@ -207,9 +207,11 @@ macro_rules! kernels {
             d.chroma = chroma;
         }
 
-        /// The eight loop-filter entries.
+        /// The loop-filter entries.
         pub(crate) fn install_deblock(d: &mut H264Dsp<u8>) {
             d.deblock_luma_v = deblock_luma_v;
+            d.deblock_luma8_v = deblock_luma8_v;
+            d.deblock_luma8_v_intra = deblock_luma8_v_intra;
             d.deblock_luma_h = deblock_luma_h;
             d.deblock_luma_v_intra = deblock_luma_v_intra;
             d.deblock_luma_h_intra = deblock_luma_h_intra;
@@ -707,6 +709,51 @@ macro_rules! kernels {
                     luma_filter_normal(&mut v, alpha, beta, tc0_luma(tc0, half));
                     store_transposed_8x8(d, stride, &v);
                 }
+            }
+        }
+
+        /// tC0 per lane for an eight-line luma edge: `tc0[i / 2]`, an MBAFF
+        /// mixed edge's strength changing every two lines rather than every
+        /// four.
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn tc0_luma8(tc0: &[i16; 4]) -> __m128i {
+            unsafe {
+                let t = |k: usize| tc0[k];
+                _mm_setr_epi16(t(0), t(0), t(1), t(1), t(2), t(2), t(3), t(3))
+            }
+        }
+
+        fn deblock_luma8_v(data: &mut [u8], off: usize, stride: usize, alpha: i32, beta: i32, tc0: &[i16; 4], _max: i32) {
+            if tc0.iter().all(|&t| t < 0) {
+                return;
+            }
+            assert!(off >= 4 && off + 7 * stride + 4 <= data.len());
+            unsafe { deblock_luma8_v_impl(data.as_mut_ptr().add(off), stride, alpha, beta, tc0) }
+        }
+
+        /// Eight lines is exactly one half of the sixteen-line kernel's
+        /// loop; only the tC0 lanes differ.
+        #[target_feature(enable = $feat)]
+        unsafe fn deblock_luma8_v_impl(data: *mut u8, stride: usize, alpha: i32, beta: i32, tc0: &[i16; 4]) {
+            unsafe {
+                let mut v = load_transposed_8x8(data, stride);
+                luma_filter_normal(&mut v, alpha, beta, tc0_luma8(tc0));
+                store_transposed_8x8(data, stride, &v);
+            }
+        }
+
+        fn deblock_luma8_v_intra(data: &mut [u8], off: usize, stride: usize, alpha: i32, beta: i32, _max: i32) {
+            assert!(off >= 4 && off + 7 * stride + 4 <= data.len());
+            unsafe { deblock_luma8_v_intra_impl(data.as_mut_ptr().add(off), stride, alpha, beta) }
+        }
+
+        #[target_feature(enable = $feat)]
+        unsafe fn deblock_luma8_v_intra_impl(data: *mut u8, stride: usize, alpha: i32, beta: i32) {
+            unsafe {
+                let mut v = load_transposed_8x8(data, stride);
+                luma_filter_intra(&mut v, alpha, beta);
+                store_transposed_8x8(data, stride, &v);
             }
         }
 
@@ -1338,7 +1385,15 @@ mod tests {
                 let off = 8 * stride + 8;
                 let mut a = plane.clone();
                 let mut b = plane.clone();
-                match trial % 8 {
+                match trial % 10 {
+                    8 => {
+                        (s.deblock_luma8_v)(&mut a, off, stride, alpha, beta, &tc0, 255);
+                        (d.deblock_luma8_v)(&mut b, off, stride, alpha, beta, &tc0, 255);
+                    }
+                    9 => {
+                        (s.deblock_luma8_v_intra)(&mut a, off, stride, alpha, beta, 255);
+                        (d.deblock_luma8_v_intra)(&mut b, off, stride, alpha, beta, 255);
+                    }
                     0 => {
                         (s.deblock_luma_v)(&mut a, off, stride, alpha, beta, &tc0, 255);
                         (d.deblock_luma_v)(&mut b, off, stride, alpha, beta, &tc0, 255);
