@@ -44,11 +44,15 @@ pub struct H264Encoder {
     /// would hand picture two the index of picture one.
     next_display: u64,
     geom: syn::Geometry,
-    /// The most recent reference picture, at *coded* size, kept because
-    /// inter prediction reads reconstructed samples rather than source ones —
-    /// that identity is what SELF checks, and predicting from the source
-    /// instead is the classic way to make an encoder that only it can decode.
-    reference: Option<Vec<syn::PaddedPlane>>,
+    /// Reference pictures, at *coded* size, newest last. Kept because inter
+    /// prediction reads reconstructed samples rather than source ones — that
+    /// identity is what SELF checks, and predicting from the source instead
+    /// is the classic way to make an encoder only its author can decode.
+    ///
+    /// A B picture needs one reference on each side of it in display order,
+    /// so this holds several and picks by POC rather than keeping only the
+    /// most recent.
+    refs: Vec<(i32, Vec<syn::PaddedPlane>)>,
     /// `frame_num`, which counts *reference* pictures and wraps.
     frame_num: u32,
     idr_pic_id: u32,
@@ -97,7 +101,7 @@ impl H264Encoder {
             frame_bytes: (luma + chroma) * bps,
             next_display: 0,
             geom,
-            reference: None,
+            refs: Vec::new(),
             frame_num: 0,
             idr_pic_id: 0,
             plane_dims,
@@ -174,16 +178,17 @@ impl H264Encoder {
         }
         let g = self.geom;
         let idr = c.kind == Kind::Idr;
-        if c.kind == Kind::B {
-            // B needs two reference lists and the direct modes; P comes
-            // first because it needs one list and no direct prediction.
-            return Err(Error::unsupported(
-                "H.264 encode: B pictures (encoder in progress; --bframes 0 works)",
+        // Reference lists, by picture order count: list0 runs backwards from
+        // the current picture, list1 forwards. A P picture uses list0 only.
+        let (past, future) = self.lists_for(c.poc);
+        if !idr && past.is_none() {
+            return Err(Error::bitstream(
+                "H.264 encode: an inter picture with no earlier reference reconstructed",
             ));
         }
-        if !idr && self.reference.is_none() {
+        if c.kind == Kind::B && future.is_none() {
             return Err(Error::bitstream(
-                "H.264 encode: a P picture with no reference reconstructed",
+                "H.264 encode: a B picture with no later reference reconstructed",
             ));
         }
 
@@ -260,9 +265,27 @@ impl H264Encoder {
             // every edge has matching motion, the same reference and no
             // coefficients, so every boundary strength is zero.
             w.ue(g.mbs_wide * g.mbs_high); // mb_skip_run
-            let reference = self.reference.as_ref().expect("checked above");
-            for (i, r) in reference.iter().enumerate() {
-                recon[i].data.copy_from_slice(&r.data);
+            let p0 = past.expect("checked above");
+            match c.kind {
+                Kind::B => {
+                    // B_Skip is direct prediction. The colocated picture's
+                    // motion is zero throughout an all-skip stream, so
+                    // temporal direct derives zero vectors on both lists and
+                    // the prediction is the default bi-predictive average,
+                    // (a + b + 1) >> 1.
+                    let p1 = future.expect("checked above");
+                    for i in 0..recon.len() {
+                        let (a, b) = (&self.refs[p0].1[i].data, &self.refs[p1].1[i].data);
+                        for (d, (&x, &y)) in recon[i].data.iter_mut().zip(a.iter().zip(b.iter())) {
+                            *d = ((x as u16 + y as u16 + 1) >> 1) as u8;
+                        }
+                    }
+                }
+                _ => {
+                    for i in 0..recon.len() {
+                        recon[i].data.copy_from_slice(&self.refs[p0].1[i].data);
+                    }
+                }
             }
         }
         w.rbsp_trailing_bits();
@@ -287,7 +310,13 @@ impl H264Encoder {
             self.idr_pic_id ^= 1;
         }
         if c.reference {
-            self.reference = Some(recon);
+            self.refs.push((c.poc, recon));
+            // The DPB the SPS declares. Dropping the oldest keeps the encoder
+            // inside what it told the decoder to allocate.
+            let cap = (self.cfg.max_refs.max(1) as usize) + 1;
+            while self.refs.len() > cap {
+                self.refs.remove(0);
+            }
         }
         Ok(Access {
             data: out,
@@ -295,6 +324,29 @@ impl H264Encoder {
             poc: c.poc,
             encode_index: c.encode,
         })
+    }
+
+    /// Indices into `refs` of the nearest reference before and after `poc`.
+    ///
+    /// Nearest rather than first: a decoder's default list order is by
+    /// distance from the current picture, and an encoder that assumes a
+    /// different order writes vectors against the wrong picture.
+    fn lists_for(&self, poc: i32) -> (Option<usize>, Option<usize>) {
+        let past = self
+            .refs
+            .iter()
+            .enumerate()
+            .filter(|(_, (p, _))| *p < poc)
+            .max_by_key(|(_, (p, _))| *p)
+            .map(|(i, _)| i);
+        let future = self
+            .refs
+            .iter()
+            .enumerate()
+            .filter(|(_, (p, _))| *p > poc)
+            .min_by_key(|(_, (p, _))| *p)
+            .map(|(i, _)| i);
+        (past, future)
     }
 
     /// The quantiser this picture is coded at, before any adaptive
