@@ -25,3 +25,10 @@ md5 = "0.7"
 
 [features]
 default = []
+
+# Built as a cdylib so `tools/wasm.sh` can instantiate it: wasm32 has no test
+# harness, so this is the only way to check that the decoder decodes there
+# rather than merely compiles.
+[[example]]
+name = "wasm_probe"
+crate-type = ["cdylib"]
