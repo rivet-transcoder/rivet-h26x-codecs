@@ -50,6 +50,7 @@
 // it would make every such change a breaking one; this crate's first release
 // already rewrote the CABAC engine and deleted three `pub` statics from it.
 pub(crate) mod bitreader;
+pub(crate) mod bitwriter;
 pub(crate) mod cabac;
 pub mod dsp;
 pub mod encode;

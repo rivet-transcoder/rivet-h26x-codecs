@@ -86,6 +86,35 @@ fn trim_trailing_zeros(mut nal: &[u8]) -> &[u8] {
     nal
 }
 
+/// Insert emulation-prevention bytes: the inverse of [`unescape_rbsp`].
+///
+/// Wherever the payload would otherwise show two zero bytes followed by one
+/// of `00 01 02 03`, a `03` goes between. The first two of those would read
+/// as a start code and end the NAL early; the third and fourth would read as
+/// an emulation-prevention byte that was never written, and the unescaper
+/// would swallow a byte of payload.
+pub fn escape_rbsp(rbsp: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rbsp.len() + rbsp.len() / 64 + 1);
+    let mut zeros = 0usize;
+    for &b in rbsp {
+        if zeros >= 2 && b <= 3 {
+            out.push(3);
+            // The `03` itself is not zero, so the run restarts — which is
+            // also what [`unescape_rbsp`] does when it drops one, and the two
+            // have to agree or a long run of zeros escapes differently in
+            // each direction.
+            zeros = 0;
+        }
+        out.push(b);
+        if b == 0 {
+            zeros += 1;
+        } else {
+            zeros = 0;
+        }
+    }
+    out
+}
+
 /// Remove emulation-prevention bytes: every `00 00 03` becomes `00 00`.
 /// Returns the RBSP (with the NAL header bytes still at the front — the
 /// header is never escaped, so callers can slice it off before or after).
@@ -209,6 +238,59 @@ impl HevcNalHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Escaping must be exactly undone by unescaping, for every payload —
+    /// including the ones built to sit on the boundary: runs of zeros of
+    /// every length, and each of the four bytes that need escaping after
+    /// two.
+    #[test]
+    fn escape_round_trips_through_unescape() {
+        let mut cases: Vec<Vec<u8>> = Vec::new();
+        cases.push(vec![]);
+        for run in 0..8usize {
+            for tail in 0u8..=4 {
+                let mut v = vec![0u8; run];
+                v.push(tail);
+                cases.push(v.clone());
+                v.insert(0, 0xaa);
+                cases.push(v);
+            }
+        }
+        // Long alternating runs, where a mishandled reset shows up late.
+        cases.push([0u8; 32].to_vec());
+        cases.push([[0u8, 0, 1].as_slice(); 16].concat());
+        cases.push([[0u8, 0, 3].as_slice(); 16].concat());
+        let mut seed = 0xdeadbeefu32;
+        let mut lcg = || {
+            seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+            (seed >> 16) as u8
+        };
+        for _ in 0..200 {
+            // Heavily biased to zero, so runs actually occur.
+            let n = 1 + (lcg() as usize % 40);
+            cases.push((0..n).map(|_| if lcg() % 3 == 0 { lcg() % 5 } else { 0 }).collect());
+        }
+
+        for rbsp in &cases {
+            let escaped = escape_rbsp(rbsp);
+            assert_eq!(&unescape_rbsp(&escaped), rbsp, "round trip failed for {rbsp:?}");
+            // And the escaped form must not contain a start code, which is
+            // the whole point of the exercise.
+            assert!(
+                !escaped.windows(3).any(|w| w == [0, 0, 1]),
+                "escaped form still contains a start code: {escaped:?} from {rbsp:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn escape_inserts_only_where_needed() {
+        assert_eq!(escape_rbsp(&[0, 0, 0]), vec![0, 0, 3, 0]);
+        assert_eq!(escape_rbsp(&[0, 0, 1]), vec![0, 0, 3, 1]);
+        assert_eq!(escape_rbsp(&[0, 0, 3]), vec![0, 0, 3, 3]);
+        assert_eq!(escape_rbsp(&[0, 0, 4]), vec![0, 0, 4]);
+        assert_eq!(escape_rbsp(&[0, 1, 0]), vec![0, 1, 0]);
+    }
 
     #[test]
     fn splits_three_and_four_byte_start_codes() {
