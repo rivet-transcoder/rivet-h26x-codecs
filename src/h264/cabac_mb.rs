@@ -38,7 +38,7 @@ pub fn init_contexts(
 
 // ctxIdx offsets (Table 9-34).
 const CTX_MB_TYPE_SI_PREFIX: usize = 0;
-const CTX_MB_TYPE_I: usize = 3;
+pub(crate) const CTX_MB_TYPE_I: usize = 3;
 const CTX_MB_SKIP_P: usize = 11;
 const CTX_MB_TYPE_P_PREFIX: usize = 14;
 const CTX_MB_TYPE_P_SUFFIX: usize = 17;

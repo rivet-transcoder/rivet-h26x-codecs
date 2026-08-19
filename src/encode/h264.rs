@@ -167,17 +167,16 @@ impl H264Encoder {
     /// macroblock layer, NAL framing and emulation prevention against a real
     /// decoder before any question of quality exists.
     fn code_picture(&mut self, c: Coded, src: &[u8]) -> Result<Access> {
-        if self.cfg.entropy == Entropy::Cabac {
-            // I_PCM through CABAC needs the mb_type binarisation and an
-            // engine re-initialisation after each PCM block. Worth doing, and
-            // not yet done; saying so beats emitting a stream that is subtly
-            // wrong.
-            return Err(Error::unsupported(
-                "H.264 encode: CABAC slice writing (encoder in progress; --cavlc works)",
-            ));
-        }
         let g = self.geom;
         let idr = c.kind == Kind::Idr;
+        if !idr && self.cfg.entropy == Entropy::Cabac {
+            // Skipping through CABAC is `mb_skip_flag` per macroblock against a
+            // context derived from the neighbours, not an `mb_skip_run` count.
+            // Different enough to be its own piece of work.
+            return Err(Error::unsupported(
+                "H.264 encode: CABAC inter slices (encoder in progress; --cavlc works)",
+            ));
+        }
         // Reference lists, by picture order count: list0 runs backwards from
         // the current picture, list1 forwards. A P picture uses list0 only.
         let (past, future) = self.lists_for(c.poc);
@@ -246,11 +245,19 @@ impl H264Encoder {
             qp,
             &mut w,
         );
+        let cabac = self.cfg.entropy == Entropy::Cabac;
         if idr {
-            for mb_y in 0..g.mbs_high {
-                for mb_x in 0..g.mbs_wide {
-                    syn::write_pcm_macroblock(&mut w, &g, mb_x, mb_y, &planes, &mut recon);
+            if cabac {
+                // Closes the slice itself: the arithmetic coder flush writes
+                // the stop bit, so there is no `rbsp_trailing_bits` after it.
+                syn::write_pcm_slice_data_cabac(&mut w, &g, qp, &planes, &mut recon);
+            } else {
+                for mb_y in 0..g.mbs_high {
+                    for mb_x in 0..g.mbs_wide {
+                        syn::write_pcm_macroblock(&mut w, &g, mb_x, mb_y, &planes, &mut recon);
+                    }
                 }
+                w.rbsp_trailing_bits();
             }
         } else {
             // Every macroblock skipped. `P_Skip` carries no motion vector
@@ -258,21 +265,17 @@ impl H264Encoder {
             // of its neighbours, which in an all-skip picture is zero
             // everywhere, so the reconstruction is the reference unchanged.
             //
-            // That is a poor picture and an entirely legal one, and it proves
-            // what this step is for — reference management, frame_num, the P
-            // slice header and the decoded picture buffer — without needing
-            // residual coding to exist first. Deblocking does not disturb it:
-            // every edge has matching motion, the same reference and no
-            // coefficients, so every boundary strength is zero.
+            // Deblocking does not disturb it either: every edge has matching
+            // motion, the same reference and no coefficients, so every
+            // boundary strength is zero.
             w.ue(g.mbs_wide * g.mbs_high); // mb_skip_run
             let p0 = past.expect("checked above");
             match c.kind {
                 Kind::B => {
-                    // B_Skip is direct prediction. The colocated picture's
-                    // motion is zero throughout an all-skip stream, so
-                    // temporal direct derives zero vectors on both lists and
-                    // the prediction is the default bi-predictive average,
-                    // (a + b + 1) >> 1.
+                    // B_Skip is direct prediction. The colocated picture motion
+                    // is zero throughout an all-skip stream, so temporal direct
+                    // derives zero vectors on both lists and the prediction is
+                    // the default bi-predictive average, (a + b + 1) >> 1.
                     let p1 = future.expect("checked above");
                     for i in 0..recon.len() {
                         let (a, b) = (&self.refs[p0].1[i].data, &self.refs[p1].1[i].data);
@@ -287,8 +290,8 @@ impl H264Encoder {
                     }
                 }
             }
+            w.rbsp_trailing_bits();
         }
-        w.rbsp_trailing_bits();
         out.extend_from_slice(&syn::annexb(
             if idr { syn::NAL_IDR } else { syn::NAL_SLICE },
             if c.reference { 3 } else { 0 },
@@ -415,13 +418,37 @@ mod tests {
     }
 
     /// The hole is where it should be: the plumbing above it runs, and what
-    /// fails names itself.
+    /// fails names itself. Entropy coding is no longer the hole — both
+    /// coders write a whole intra picture — so what this pins now is that an
+    /// all-intra configuration codes, and that the next thing missing
+    /// announces itself as inter prediction rather than failing obscurely.
     #[test]
-    fn coding_refuses_at_the_entropy_stage_and_says_so() {
-        let mut e = H264Encoder::new(cfg(64, 64, ChromaFormat::Yuv420, 8)).unwrap();
-        let err = e.push(&vec![0u8; 64 * 64 * 3 / 2]).unwrap_err();
-        let s = format!("{err}");
-        assert!(s.contains("slice writing"), "{s}");
+    fn intra_codes_and_the_remaining_hole_says_what_it_is() {
+        for entropy in [Entropy::Cabac, Entropy::Cavlc] {
+            let mut e = H264Encoder::new(Config {
+                gop: 0,
+                entropy,
+                ..cfg(64, 64, ChromaFormat::Yuv420, 8)
+            })
+            .unwrap();
+            let out = e.push(&vec![0u8; 64 * 64 * 3 / 2]).unwrap();
+            assert_eq!(out.len(), 1, "{entropy:?}: an all-intra picture should code");
+            assert!(out[0].keyframe, "{entropy:?}: the first picture is an IDR");
+        }
+
+        let mut e =
+            H264Encoder::new(Config { gop: 8, ..cfg(64, 64, ChromaFormat::Yuv420, 8) }).unwrap();
+        let frame = vec![0u8; 64 * 64 * 3 / 2];
+        let mut named = false;
+        for _ in 0..4 {
+            if let Err(err) = e.push(&frame) {
+                let s = format!("{err}");
+                assert!(s.contains("inter prediction"), "{s}");
+                named = true;
+                break;
+            }
+        }
+        assert!(named, "a GOP longer than one should have reached inter prediction");
     }
 
     /// Every picture offered must be codable exactly once, whatever the GOP
@@ -439,23 +466,28 @@ mod tests {
             .unwrap();
             let frame = vec![0u8; 64 * 64 * 3 / 2];
             for i in 0..6 {
-                // Two outcomes are legitimate: the picture was held for its
-                // anchor (Ok, nothing released), or it reached the named hole
-                // in entropy coding. "scheduler released an absent picture"
-                // is neither, and means the index bookkeeping is wrong.
-                match e.push(&frame) {
-                    Ok(released) => assert!(
-                        released.is_empty(),
-                        "gop={gop} b={bframes} picture {i}: coded something with no entropy coder"
-                    ),
-                    Err(err) => {
-                        let s = format!("{err}");
-                        assert!(
-                            s.contains("slice writing"),
-                            "gop={gop} b={bframes} picture {i}: {s}"
-                        );
-                    }
+                // Coding, holding, and refusing an unbuilt tool are all
+                // legitimate. "scheduler released an absent picture" is not:
+                // it means a picture was released under an index the map
+                // never held, which is the bookkeeping fault this exists to
+                // catch, and it would otherwise look like a coding bug.
+                if let Err(err) = e.push(&frame) {
+                    let s = format!("{err}");
+                    assert!(
+                        !s.contains("absent picture"),
+                        "gop={gop} b={bframes} picture {i}: {s}"
+                    );
+                    assert!(
+                        s.contains("inter prediction"),
+                        "gop={gop} b={bframes} picture {i}: {s}"
+                    );
                 }
+            }
+            // Flushing releases whatever is still held, and must not find a
+            // picture missing either.
+            if let Err(err) = e.flush() {
+                let s = format!("{err}");
+                assert!(!s.contains("absent picture"), "gop={gop} b={bframes} flush: {s}");
             }
         }
     }

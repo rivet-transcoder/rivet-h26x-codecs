@@ -18,7 +18,10 @@
 //! libavcodec.
 
 use crate::bitwriter::BitWriter;
+use crate::cabac_enc::CabacEncoder;
 use crate::encode::gop::Kind;
+use crate::h264::SliceType;
+use crate::h264::cabac_mb::{CTX_MB_TYPE_I, CabacState};
 use crate::encode::{Config, Entropy};
 use crate::picture::ChromaFormat;
 
@@ -289,6 +292,91 @@ pub fn write_pcm_macroblock(
     // `mb_type` 25 is I_PCM in an I slice, as ue(v) for CAVLC.
     w.ue(25);
     w.align_zero(); // pcm_alignment_zero_bit
+    write_pcm_samples(w, g, mb_x, mb_y, planes, dst);
+}
+
+/// The CABAC slice data of an all-`I_PCM` picture: `cabac_alignment_one_bit`,
+/// every macroblock, then the terminate that closes the slice.
+///
+/// The arithmetic engine does not run across the whole slice. `I_PCM`'s
+/// `mb_type` ends in a terminate bin of 1, and that *flushes* the codeword;
+/// the samples follow byte-aligned as plain bits, and a new engine
+/// initialises after them (9.3.1.2). So the slice is a chain of short
+/// codewords, each starting on a byte boundary and each closed by the
+/// terminate that introduces the next block of samples:
+///
+/// ```text
+/// align_one | mbtype(0) term=1 | PCM(0) | eos=0 mbtype(1) term=1 | PCM(1) | ... | eos=1
+/// ```
+///
+/// The *context state* is carried across all of it. Re-initialising the
+/// engine does not re-initialise the contexts — the decoder's
+/// `Cabac::reinit` likewise leaves its `CabacState` alone — and a writer that
+/// reset them per macroblock would agree with the decoder on the first
+/// macroblock and diverge on the second.
+pub fn write_pcm_slice_data_cabac(
+    w: &mut BitWriter,
+    g: &Geometry,
+    qp: u8,
+    planes: &[Plane<'_>],
+    dst: &mut [PaddedPlane],
+) {
+    // `cabac_alignment_one_bit` until the slice data starts on a byte.
+    w.align_one();
+    // The same initialisation the decoder runs, from the same tables. I
+    // slices have no `cabac_init_idc`, so the value passed is not read.
+    let mut st = CabacState::new(SliceType::I, 0, qp as i32);
+    let total = g.mbs_wide * g.mbs_high;
+    for idx in 0..total {
+        {
+            let mut e = CabacEncoder::new(w);
+            if idx > 0 {
+                // `end_of_slice_flag` of the macroblock before this one. A
+                // zero does not flush, so this engine carries on into the
+                // `mb_type` below.
+                e.encode_terminate(0);
+            }
+            // `mb_type`: one bin saying "not I_NxN", then the terminate that
+            // says I_PCM. ctxIdxInc counts available neighbours that are not
+            // I_NxN (9.3.3.1.1.3); every macroblock here is I_PCM, so an
+            // available neighbour always contributes one, and with a single
+            // slice per picture "available" is just "inside the picture".
+            let inc = (idx % g.mbs_wide > 0) as usize + (idx / g.mbs_wide > 0) as usize;
+            e.encode_decision(&mut st.ctx[CTX_MB_TYPE_I + inc], 1);
+            e.encode_terminate(1);
+        }
+        // `pcm_alignment_zero_bit`, then the samples as plain bits.
+        w.align_zero();
+        write_pcm_samples(w, g, idx % g.mbs_wide, idx / g.mbs_wide, planes, dst);
+    }
+    // The last macroblock's `end_of_slice_flag`, in an engine of its own
+    // because the one before it was flushed by that macroblock's I_PCM.
+    {
+        let mut e = CabacEncoder::new(w);
+        e.encode_terminate(1);
+    }
+    // The flush already wrote a one as its last bit, and that bit *is* the
+    // `rbsp_stop_one_bit` (9.3.4.6). What is left is padding to the byte —
+    // writing `rbsp_trailing_bits` here instead would emit a second stop bit
+    // and leave a byte of rubbish after the slice.
+    w.align_zero();
+}
+
+/// The raw samples of one `I_PCM` macroblock, and the same values into the
+/// reconstruction — which is what makes the coding exactly lossless.
+///
+/// Shared by both entropy coders: only how `mb_type` is spelled differs
+/// between them, and the alignment bit and samples that follow are identical.
+/// Sources narrower than a whole macroblock repeat their edge sample, which
+/// is what the cropping in the SPS then hides.
+fn write_pcm_samples(
+    w: &mut BitWriter,
+    g: &Geometry,
+    mb_x: u32,
+    mb_y: u32,
+    planes: &[Plane<'_>],
+    dst: &mut [PaddedPlane],
+) {
     let bd = g.bit_depth;
     let (cw, ch) = g.chroma_mb();
     let sizes: [(u32, u32); 3] = [(16, 16), (cw, ch), (cw, ch)];
