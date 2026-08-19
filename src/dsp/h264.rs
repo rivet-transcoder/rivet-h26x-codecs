@@ -296,6 +296,15 @@ fn qpel_scalar<S: Sample, const XF: usize, const YF: usize>(dst: &mut [S], src: 
     // hh: half-sample vertically at block (x, y): h1 at window column x + 2.
     let hh = |x: usize, y: usize| ((h1(src, stride, x + 2, y) + 16) >> 5).clamp(0, max);
     // j: centre, vertical six-tap over b1 rows y..y+5 (window rows).
+    //
+    // This recomputes all six horizontal taps for every sample, and rows y and
+    // y+1 share five of them — the redundancy the SIMD kernels hoist out into
+    // a sliding window. It is left in deliberately. This function is the
+    // executable statement of 8.4.2.2.1 that the others are tested against, so
+    // its job is to read like the clause; sliding a window through it would
+    // cost that and buy nothing, because SSE2 and NEON are baseline on the two
+    // architectures we build for and nothing selects these paths but
+    // `H26X_NO_SIMD=1`.
     let j = |x: usize, y: usize| {
         let j1 = tap6(b1(src, stride, x, y), b1(src, stride, x, y + 1), b1(src, stride, x, y + 2), b1(src, stride, x, y + 3), b1(src, stride, x, y + 4), b1(src, stride, x, y + 5));
         ((j1 + 512) >> 10).clamp(0, max)
