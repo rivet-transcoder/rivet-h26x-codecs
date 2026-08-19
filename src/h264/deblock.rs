@@ -1009,18 +1009,34 @@ fn deblock_mbaff_pairs<S: Sample>(
                             );
                             line_pa[k] = pa;
                         }
-                        for k in 0..16 {
-                            if line_bs[k] == 0 {
+                        // The sixteen lines are two halves of eight, each
+                        // belonging to one macroblock of the left pair and
+                        // lying two rows apart, so each is one kernel call:
+                        // one QP, one pair of thresholds, and a strength
+                        // that changes every two lines (`LumaDeblock8Fn`).
+                        for g in 0..2usize {
+                            let (first, span) = if !mf { (g, 2) } else { (g * 8, 1) };
+                            let mut bs = 0u32;
+                            for j in 0..4 {
+                                bs |= (line_bs[first + span * 2 * j] as u32) << (j * 8);
+                            }
+                            if bs == 0 {
                                 continue;
                             }
-                            let pa = line_pa[k];
-                            let t = thr.get(info.mbs[pa].qp as i32, m.qp as i32);
-                            let (alpha, beta) = (t.alpha, t.beta);
-                            let Some(tc) = tc0_line(line_bs[k], &t.lut) else {
-                                continue;
-                            };
-                            let pos = frame.y.offset(x0 as isize, (y_p + dy * k) as isize);
-                            filter_line(&mut frame.y.data, pos, 1, tc, alpha, beta, false, max);
+                            let t = thr.get(info.mbs[line_pa[first]].qp as i32, m.qp as i32);
+                            let off = frame.y.offset(x0 as isize, (y_p + dy * first) as isize);
+                            filter_edge(
+                                dsp.deblock_luma8_v,
+                                dsp.deblock_luma8_v_intra,
+                                &mut frame.y.data,
+                                off,
+                                ystride * 2,
+                                bs,
+                                t.alpha,
+                                t.beta,
+                                &t.lut,
+                                max,
+                            );
                         }
                         if do_chroma {
                             // Chroma line k takes the bS of the luma line at
