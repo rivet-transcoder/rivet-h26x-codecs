@@ -3,6 +3,27 @@
 //! the luma and chroma edge filters, macroblock by macroblock in raster
 //! order — vertical edges first, then horizontal, luma then chroma.
 
+//! Where the time in here goes, measured by pricing each part at zero — the
+//! kernels made no-ops, the dispatch skipped with the derived thresholds fed
+//! through `black_box`, and the whole stage skipped — against a same-rung
+//! control reading 1.000. Two CABAC clips at the AVX2 rung, as a share of
+//! whole-decode time:
+//!
+//! | | cabac3 | bbb_720p_cabac |
+//! |---|---|---|
+//! | boundary strengths and thresholds | 5.9% | 6.7% |
+//! | the filter kernels | 4.4% | 4.6% |
+//! | dispatch: `tc4` on the stack, indirect call | 0.7% | 0.1% |
+//! | **the stage** | **11.0%** | **11.4%** |
+//!
+//! The reason to write that down is that the obvious optimisation is the
+//! wrong one. Collapsing the six-to-eight per-macroblock calls into a single
+//! "filter every internal edge" entry point targets the bottom row, which is
+//! under one percent and below what this machine can measure — and it would
+//! cost a `H264Dsp` signature change across four architecture files. The room
+//! is in the top row: deriving boundary strengths costs more than all the
+//! filtering, and more than eight times the dispatch it is usually blamed on.
+
 use crate::dsp::h264::{H264Dsp, LumaDeblockFn, LumaDeblockIntraFn};
 use crate::sample::Sample;
 
