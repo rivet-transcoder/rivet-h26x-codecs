@@ -21,6 +21,16 @@
 //! position, which is all [`Quant`] computes. It reproduces the tables
 //! every H.264 encoder carries, entry for entry, and a test asserts so.
 //!
+//! One property of that pairing is worth naming, because it is easy to
+//! undo by accident. A round-trip test is *structurally blind* to a fault
+//! applied symmetrically to both sides of an inverse pair: mutate the
+//! forward transform and the inverse the same way and the round trip
+//! still closes. What protects the tests here is that the inverse is not
+//! ours — it is the decoder's, held in place by the conformance suites —
+//! so a mistake on this side has nothing to cancel against. Writing a
+//! private inverse "for the tests" would quietly remove that protection
+//! and leave a test that can only catch asymmetric mistakes. Don't.
+//!
 //! Watch the shifts: 8.5.13.1 dequantises an 8x8 block by `qP/6 - 6`
 //! where 8.5.12.1 uses `qP/6 - 4`, so although both multiplier tables are
 //! scaled the same way, the 8x8 quantises with two bits fewer. Getting
