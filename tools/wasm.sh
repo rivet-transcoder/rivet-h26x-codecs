@@ -59,6 +59,20 @@ EXPECT=$(
 [ -n "$EXPECT" ] || { echo "wasm.sh: could not read the expectations out of tests/decode.rs"; exit 1; }
 
 fail=0
+
+# A tier that installed nothing would pass every comparison below without
+# running one vector instruction, so check which kernels each build actually
+# selected before believing that they agree.
+echo
+echo "== which kernels each build selected =="
+for w in scalar:scalar simd128:SIMD128; do
+  b=${w%%:*}; want=${w##*:}
+  got=$(node tools/wasm_run.mjs "$TMP/$b.wasm" --rung 2>&1)
+  printf "  %-8s %s
+" "$b" "$got"
+  [ "$got" = "$want" ] || { echo "    expected $want"; fail=1; }
+done
+
 for w in scalar simd128; do
   echo
   echo "== vendored streams, decoded inside wasm ($w) =="

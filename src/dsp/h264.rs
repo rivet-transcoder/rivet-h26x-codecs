@@ -257,6 +257,10 @@ pub fn install_simd_u8(d: &mut H264Dsp<u8>, cpu: Cpu) {
     if cpu.neon {
         super::h264_neon::install(d);
     }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    if cpu.simd128 {
+        super::h264_wasm128::install(d);
+    }
 }
 
 // ----------------------------------------------------------------------

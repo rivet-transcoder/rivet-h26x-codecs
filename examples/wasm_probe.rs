@@ -44,6 +44,21 @@ impl Hasher {
     }
 }
 
+/// Which kernels this module was built with, written as text to `out` (at
+/// most 16 bytes), returning the length.
+///
+/// A decode that produces the right bytes proves nothing about *which* code
+/// produced them — a tier that installed nothing would pass every comparison
+/// in `tools/wasm.sh` without running one vector instruction. This is how the
+/// script tells the two apart.
+#[unsafe(no_mangle)]
+pub extern "C" fn h26x_rung(out: *mut u8) -> u32 {
+    let s = h26x::dsp::Cpu::detect().rung().as_bytes();
+    let n = s.len().min(16);
+    unsafe { std::ptr::copy_nonoverlapping(s.as_ptr(), out, n) };
+    n as u32
+}
+
 /// `len` bytes of scratch inside the module's memory, for the caller to write
 /// the stream into and to read the hash out of.
 ///

@@ -30,6 +30,8 @@ pub(crate) mod h264_avx2;
 #[cfg(target_arch = "aarch64")]
 #[allow(unused_unsafe)]
 pub(crate) mod h264_neon;
+#[cfg(target_arch = "wasm32")]
+pub(crate) mod h264_wasm128;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_unsafe)]
 pub(crate) mod hevc_x86_128;
@@ -91,6 +93,14 @@ pub struct Cpu {
     /// x86-64 with SSE2 — baseline on every x86-64 CPU, so on this
     /// architecture the scalar kernels are a reference, never a fallback.
     pub sse2: bool,
+    /// wasm32 with the `simd128` proposal.
+    ///
+    /// Not detected the way the others are, because there is nothing to
+    /// detect: `simd128` is a compile-time target feature, so a module either
+    /// was built with it or was not. It is a field on `Cpu` anyway so that
+    /// `rung` can name it and `H26X_NO_SIMD=1` can still take it away, which
+    /// is what makes the scalar reference reachable for comparison.
+    pub simd128: bool,
     /// AArch64 NEON (baseline on every AArch64 CPU).
     pub neon: bool,
     /// AArch64 with the ARMv8.2-A dot product extension (`sdot` / `udot`):
@@ -125,6 +135,10 @@ impl Cpu {
             let avx512vnni = avx512 && std::is_x86_feature_detected!("avx512vnni");
             return Self { avx2, avx512, avx512vnni, avx, sse41, ssse3, sse2, ..Self::SCALAR };
         }
+        #[cfg(target_arch = "wasm32")]
+        {
+            return Self { simd128: cfg!(target_feature = "simd128"), ..Self::SCALAR };
+        }
         #[cfg(target_arch = "aarch64")]
         {
             let dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
@@ -145,6 +159,7 @@ impl Cpu {
         sse41: false,
         ssse3: false,
         sse2: false,
+        simd128: false,
         neon: false,
         dotprod: false,
         i8mm: false,
@@ -156,7 +171,9 @@ impl Cpu {
     /// two, so a user who cannot ask which one they got cannot make sense of
     /// a measurement. `h26xdec --rung` prints this.
     pub fn rung(&self) -> &'static str {
-        if self.avx512 {
+        if self.simd128 {
+            "SIMD128"
+        } else if self.avx512 {
             "AVX-512"
         } else if self.avx2 {
             "AVX2"
