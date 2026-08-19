@@ -1063,6 +1063,20 @@ impl<S: Sample> H264DecoderImpl<S> {
         if hdr.redundant_pic_cnt > 0 {
             return Ok(());
         }
+        // Refusing is deliberate, and it is better than what libavcodec does
+        // here rather than worse. Given the two JVT SP streams it decodes 400
+        // frames with no error and no warning, matching the reference exactly
+        // until the first SP slice at frame 10 and then differing in 78% of
+        // that frame's bytes — the signature of decoding an SP slice as an
+        // ordinary P one, which is what happens when the SP transform and
+        // quantisation path (8.5.1, 8.5.2) is not implemented. It even
+        // reports the profile as Extended on the way past.
+        //
+        // A caller who hands us a stream we refuse can try another decoder;
+        // a caller handed plausible wrong pixels has no way to find out. So
+        // this stays until 8.5.1 and 8.5.2 are actually implemented, and the
+        // absence of these streams from the pass list is not a coverage gap
+        // against libavcodec.
         if matches!(hdr.slice_type, SliceType::Sp | SliceType::Si) {
             return Err(Error::unsupported("H.264 SP/SI slices"));
         }
