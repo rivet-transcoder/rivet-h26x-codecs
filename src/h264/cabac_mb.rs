@@ -393,7 +393,15 @@ fn decode_ref_idx(
 /// them agree on everything but the last step. Finding the block, deciding
 /// whether it counts, and scaling across a field boundary is the work; which
 /// component is then read is a field access. Deriving the pair once halves
-/// what a motion vector difference costs in neighbour lookups.
+/// what a motion vector difference costs in neighbour lookups — counted on
+/// `cabac3.264`, exactly half: 1,557,633 mvd pairs, four neighbour
+/// derivations each before and two after, 3,115,266 lookups removed.
+///
+/// That count is the whole claim. The time saved is below what any
+/// instrument here can resolve, and an earlier commit message said 2.4%
+/// on the strength of a harness that had never been given a same-binary
+/// control; see the retraction in the log. For a bit-exact refactor,
+/// count the work removed and say nothing about the clock.
 fn mvd_neighbour_abs(
     info: &PicInfo,
     layer: &MbLayer,
