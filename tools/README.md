@@ -131,6 +131,20 @@ at all, and gave a 2–3% noise floor while the end-to-end number was useless.
 That is how the deblocking rewrite was measured at 0.66x when end to end it
 only showed as 3-4%.
 
+**Self time lies about inlined hot loops, so be careful which function you
+pick.** A profiler charges an `#[inline(always)]` function to whichever caller
+it was inlined into. A caller that is largely a wrapper around one therefore
+reads as though its own body were the expense, and planning work against that
+figure plans against the wrong code. `residual_block_cabac` profiled at 15.2%
+self time and was taken here as 15.2% of addressable call-site overhead; nearly
+all of it was the arithmetic decoder inlined into it. The two measurements that
+followed say so plainly — making each bin cheaper took 9% off entropy decoding,
+while every attempt at the loops *around* the bins took 2.4% or nothing — but
+that was a track's worth of work to find out. Before believing a self-time
+figure names something you can fix, check whether the function contains an
+inlined hot loop; if it does, the figure belongs to the loop, not to its
+caller.
+
 ## Traps
 
 `cargo fmt -- src/some/file.rs` does **not** scope to that path: it reformats
