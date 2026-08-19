@@ -55,12 +55,19 @@ fi
 # Configurations. Each is a name and the encoder flags for it. The list starts
 # at the simplest thing that can be legal and adds one axis at a time, because
 # when several are red at once the simplest one names the bug.
+#
+# Each axis appears in a CAVLC form as well as a CABAC one. That is not
+# redundancy: it lets inter prediction be verified without waiting for CABAC
+# slice writing and vice versa, so two people can make progress against this
+# gate at the same time without one of them being blocked behind the other.
 CONFIGS=${CONFIGS:-"
 lossless-intra|--codec h264 --lossless --gop 0
 cqp-intra|--codec h264 --qp 26 --gop 0
 cqp-ip|--codec h264 --qp 26 --gop 8
 cqp-ipb|--codec h264 --qp 26 --gop 8 --bframes 2
 cavlc-intra|--codec h264 --qp 26 --gop 0 --cavlc
+cavlc-ip|--codec h264 --qp 26 --gop 8 --cavlc
+cavlc-ipb|--codec h264 --qp 26 --gop 8 --bframes 2 --cavlc
 hevc-lossless-intra|--codec h265 --lossless --gop 0
 hevc-cqp-intra|--codec h265 --qp 26 --gop 0
 hevc-cqp-ip|--codec h265 --qp 26 --gop 8

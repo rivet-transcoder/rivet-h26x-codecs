@@ -59,6 +59,7 @@ use crate::picture::ChromaFormat;
 pub mod gop;
 pub mod h264;
 pub mod h264_syntax;
+pub mod h265_syntax;
 
 /// How lossy, and by what means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
