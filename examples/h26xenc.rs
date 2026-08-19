@@ -106,7 +106,7 @@ fn main() {
         }
         let mut stream: Vec<u8> = Vec::new();
         let mut frames = 0usize;
-        let mut fail = |e: h26x::Error| -> ! {
+        let fail = |e: h26x::Error| -> ! {
             eprintln!("h26xenc: {e}");
             std::process::exit(1);
         };
