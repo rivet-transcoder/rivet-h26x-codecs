@@ -50,7 +50,8 @@
 //! - **The neighbour `MbInfo` loads are free**, which is the one that looks
 //!   wrong — the row above is a different cache line per macroblock. Reading
 //!   the current macroblock's info in the neighbour's place, for identical
-//!   instruction count and perfect locality, changed the time by 0.0%.
+//!   instruction count and perfect locality, changed the time by 0.0%. A
+//!   cache miss you can argue for is not a cache miss you have measured.
 //! - **The dispatch is 0.1-0.7%**, so a multi-edge entry point collapsing the
 //!   six-to-eight calls per macroblock is buying that at most, against a
 //!   `H264Dsp` signature change across four architecture files.
