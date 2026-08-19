@@ -89,12 +89,57 @@ fn main() {
 
     let raw = std::fs::read(&input).unwrap_or_else(|e| die(&format!("read {input}: {e}")));
 
-    // Only H.264 has an encoder to drive at all; H.265's is the next one
-    // built. Reporting that plainly beats pretending the argument is
-    // unsupported for some other reason.
+    // H.265 has an encoder skeleton whose refusal names the missing piece
+    // (the CABAC coding tree), so drive it for real rather than refusing at
+    // the argument parser — the gate then reports the precise hole.
     if codec == "h265" {
-        eprintln!("h26xenc: unsupported: H.265 encoding (encoder in progress)");
-        std::process::exit(1);
+        let mut enc = match h26x::encode::h265::H265Encoder::new(cfg) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("h26xenc: {e}");
+                std::process::exit(1);
+            }
+        };
+        let fb = enc.frame_bytes();
+        if fb == 0 || raw.len() < fb {
+            die(&format!("input is {} bytes, less than one {fb}-byte picture", raw.len()));
+        }
+        let mut stream: Vec<u8> = Vec::new();
+        let mut frames = 0usize;
+        let mut fail = |e: h26x::Error| -> ! {
+            eprintln!("h26xenc: {e}");
+            std::process::exit(1);
+        };
+        for chunk in raw.chunks_exact(fb) {
+            match enc.push(chunk) {
+                Ok(units) => {
+                    for a in units {
+                        stream.extend_from_slice(&a.data);
+                        frames += 1;
+                    }
+                }
+                Err(e) => fail(e),
+            }
+        }
+        match enc.flush() {
+            Ok(units) => {
+                for a in units {
+                    stream.extend_from_slice(&a.data);
+                    frames += 1;
+                }
+            }
+            Err(e) => fail(e),
+        }
+        std::fs::write(&output, &stream).unwrap_or_else(|e| die(&format!("write {output}: {e}")));
+        if let Some(path) = recon {
+            let mut f = std::fs::File::create(&path)
+                .unwrap_or_else(|e| die(&format!("create {path}: {e}")));
+            for r in enc.reconstructions() {
+                f.write_all(r).unwrap_or_else(|e| die(&format!("write {path}: {e}")));
+            }
+        }
+        eprintln!("{frames} pictures, {} bytes", stream.len());
+        return;
     }
 
     let mut enc = match h26x::encode::h264::H264Encoder::new(cfg) {
