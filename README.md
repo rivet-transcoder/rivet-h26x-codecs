@@ -136,6 +136,12 @@ gets. `H26X_MAX_SIMD` caps the ladder, which is how one machine produces every
 row; the rung it selects on its own is in bold, and is what a user on that
 hardware actually runs.
 
+One line under each table is generated and says "Widest rung against
+libavcodec". For the two H.264 tables that widest rung is byte-identical to
+the row beneath it, since no H.264 kernel is AVX-512 — so it names a
+configuration that is not distinct for this codec, and those two rows should
+be read as a control pair rather than as two rungs.
+
 The single-threaded rows are pinned to one quiet core, both decoders alike, so
 that column survives a machine that is doing other things. The all-threads
 rows cannot be — pinning them would measure something other than what they
@@ -231,9 +237,14 @@ paths, switched by an environment variable — which is what
 do, and what a table like this cannot.
 
 **With that said: single-threaded, H.265 is at parity with libavcodec** (1.02x
-and 1.12x) and H.264 costs about half as much again (1.49x on a CABAC stream,
-1.55x on a CAVLC one). The gap is not in the pixel kernels; it is entropy
-decoding and per-macroblock bookkeeping, which is where the remaining work is.
+and 1.12x) and H.264 costs about half as much again — 1.46-1.49x on a CABAC
+stream, 1.54-1.55x on a CAVLC one. Those are ranges rather than figures
+because the two H.264 rows they come from are the same code: the bolded row is
+whichever rung this machine selects, not whichever sample came out faster, and
+on both clips it happens to be the slower one. Quoting it alone would inflate
+the gap by the width of the control. The gap itself is not in the pixel
+kernels; it is entropy decoding and per-macroblock bookkeeping, which is where
+the remaining work is.
 
 **With every thread, two of the four comparisons say anything.** Ahead on WPP
 (1963 against 1774 fps, +10.7%) and behind on the H.265 clip without
@@ -263,8 +274,16 @@ vertical 14-bit stage of a diagonal interpolation, the wide luma filters at 32
 samples and up, and the 32-point inverse transform, whose row *is* a 512-bit
 vector. Everything it does not carry keeps the AVX2 version — H.265 chroma
 interpolation was written for it, measured worse, and was left behind, as were
-four H.264 kernels. Its measured end-to-end contribution is small and,
-per the floor above, close to what this table can resolve.
+four H.264 kernels.
+
+Its end-to-end contribution is the one figure in this section with no control
+behind it. The byte-identical pair exists only in the H.264 tables, because
+AVX-512 genuinely does carry H.265 kernels — so the H.265 tables have no two
+rows running the same code, and the H.264 floor cannot be borrowed across to
+them when that floor is itself anything from 0.0% to 4.0% depending on the
+column. Per-kernel it is 1.6-2.3x on the shapes it carries; what that is worth
+inside a decode was measured separately, against its own control, and is
+recorded in the commit that added the tier rather than inferred from here.
 
 Numbers move with the clip. These are 720p Big Buck Bunny encodes — H.264 High
 profile from x264 at CRF 20 with B-pyramid and the 8x8 transform, H.265 Main
