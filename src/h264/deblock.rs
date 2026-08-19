@@ -623,6 +623,23 @@ pub fn deblock_mb_rows<S: Sample>(
                         e += step;
                     }
                 }
+                // A macroblock edge between two inter macroblocks is where
+                // this filter still reads the picture-wide motion arrays, and
+                // that read is what `motion_bs` costs — two Vecs 128 bytes
+                // apart per macroblock, 0.42% of a whole decode on the line
+                // that first touches them.
+                //
+                // Caching a single-partition macroblock's motion in `PicInfo`
+                // and comparing one word instead was built and measured, and
+                // is not here on purpose. It settles 52% of these edges and is
+                // worth 0.958x / 0.977x of this function on cabac3 / cavlc3 —
+                // real, and reproducibly separated from noise. But the filter
+                // is ~9% of a decode, so that is 0.3% end to end, under the
+                // floor of the machine measuring it, in exchange for an
+                // invariant spanning derivation and this file. It lives on
+                // `perf/deblock-motion-key`, green, one commit, with the
+                // numbers and the invariant analysis in its message — worth
+                // reviving only if deblocking's share of a decode grows.
                 if filter_left {
                     let ml = &info.mbs[left];
                     if ml.kind.is_intra() {
