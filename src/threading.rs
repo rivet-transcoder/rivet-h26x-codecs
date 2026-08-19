@@ -101,14 +101,12 @@ impl Progress {
         if self.done.load(Ordering::Acquire) >= y {
             return;
         }
-        let t = std::time::Instant::now();
+        let t = prof::at();
         let mut g = self.lock.lock().unwrap();
         while self.done.load(Ordering::Acquire) < y {
             g = self.cv.wait(g).unwrap();
         }
-        if prof::enabled() {
-            prof::add(&prof::WAIT_REF, t);
-        }
+        prof::add(&prof::WAIT_REF, t);
     }
 
     /// Block until rows `< y` are parsed and their motion derived.
@@ -116,14 +114,12 @@ impl Progress {
         if self.derived.load(Ordering::Acquire) >= y {
             return;
         }
-        let t = std::time::Instant::now();
+        let t = prof::at();
         let mut g = self.lock.lock().unwrap();
         while self.derived.load(Ordering::Acquire) < y {
             g = self.cv.wait(g).unwrap();
         }
-        if prof::enabled() {
-            prof::add(&prof::WAIT_REF, t);
-        }
+        prof::add(&prof::WAIT_REF, t);
     }
 
     /// Block until rows `< y` are reconstructed.
@@ -131,14 +127,12 @@ impl Progress {
         if self.decoded.load(Ordering::Acquire) >= y {
             return;
         }
-        let t = std::time::Instant::now();
+        let t = prof::at();
         let mut g = self.lock.lock().unwrap();
         while self.decoded.load(Ordering::Acquire) < y {
             g = self.cv.wait(g).unwrap();
         }
-        if prof::enabled() {
-            prof::add(&prof::WAIT_REF, t);
-        }
+        prof::add(&prof::WAIT_REF, t);
     }
 
     /// Block until finished.
@@ -288,15 +282,33 @@ pub mod prof {
     pub static WAIT_TASKS: AtomicU64 = AtomicU64::new(0);
     /// Time on the caller's thread inside push_nal.
     pub static MAIN: AtomicU64 = AtomicU64::new(0);
+    /// A start time — taken only when profiling is on.
+    ///
+    /// `Instant::now()` is not free (a counter read, and a libc call on some
+    /// targets) and on `wasm32-unknown-unknown` it is not implemented at all:
+    /// std panics. Taking one per CTB and per NAL to throw it away when
+    /// profiling is off therefore cost every platform a little and cost wasm
+    /// the ability to run.
+    pub type At = Option<std::time::Instant>;
+
+    /// [`At`] for right now, or `None` when profiling is off.
+    #[inline]
+    pub fn at() -> At {
+        if enabled() { Some(std::time::Instant::now()) } else { None }
+    }
+
     /// Whether profiling is on (read once).
     pub fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("H26X_PROF").is_some())
     }
-    /// Add elapsed nanoseconds since `t` to `c`.
+    /// Add elapsed nanoseconds since `t` to `c`. A `None` start is a run
+    /// with profiling off, and nothing to add.
     #[inline]
-    pub fn add(c: &AtomicU64, t: std::time::Instant) {
-        c.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    pub fn add(c: &AtomicU64, t: At) {
+        if let Some(t) = t {
+            c.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
     }
     /// Print the counters.
     pub fn report() {

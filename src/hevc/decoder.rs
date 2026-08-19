@@ -129,9 +129,9 @@ struct PicShared<S: Sample> {
     trace: TraceCfg,
     warnings: Arc<AtomicU64>,
     /// When the picture was created (profiling).
-    created: std::time::Instant,
+    created: prof::At,
     /// When its first CTB was decoded (profiling).
-    first_ctb: Mutex<Option<std::time::Instant>>,
+    first_ctb: Mutex<prof::At>,
 }
 
 // SAFETY: `info` and the frame are written by tasks in disjoint CTB regions
@@ -188,15 +188,13 @@ impl<S: Sample> PicShared<S> {
         if self.ctb_done[addr].load(Ordering::Acquire) || !self.parallel {
             return;
         }
-        struct T(std::time::Instant);
+        struct T(prof::At);
         impl Drop for T {
             fn drop(&mut self) {
-                if prof::enabled() {
-                    prof::add(&prof::WAIT_NEIGHBOUR, self.0);
-                }
+                prof::add(&prof::WAIT_NEIGHBOUR, self.0);
             }
         }
-        let _t = T(std::time::Instant::now());
+        let _t = T(prof::at());
         // Spin briefly: the producer is usually one CTB away.
         let start = std::time::Instant::now();
         loop {
@@ -507,11 +505,11 @@ fn run_substream<S: Sample>(pic_arc: &Arc<PicShared<S>>, seg_arc: &Arc<Segment>,
             let rx = ctb_addr_rs % wc;
             let ry = ctb_addr_rs / wc;
             pic.wait_neighbours(rx, ry);
-            let t_dec = std::time::Instant::now();
-            if prof::enabled() {
+            let t_dec = prof::at();
+            if t_dec.is_some() {
                 let mut f = pic.first_ctb.lock().unwrap();
                 if f.is_none() {
-                    *f = Some(t_dec);
+                    *f = t_dec;
                 }
             }
             dec.decode_ctu(ctb_addr_rs, ctb_addr_ts)?;
@@ -562,11 +560,9 @@ fn run_substream<S: Sample>(pic_arc: &Arc<PicShared<S>>, seg_arc: &Arc<Segment>,
                 match &pic_arc.filter_pool {
                     Some(pool) => spawn_filter_task(pic_arc, pool),
                     None => {
-                        let t_f = std::time::Instant::now();
+                        let t_f = prof::at();
                         pic.run_filters(dec.frame, dec.info);
-                        if prof::enabled() {
-                            prof::add(&prof::FILTER, t_f);
-                        }
+                        prof::add(&prof::FILTER, t_f);
                     }
                 }
             }
@@ -657,16 +653,14 @@ fn spawn_filter_task<S: Sample>(pic: &Arc<PicShared<S>>, pool: &Arc<Pool>) {
             }
         }
         let _done = Done(&pic_arc);
-        let t_f = std::time::Instant::now();
+        let t_f = prof::at();
         // SAFETY: the filters touch only rows the decoding tasks have
         // finished (row_ctbs), the same discipline as when a decoding task
         // runs them; the filter state is behind its mutex.
         let frame: &mut Frame<S> = unsafe { pic_arc.frame_mut() };
         let info: &PicInfo = unsafe { pic_arc.info() };
         pic_arc.run_filters(frame, info);
-        if prof::enabled() {
-            prof::add(&prof::FILTER, t_f);
-        }
+        prof::add(&prof::FILTER, t_f);
     }));
 }
 
@@ -823,7 +817,7 @@ impl<S: Sample> RowFilterState<S> {
 /// The tail of a picture: run once every task has finished — the last
 /// filter rows, then completion.
 fn finish_picture_tasks<S: Sample>(pic: &PicShared<S>) {
-    let t = std::time::Instant::now();
+    let t = prof::at();
     // SAFETY: all tasks are done; this is now the only accessor.
     let frame: &mut Frame<S> = unsafe { pic.frame_mut() };
     let info: &PicInfo = unsafe { pic.info() };
@@ -835,8 +829,13 @@ fn finish_picture_tasks<S: Sample>(pic: &PicShared<S>) {
     pic.frame.progress.finish();
     if prof::enabled() {
         prof::add(&prof::WAIT_TASKS, t);
-        let first = pic.first_ctb.lock().unwrap().map(|f| f.duration_since(pic.created).as_micros()).unwrap_or(0);
-        eprintln!("pic poc={} created+{}us first-ctb, +{}us complete", pic.poc, first, pic.created.elapsed().as_micros());
+        // Both are `Some` whenever this line runs: profiling was on when the
+        // picture was created and when its first CTB was decoded, which is
+        // the same flag read once per process.
+        if let Some(created) = pic.created {
+            let first = pic.first_ctb.lock().unwrap().map(|f| f.duration_since(created).as_micros()).unwrap_or(0);
+            eprintln!("pic poc={} created+{}us first-ctb, +{}us complete", pic.poc, first, created.elapsed().as_micros());
+        }
     }
 }
 
@@ -956,11 +955,9 @@ impl<S: Sample> HevcDecoderImpl<S> {
 
     /// Feed one NAL unit (with its two header bytes, without start code).
     pub fn push_nal(&mut self, nal: &[u8]) -> Result<()> {
-        let t = std::time::Instant::now();
+        let t = prof::at();
         let r = self.push_nal_inner(nal);
-        if prof::enabled() {
-            prof::add(&prof::MAIN, t);
-        }
+        prof::add(&prof::MAIN, t);
         r
     }
 
@@ -1334,7 +1331,7 @@ impl<S: Sample> HevcDecoderImpl<S> {
             sao: self.sao,
             trace: TraceCfg::from_env(),
             warnings: self.warnings.clone(),
-            created: std::time::Instant::now(),
+            created: prof::at(),
             first_ctb: Mutex::new(None),
         });
         self.cur = Some(Current { id, pic_output, shared: pic, independent: None, slice_count: 0, buffers_ready: false });
