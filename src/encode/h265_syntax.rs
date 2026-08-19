@@ -85,18 +85,28 @@ impl Geometry {
     /// picture is smaller than that, because a CTU larger than the picture is
     /// legal but wastes header bits describing a tree that cannot split.
     pub fn new(cfg: &Config) -> Self {
-        let smaller = cfg.width.min(cfg.height);
-        let log2_ctb = if smaller >= 64 {
-            6
-        } else if smaller >= 32 {
-            5
-        } else {
-            4
-        };
         let log2_min_cb = 3;
-        let min_cb = 1u32 << log2_min_cb;
-        let coded_width = cfg.width.div_ceil(min_cb) * min_cb;
-        let coded_height = cfg.height.div_ceil(min_cb) * min_cb;
+        // The coded picture is a whole number of CTUs, with the conformance
+        // window cropping the rest — not the minimal legal size, which only
+        // needs a multiple of the minimum coding block. Whole CTUs because
+        // the intra decision machinery codes exactly one CU per CTU and
+        // cannot express the quadtree shapes a partial edge CTU needs; the
+        // padding costs a few edge blocks of replicated content, and the
+        // window hides them. The standard's CTB floor is 16 (an 8x8 CTB is
+        // illegal — this crate's own SPS parser rejects it, which is how
+        // that constraint was rediscovered), and the decision machinery's
+        // ceiling is 32, so the choice is 16 or 32: whichever pads less,
+        // the larger on a tie.
+        let (log2_ctb, coded_width, coded_height) = [5u32, 4]
+            .into_iter()
+            .map(|v| {
+                let n = 1u32 << v;
+                let w = cfg.width.div_ceil(n) * n;
+                let h = cfg.height.div_ceil(n) * n;
+                (v, w, h)
+            })
+            .min_by_key(|&(v, w, h)| (w * h, u32::MAX - v))
+            .unwrap();
         let ctb = 1u32 << log2_ctb;
         Self {
             log2_ctb,
@@ -218,7 +228,13 @@ pub fn write_sps(cfg: &Config, g: &Geometry, log2_max_poc_lsb: u32) -> Vec<u8> {
     w.ue(g.log2_min_cb - 3); // log2_min_luma_coding_block_size_minus3
     w.ue(g.log2_ctb - g.log2_min_cb); // log2_diff_max_min_luma_coding_block_size
     w.ue(0); // log2_min_luma_transform_block_size_minus2 -> 4x4
-    w.ue(g.log2_ctb - 2 - 1); // log2_diff_max_min_luma_transform_block_size
+    // The maximum transform size equals the CTB size (the CTB is at most 32,
+    // which is also the standard's largest transform), so a 2Nx2N CU can
+    // carry a single CU-sized TU — which is the only transform tree the
+    // intra decision module produces. The previous value, one below the CTB,
+    // would have forced an inferred transform split under every whole-CTU
+    // CU and made that shape unrepresentable.
+    w.ue(g.log2_ctb - 2); // log2_diff_max_min_luma_transform_block_size
     w.ue(2); // max_transform_hierarchy_depth_inter
     w.ue(2); // max_transform_hierarchy_depth_intra
     w.flag(false); // scaling_list_enabled_flag
@@ -260,7 +276,18 @@ pub fn write_pps(qp: u8) -> Vec<u8> {
     w.flag(false); // tiles_enabled_flag
     w.flag(false); // entropy_coding_sync_enabled_flag
     w.flag(true); // pps_loop_filter_across_slices_enabled_flag
-    w.flag(false); // deblocking_filter_control_present_flag
+    // The deblocking filter is disabled picture-wide, and the reason is the
+    // SELF property, not taste: the encoder does not yet run the filter over
+    // its own reconstruction, and a decoder that filters against an encoder
+    // that does not desyncs on exactly the samples the filter touches — a
+    // first H.265 stream failed SELF on 24 luma samples, every one within
+    // three of the 8-sample deblocking grid, while libavcodec and our
+    // decoder agreed with each other perfectly. When the encoder learns to
+    // deblock its reconstruction, these three bits flip for the quality the
+    // filter buys.
+    w.flag(true); // deblocking_filter_control_present_flag
+    w.flag(false); // deblocking_filter_override_enabled_flag
+    w.flag(true); // pps_deblocking_filter_disabled_flag
     w.flag(false); // pps_scaling_list_data_present_flag
     w.flag(false); // lists_modification_present_flag
     w.ue(0); // log2_parallel_merge_level_minus2
@@ -308,7 +335,12 @@ pub fn write_slice_header(h: &SliceHeader, pps_qp: u8, nal_type: u8, w: &mut Bit
     // spurious bit that shifted everything after it, unnoticed because
     // nothing could decode past the header until the coding tree existed.)
     w.se(h.qp as i32 - pps_qp as i32); // slice_qp_delta
-    w.flag(false); // slice_loop_filter_across_slices, deblocking defaults
+    // slice_loop_filter_across_slices_enabled_flag is NOT written: the
+    // reader reads it only when SAO is on for the slice or deblocking is
+    // not disabled, and this encoder's PPS disables deblocking while its
+    // SPS disables SAO. Writing it anyway shifts every bit after it — the
+    // same one-spurious-bit shape as the SAO flag this header once wrote,
+    // caught the same way, by the production parser refusing the header.
 }
 
 #[cfg(test)]
@@ -349,7 +381,7 @@ mod tests {
     #[test]
     fn the_conformance_window_recovers_the_requested_size() {
         let (cfg, g) = geom(50, 34, ChromaFormat::Yuv420);
-        assert_eq!((g.coded_width, g.coded_height), (56, 40));
+        assert_eq!((g.coded_width, g.coded_height), (64, 48));
         let sps = write_sps(&cfg, &g, 8);
         let parsed = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&sps)).unwrap();
         let (l, r, t, b) = parsed.conf_win;
@@ -357,13 +389,20 @@ mod tests {
         assert_eq!(g.coded_height - t - b, 34);
     }
 
-    /// A CTU larger than the picture is legal but wasteful, so the size is
-    /// chosen from the picture rather than fixed.
+    /// The coded picture is a whole number of CTUs, CTB 16 or 32 by least
+    /// padding — see `Geometry::new` for why partial edge CTUs are avoided.
     #[test]
-    fn the_ctu_size_shrinks_for_small_pictures() {
-        assert_eq!(Geometry::new(&geom(64, 64, ChromaFormat::Yuv420).0).log2_ctb, 6);
-        assert_eq!(Geometry::new(&geom(48, 48, ChromaFormat::Yuv420).0).log2_ctb, 5);
-        assert_eq!(Geometry::new(&geom(24, 24, ChromaFormat::Yuv420).0).log2_ctb, 4);
+    fn the_coded_picture_is_whole_ctus_with_least_padding() {
+        let g = Geometry::new(&geom(64, 64, ChromaFormat::Yuv420).0);
+        assert_eq!((g.log2_ctb, g.coded_width, g.coded_height), (5, 64, 64));
+        let g = Geometry::new(&geom(48, 48, ChromaFormat::Yuv420).0);
+        assert_eq!((g.log2_ctb, g.coded_width, g.coded_height), (4, 48, 48));
+        // 24x24 pads to 32x32 under either CTB size; the tie goes to 32.
+        let g = Geometry::new(&geom(24, 24, ChromaFormat::Yuv420).0);
+        assert_eq!((g.log2_ctb, g.coded_width, g.coded_height), (5, 32, 32));
+        // 50x34: CTB 16 pads to 64x48, CTB 32 to 64x64 — 16 pads less.
+        let g = Geometry::new(&geom(50, 34, ChromaFormat::Yuv420).0);
+        assert_eq!((g.log2_ctb, g.coded_width, g.coded_height), (4, 64, 48));
     }
 
     #[test]
