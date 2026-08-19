@@ -11,6 +11,7 @@
 //! CPU themselves and the scalar path stays the executable specification the
 //! SIMD path is tested against.
 
+pub mod distortion;
 pub mod h264;
 pub mod h264_enc;
 pub mod hevc;
