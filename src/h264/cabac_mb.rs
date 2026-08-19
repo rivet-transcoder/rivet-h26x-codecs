@@ -385,54 +385,80 @@ fn decode_ref_idx(
     Ok(v)
 }
 
-/// `mvd_lX` component (9.3.3.1.1.7): TU prefix (cMax 9) + UEG3 suffix + sign.
-fn decode_mvd_component(
+/// Both absolute mvd components of one neighbouring 4x4 block, for the
+/// ctxIdxInc of 9.3.3.1.1.7 — zero where the neighbour is absent, skipped,
+/// intra, or direct-predicted, which have no mvd of their own.
+///
+/// The two components come back together because the two calls that want
+/// them agree on everything but the last step. Finding the block, deciding
+/// whether it counts, and scaling across a field boundary is the work; which
+/// component is then read is a field access. Deriving the pair once halves
+/// what a motion vector difference costs in neighbour lookups.
+fn mvd_neighbour_abs(
+    info: &PicInfo,
+    layer: &MbLayer,
+    nb: &MbNeighbours,
+    list: usize,
+    bx: i32,
+    by: i32,
+) -> (i32, i32) {
+    let Some((addr, blk)) = nb.block(bx, by) else {
+        return (0, 0);
+    };
+    if addr == nb.addr {
+        if is_direct_block(info, layer, nb.addr, addr, blk) {
+            return (0, 0);
+        }
+        let m = layer.mvd[blk].mvd[list];
+        return (m.x.abs() as i32, m.y.abs() as i32);
+    }
+    let mi = &info.mbs[addr];
+    if mi.kind.is_skip() || mi.kind.is_intra() || is_direct_block(info, layer, nb.addr, addr, blk) {
+        return (0, 0);
+    }
+    let m = info.mvd[list][addr * 16 + blk];
+    let y = if nb.mbaff && !nb.cur_field && mi.field {
+        // 9.3.3.1.1.7: a frame macroblock reads a field neighbour's vertical
+        // mvd doubled, a field macroblock a frame one's halved.
+        m.y.abs() as i32 * 2
+    } else if nb.mbaff && nb.cur_field && !mi.field {
+        m.y.abs() as i32 / 2
+    } else {
+        m.y.abs() as i32
+    };
+    (m.x.abs() as i32, y)
+}
+
+/// `mvd_l0` / `mvd_l1` for one partition: both components, in that order.
+fn decode_mvd(
     c: &mut Cabac,
     st: &mut CabacState,
     info: &PicInfo,
     layer: &MbLayer,
     nb: &MbNeighbours,
     list: usize,
-    comp: usize,
     bx: i32,
     by: i32,
+) -> Result<(i16, i16)> {
+    // Nothing between the two components writes the neighbouring mvds — the
+    // caller stores this partition's only once both are decoded — so one
+    // derivation serves both.
+    let left = mvd_neighbour_abs(info, layer, nb, list, bx - 1, by);
+    let above = mvd_neighbour_abs(info, layer, nb, list, bx, by - 1);
+    let x = decode_mvd_component(c, st, left.0 + above.0, list, 0)?;
+    let y = decode_mvd_component(c, st, left.1 + above.1, list, 1)?;
+    Ok((x, y))
+}
+
+/// One `mvd_lX` component (9.3.3.1.1.7), given the sum of its neighbours'
+/// absolute values: TU prefix (cMax 9) + UEG3 suffix + sign.
+fn decode_mvd_component(
+    c: &mut Cabac,
+    st: &mut CabacState,
+    sum: i32,
+    list: usize,
+    comp: usize,
 ) -> Result<i16> {
-    let abs_of = |dx: i32, dy: i32| -> i32 {
-        let Some((addr, blk)) = nb.block(bx + dx, by + dy) else {
-            return 0;
-        };
-        if addr == nb.addr {
-            if is_direct_block(info, layer, nb.addr, addr, blk) {
-                return 0;
-            }
-            let m = layer.mvd[blk].mvd[list];
-            return if comp == 0 {
-                m.x.abs() as i32
-            } else {
-                m.y.abs() as i32
-            };
-        }
-        let mi = &info.mbs[addr];
-        if mi.kind.is_skip()
-            || mi.kind.is_intra()
-            || is_direct_block(info, layer, nb.addr, addr, blk)
-        {
-            return 0;
-        }
-        let m = info.mvd[list][addr * 16 + blk];
-        if comp == 0 {
-            m.x.abs() as i32
-        } else if nb.mbaff && !nb.cur_field && mi.field {
-            // 9.3.3.1.1.7: a frame macroblock reads a field neighbour's
-            // vertical mvd doubled, a field macroblock a frame one's halved.
-            m.y.abs() as i32 * 2
-        } else if nb.mbaff && nb.cur_field && !mi.field {
-            m.y.abs() as i32 / 2
-        } else {
-            m.y.abs() as i32
-        }
-    };
-    let sum = abs_of(-1, 0) + abs_of(0, -1);
     let base = if comp == 0 { CTX_MVD_X } else { CTX_MVD_Y };
     let inc = if sum < 3 {
         0
@@ -447,8 +473,10 @@ fn decode_mvd_component(
     let mut prefix = 0u32;
     if bin(c, st, base + inc) != 0 {
         prefix = 1;
-        let incs = [3usize, 4, 5, 6, 6, 6, 6, 6];
-        while prefix < 9 && bin(c, st, base + incs[(prefix - 1) as usize]) != 0 {
+        // ctxIdxInc runs 3, 4, 5, 6, 6, 6, 6, 6 over the remaining bins
+        // (Table 9-34), which is the count capped at three, plus three —
+        // cheaper to work out than to look up.
+        while prefix < 9 && bin(c, st, base + 3 + (prefix - 1).min(3) as usize) != 0 {
             prefix += 1;
         }
     }
@@ -1129,8 +1157,7 @@ pub fn parse_mb_cabac(
                 for sub in 0..shape.count() {
                     let (x, y, _, _) = sub_partition_rect(part, shape, sub);
                     let (bx, by) = ((x / 4) as i32, (y / 4) as i32);
-                    let mx = decode_mvd_component(c, st, info, &layer, nb, list, 0, bx, by)?;
-                    let my = decode_mvd_component(c, st, info, &layer, nb, list, 1, bx, by)?;
+                    let (mx, my) = decode_mvd(c, st, info, &layer, nb, list, bx, by)?;
                     // The mvd applies to every 4x4 of the sub-partition (for
                     // later neighbours' contexts).
                     let (_, _, w, h) = sub_partition_rect(part, shape, sub);
@@ -1224,8 +1251,7 @@ pub fn parse_mb_cabac(
                             continue;
                         }
                         let (bx, by) = ((x / 4) as i32, (y / 4) as i32);
-                        let mx = decode_mvd_component(c, st, info, &layer, nb, list, 0, bx, by)?;
-                        let my = decode_mvd_component(c, st, info, &layer, nb, list, 1, bx, by)?;
+                        let (mx, my) = decode_mvd(c, st, info, &layer, nb, list, bx, by)?;
                         for yy in y / 4..(y + h) / 4 {
                             for xx in x / 4..(x + w) / 4 {
                                 layer.mvd[yy * 4 + xx].mvd[list] = Mv::new(mx, my);
