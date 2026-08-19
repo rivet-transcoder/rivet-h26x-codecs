@@ -303,7 +303,10 @@ pub fn write_slice_header(h: &SliceHeader, pps_qp: u8, nal_type: u8, w: &mut Bit
                       // num_short_term_ref_pic_sets 0 this encoder must send
                       // an inline set, which arrives with inter prediction.
     }
-    w.flag(false); // slice_sao_luma_flag is absent: SAO disabled in the SPS
+    // slice_sao_luma_flag / slice_sao_chroma_flag are absent: SAO is
+    // disabled in the SPS. (A flag was once written here anyway — one
+    // spurious bit that shifted everything after it, unnoticed because
+    // nothing could decode past the header until the coding tree existed.)
     w.se(h.qp as i32 - pps_qp as i32); // slice_qp_delta
     w.flag(false); // slice_loop_filter_across_slices, deblocking defaults
 }

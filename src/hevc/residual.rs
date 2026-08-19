@@ -1,8 +1,12 @@
 //! Residual coding (H.265 7.3.8.11 / 9.3.4.2.3–7): parsing the transform
 //! coefficient levels of one transform block, then scaling (8.6.3); the
-//! inverse transforms live in [`crate::dsp::hevc`].
+//! inverse transforms live in [`crate::dsp::hevc`]. The *writer* for the
+//! same syntax ([`write_residual`]) lives here too, beside the parser it
+//! inverts, and the two share every scan table and context derivation —
+//! an inverse pair drifts when its halves are edited apart.
 
 use crate::cabac::Cabac;
+use crate::cabac_enc::CabacEncoder;
 use crate::{Error, Result};
 
 use super::ctx::*;
@@ -114,6 +118,101 @@ fn sub_block_tables() -> &'static SubBlockTables {
     })
 }
 
+/// The context assignment of `last_sig_coeff_{x,y}_prefix` (9.3.4.2.3) as
+/// `(ctxOffset, ctxShift)`: bin `binIdx` of either prefix uses context
+/// `OFFSET + ctxOffset + (binIdx >> ctxShift)` of its element's range.
+///
+/// One copy of the formula, read by [`parse_residual`] and
+/// [`write_residual`] both, so the two directions cannot disagree about it.
+#[inline]
+fn last_sig_ctx(c_idx: usize, log2: u32) -> (u32, u32) {
+    if c_idx == 0 {
+        (3 * (log2 - 2) + ((log2 - 1) >> 2), (log2 + 1) >> 2)
+    } else {
+        (15, log2 - 2)
+    }
+}
+
+/// The `sig_coeff_flag` context index for every scan position of one 4x4
+/// sub-block (9.3.4.2.5), written into `ctx_of[..fill]` — absolute indices
+/// into [`Contexts::c`]. `prev_csbf` is the neighbour pattern (bit 0 =
+/// right sub-block coded, bit 1 = below), `(xs, ys)` the sub-block's
+/// position in sub-block units, `ts_sig_ctx` the single-context override
+/// for transform-skipped / bypassed blocks under
+/// `transform_skip_context_enabled_flag`.
+///
+/// Shared between [`parse_residual`] and [`write_residual`]: the
+/// significance context derivation is the most intricate table in residual
+/// coding, and the conformance suites pin the parser's use of it — sharing
+/// it means the writer inherits that proof rather than re-deriving the
+/// tables and drifting.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn sig_ctx_of(
+    tabs: &SubBlockTables,
+    scan_idx: u32,
+    log2: u32,
+    c_idx: usize,
+    xs: usize,
+    ys: usize,
+    prev_csbf: usize,
+    ts_sig_ctx: Option<usize>,
+    fill: usize,
+    ctx_of: &mut [u16; 16],
+) {
+    let sig_tab = &tabs.sig[scan_idx as usize][prev_csbf];
+    // The sub-block-level part of sigCtx (everything but the position).
+    let sig_base: u32 = if log2 == 2 {
+        0
+    } else if c_idx == 0 {
+        (if xs + ys > 0 { 3 } else { 0 }) + if log2 == 3 { if scan_idx == 0 { 9 } else { 15 } } else { 21 }
+    } else if log2 == 3 {
+        9
+    } else {
+        12
+    };
+    let sig_ctx_off = SIGNIFICANT_COEFF_FLAG_OFFSET + if c_idx == 0 { 0 } else { 27 };
+    if let Some(c) = ts_sig_ctx {
+        // Transform-skipped / bypassed: one context for every position.
+        ctx_of[..fill].fill((sig_ctx_off + c - if c_idx == 0 { 0 } else { 27 }) as u16);
+    } else if log2 == 2 {
+        for (t, &m) in ctx_of[..fill].iter_mut().zip(&tabs.ctx4[scan_idx as usize]) {
+            *t = (sig_ctx_off + m as usize) as u16;
+        }
+    } else {
+        for (t, &s) in ctx_of[..fill].iter_mut().zip(sig_tab.iter()) {
+            *t = (sig_ctx_off + sig_base as usize + s as usize) as u16;
+        }
+        if xs + ys == 0 && fill > 0 {
+            // (xC, yC) == (0, 0): the DC of the block.
+            ctx_of[0] = sig_ctx_off as u16;
+        }
+    }
+}
+
+/// `scanIdx` for a transform block (7.4.9.11): mode-dependent for small
+/// intra blocks — near-horizontal modes (6..=14) scan vertically,
+/// near-vertical modes (22..=30) horizontally, everything else diagonally.
+/// `pred_mode` is the intra prediction mode of the block's own component
+/// (the chroma mode for a chroma block).
+///
+/// This is decision-side configuration for [`ResidualParams::scan_idx`]:
+/// the parser derives it from the reconstructed modes, and an encoder must
+/// derive it from the modes it chose, through this one copy.
+pub(crate) fn residual_scan_idx(intra: bool, log2: u32, c_idx: usize, chroma_array_type: u32, pred_mode: u32) -> u32 {
+    if intra && (log2 == 2 || (log2 == 3 && (c_idx == 0 || chroma_array_type == 3))) {
+        if (6..=14).contains(&pred_mode) {
+            2
+        } else if (22..=30).contains(&pred_mode) {
+            1
+        } else {
+            0
+        }
+    } else {
+        0
+    }
+}
+
 /// What the transform block needs from its surroundings.
 pub struct ResidualParams {
     /// `log2TrafoSize`.
@@ -201,11 +300,7 @@ pub fn parse_residual(cabac: &mut Cabac, cx: &mut Contexts, p: &ResidualParams, 
     let sb_type = (c_idx == 0) as usize * 2 + ts_or_bypass as usize;
 
     // last_sig_coeff_{x,y}_prefix / suffix.
-    let (ctx_offset, ctx_shift) = if c_idx == 0 {
-        (3 * (log2 - 2) + ((log2 - 1) >> 2), (log2 + 1) >> 2)
-    } else {
-        (15, log2 - 2)
-    };
+    let (ctx_offset, ctx_shift) = last_sig_ctx(c_idx, log2);
     let c_max = (log2 << 1) - 1;
     let mut last_x_prefix = 0u32;
     while last_x_prefix < c_max
@@ -291,18 +386,6 @@ pub fn parse_residual(cabac: &mut Cabac, cx: &mut Contexts, p: &ResidualParams, 
             prev_csbf += (csbf[(ys + 1) * sb_w + xs] as usize) << 1;
         }
         let pos_tab = &tabs.pos[p.scan_idx as usize];
-        let sig_tab = &tabs.sig[p.scan_idx as usize][prev_csbf];
-        // The sub-block-level part of sigCtx (everything but the position).
-        let sig_base: u32 = if log2 == 2 {
-            0
-        } else if c_idx == 0 {
-            (if xs + ys > 0 { 3 } else { 0 }) + if log2 == 3 { if p.scan_idx == 0 { 9 } else { 15 } } else { 21 }
-        } else if log2 == 3 {
-            9
-        } else {
-            12
-        };
-        let sig_ctx_off = SIGNIFICANT_COEFF_FLAG_OFFSET + if c_idx == 0 { 0 } else { 27 };
         if coded {
             // Significance context per scan position (9.3.4.2.5): which of
             // the three derivations applies is fixed for the whole transform
@@ -312,22 +395,7 @@ pub fn parse_residual(cabac: &mut Cabac, cx: &mut Contexts, p: &ResidualParams, 
             // coefficient inside the loop below.
             let mut ctx_of = [0u16; 16];
             let fill = (start_n + 1) as usize;
-            if let Some(c) = ts_sig_ctx {
-                // Transform-skipped / bypassed: one context for every position.
-                ctx_of[..fill].fill((sig_ctx_off + c - if c_idx == 0 { 0 } else { 27 }) as u16);
-            } else if log2 == 2 {
-                for (t, &m) in ctx_of[..fill].iter_mut().zip(&tabs.ctx4[p.scan_idx as usize]) {
-                    *t = (sig_ctx_off + m as usize) as u16;
-                }
-            } else {
-                for (t, &s) in ctx_of[..fill].iter_mut().zip(sig_tab.iter()) {
-                    *t = (sig_ctx_off + sig_base as usize + s as usize) as u16;
-                }
-                if xs + ys == 0 && fill > 0 {
-                    // (xC, yC) == (0, 0): the DC of the block.
-                    ctx_of[0] = sig_ctx_off as u16;
-                }
-            }
+            sig_ctx_of(tabs, p.scan_idx, log2, c_idx, xs, ys, prev_csbf, ts_sig_ctx, fill, &mut ctx_of);
             // Scan position 0 is the only one that can be inferred, so it
             // comes after the loop rather than being tested inside it.
             let mut nn = start_n;
@@ -465,6 +533,300 @@ pub fn parse_residual(cabac: &mut Cabac, cx: &mut Contexts, p: &ResidualParams, 
         return Err(Error::bitstream("slice data exhausted in residual coding"));
     }
     Ok(ResidualInfo { transform_skip, max_x, max_y, rdpcm })
+}
+
+/// Write `residual_coding()` for one transform block: the inverse of
+/// [`parse_residual`]. `coeffs` is the block in raster order — the layout
+/// that function decodes *into* — with `1 << (2 * log2_size)` entries, at
+/// least one of them nonzero (an all-zero block cannot be spelled here; the
+/// caller says it with a cbf instead).
+///
+/// It lives beside the reader on purpose, and shares its scan tables and
+/// context derivations ([`sig_ctx_of`], [`last_sig_ctx`]): the two are
+/// exact inverses over a binarisation full of small rules — a last position
+/// coded as coordinates rather than a flag, a DC significance bit that is
+/// sometimes inferred rather than coded, flag thresholds that decide
+/// whether a remaining level follows, a Rice parameter that adapts on the
+/// previous level — and every rule read off different lines twice is a
+/// desync waiting to surface hundreds of blocks later.
+///
+/// Only the configuration this crate's encoder writes is spellable —
+/// no transquant bypass, no transform skip, no sign data hiding, none of
+/// the range-extension coding tools — and the writer refuses the rest
+/// (debug assertions) rather than half-supporting it: `sign_hiding`
+/// especially would change which sign bins exist, not just their values.
+///
+/// Nothing outside the tests calls it yet — the H.265 encoder that will is
+/// being built alongside it; drop the allow when it lands.
+#[allow(dead_code)]
+pub(crate) fn write_residual(e: &mut CabacEncoder, cx: &mut Contexts, p: &ResidualParams, coeffs: &[i16]) {
+    debug_assert!(!p.bypass, "cu_transquant_bypass residual writing is not supported");
+    debug_assert!(!p.transform_skip_allowed, "transform_skip_flag writing is not supported (PPS keeps it off)");
+    debug_assert!(!p.sign_hiding, "sign data hiding is not supported (PPS keeps it off)");
+    debug_assert!(!p.explicit_rdpcm && !p.persistent_rice && !p.ts_context, "range-extension residual tools are not supported");
+    let log2 = p.log2_size;
+    let n = 1usize << log2;
+    let c_idx = p.c_idx;
+
+    // The last significant coefficient in scan order: highest sub-block
+    // first, highest scan position within it second — through the same
+    // inverse scans the reader uses to locate it from the coordinates.
+    let log2_sb = log2 - 2;
+    let sb_w = 1usize << log2_sb;
+    let tabs = sub_block_tables();
+    let scan = p.scan_idx as usize;
+    let mut last_x = 0usize;
+    let mut last_y = 0usize;
+    let mut best = -1i32;
+    for y in 0..n {
+        for x in 0..n {
+            if coeffs[y * n + x] != 0 {
+                let sb = tabs.inv_sb[scan][log2_sb as usize][((y >> 2) << log2_sb) + (x >> 2)] as i32;
+                let pos = tabs.inv4[scan][((y & 3) << 2) + (x & 3)] as i32;
+                let key = sb * 16 + pos;
+                if key > best {
+                    best = key;
+                    last_x = x;
+                    last_y = y;
+                }
+            }
+        }
+    }
+    debug_assert!(best >= 0, "residual_coding cannot spell an all-zero block");
+
+    // last_sig_coeff_{x,y}: the reader swaps x and y *after* reading for a
+    // vertical scan, so the writer swaps before writing. Both prefixes come
+    // first, then both suffixes — the reader's read order.
+    let (lx, ly) = if p.scan_idx == 2 { (last_y as u32, last_x as u32) } else { (last_x as u32, last_y as u32) };
+    let (ctx_offset, ctx_shift) = last_sig_ctx(c_idx, log2);
+    let c_max = (log2 << 1) - 1;
+    // The prefix groups of 9.3.3.9: values 0..=3 spell themselves; above
+    // that, prefix p covers 2^(p/2 - 1) values from (2 + p % 2) << (p/2 - 1)
+    // — read off the reader's reconstruction `(1 << nb) * (2 + (prefix & 1))
+    // + suffix` with `nb = (prefix >> 1) - 1`.
+    let prefix_of = |v: u32| -> u32 {
+        if v <= 3 {
+            return v;
+        }
+        let msb = 31 - v.leading_zeros();
+        2 * msb + ((v - (1 << msb) >= (1 << (msb - 1))) as u32)
+    };
+    let (px, py) = (prefix_of(lx), prefix_of(ly));
+    for i in 0..px {
+        e.encode_decision(&mut cx.c[LAST_SIGNIFICANT_COEFF_X_PREFIX_OFFSET + (ctx_offset + (i >> ctx_shift)) as usize], 1);
+    }
+    if px < c_max {
+        e.encode_decision(&mut cx.c[LAST_SIGNIFICANT_COEFF_X_PREFIX_OFFSET + (ctx_offset + (px >> ctx_shift)) as usize], 0);
+    }
+    for i in 0..py {
+        e.encode_decision(&mut cx.c[LAST_SIGNIFICANT_COEFF_Y_PREFIX_OFFSET + (ctx_offset + (i >> ctx_shift)) as usize], 1);
+    }
+    if py < c_max {
+        e.encode_decision(&mut cx.c[LAST_SIGNIFICANT_COEFF_Y_PREFIX_OFFSET + (ctx_offset + (py >> ctx_shift)) as usize], 0);
+    }
+    if px > 3 {
+        let nb = (px >> 1) - 1;
+        e.encode_bypass_bits(nb, lx - (1 << nb) * (2 + (px & 1)));
+    }
+    if py > 3 {
+        let nb = (py >> 1) - 1;
+        e.encode_bypass_bits(nb, ly - (1 << nb) * (2 + (py & 1)));
+    }
+
+    let last_sub_block = tabs.inv_sb[scan][log2_sb as usize][((last_y >> 2) << log2_sb) + (last_x >> 2)] as usize;
+    let last_scan_pos = tabs.inv4[scan][((last_y & 3) << 2) + (last_x & 3)] as usize;
+
+    let pos_tab = &tabs.pos[scan];
+    // The raster index of scan position `sp` of sub-block (xs, ys).
+    let coord = |xs: usize, ys: usize, sp: usize| -> usize {
+        let (xp, yp) = pos_tab[sp];
+        ((ys << 2) + yp as usize) * n + (xs << 2) + xp as usize
+    };
+
+    let mut csbf = [0u8; 64];
+    let mut greater1_ctx_state: u32 = 1; // greater1Ctx carried across sub-blocks
+    let mut first_sb_processed = true;
+
+    for i in (0..=last_sub_block).rev() {
+        let (xs, ys) = scan_pos(p.scan_idx, log2_sb, i);
+        let mut infer_sb_dc_sig = false;
+        let coded: bool;
+        if i < last_sub_block && i > 0 {
+            let mut csbf_ctx = 0u32;
+            if xs < sb_w - 1 {
+                csbf_ctx += csbf[ys * sb_w + xs + 1] as u32;
+            }
+            if ys < sb_w - 1 {
+                csbf_ctx += csbf[(ys + 1) * sb_w + xs] as u32;
+            }
+            let inc = if c_idx == 0 { csbf_ctx.min(1) } else { 2 + csbf_ctx.min(1) };
+            coded = (0..16).any(|sp| coeffs[coord(xs, ys, sp)] != 0);
+            e.encode_decision(&mut cx.c[SIGNIFICANT_COEFF_GROUP_FLAG_OFFSET + inc as usize], coded as u32);
+            infer_sb_dc_sig = true;
+        } else {
+            coded = true; // the first and last sub-blocks are inferred coded
+        }
+        csbf[ys * sb_w + xs] = coded as u8;
+        if !coded {
+            continue;
+        }
+
+        // Significance flags in reverse scan; the significant positions are
+        // collected the way the reader collects them (reverse scan order,
+        // the last coefficient of the block first).
+        let mut sig_pos = [0u8; 16];
+        let mut n_sig = 0usize;
+        let start_n = if i == last_sub_block { last_scan_pos as i32 - 1 } else { 15 };
+        if i == last_sub_block {
+            // Implied by the last-position coordinates; no flag is coded.
+            sig_pos[0] = last_scan_pos as u8;
+            n_sig = 1;
+        }
+        let mut prev_csbf = 0usize;
+        if xs < sb_w - 1 {
+            prev_csbf += csbf[ys * sb_w + xs + 1] as usize;
+        }
+        if ys < sb_w - 1 {
+            prev_csbf += (csbf[(ys + 1) * sb_w + xs] as usize) << 1;
+        }
+        let mut ctx_of = [0u16; 16];
+        let fill = (start_n + 1) as usize;
+        sig_ctx_of(tabs, p.scan_idx, log2, c_idx, xs, ys, prev_csbf, None, fill, &mut ctx_of);
+        let mut nn = start_n;
+        while nn > 0 {
+            let sig = coeffs[coord(xs, ys, nn as usize)] != 0;
+            e.encode_decision(&mut cx.c[ctx_of[nn as usize] as usize], sig as u32);
+            if sig {
+                sig_pos[n_sig] = nn as u8;
+                n_sig += 1;
+                infer_sb_dc_sig = false;
+            }
+            nn -= 1;
+        }
+        if nn == 0 {
+            let dc_sig = coeffs[coord(xs, ys, 0)] != 0;
+            if !infer_sb_dc_sig {
+                e.encode_decision(&mut cx.c[ctx_of[0] as usize], dc_sig as u32);
+                if dc_sig {
+                    sig_pos[n_sig] = 0;
+                    n_sig += 1;
+                }
+            } else {
+                // A coded sub-block with no other significant coefficient:
+                // the reader infers the DC significant, so no flag may be
+                // written — and the DC really is nonzero, because `coded`
+                // was derived from these very coefficients.
+                debug_assert!(dc_sig, "coded sub-block with nothing significant: the DC inference would lie");
+                sig_pos[n_sig] = 0;
+                n_sig += 1;
+            }
+        }
+        if n_sig == 0 {
+            continue;
+        }
+        let sig_pos = &sig_pos[..n_sig];
+        let abs_of = |k: usize| coeffs[coord(xs, ys, sig_pos[k] as usize)].unsigned_abs() as i32;
+
+        // Levels: greater1 (up to 8), greater2 (one), signs, remaining —
+        // with the context-set selection and greater1Ctx carry of 9.3.4.2.6,
+        // advanced exactly as the reader advances them.
+        let mut ctx_set: u32 = if i == 0 || c_idx > 0 { 0 } else { 2 };
+        if !first_sb_processed && greater1_ctx_state == 0 {
+            ctx_set += 1;
+        }
+        first_sb_processed = false;
+        let mut greater1_ctx: u32 = 1;
+        let mut last_greater1_idx: i32 = -1;
+        let g1_ctx_base = COEFF_ABS_LEVEL_GREATER1_FLAG_OFFSET + (ctx_set * 4) as usize + if c_idx > 0 { 16 } else { 0 };
+        for k in 0..n_sig.min(8) {
+            let g1 = abs_of(k) > 1;
+            e.encode_decision(&mut cx.c[g1_ctx_base + greater1_ctx.min(3) as usize], g1 as u32);
+            if greater1_ctx > 0 {
+                greater1_ctx = if g1 { 0 } else { greater1_ctx + 1 };
+            }
+            if g1 && last_greater1_idx == -1 {
+                last_greater1_idx = k as i32;
+            }
+        }
+        greater1_ctx_state = greater1_ctx;
+        if last_greater1_idx != -1 {
+            let inc = ctx_set as usize + if c_idx > 0 { 4 } else { 0 };
+            e.encode_decision(&mut cx.c[COEFF_ABS_LEVEL_GREATER2_FLAG_OFFSET + inc], (abs_of(last_greater1_idx as usize) > 2) as u32);
+        }
+        // Signs: one bypass run, MSB = first in reverse scan order. No sign
+        // hiding (asserted above), so every significant coefficient has one.
+        let mut signs = 0u32;
+        for k in 0..n_sig {
+            signs = (signs << 1) | (coeffs[coord(xs, ys, sig_pos[k] as usize)] < 0) as u32;
+        }
+        e.encode_bypass_bits(n_sig as u32, signs);
+        // Remaining levels: coded exactly where the flags saturated. The
+        // base level the reader will have reconstructed from the flags is 1,
+        // plus the greater1 flag, plus the greater2 flag at its one index —
+        // and the remaining is present iff that base equals the threshold
+        // the flags could not exceed.
+        let mut c_last_abs: i32 = 0;
+        let mut c_last_rice: u32 = 0;
+        let mut first_remaining = true;
+        for k in 0..n_sig {
+            let a = abs_of(k);
+            let (base_level, threshold) = if k < 8 {
+                if k as i32 == last_greater1_idx {
+                    (1 + (a > 1) as i32 + (a > 2) as i32, 3)
+                } else {
+                    (1 + (a > 1) as i32, 2)
+                }
+            } else {
+                (1, 1)
+            };
+            if base_level == threshold {
+                let rice = if first_remaining {
+                    0 // StatCoeff initialisation is a range-extension tool
+                } else {
+                    let up = c_last_rice + (c_last_abs > 3 * (1 << c_last_rice)) as u32;
+                    up.min(4)
+                };
+                write_abs_level_remaining(e, rice, (a - base_level) as u32);
+                first_remaining = false;
+                c_last_abs = a;
+                c_last_rice = rice;
+            }
+        }
+    }
+}
+
+/// `coeff_abs_level_remaining`: the inverse of [`decode_abs_level_remaining`].
+/// A truncated-Rice prefix of up to four ones — the fourth is not followed
+/// by a terminating zero, the reader's loop stops there on its own — then
+/// either `rice` suffix bits, or an EGk escape with `k = rice + 1` for what
+/// lies beyond the four groups.
+#[allow(dead_code)]
+#[inline]
+fn write_abs_level_remaining(e: &mut CabacEncoder, rice: u32, v: u32) {
+    let prefix = v >> rice;
+    if prefix < 4 {
+        for _ in 0..prefix {
+            e.encode_bypass(1);
+        }
+        e.encode_bypass(0);
+        e.encode_bypass_bits(rice, v & ((1u32 << rice) - 1));
+    } else {
+        for _ in 0..4 {
+            e.encode_bypass(1);
+        }
+        // EGk: ones while the remainder covers the next doubling, a zero,
+        // then that many bits of what is left.
+        let mut rem = v - (4 << rice);
+        let mut k = rice + 1;
+        while rem >= (1 << k) {
+            e.encode_bypass(1);
+            rem -= 1 << k;
+            k += 1;
+            debug_assert!(k <= 30, "coeff_abs_level_remaining too large to binarise");
+        }
+        e.encode_bypass(0);
+        e.encode_bypass_bits(k, rem);
+    }
 }
 
 /// Rotate a 4x4 residual by 180 degrees (`transform_skip_rotation_enabled_flag`).
@@ -605,5 +967,274 @@ pub fn transform_skip_residual(coeffs: &mut [i16], log2: u32, bit_depth: u32) {
     let round = 1i32 << (bd_shift - 1);
     for v in coeffs.iter_mut().take(n * n) {
         *v = ((((*v as i32) << ts_shift) + round) >> bd_shift).clamp(-32768, 32767) as i16;
+    }
+}
+
+#[cfg(test)]
+mod write_round_trip {
+    use super::*;
+    use crate::bitwriter::BitWriter;
+
+    fn params(log2: u32, c_idx: usize, scan_idx: u32) -> ResidualParams {
+        ResidualParams {
+            log2_size: log2,
+            c_idx,
+            scan_idx,
+            bypass: false,
+            transform_skip_allowed: false,
+            sign_hiding: false,
+            intra: true,
+            pred_mode_intra: 0,
+            ts_context: false,
+            implicit_rdpcm: false,
+            explicit_rdpcm: false,
+            persistent_rice: false,
+            trace: false,
+        }
+    }
+
+    /// Encode a sequence of blocks into one codeword, decode it with the
+    /// production parser, and require the coefficients, the nonzero extents
+    /// and the *entire* context state to come back.
+    ///
+    /// The context comparison is the half that catches a desync: two
+    /// binarisations can spell the same coefficients while leaving the
+    /// probability model in different places, and nothing goes wrong until
+    /// a later block reads a bin against a state the writer never had.
+    /// Chaining blocks through one state is what makes the carried
+    /// `greater1Ctx` set selection and the shared contexts load-bearing.
+    fn round_trip(qp: i32, blocks: &[(ResidualParams, Vec<i16>)]) {
+        let mut enc_cx = Contexts::new(0, qp);
+        let mut w = BitWriter::new();
+        {
+            let mut e = CabacEncoder::new(&mut w);
+            for (p, c) in blocks {
+                write_residual(&mut e, &mut enc_cx, p, c);
+            }
+            e.encode_terminate(1);
+        }
+        w.align_zero();
+        let data = w.into_rbsp();
+
+        let mut dec_cx = Contexts::new(0, qp);
+        let mut d = Cabac::new(&data);
+        let mut out = vec![0i16; 1024];
+        for (k, (p, want)) in blocks.iter().enumerate() {
+            let n = 1usize << p.log2_size;
+            let ri = parse_residual(&mut d, &mut dec_cx, p, &mut out)
+                .unwrap_or_else(|e| panic!("block {k}: the reader rejected what the writer produced: {e}"));
+            assert!(!ri.transform_skip, "block {k}");
+            assert_eq!(&out[..n * n], &want[..], "block {k}: coefficients differ");
+            let (mut mx, mut my) = (0usize, 0usize);
+            for y in 0..n {
+                for x in 0..n {
+                    if want[y * n + x] != 0 {
+                        mx = mx.max(x);
+                        my = my.max(y);
+                    }
+                }
+            }
+            assert_eq!((ri.max_x, ri.max_y), (mx, my), "block {k}: extents differ");
+        }
+        assert_eq!(d.terminate(), 1, "the closing terminate did not read back as 1");
+        assert!(!d.overrun(), "the reader ran past what the writer wrote");
+        assert_eq!(enc_cx.c, dec_cx.c, "context states diverged: the sides would desync on the next block");
+        assert_eq!(enc_cx.stat_coeff, dec_cx.stat_coeff);
+    }
+
+    fn one(qp: i32, p: ResidualParams, coeffs: Vec<i16>) {
+        round_trip(qp, &[(p, coeffs)]);
+    }
+
+    /// The (size, component, scan) shapes legal under this encoder's SPS:
+    /// mode-dependent scans exist only for 4x4 blocks and luma 8x8; chroma
+    /// blocks in 4:2:0 stop at 16x16.
+    fn shapes() -> Vec<(u32, usize, u32)> {
+        let mut v = Vec::new();
+        for c_idx in [0usize, 1] {
+            for log2 in 2..=(if c_idx == 0 { 5u32 } else { 4 }) {
+                let scans: &[u32] = if log2 == 2 || (log2 == 3 && c_idx == 0) { &[0, 1, 2] } else { &[0] };
+                for &s in scans {
+                    v.push((log2, c_idx, s));
+                }
+            }
+        }
+        v
+    }
+
+    /// Single coefficients at telling positions, with magnitudes either side
+    /// of every rule boundary: 1 (no flags), 2 and 3 (the greater1/greater2
+    /// flags), 4..6 (a remaining under the Rice prefix), 7.. (the EGk
+    /// escape), up to the full i16 range — including `i16::MIN`, whose
+    /// magnitude is the one value that does not fit an i16.
+    #[test]
+    fn round_trips_single_coefficients() {
+        for (log2, c_idx, scan) in shapes() {
+            let n = 1usize << log2;
+            for pos in [0usize, 1, n - 1, (n - 1) * n, n * n - 1, (n / 2) * n + n / 2] {
+                for m in [1i16, 2, 3, 4, 5, 6, 7, 9, 100, 32767] {
+                    let mut c = vec![0i16; n * n];
+                    c[pos] = m;
+                    one(26, params(log2, c_idx, scan), c.clone());
+                    c[pos] = -m;
+                    one(26, params(log2, c_idx, scan), c);
+                }
+            }
+            let mut c = vec![0i16; n * n];
+            c[0] = i16::MIN;
+            one(26, params(log2, c_idx, scan), c);
+        }
+    }
+
+    /// Runs of ±1 — what quantised residual mostly is, and a previously
+    /// found blind spot: only a run longer than eight reaches the k >= 8
+    /// threshold, where even a magnitude of one codes a remaining level.
+    #[test]
+    fn round_trips_runs_of_ones() {
+        for (log2, c_idx, scan) in shapes() {
+            let n = 1usize << log2;
+            for len in [2usize, 4, 7, 8, 9, 15, 16, 17, 24, 33] {
+                if len > n * n {
+                    continue;
+                }
+                // All ones, all minus ones, alternating.
+                for pattern in 0..3 {
+                    let mut c = vec![0i16; n * n];
+                    for (i, v) in c.iter_mut().enumerate().take(len) {
+                        *v = match pattern {
+                            0 => 1,
+                            1 => -1,
+                            _ => {
+                                if i % 2 == 0 {
+                                    1
+                                } else {
+                                    -1
+                                }
+                            }
+                        };
+                    }
+                    one(26, params(log2, c_idx, scan), c);
+                }
+                // The same run under a single outlier at either end: the
+                // Rice parameter must climb after the outlier's escape and
+                // the remainders after it still round-trip.
+                let mut c = vec![0i16; n * n];
+                for v in c.iter_mut().take(len) {
+                    *v = 1;
+                }
+                c[0] = 900;
+                one(26, params(log2, c_idx, scan), c.clone());
+                c[0] = 1;
+                c[len - 1] = -21000;
+                one(26, params(log2, c_idx, scan), c);
+            }
+            // Every magnitude at the boundary of the Rice update rule
+            // (cLastAbsLevel > 3 << cLastRiceParam), followed by more
+            // remainders that read the updated parameter: 3 vs 4 at rice 0,
+            // 6 vs 7 at rice 1, and so on. A mutation of the threshold is
+            // invisible until a level sits exactly on it with another
+            // remaining level behind it.
+            for edge in [3i16, 4, 6, 7, 12, 13, 24, 25] {
+                let mut c = vec![0i16; 1usize << (2 * log2)];
+                c[0] = edge;
+                c[1] = 9;
+                c[2] = -9;
+                c[3] = edge;
+                one(26, params(log2, c_idx, scan), c);
+            }
+        }
+    }
+
+    /// The coded_sub_block_flag machinery of blocks larger than 4x4: holes
+    /// (sub-blocks skipped entirely), and coded sub-blocks whose only
+    /// nonzero coefficient is their DC — the case where the reader *infers*
+    /// the DC significant and the writer must not spell it.
+    #[test]
+    fn round_trips_sub_block_inference() {
+        for (log2, c_idx, scan) in shapes() {
+            if log2 == 2 {
+                continue;
+            }
+            let n = 1usize << log2;
+            let sbs = n / 4;
+            // Far corner significant, then every middle sub-block in turn
+            // carrying only its DC.
+            for sy in 0..sbs {
+                for sx in 0..sbs {
+                    let mut c = vec![0i16; n * n];
+                    c[n * n - 1] = 1;
+                    c[(sy * 4) * n + sx * 4] = -3;
+                    one(26, params(log2, c_idx, scan), c);
+                }
+            }
+            // A diagonal band of only-DC sub-blocks at once, magnitudes
+            // driving every level rule inside the inference case.
+            let mut c = vec![0i16; n * n];
+            c[n * n - 1] = 2;
+            for s in 0..sbs {
+                c[(s * 4) * n + s * 4] = [1i16, -2, 3, 800][s % 4];
+            }
+            one(26, params(log2, c_idx, scan), c);
+        }
+    }
+
+    /// Dense blocks: every position significant, which drives the greater1
+    /// counter to its cap in every sub-block and exercises the context-set
+    /// bump carried between sub-blocks.
+    #[test]
+    fn round_trips_dense_blocks() {
+        for (log2, c_idx, scan) in shapes() {
+            let n = 1usize << log2;
+            let mut c = vec![0i16; n * n];
+            for (i, v) in c.iter_mut().enumerate() {
+                *v = if i % 2 == 0 { (i % 37) as i16 + 1 } else { -((i % 11) as i16) - 1 };
+            }
+            one(26, params(log2, c_idx, scan), c.clone());
+            for v in c.iter_mut() {
+                *v = 1;
+            }
+            one(26, params(log2, c_idx, scan), c);
+        }
+    }
+
+    /// Pseudo-random blocks of every shape chained through one codeword and
+    /// one context state, at several QPs (the initial context states depend
+    /// on the QP). Mostly-zero blocks, the occasional outlier: the shape of
+    /// real residual.
+    #[test]
+    fn round_trips_random_chains() {
+        let mut seed = 0x2545f4914f6cdd1du64;
+        let mut lcg = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        let shapes = shapes();
+        for qp in [0i32, 17, 26, 39, 51] {
+            for _ in 0..30 {
+                let mut blocks = Vec::new();
+                for _ in 0..(1 + lcg() % 8) {
+                    let (log2, c_idx, scan) = shapes[lcg() as usize % shapes.len()];
+                    // Chroma components share contexts; alternate 1 and 2 to
+                    // prove the writer treats them identically.
+                    let c_idx = if c_idx == 1 && lcg() % 2 == 0 { 2 } else { c_idx };
+                    let n = 1usize << log2;
+                    let mut c = vec![0i16; n * n];
+                    let mut any = false;
+                    for v in c.iter_mut() {
+                        if lcg() % 5 == 0 {
+                            let m = 1 + (lcg() % 60) as i16;
+                            let m = if lcg() % 19 == 0 { m * 500 } else { m };
+                            *v = if lcg() % 2 == 0 { m } else { -m };
+                            any = true;
+                        }
+                    }
+                    if !any {
+                        c[(lcg() as usize) % (n * n)] = 1;
+                    }
+                    blocks.push((params(log2, c_idx, scan), c));
+                }
+                round_trip(qp, &blocks);
+            }
+        }
     }
 }

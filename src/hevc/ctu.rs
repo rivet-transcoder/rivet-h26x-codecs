@@ -4,6 +4,7 @@
 //! and the per-CU bookkeeping the loop filters and later CUs read.
 
 use crate::cabac::Cabac;
+use crate::cabac_enc::CabacEncoder;
 use crate::picture::ChromaFormat;
 use crate::{Error, Result};
 
@@ -14,7 +15,7 @@ use super::intra::{IntraScratch, predict as intra_predict};
 use super::mvpred::{Cand, PuPos, RefCtx, amvp, merge_candidate};
 use super::pic::{AvailCtx, PicInfo, SaoParams};
 use super::pps::Pps;
-use super::residual::{ResidualParams, ScalingSource, parse_residual, rdpcm_residual, rotate_residual4, scale_coefficients, transform_skip_residual};
+use super::residual::{ResidualParams, ScalingSource, parse_residual, rdpcm_residual, residual_scan_idx, rotate_residual4, scale_coefficients, transform_skip_residual};
 use crate::dsp::hevc::HevcDsp;
 use super::slice::{SliceHeader, SliceType};
 use super::sps::{ScalingList, Sps};
@@ -522,15 +523,7 @@ impl<'a, S: Sample> SliceDec<'a, S> {
                 for i in 0..4 {
                     let luma = intra_modes[if cat == 3 { i } else { 0 }];
                     let syn = chroma_mode_syntax[if cat == 3 { i } else { 0 }];
-                    let m = match syn {
-                        0 => 0,
-                        1 => 26,
-                        2 => 10,
-                        3 => 1,
-                        _ => luma,
-                    };
-                    let m = if syn < 4 && m == luma { 34 } else { m };
-                    chroma_modes[i] = if cat == 2 { MODE_422[m as usize] } else { m };
+                    chroma_modes[i] = intra_chroma_mode(cat, luma, syn);
                 }
             }
             if rqt_root_cbf {
@@ -1245,17 +1238,7 @@ impl<'a, S: Sample> SliceDec<'a, S> {
     fn residual_block(&mut self, cu: &CuCtx, x: usize, y: usize, log2: u32, c_idx: usize, pred_mode: u32, keep_luma: bool, res_scale: i32) -> Result<()> {
         let n = 1usize << log2;
         // scanIdx (7.4.9.11).
-        let scan_idx = if cu.intra && (log2 == 2 || (log2 == 3 && (c_idx == 0 || self.sps.chroma_array_type() == 3))) {
-            if (6..=14).contains(&pred_mode) {
-                2
-            } else if (22..=30).contains(&pred_mode) {
-                1
-            } else {
-                0
-            }
-        } else {
-            0
-        };
+        let scan_idx = residual_scan_idx(cu.intra, log2, c_idx, self.sps.chroma_array_type(), pred_mode);
         let params = ResidualParams {
             log2_size: log2,
             c_idx,
@@ -1358,6 +1341,178 @@ impl<'a, S: Sample> SliceDec<'a, S> {
     }
 }
 
+// ----------------------------------------------------------------------
+// Writers: the exact inverses of the intra coding-quadtree readers above,
+// kept in this file beside them because inverse pairs drift when they are
+// edited apart. Free functions rather than methods, because an encoder has
+// no `SliceDec`: everything the reader digs out of its own state arrives
+// here as a documented argument, already derived by the caller. What the
+// reader *infers* rather than reads — `split_cu_flag` at a picture edge,
+// `pred_mode_flag` in an I slice, `rqt_root_cbf` for intra CUs, the NxN
+// restriction of `part_mode` to the minimum CB size — the caller must
+// infer identically, by walking the same conditions; no writer exists for
+// an uncoded bin. Inter-slice syntax has no writers yet: they arrive with
+// inter prediction.
+//
+// Nothing outside the round-trip tests calls these yet — the H.265 encoder
+// that will is being built alongside them; drop the allows when it lands.
+// ----------------------------------------------------------------------
+
+/// The neighbour facts `split_cu_flag`'s context derivation needs, already
+/// resolved by the caller: `CtDepth` of the 4x4 block left of the coding
+/// block's top-left corner and of the one above it, or `None` where that
+/// neighbour is unavailable in the z-scan sense of 6.4.1 (outside the
+/// picture, in another slice or tile, or not yet coded).
+///
+/// This is the same seam the reader uses at the top of `coding_quadtree`:
+/// it consults `PicInfo::available_at` plus the `ct_depth` array, and an
+/// encoder consults whatever bookkeeping it maintains — the flag's context
+/// counts the available neighbours coded deeper than the current depth.
+#[allow(dead_code)]
+pub(crate) struct SplitCuNb {
+    /// `CtDepth` of the block at `(x0 - 1, y0)`, if available.
+    pub left_depth: Option<u8>,
+    /// `CtDepth` of the block at `(x0, y0 - 1)`, if available.
+    pub above_depth: Option<u8>,
+}
+
+/// Write `split_cu_flag`: the inverse of the read at the top of
+/// `coding_quadtree`. Only for a flag the reader will actually read — when
+/// the coding block lies fully inside the picture and is larger than the
+/// minimum CB — otherwise the split is inferred and writing anything here
+/// desyncs the stream. `depth` is the current coding-tree depth the
+/// neighbour depths are compared against.
+#[allow(dead_code)]
+pub(crate) fn write_split_cu_flag(e: &mut CabacEncoder, cx: &mut Contexts, nb: &SplitCuNb, depth: u32, split: bool) {
+    let mut inc = 0usize;
+    if nb.left_depth.is_some_and(|d| d as u32 > depth) {
+        inc += 1;
+    }
+    if nb.above_depth.is_some_and(|d| d as u32 > depth) {
+        inc += 1;
+    }
+    e.encode_decision(&mut cx.c[SPLIT_CODING_UNIT_FLAG_OFFSET + inc], split as u32);
+}
+
+/// Write `part_mode` for an intra CU: the inverse of `parse_part_mode`
+/// with `intra` true — a single context-coded bin, 1 for 2Nx2N, 0 for NxN.
+/// Coded only when `log2_cb == log2_min_cb_size` (the reader does not read
+/// it otherwise, and infers 2Nx2N); NxN exists only there.
+///
+/// There is no `pred_mode_flag` writer: in an I slice the reader never
+/// reads one — intra is inferred — and inter slices are future work.
+#[allow(dead_code)]
+pub(crate) fn write_part_mode_intra(e: &mut CabacEncoder, cx: &mut Contexts, nxn: bool) {
+    e.encode_decision(&mut cx.c[PART_MODE_OFFSET], !nxn as u32);
+}
+
+/// Write `prev_intra_luma_pred_flag` for one prediction unit. The reader
+/// reads all of a CU's flags (one per PU: one, or four for NxN) *before*
+/// any `mpm_idx` / `rem_intra_luma_pred_mode`, so a caller with NxN must
+/// call this four times and only then write the four payloads.
+///
+/// Whether the PU's mode is one of its three MPM candidates — and which
+/// index, or which remainder — is the *decision* side's problem, the same
+/// seam as H.264's `PredMode`: the candidate derivation (8.4.2) belongs to
+/// the encoder's mode decision, which mirrors `mpm_candidates` over its own
+/// reconstruction state. The writers take the already-derived values.
+#[allow(dead_code)]
+pub(crate) fn write_prev_intra_luma_pred_flag(e: &mut CabacEncoder, cx: &mut Contexts, prev: bool) {
+    e.encode_decision(&mut cx.c[PREV_INTRA_LUMA_PRED_FLAG_OFFSET], prev as u32);
+}
+
+/// Write `mpm_idx` (0..=2): truncated-unary bypass with cMax 2, the inverse
+/// of the reader's `while idx < 2 && bypass() != 0` — `idx` ones, then a
+/// terminating zero unless the cap was reached.
+#[allow(dead_code)]
+pub(crate) fn write_mpm_idx(e: &mut CabacEncoder, idx: u32) {
+    debug_assert!(idx <= 2);
+    for _ in 0..idx {
+        e.encode_bypass(1);
+    }
+    if idx < 2 {
+        e.encode_bypass(0);
+    }
+}
+
+/// Write `rem_intra_luma_pred_mode` (0..=31): five bypass bits. The
+/// remainder counts modes with the three MPM candidates removed: the
+/// decision side takes its target mode and subtracts one for every
+/// candidate smaller than it — the inverse of the reader's re-insertion
+/// over the sorted candidates.
+#[allow(dead_code)]
+pub(crate) fn write_rem_intra_luma_pred_mode(e: &mut CabacEncoder, rem: u32) {
+    debug_assert!(rem < 32);
+    e.encode_bypass_bits(5, rem);
+}
+
+/// Write `intra_chroma_pred_mode`'s binarisation: `syntax` is the coded
+/// value 0..=4, where 4 means "same as luma" (one context-coded 0) and
+/// 0..=3 select from Table 8-2 (a context-coded 1, then two bypass bits).
+/// One per CU, or one per PB in 4:4:4 NxN — the caller follows the
+/// reader's loop. [`intra_chroma_mode`] maps what this spells to the
+/// resulting `IntraPredModeC`; an encoder chooses the syntax and derives
+/// the mode through that one copy of the mapping.
+#[allow(dead_code)]
+pub(crate) fn write_intra_chroma_pred_mode(e: &mut CabacEncoder, cx: &mut Contexts, syntax: u32) {
+    debug_assert!(syntax <= 4);
+    if syntax == 4 {
+        e.encode_decision(&mut cx.c[INTRA_CHROMA_PRED_MODE_OFFSET], 0);
+    } else {
+        e.encode_decision(&mut cx.c[INTRA_CHROMA_PRED_MODE_OFFSET], 1);
+        e.encode_bypass_bits(2, syntax);
+    }
+}
+
+/// Write `split_transform_flag`: the inverse of the read at the top of
+/// `transform_tree`. Coded only when the reader would read it — `log2` at
+/// most the maximum TB size, above the minimum, depth below
+/// `MaxTrafoDepth`, and not the forced split of an NxN intra CU's first
+/// level — otherwise the split is inferred from those same conditions.
+/// The context depends only on the TB size.
+#[allow(dead_code)]
+pub(crate) fn write_split_transform_flag(e: &mut CabacEncoder, cx: &mut Contexts, log2: u32, split: bool) {
+    e.encode_decision(&mut cx.c[SPLIT_TRANSFORM_FLAG_OFFSET + (5 - log2) as usize], split as u32);
+}
+
+/// Write `cbf_cb` or `cbf_cr` (they share contexts): the context is the
+/// transform-tree depth of the node coding the flag. Coded at a node when
+/// the chroma block is at least 4x4 (`log2 > 2` outside 4:4:4) and either
+/// `trafo_depth == 0` or the parent's corresponding flag was 1; at
+/// `log2 == 2` the reader inherits the parent's flags instead — nothing
+/// may be written there. In 4:2:2 the second (lower) chroma square has its
+/// own flag at the same context; the caller writes it right after the
+/// first, mirroring the reader's order (cb both halves, then cr).
+#[allow(dead_code)]
+pub(crate) fn write_cbf_chroma(e: &mut CabacEncoder, cx: &mut Contexts, trafo_depth: u32, cbf: bool) {
+    e.encode_decision(&mut cx.c[CBF_CB_CR_OFFSET + trafo_depth as usize], cbf as u32);
+}
+
+/// Write `cbf_luma`: context 1 at transform-tree depth 0, else 0. Read by
+/// the reader at every leaf of an intra CU's transform tree (for inter it
+/// is inferred 1 when nothing else in the leaf is coded — future work).
+#[allow(dead_code)]
+pub(crate) fn write_cbf_luma(e: &mut CabacEncoder, cx: &mut Contexts, trafo_depth: u32, cbf: bool) {
+    e.encode_decision(&mut cx.c[CBF_LUMA_OFFSET + (trafo_depth == 0) as usize], cbf as u32);
+}
+
+/// `IntraPredModeC` (8.4.3): the mode `intra_chroma_pred_mode` syntax
+/// `syn` selects given the PB's luma mode — Table 8-2's substitution of 34
+/// where the selection collides with luma, and Table 8-3's 4:2:2 mapping.
+/// One copy, used by the parser above and by the decision side of the
+/// encoder (which needs it for the chroma scan order, among others).
+pub(crate) fn intra_chroma_mode(chroma_array_type: u32, luma: u32, syn: u32) -> u32 {
+    let m = match syn {
+        0 => 0,
+        1 => 26,
+        2 => 10,
+        3 => 1,
+        _ => luma,
+    };
+    let m = if syn < 4 && m == luma { 34 } else { m };
+    if chroma_array_type == 2 { MODE_422[m as usize] } else { m }
+}
+
 /// `QpC` as a function of `qPi` (8.6.1): Table 8-10 for 4:2:0, otherwise
 /// `Min(qPi, 51)`.
 pub fn chroma_qp(chroma_array_type: u32, qpi: i32) -> i32 {
@@ -1376,6 +1531,546 @@ pub fn chroma_qp(chroma_array_type: u32, qpi: i32) -> i32 {
 
 /// The 4:2:2 chroma intra mode mapping (Table 8-3), by `modeIdc`.
 const MODE_422: [u32; 35] = [0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 12, 13, 15, 17, 18, 19, 20, 21, 22, 23, 23, 24, 24, 25, 25, 26, 27, 27, 28, 28, 29, 29, 30, 31];
+
+#[cfg(test)]
+mod write_round_trip {
+    use super::*;
+    use crate::bitwriter::BitWriter;
+    use crate::encode::Config;
+    use crate::encode::gop::Kind;
+    use crate::encode::h265_syntax::{Geometry as EncGeometry, NAL_IDR_N_LP, SliceHeader as EncSliceHeader, write_pps, write_slice_header, write_sps};
+    use crate::hevc::pic::Geometry as PicGeometry;
+    use crate::hevc::residual::write_residual;
+    use crate::nal::{HevcNalHeader, unescape_rbsp};
+    use std::sync::Arc;
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u32
+        }
+        fn below(&mut self, n: u32) -> u32 {
+            self.next() % n
+        }
+        fn chance(&mut self, pct: u32) -> bool {
+            self.below(100) < pct
+        }
+    }
+
+    /// The writer side of the round trip: what an encoder's slice writer
+    /// will be, over synthetic decisions. It mirrors the reader's *walk* —
+    /// the same recursion, the same inference conditions, the same fill
+    /// order for the side-data arrays the context derivations and the MPM
+    /// lists read — and calls the production writers for every coded bin.
+    /// Its bookkeeping arrays stand in for `PicInfo`: `coded` plays the
+    /// z-scan availability test's role (a 4x4 is available exactly when an
+    /// earlier CU or PU wrote it — one slice, one tile, raster CTBs), and
+    /// `ct_depth` / `intra_mode` mirror the arrays of the same names.
+    struct CtuWriter {
+        pw: i32,
+        ph: i32,
+        w4: usize,
+        log2_ctb: u32,
+        log2_min_cb: u32,
+        log2_min_tb: u32,
+        log2_max_tb: u32,
+        max_depth_intra: u32,
+        coded: Vec<bool>,
+        ct_depth: Vec<u8>,
+        intra_mode: Vec<u8>,
+        /// Expected `PicInfo::cbf_luma` after the decode.
+        exp_cbf_luma: Vec<u8>,
+        cx: Contexts,
+        rng: Lcg,
+    }
+
+    impl CtuWriter {
+        fn new(sps: &Sps, qp: i32, seed: u64) -> Self {
+            let w4 = (sps.width as usize).div_ceil(4);
+            let h4 = (sps.height as usize).div_ceil(4);
+            CtuWriter {
+                pw: sps.width as i32,
+                ph: sps.height as i32,
+                w4,
+                log2_ctb: sps.log2_ctb_size,
+                log2_min_cb: sps.log2_min_cb_size,
+                log2_min_tb: sps.log2_min_tb_size,
+                log2_max_tb: sps.log2_max_tb_size,
+                max_depth_intra: sps.max_th_depth_intra,
+                coded: vec![false; w4 * h4],
+                ct_depth: vec![0; w4 * h4],
+                // PicInfo::new starts intra_mode at 1 (DC), and so must the
+                // expectation.
+                intra_mode: vec![1; w4 * h4],
+                exp_cbf_luma: vec![0; w4 * h4],
+                cx: Contexts::new(0, qp),
+                rng: Lcg(seed),
+            }
+        }
+
+        fn idx4(&self, x: i32, y: i32) -> usize {
+            (y as usize >> 2) * self.w4 + (x as usize >> 2)
+        }
+
+        /// `CtDepth` of the neighbour at `(xn, yn)` if it is available in
+        /// the z-scan sense — for a raster walk over one slice and one
+        /// tile, exactly "inside the picture and already written".
+        fn neighbour_depth(&self, xn: i32, yn: i32) -> Option<u8> {
+            if xn < 0 || yn < 0 || xn >= self.pw || yn >= self.ph {
+                return None;
+            }
+            let i = self.idx4(xn, yn);
+            if self.coded[i] { Some(self.ct_depth[i]) } else { None }
+        }
+
+        fn write_ctu(&mut self, e: &mut CabacEncoder, ctb_addr_rs: usize, wc: usize) {
+            let rx = ctb_addr_rs % wc;
+            let ry = ctb_addr_rs / wc;
+            let x0 = (rx << self.log2_ctb) as i32;
+            let y0 = (ry << self.log2_ctb) as i32;
+            self.quadtree(e, x0, y0, self.log2_ctb, 0);
+        }
+
+        /// The writer's `coding_quadtree`: the flag is coded only where the
+        /// reader reads one, and inferred by the same conditions elsewhere.
+        fn quadtree(&mut self, e: &mut CabacEncoder, x0: i32, y0: i32, log2_cb: u32, depth: u32) {
+            let size = 1i32 << log2_cb;
+            let split = if x0 + size <= self.pw && y0 + size <= self.ph && log2_cb > self.log2_min_cb {
+                let split = self.rng.chance(if log2_cb >= 6 { 75 } else { 45 });
+                let nb = SplitCuNb { left_depth: self.neighbour_depth(x0 - 1, y0), above_depth: self.neighbour_depth(x0, y0 - 1) };
+                write_split_cu_flag(e, &mut self.cx, &nb, depth, split);
+                split
+            } else {
+                log2_cb > self.log2_min_cb
+            };
+            if split {
+                let half = size / 2;
+                let x1 = x0 + half;
+                let y1 = y0 + half;
+                self.quadtree(e, x0, y0, log2_cb - 1, depth + 1);
+                if x1 < self.pw {
+                    self.quadtree(e, x1, y0, log2_cb - 1, depth + 1);
+                }
+                if y1 < self.ph {
+                    self.quadtree(e, x0, y1, log2_cb - 1, depth + 1);
+                }
+                if x1 < self.pw && y1 < self.ph {
+                    self.quadtree(e, x1, y1, log2_cb - 1, depth + 1);
+                }
+            } else {
+                self.cu(e, x0, y0, log2_cb, depth);
+            }
+        }
+
+        /// The three MPM candidates (8.4.2), mirroring `mpm_candidates`
+        /// over the writer's own arrays: this derivation belongs to the
+        /// decision side, and this is what the encoder's copy will be.
+        fn mpm(&self, xp: i32, yp: i32) -> [u32; 3] {
+            let cand = |xn: i32, yn: i32, is_above: bool| -> u32 {
+                if xn < 0 || yn < 0 || xn >= self.pw || yn >= self.ph {
+                    return 1;
+                }
+                let i = self.idx4(xn, yn);
+                if !self.coded[i] {
+                    return 1;
+                }
+                if is_above && yn < ((yp >> self.log2_ctb) << self.log2_ctb) {
+                    return 1;
+                }
+                self.intra_mode[i] as u32
+            };
+            let a = cand(xp - 1, yp, false);
+            let b = cand(xp, yp - 1, true);
+            if a == b {
+                if a < 2 {
+                    [0, 1, 26]
+                } else {
+                    [a, 2 + ((a + 29) % 32), 2 + ((a - 2 + 1) % 32)]
+                }
+            } else {
+                let c = if a != 0 && b != 0 {
+                    0
+                } else if a != 1 && b != 1 {
+                    1
+                } else {
+                    26
+                };
+                [a, b, c]
+            }
+        }
+
+        fn cu(&mut self, e: &mut CabacEncoder, x0: i32, y0: i32, log2_cb: u32, depth: u32) {
+            let n = 1i32 << log2_cb;
+            debug_assert!(x0 + n <= self.pw && y0 + n <= self.ph, "leaf CUs lie inside the coded picture");
+            // The reader records CtDepth for the whole CU before parsing
+            // inside it; later siblings' split_cu_flag contexts read it.
+            PicInfo::fill4(&mut self.ct_depth, self.w4, x0 as usize, y0 as usize, n as usize, n as usize, depth as u8);
+            let nxn = log2_cb == self.log2_min_cb && self.rng.chance(40);
+            if log2_cb == self.log2_min_cb {
+                write_part_mode_intra(e, &mut self.cx, nxn);
+            }
+            let npu = if nxn { 4 } else { 1 };
+            let pb = if nxn { n / 2 } else { n };
+            // Choose a target mode per PU and derive its spelling against
+            // the MPM list *at that PU's turn* — each PU's list reads the
+            // modes of the PUs before it, so derivation and fill interleave
+            // even though the flags are all written first.
+            let mut flags = [false; 4];
+            let mut payload = [0u32; 4];
+            let mut modes = [0u32; 4];
+            for i in 0..npu {
+                let xp = x0 + (i as i32 % 2) * pb;
+                let yp = y0 + (i as i32 / 2) * pb;
+                let target = self.rng.below(35);
+                let cands = self.mpm(xp, yp);
+                if let Some(idx) = cands.iter().position(|&c| c == target) {
+                    flags[i] = true;
+                    payload[i] = idx as u32;
+                } else {
+                    let mut rem = target;
+                    for &c in &cands {
+                        if c < target {
+                            rem -= 1;
+                        }
+                    }
+                    flags[i] = false;
+                    payload[i] = rem;
+                }
+                modes[i] = target;
+                PicInfo::fill4(&mut self.intra_mode, self.w4, xp as usize, yp as usize, pb as usize, pb as usize, target as u8);
+                PicInfo::fill4(&mut self.coded, self.w4, xp as usize, yp as usize, pb as usize, pb as usize, true);
+            }
+            for &f in flags.iter().take(npu) {
+                write_prev_intra_luma_pred_flag(e, &mut self.cx, f);
+            }
+            for i in 0..npu {
+                if flags[i] {
+                    write_mpm_idx(e, payload[i]);
+                } else {
+                    write_rem_intra_luma_pred_mode(e, payload[i]);
+                }
+            }
+            // intra_chroma_pred_mode: one per CU in 4:2:0.
+            let csyn = self.rng.below(5);
+            write_intra_chroma_pred_mode(e, &mut self.cx, csyn);
+            let chroma_mode = intra_chroma_mode(1, modes[0], csyn);
+            // rqt_root_cbf is not coded for intra CUs; the tree follows.
+            let intra_split = nxn;
+            let max_depth = self.max_depth_intra + intra_split as u32;
+            self.tt(e, x0, y0, log2_cb, 0, 0, [true; 2], intra_split, max_depth, chroma_mode);
+        }
+
+        /// The writer's `transform_tree`, over the same inference
+        /// conditions as the reader's.
+        #[allow(clippy::too_many_arguments)]
+        fn tt(&mut self, e: &mut CabacEncoder, x0: i32, y0: i32, log2: u32, depth: u32, blk_idx: u32, parent_cbf: [bool; 2], intra_split: bool, max_depth: u32, chroma_mode: u32) {
+            let split = if log2 <= self.log2_max_tb && log2 > self.log2_min_tb && depth < max_depth && !(intra_split && depth == 0) {
+                let s = self.rng.chance(40);
+                write_split_transform_flag(e, &mut self.cx, log2, s);
+                s
+            } else {
+                log2 > self.log2_max_tb || (intra_split && depth == 0)
+            };
+            let mut cbf_c = [false; 2];
+            if log2 > 2 {
+                for c in 0..2 {
+                    if depth == 0 || parent_cbf[c] {
+                        cbf_c[c] = self.rng.chance(45);
+                        write_cbf_chroma(e, &mut self.cx, depth, cbf_c[c]);
+                    }
+                }
+            } else {
+                // 4x4: chroma is coded at the parent's size; the flags are
+                // inherited, nothing is written.
+                cbf_c = parent_cbf;
+            }
+            if split {
+                let half = 1i32 << (log2 - 1);
+                self.tt(e, x0, y0, log2 - 1, depth + 1, 0, cbf_c, intra_split, max_depth, chroma_mode);
+                self.tt(e, x0 + half, y0, log2 - 1, depth + 1, 1, cbf_c, intra_split, max_depth, chroma_mode);
+                self.tt(e, x0, y0 + half, log2 - 1, depth + 1, 2, cbf_c, intra_split, max_depth, chroma_mode);
+                self.tt(e, x0 + half, y0 + half, log2 - 1, depth + 1, 3, cbf_c, intra_split, max_depth, chroma_mode);
+                return;
+            }
+            // A leaf: cbf_luma is always coded for intra CUs. All-zero-cbf
+            // leaves are legal and must round-trip too.
+            let cbf_luma = self.rng.chance(70);
+            write_cbf_luma(e, &mut self.cx, depth, cbf_luma);
+            if cbf_luma {
+                let mode = self.intra_mode[self.idx4(x0, y0)] as u32;
+                let coeffs = self.gen_coeffs(log2);
+                let p = res_params(log2, 0, crate::hevc::residual::residual_scan_idx(true, log2, 0, 1, mode));
+                write_residual(e, &mut self.cx, &p, &coeffs);
+                let nn = 1usize << log2;
+                PicInfo::fill4(&mut self.exp_cbf_luma, self.w4, x0 as usize, y0 as usize, nn, nn, 1);
+            }
+            // Chroma: at this TU when its blocks are at least 4x4, else once
+            // at the fourth 4x4 luma block, at the parent's size — with the
+            // *inherited* flags. Coordinates carry no syntax; only the size
+            // and the flags do.
+            let here = if log2 > 2 {
+                Some(log2 - 1)
+            } else if blk_idx == 3 {
+                Some(2)
+            } else {
+                None
+            };
+            if let Some(log2c) = here {
+                for c in 0..2usize {
+                    if cbf_c[c] {
+                        let p = res_params(log2c, 1 + c, crate::hevc::residual::residual_scan_idx(true, log2c, 1 + c, 1, chroma_mode));
+                        let coeffs = self.gen_coeffs(log2c);
+                        write_residual(e, &mut self.cx, &p, &coeffs);
+                    }
+                }
+            }
+        }
+
+        /// Coefficient blocks shaped like the ones that matter: runs of ±1
+        /// (quantised residual is mostly that), single outliers that drive
+        /// the Rice escape, only-DC sub-blocks (the inference path), dense
+        /// blocks, and sparse noise.
+        fn gen_coeffs(&mut self, log2: u32) -> Vec<i16> {
+            let n = 1usize << log2;
+            let mut c = vec![0i16; n * n];
+            loop {
+                match self.rng.below(6) {
+                    0 => {
+                        const MAGS: [i16; 9] = [1, 2, 3, 4, 5, 9, 100, 5000, 32767];
+                        let m = MAGS[self.rng.below(9) as usize];
+                        let p = self.rng.below((n * n) as u32) as usize;
+                        c[p] = if self.rng.chance(50) { -m } else { m };
+                    }
+                    1 => {
+                        let len = 1 + self.rng.below((n * n) as u32) as usize;
+                        for (i, v) in c.iter_mut().enumerate().take(len) {
+                            *v = if i % 3 == 0 { -1 } else { 1 };
+                        }
+                    }
+                    2 => {
+                        let len = (2 + self.rng.below(14) as usize).min(n * n);
+                        for v in c.iter_mut().take(len) {
+                            *v = 1;
+                        }
+                        if self.rng.chance(50) {
+                            c[0] = 900;
+                        } else {
+                            c[len - 1] = -900;
+                        }
+                    }
+                    3 => {
+                        for v in c.iter_mut() {
+                            *v = [0, 1, -1, 2, -2, 3, -3, 4][self.rng.below(8) as usize];
+                        }
+                    }
+                    4 => {
+                        c[0] = self.rng.below(3) as i16 + 1;
+                    }
+                    _ => {
+                        c[n * n - 1] = 1;
+                        if n >= 8 {
+                            for sy in 0..n / 4 {
+                                for sx in 0..n / 4 {
+                                    if (sx == 0 && sy == 0) || (sx == n / 4 - 1 && sy == n / 4 - 1) {
+                                        continue;
+                                    }
+                                    if self.rng.chance(40) {
+                                        c[(sy * 4) * n + sx * 4] = [1, -1, 2, 700][self.rng.below(4) as usize];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if c.iter().any(|&v| v != 0) {
+                    return c;
+                }
+            }
+        }
+    }
+
+    fn res_params(log2: u32, c_idx: usize, scan_idx: u32) -> ResidualParams {
+        ResidualParams {
+            log2_size: log2,
+            c_idx,
+            scan_idx,
+            bypass: false,
+            transform_skip_allowed: false,
+            sign_hiding: false,
+            intra: true,
+            pred_mode_intra: 0,
+            ts_context: false,
+            implicit_rdpcm: false,
+            explicit_rdpcm: false,
+            persistent_rice: false,
+            trace: false,
+        }
+    }
+
+    /// Write a complete IDR slice NAL — parameter sets from the encoder's
+    /// own writers, header, byte alignment, then every CTU's coding
+    /// quadtree — and decode it with the *production* slice decoder.
+    /// Compare everything the decoder reconstructs that the writer decided:
+    /// the coding-tree depths, the luma intra modes (through the MPM
+    /// spelling), the luma cbfs, the QP map, and — the desync detector —
+    /// the entire CABAC context state after the last CTU.
+    fn round_trip(width: u32, height: u32, qp: i32, seed: u64) {
+        // The configuration under test is the one the encoder actually
+        // writes: parse the written SPS/PPS with the production parsers and
+        // drive both sides from the result.
+        let cfg = Config { width, height, chroma: ChromaFormat::Yuv420, bit_depth: 8, ..Config::default() };
+        let g = EncGeometry::new(&cfg);
+        let sps = Sps::parse(&unescape_rbsp(&write_sps(&cfg, &g, 8))).expect("the encoder's SPS must parse");
+        let mut pps = Pps::parse(&unescape_rbsp(&write_pps(26))).expect("the encoder's PPS must parse");
+        pps.resolve_tiles(&sps).expect("one tile covering the picture");
+        assert!(!pps.sign_data_hiding && !pps.transform_skip_enabled && !pps.cu_qp_delta_enabled);
+
+        // The slice NAL: two header bytes, the slice segment header, byte
+        // alignment, CABAC slice data (a terminate after every CTU).
+        let wc = sps.pic_width_in_ctbs() as usize;
+        let hc = sps.pic_height_in_ctbs() as usize;
+        let mut w = BitWriter::new();
+        w.bits(8, ((NAL_IDR_N_LP as u32) & 0x3f) << 1);
+        w.bits(8, 1); // nuh_layer_id 0, nuh_temporal_id_plus1 1
+        let eh = EncSliceHeader { kind: Kind::Idr, poc_lsb: 0, qp: qp as u8, log2_max_poc_lsb: 8 };
+        write_slice_header(&eh, 26, NAL_IDR_N_LP, &mut w);
+        w.flag(true); // byte_alignment(): alignment_bit_equal_to_one
+        w.align_zero();
+        let mut wr = CtuWriter::new(&sps, qp, seed);
+        {
+            let mut e = CabacEncoder::new(&mut w);
+            for ctb in 0..wc * hc {
+                wr.write_ctu(&mut e, ctb, wc);
+                e.encode_terminate((ctb == wc * hc - 1) as u32);
+            }
+        }
+        w.align_zero();
+        let rbsp = w.into_rbsp();
+
+        // The production header parser reads the header back (this is what
+        // caught the spurious SAO bit the header writer used to emit).
+        let nal = HevcNalHeader::parse(&rbsp).expect("NAL header");
+        let psc = pps.clone();
+        let ssc = sps.clone();
+        let (hdr, pps, sps) = SliceHeader::parse(&rbsp, nal, &|_| Some(psc.clone()), &|_| Some(ssc.clone()), None).expect("the encoder's slice header must parse");
+        assert_eq!(hdr.slice_type, SliceType::I);
+        assert_eq!(hdr.slice_qp, qp, "the header must carry the QP the contexts initialise from");
+        assert_eq!(hdr.data_bit_offset % 8, 0);
+
+        // The production slice decoder, assembled the way `decoder.rs`
+        // assembles it for a one-slice I picture.
+        let mut frame = Frame::<u8>::new(sps.width as usize, sps.height as usize, ChromaFormat::Yuv420, 8);
+        let geo = Arc::new(PicGeometry::new(&sps, &pps));
+        let mut info = PicInfo::new(geo);
+        let cabac = Cabac::new(&rbsp[(hdr.data_bit_offset / 8) as usize..]);
+        let mut dec = SliceDec {
+            sps: &sps,
+            pps: &pps,
+            hdr: &hdr,
+            frame: &mut frame,
+            info: &mut info,
+            cabac,
+            cx: Contexts::new(0, hdr.slice_qp),
+            refs: RefCtx {
+                pocs: [Vec::new(), Vec::new()],
+                long_term: [Vec::new(), Vec::new()],
+                col: None,
+                cur_poc: 0,
+                no_backward_pred: true,
+                tmvp: false,
+                max_merge_cand: hdr.max_num_merge_cand as usize,
+                log2_par_mrg_level: pps.log2_parallel_merge_level,
+                is_b: false,
+                num_ref_idx: [0, 0],
+                col_from_l0: true,
+            },
+            ref_frames: [Vec::new(), Vec::new()],
+            ref_shared: [Vec::new(), Vec::new()],
+            col_shared: None,
+            slice_idx: 0,
+            slice_addr: 0,
+            scaling: None,
+            qp_y: hdr.slice_qp,
+            qp_y_prev: hdr.slice_qp,
+            cu_qp_delta_val: 0,
+            is_cu_qp_delta_coded: false,
+            is_cu_chroma_qp_offset_coded: false,
+            cu_qp_offset_c: [0, 0],
+            qg: (0, 0),
+            qg_qp_prev: hdr.slice_qp,
+            first_qg: true,
+            last_pu_merged: false,
+            ctb_addr_rs: 0,
+            ctb_addr_ts: 0,
+            coeffs: vec![0; 1024],
+            luma_res: Vec::new(),
+            luma_res_valid: false,
+            dsp: HevcDsp::<u8>::SCALAR,
+            mc: McScratch::new(),
+            intra: IntraScratch::default(),
+            warnings: 0,
+            trace: TraceCfg::default(),
+        };
+        for ctb in 0..wc * hc {
+            dec.decode_ctu(ctb, ctb).unwrap_or_else(|e| panic!("{width}x{height} qp={qp} seed={seed}: CTU {ctb} did not decode: {e}"));
+            let end = dec.cabac.terminate();
+            assert_eq!(end != 0, ctb == wc * hc - 1, "end_of_slice_segment_flag at CTU {ctb}");
+        }
+        assert!(!dec.cabac.overrun(), "the decoder ran past what the writer wrote");
+        assert_eq!(dec.warnings, 0);
+
+        // Decoded fields against the writer's decisions…
+        let tag = format!("{width}x{height} qp={qp} seed={seed}");
+        assert!(wr.coded.iter().all(|&c| c), "{tag}: the writer's walk must tile the picture");
+        assert_eq!(dec.info.ct_depth, wr.ct_depth, "{tag}: CtDepth differs");
+        assert_eq!(dec.info.intra_mode, wr.intra_mode, "{tag}: intra modes differ");
+        assert_eq!(dec.info.cbf_luma, wr.exp_cbf_luma, "{tag}: cbf_luma differs");
+        assert!(dec.info.pred_mode.iter().all(|&p| p == 1), "{tag}: every CU is intra");
+        assert!(dec.info.qp_y.iter().all(|&q| q as i32 == qp), "{tag}: QP map differs");
+        // …and the whole context state: bins can agree while states
+        // diverge, and then the *next* block falls apart far from the
+        // cause. This is the assertion that makes the round trip a proof.
+        assert_eq!(dec.cx.c, wr.cx.c, "{tag}: CABAC context states diverged");
+        assert_eq!(dec.cx.stat_coeff, wr.cx.stat_coeff, "{tag}");
+    }
+
+    /// One aligned 64x64 CTU, several seeds and QPs (the initial context
+    /// states depend on the QP, so each QP is a different starting point).
+    #[test]
+    fn round_trips_a_single_ctu() {
+        for (qp, seed) in [(26, 1u64), (26, 2), (12, 3), (39, 4), (51, 5), (0, 6)] {
+            round_trip(64, 64, qp, seed);
+        }
+    }
+
+    /// Several CTUs: the neighbour contexts (split_cu_flag's depth
+    /// comparison, the MPM lists' above-CTB-row rule) cross CTB borders.
+    #[test]
+    fn round_trips_multiple_ctus() {
+        for seed in 1..=4u64 {
+            round_trip(128, 64, 26, seed);
+        }
+        for seed in 5..=8u64 {
+            round_trip(96, 96, 33, seed); // 32x32 CTUs, 3x3 of them
+        }
+    }
+
+    /// A picture that is not a whole number of CTUs: the boundary CTBs
+    /// force splits the reader *infers* — no flag is coded — and skip the
+    /// quadtree children that fall outside; the writer must walk the same
+    /// shape without writing a bin for any of it.
+    #[test]
+    fn round_trips_partial_ctus() {
+        for seed in 1..=4u64 {
+            round_trip(40, 40, 26, seed);
+        }
+        for seed in 5..=7u64 {
+            round_trip(24, 16, 45, seed); // 16x16 CTUs, right column partial
+        }
+        round_trip(72, 48, 18, 8); // 64x64 CTUs, both edges partial
+    }
+}
 
 /// The coding unit facts the transform tree needs.
 pub struct CuCtx {
