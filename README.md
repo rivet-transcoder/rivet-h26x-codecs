@@ -61,6 +61,42 @@ checked as well.
 falls through to the next backend (libavcodec when built with the `ffmpeg`
 feature, openh264 for H.264).
 
+## What it encodes (in progress)
+
+Encoders for both codecs are being built to the same standard as the
+decoders, and the part that is settled is how they are verified, because an
+encoder cannot have a conformance suite: a standard constrains what a
+*decoder* must do with a bitstream and leaves an encoder free to choose any
+legal one, so there is no golden output to compare against. Three properties
+replace it, two of them exact:
+
+1. **SELF** — the encoder records the reconstruction it believes its
+   bitstream carries, and this crate's own decoder must reproduce it byte for
+   byte. A mismatch is encoder/decoder state desync: always a bug, never a
+   quality question, and it needs no reference data.
+2. **CROSS** — libavcodec must decode the bitstream to the same pictures our
+   decoder does. SELF alone would pass if both of our sides shared a
+   misreading; CROSS is what makes the output *legal* rather than merely
+   self-compatible.
+3. **QUALITY** — PSNR against the source, reported rather than gated, except
+   in lossless mode where the reconstruction must equal the source exactly
+   and the measurement becomes a check like the other two.
+
+`tools/verify_encode.sh` gates 1 and 2 and reports 3, over seven generated
+clips (4:0:0 through 4:4:4, plus a 50x34 one because cropping is a common
+place to be wrong) and a configuration list that grows one axis at a time.
+
+Current state: H.264 produces legal streams — verified against libavcodec —
+for all-intra content through both entropy coders (I_PCM, exactly lossless)
+and CAVLC P/B envelopes (all-skip); the intra transform path, both residual
+writers, forward transforms and quantisation for both codecs, and the
+distortion metrics all exist and are converging on real compression. H.265
+has its parameter sets (accepted by this crate's own conformance-proven
+parsers) and refuses at the coding tree, which H.265 requires for even a PCM
+picture since every slice payload is CABAC. Anything not yet built refuses
+with `Error::Unsupported` naming the missing piece — the gate distinguishes
+"not built" from "wrong".
+
 ## Threading and SIMD
 
 Both decoders are threaded two ways, on one FIFO worker pool sized to the
