@@ -1155,12 +1155,11 @@ pub fn parse_mb_cabac(
                     continue;
                 }
                 for sub in 0..shape.count() {
-                    let (x, y, _, _) = sub_partition_rect(part, shape, sub);
+                    let (x, y, w, h) = sub_partition_rect(part, shape, sub);
                     let (bx, by) = ((x / 4) as i32, (y / 4) as i32);
                     let (mx, my) = decode_mvd(c, st, info, &layer, nb, list, bx, by)?;
                     // The mvd applies to every 4x4 of the sub-partition (for
                     // later neighbours' contexts).
-                    let (_, _, w, h) = sub_partition_rect(part, shape, sub);
                     for yy in y / 4..(y + h) / 4 {
                         for xx in x / 4..(x + w) / 4 {
                             layer.mvd[yy * 4 + xx].mvd[list] = Mv::new(mx, my);
