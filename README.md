@@ -211,8 +211,12 @@ worth reading before any of the numbers.**
 
 The first is inside each H.264 table. No H.264 kernel is AVX-512 — the tier
 carries H.265 kernels only — so the top two rows of those two tables run
-*byte-identical code*. They differ by 2.1% and 1.0%. That is the floor within
-a single run.
+*byte-identical code*, and every difference between them is measurement noise.
+There is no single number for it, because it depends on the column: 2.1% and
+1.0% in single-threaded CPU seconds, 0.0% and 1.6% in all-thread CPU seconds,
+and **2.4% and 4.0% in all-thread frames per second**. The threaded columns
+are the noisiest, and they are the ones the multi-threaded claims below are
+made in, so read those against 4% and not against 2%.
 
 The second is between runs. This table replaced one taken earlier on the same
 machine, and no H.265 code changed in between — yet `wpp10.265` moved from
@@ -231,11 +235,13 @@ and 1.12x) and H.264 costs about half as much again (1.49x on a CABAC stream,
 1.55x on a CAVLC one). The gap is not in the pixel kernels; it is entropy
 decoding and per-macroblock bookkeeping, which is where the remaining work is.
 
-**With every thread it trades wins**: ahead on CAVLC (3116 against 3063 fps),
-on WPP (1963 against 1774) and on CABAC (2169 against 2119), behind on the
-H.265 clip without wavefronts (1288 against 1387). Frame threading is the
-whole of it for H.264; H.265 adds wavefront rows, tiles and slice segments
-inside a picture.
+**With every thread, two of the four comparisons say anything.** Ahead on WPP
+(1963 against 1774 fps, +10.7%) and behind on the H.265 clip without
+wavefronts (1288 against 1387, -7.1%). The other two do not clear the floor:
+CAVLC (3116 against 3063) is +1.7% and CABAC (2169 against 2119) is +2.4%,
+against a byte-identical control spread of 4.0% and 2.4% in that same column.
+Frame threading is the whole of it for H.264; H.265 adds wavefront rows, tiles
+and slice segments inside a picture.
 
 **Nearly all of the SIMD win is on the bottom rung, and on H.264 there is now
 almost nothing above it.** Scalar to SSE2 is worth 2.4–2.9x. Everything above
