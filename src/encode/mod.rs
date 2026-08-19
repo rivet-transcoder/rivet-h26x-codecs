@@ -76,17 +76,6 @@ pub enum RateControl {
     Lossless,
 }
 
-/// What a slice may contain, and therefore what the encoder may search.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum SliceKind {
-    /// Intra only.
-    I,
-    /// One reference list.
-    P,
-    /// Two reference lists.
-    B,
-}
-
 /// Entropy coder, where the standard offers a choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Entropy {
