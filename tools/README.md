@@ -131,6 +131,26 @@ at all, and gave a 2–3% noise floor while the end-to-end number was useless.
 That is how the deblocking rewrite was measured at 0.66x when end to end it
 only showed as 3-4%.
 
+**A control is needed per instrument *and* per effect size.** An instrument
+validated once against a large effect is not thereby sound for a small one.
+The rdtsc-per-function harness was checked against a 9% engine change, agreed
+with an independent end-to-end measurement, and was then trusted for a 2% one
+— for which it had never been given a same-binary control. When it finally
+was, the control read 0.4-0.6% off unity and drifted 0.984 to 1.006 between
+sessions, which is the size of the effects it had been used to claim. A merged
+commit message carries a number that came out of that gap; see the retraction
+in the log. Run the control on the instrument you are about to use, at the
+effect size you are about to claim, every time.
+
+**For a bit-exact refactor, count the work instead of timing it.** "Does this
+do less" is often the question that matters, and unlike "is this faster" it
+can be answered exactly: instrument a counter for whatever the change removes
+— neighbour derivations, block lookups, filter calls — and report the
+reduction alongside "the time saved was below measurement". That is true,
+useful, reproducible on any machine, and it is what should have been reported
+for the mvd derivation: four neighbour derivations per motion vector
+difference became two, and nothing measurable happened to the clock.
+
 **Self time lies about inlined hot loops, so be careful which function you
 pick.** A profiler charges an `#[inline(always)]` function to whichever caller
 it was inlined into. A caller that is largely a wrapper around one therefore
@@ -139,8 +159,8 @@ figure plans against the wrong code. `residual_block_cabac` profiled at 15.2%
 self time and was taken here as 15.2% of addressable call-site overhead; nearly
 all of it was the arithmetic decoder inlined into it. The two measurements that
 followed say so plainly — making each bin cheaper took 9% off entropy decoding,
-while every attempt at the loops *around* the bins took 2.4% or nothing — but
-that was a track's worth of work to find out. Before believing a self-time
+while nothing tried in the loops *around* the bins moved at all — but that was
+a track's worth of work to find out. Before believing a self-time
 figure names something you can fix, check whether the function contains an
 inlined hot loop; if it does, the figure belongs to the loop, not to its
 caller.
