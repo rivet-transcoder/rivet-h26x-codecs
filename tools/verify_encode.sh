@@ -101,6 +101,18 @@ fail=0
 # found had been pushed. The commit was not broken; the environment around it
 # had moved. If a result surprises you, check `ls src_*.yuv` against the
 # generator in your checkout before believing the commit is at fault.
+#
+# A SECOND WAY TO VERIFY THE WRONG THING: cargo does not always rebuild
+# after an edit here. A source change followed by `cargo build` has been
+# observed finishing in hundredths of a second with no `Compiling` line,
+# leaving the previous binary in place — so the gate then runs against
+# code you did not write. Touching the file is not always enough;
+# bumping its mtime into the future forces it, and deleting the target
+# binary always does. The failure mode is the one this whole file exists
+# to hunt: no error, a confident wrong answer, and a run that quietly
+# tested something other than the change. If a result is surprising in
+# either direction, confirm the binary is newer than the source before
+# believing it.
 SOURCES=${SOURCES:-$(ls src_*.yuv 2>/dev/null)}
 if [ -z "$SOURCES" ]; then
   echo "no source clips (src_*.yuv); nothing to verify" >&2
