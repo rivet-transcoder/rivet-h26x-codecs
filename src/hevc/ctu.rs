@@ -1500,12 +1500,176 @@ pub(crate) fn write_cbf_chroma(e: &mut CabacEncoder, cx: &mut Contexts, trafo_de
     e.encode_decision(&mut cx.c[CBF_CB_CR_OFFSET + trafo_depth as usize], cbf as u32);
 }
 
-/// Write `cbf_luma`: context 1 at transform-tree depth 0, else 0. Read by
-/// the reader at every leaf of an intra CU's transform tree (for inter it
-/// is inferred 1 when nothing else in the leaf is coded — future work).
+/// Write `cbf_luma`: context 1 at transform-tree depth 0, else 0. Read at
+/// every leaf of an intra CU's transform tree; for an inter CU only when
+/// the leaf sits below depth 0 or one of its chroma cbfs is set — at an
+/// inter CU's depth-0 leaf with no chroma flags the reader infers 1 and
+/// nothing may be written, so such a leaf must genuinely carry luma
+/// coefficients (a residual-free inter CU spells `rqt_root_cbf` 0, or
+/// skips, instead). The caller mirrors `transform_tree`'s exact condition:
+/// `cu.intra || depth != 0 || any chroma cbf of this leaf`.
 #[allow(dead_code)]
 pub(crate) fn write_cbf_luma(e: &mut CabacEncoder, cx: &mut Contexts, trafo_depth: u32, cbf: bool) {
     e.encode_decision(&mut cx.c[CBF_LUMA_OFFSET + (trafo_depth == 0) as usize], cbf as u32);
+}
+
+
+/// Write `cu_skip_flag`: the inverse of the read in `coding_unit`. Present
+/// for every CU of a P (or B) slice; an I slice never reads one. The
+/// ctxIdxInc counts the available left / above neighbours that are
+/// themselves skipped — the caller passes `None` for a neighbour that is
+/// not available in the z-scan sense (outside the picture, or not yet
+/// coded), mirroring the reader's `available_at` + `info.skip` reads.
+/// Note the polarity: H.264's skip context counts *coded* neighbours,
+/// HEVC's counts *skipped* ones.
+#[allow(dead_code)]
+pub(crate) fn write_cu_skip_flag(
+    e: &mut CabacEncoder,
+    cx: &mut Contexts,
+    left_skip: Option<bool>,
+    above_skip: Option<bool>,
+    skip: bool,
+) {
+    let inc = left_skip.unwrap_or(false) as usize + above_skip.unwrap_or(false) as usize;
+    e.encode_decision(&mut cx.c[SKIP_FLAG_OFFSET + inc], skip as u32);
+}
+
+/// Write `pred_mode_flag` (1 = intra): present for every non-skipped CU of
+/// a P or B slice. An I slice never reads one — intra is inferred — so
+/// writing one there desyncs the stream, exactly like the split flags the
+/// reader infers.
+#[allow(dead_code)]
+pub(crate) fn write_pred_mode_flag(e: &mut CabacEncoder, cx: &mut Contexts, intra: bool) {
+    e.encode_decision(&mut cx.c[PRED_MODE_FLAG_OFFSET], intra as u32);
+}
+
+/// Write `part_mode` for an inter CU: PART_2Nx2N only — the single
+/// context-coded 1 of `parse_part_mode`'s first bin. Unlike intra, an
+/// inter CU codes `part_mode` at every size. The rectangular shapes
+/// (2NxN, Nx2N, inter NxN) and the four AMP shapes are refused by name
+/// until a writer spells their bins — their trees depend on the CB size
+/// and `amp_enabled_flag`, and a half-spelled shape is a desync.
+#[allow(dead_code)]
+pub(crate) fn write_part_mode_inter(e: &mut CabacEncoder, cx: &mut Contexts, mode: PartMode) {
+    debug_assert!(
+        mode == PartMode::P2Nx2N,
+        "only PART_2Nx2N has an inter writer (2NxN / Nx2N / NxN / AMP refused)"
+    );
+    e.encode_decision(&mut cx.c[PART_MODE_OFFSET], 1);
+}
+
+/// Write `merge_flag` for a non-skipped inter PU (a skipped CU implies
+/// merge and codes no flag).
+#[allow(dead_code)]
+pub(crate) fn write_merge_flag(e: &mut CabacEncoder, cx: &mut Contexts, merge: bool) {
+    e.encode_decision(&mut cx.c[MERGE_FLAG_OFFSET], merge as u32);
+}
+
+/// Write `merge_idx`: the inverse of `parse_merge_idx` — nothing at all
+/// when the slice's MaxNumMergeCand is 1 (the reader reads nothing and
+/// infers 0); else one context-coded bin (idx != 0) and, above zero,
+/// `idx - 1` bypass ones then a bypass zero unless idx reached
+/// cMax = MaxNumMergeCand - 1. The cMax is the slice header's
+/// `five_minus_max_num_merge_cand` contract: writer and header must agree
+/// or every bin after the first mismatched index desyncs.
+#[allow(dead_code)]
+pub(crate) fn write_merge_idx(e: &mut CabacEncoder, cx: &mut Contexts, max_num_merge_cand: u32, idx: u32) {
+    debug_assert!(idx < max_num_merge_cand.max(1), "merge_idx beyond the candidate count");
+    if max_num_merge_cand <= 1 {
+        return;
+    }
+    e.encode_decision(&mut cx.c[MERGE_IDX_OFFSET], (idx != 0) as u32);
+    for _ in 1..idx {
+        e.encode_bypass(1);
+    }
+    if idx != 0 && idx < max_num_merge_cand - 1 {
+        e.encode_bypass(0);
+    }
+}
+
+/// Write `ref_idx_l0` / `ref_idx_l1` (one shared context pair): the
+/// inverse of `parse_ref_idx` — truncated unary against
+/// cMax = `nref` - 1, the first two bins context-coded, the rest bypass,
+/// with no terminating zero at the cap. Writes nothing when the list has
+/// a single entry, exactly as the reader then reads nothing.
+#[allow(dead_code)]
+pub(crate) fn write_ref_idx(e: &mut CabacEncoder, cx: &mut Contexts, nref: u32, v: u32) {
+    debug_assert!(v < nref.max(1), "ref_idx beyond the active list");
+    let cmax = nref.saturating_sub(1);
+    for k in 0..v {
+        if k < 2 {
+            e.encode_decision(&mut cx.c[REF_IDX_L0_OFFSET + k as usize], 1);
+        } else {
+            e.encode_bypass(1);
+        }
+    }
+    if v < cmax {
+        if v < 2 {
+            e.encode_decision(&mut cx.c[REF_IDX_L0_OFFSET + v as usize], 0);
+        } else {
+            e.encode_bypass(0);
+        }
+    }
+}
+
+/// Write `mvd_coding`: the exact inverse of `parse_mvd`. The order is the
+/// reader's — both components' greater0 flags (x then y, one shared
+/// context), both greater1 flags (the generated table keeps that context
+/// at slot +1), and only then each nonzero component's payload:
+/// `abs_mvd_minus2` as EG1 bypass where the magnitude exceeds one, then
+/// the bypass sign. A zero component carries no sign bin.
+#[allow(dead_code)]
+pub(crate) fn write_mvd(e: &mut CabacEncoder, cx: &mut Contexts, mvd: Mv) {
+    let ax = (mvd.x as i32).unsigned_abs();
+    let ay = (mvd.y as i32).unsigned_abs();
+    e.encode_decision(&mut cx.c[ABS_MVD_GREATER0_FLAG_OFFSET], (ax > 0) as u32);
+    e.encode_decision(&mut cx.c[ABS_MVD_GREATER0_FLAG_OFFSET], (ay > 0) as u32);
+    if ax > 0 {
+        e.encode_decision(&mut cx.c[ABS_MVD_GREATER1_FLAG_OFFSET + 1], (ax > 1) as u32);
+    }
+    if ay > 0 {
+        e.encode_decision(&mut cx.c[ABS_MVD_GREATER1_FLAG_OFFSET + 1], (ay > 1) as u32);
+    }
+    for (a, neg) in [(ax, mvd.x < 0), (ay, mvd.y < 0)] {
+        if a == 0 {
+            continue;
+        }
+        if a > 1 {
+            // abs_mvd_minus2, EG1: ones while the remainder covers the
+            // next doubling (starting at 1 << 1), a zero, then the
+            // remainder's bits — the reader's k grows the same way.
+            let mut rem = a - 2;
+            let mut k = 1u32;
+            while rem >= (1 << k) {
+                e.encode_bypass(1);
+                rem -= 1 << k;
+                k += 1;
+                debug_assert!(k <= 24, "mvd too large to binarise");
+            }
+            e.encode_bypass(0);
+            e.encode_bypass_bits(k, rem);
+        }
+        e.encode_bypass(neg as u32);
+    }
+}
+
+/// Write `mvp_l0_flag` / `mvp_l1_flag` (one shared context): which of the
+/// two AMVP candidates the decoder should add the mvd to.
+#[allow(dead_code)]
+pub(crate) fn write_mvp_flag(e: &mut CabacEncoder, cx: &mut Contexts, flag: bool) {
+    e.encode_decision(&mut cx.c[MVP_LX_FLAG_OFFSET], flag as u32);
+}
+
+/// Write `rqt_root_cbf`. Present exactly when the reader reads it —
+/// `coding_unit`'s condition: the CU is inter, not skipped, and not a
+/// merged PART_2Nx2N. A skipped CU infers false (no residual, no tree); a
+/// merged 2Nx2N infers *true*, so its transform tree always follows —
+/// which is why a zero-residual merge is spelled as a skip, never as a
+/// merge with an empty tree (the depth-0 leaf would then infer
+/// `cbf_luma` 1 with nothing to code).
+#[allow(dead_code)]
+pub(crate) fn write_rqt_root_cbf(e: &mut CabacEncoder, cx: &mut Contexts, cbf: bool) {
+    e.encode_decision(&mut cx.c[NO_RESIDUAL_DATA_FLAG_OFFSET], cbf as u32);
 }
 
 /// `IntraPredModeC` (8.4.3): the mode `intra_chroma_pred_mode` syntax
@@ -1553,7 +1717,7 @@ mod write_round_trip {
     use crate::bitwriter::BitWriter;
     use crate::encode::Config;
     use crate::encode::gop::Kind;
-    use crate::encode::h265_syntax::{Geometry as EncGeometry, NAL_IDR_N_LP, SliceHeader as EncSliceHeader, write_pps, write_slice_header, write_sps};
+    use crate::encode::h265_syntax::{Geometry as EncGeometry, NAL_IDR_N_LP, NAL_TRAIL_R, SliceHeader as EncSliceHeader, write_pps, write_slice_header, write_sps};
     use crate::hevc::pic::Geometry as PicGeometry;
     use crate::hevc::residual::write_residual;
     use crate::nal::{HevcNalHeader, unescape_rbsp};
@@ -1601,6 +1765,22 @@ mod write_round_trip {
         /// The PPS's `transquant_bypass_enabled_flag`: when set, every CU
         /// writes a `cu_transquant_bypass_flag` and may carry raw residuals.
         pps_bypass: bool,
+        /// P-slice mode: every CU spells `cu_skip_flag` (and, when not
+        /// skipped, `pred_mode_flag`), and the walk mixes skip, merge,
+        /// AMVP and intra CUs.
+        p_slice: bool,
+        /// `num_ref_idx_l0_active`: `ref_idx` is spelled only above one.
+        nref: u32,
+        /// `MaxNumMergeCand`, from the header's five_minus field — the
+        /// merge_idx cMax contract.
+        max_merge: u32,
+        /// `max_transform_hierarchy_depth_inter`.
+        max_depth_inter: u32,
+        /// Expected `PicInfo::skip` after the decode.
+        exp_skip: Vec<u8>,
+        /// Expected `PicInfo::pred_mode` (0 inter, 1 intra); the decoder
+        /// initialises the map to 2, so the walk must overwrite all of it.
+        exp_pred: Vec<u8>,
         cx: Contexts,
         rng: Lcg,
     }
@@ -1626,9 +1806,28 @@ mod write_round_trip {
                 exp_cbf_luma: vec![0; w4 * h4],
                 exp_exempt: vec![0; w4 * h4],
                 pps_bypass,
+                p_slice: false,
+                nref: 1,
+                max_merge: 5,
+                max_depth_inter: sps.max_th_depth_inter,
+                exp_skip: vec![0; w4 * h4],
+                exp_pred: vec![2; w4 * h4],
                 cx: Contexts::new(0, qp),
                 rng: Lcg(seed),
             }
+        }
+
+        /// A writer for a P slice: context init type 1 (P with
+        /// `cabac_init_flag` 0 — the decoder derives the same), and the
+        /// reference-list length and merge cMax the hand-written header
+        /// carries.
+        fn for_p(sps: &Sps, qp: i32, seed: u64, nref: u32, max_merge: u32) -> Self {
+            let mut w = Self::new(sps, qp, seed, false);
+            w.p_slice = true;
+            w.nref = nref;
+            w.max_merge = max_merge;
+            w.cx = Contexts::new(1, qp);
+            w
         }
 
         fn idx4(&self, x: i32, y: i32) -> usize {
@@ -1644,6 +1843,33 @@ mod write_round_trip {
             }
             let i = self.idx4(xn, yn);
             if self.coded[i] { Some(self.ct_depth[i]) } else { None }
+        }
+
+        /// The skip flag of the neighbour at `(xn, yn)` when it is
+        /// available in the z-scan sense — the `cu_skip_flag` context's
+        /// mirror of the reader's `available_at` + `info.skip` reads.
+        fn neighbour_skip(&self, xn: i32, yn: i32) -> Option<bool> {
+            if xn < 0 || yn < 0 || xn >= self.pw || yn >= self.ph {
+                return None;
+            }
+            let i = self.idx4(xn, yn);
+            if self.coded[i] { Some(self.exp_skip[i] != 0) } else { None }
+        }
+
+        /// One mvd component whose magnitude lands in each spelling
+        /// regime: zero, one (greater0 only), two (the smallest EG1
+        /// payload), a short suffix, a few escape doublings, and far into
+        /// the escape.
+        fn gen_mvd_comp(&mut self) -> i16 {
+            let mag = match self.rng.below(6) {
+                0 => 0,
+                1 => 1,
+                2 => 2,
+                3 => 3 + self.rng.below(6) as i16,
+                4 => 10 + self.rng.below(120) as i16,
+                _ => 1000 + self.rng.below(30000) as i16,
+            };
+            if self.rng.chance(50) { -mag } else { mag }
         }
 
         fn write_ctu(&mut self, e: &mut CabacEncoder, ctb_addr_rs: usize, wc: usize) {
@@ -1726,7 +1952,8 @@ mod write_round_trip {
             let n = 1i32 << log2_cb;
             debug_assert!(x0 + n <= self.pw && y0 + n <= self.ph, "leaf CUs lie inside the coded picture");
             // cu_transquant_bypass_flag is the first bin of the CU when the
-            // PPS enables it — before part_mode, mirroring the reader.
+            // PPS enables it — before the skip flag and part_mode,
+            // mirroring the reader.
             let by = self.pps_bypass && self.rng.chance(65);
             if self.pps_bypass {
                 write_cu_transquant_bypass_flag(e, &mut self.cx, by);
@@ -1739,6 +1966,73 @@ mod write_round_trip {
             // The reader records CtDepth for the whole CU before parsing
             // inside it; later siblings' split_cu_flag contexts read it.
             PicInfo::fill4(&mut self.ct_depth, self.w4, x0 as usize, y0 as usize, n as usize, n as usize, depth as u8);
+            if self.p_slice {
+                self.p_cu(e, x0, y0, log2_cb, by);
+                return;
+            }
+            self.intra_cu_body(e, x0, y0, log2_cb, by);
+        }
+
+        /// One CU of a P slice, in `coding_unit`'s exact order: the skip
+        /// flag (always), then merge_idx for a skip; else pred_mode_flag
+        /// and either the intra body or the 2Nx2N inter PU — merge_flag,
+        /// merge_idx or ref_idx / mvd / mvp_l0_flag — then rqt_root_cbf
+        /// where the reader reads it (never for a merged 2Nx2N, whose tree
+        /// is inferred present) and the transform tree.
+        fn p_cu(&mut self, e: &mut CabacEncoder, x0: i32, y0: i32, log2_cb: u32, by: bool) {
+            let n = 1i32 << log2_cb;
+            let skip = self.rng.chance(30);
+            let ls = self.neighbour_skip(x0 - 1, y0);
+            let a_s = self.neighbour_skip(x0, y0 - 1);
+            write_cu_skip_flag(e, &mut self.cx, ls, a_s, skip);
+            PicInfo::fill4(&mut self.exp_skip, self.w4, x0 as usize, y0 as usize, n as usize, n as usize, skip as u8);
+            if skip {
+                PicInfo::fill4(&mut self.exp_pred, self.w4, x0 as usize, y0 as usize, n as usize, n as usize, 0);
+                PicInfo::fill4(&mut self.coded, self.w4, x0 as usize, y0 as usize, n as usize, n as usize, true);
+                write_merge_idx(e, &mut self.cx, self.max_merge, self.rng.below(self.max_merge.max(1)));
+                return; // no residual, no tree
+            }
+            let intra = self.rng.chance(35);
+            write_pred_mode_flag(e, &mut self.cx, intra);
+            if intra {
+                PicInfo::fill4(&mut self.exp_pred, self.w4, x0 as usize, y0 as usize, n as usize, n as usize, 1);
+                self.intra_cu_body(e, x0, y0, log2_cb, by);
+                return;
+            }
+            PicInfo::fill4(&mut self.exp_pred, self.w4, x0 as usize, y0 as usize, n as usize, n as usize, 0);
+            PicInfo::fill4(&mut self.coded, self.w4, x0 as usize, y0 as usize, n as usize, n as usize, true);
+            write_part_mode_inter(e, &mut self.cx, PartMode::P2Nx2N);
+            // One 2Nx2N prediction unit. A P slice never reads
+            // inter_pred_idc: PRED_L0 is implied.
+            let merge = self.rng.chance(50);
+            write_merge_flag(e, &mut self.cx, merge);
+            if merge {
+                write_merge_idx(e, &mut self.cx, self.max_merge, self.rng.below(self.max_merge.max(1)));
+            } else {
+                if self.nref > 1 {
+                    write_ref_idx(e, &mut self.cx, self.nref, self.rng.below(self.nref));
+                }
+                let mvd = Mv::new(self.gen_mvd_comp(), self.gen_mvd_comp());
+                write_mvd(e, &mut self.cx, mvd);
+                write_mvp_flag(e, &mut self.cx, self.rng.chance(50));
+            }
+            let rqt = if merge {
+                true // inferred present: the reader reads no flag
+            } else {
+                let r = self.rng.chance(70);
+                write_rqt_root_cbf(e, &mut self.cx, r);
+                r
+            };
+            if rqt {
+                self.tt(e, x0, y0, log2_cb, 0, 0, [true; 2], false, self.max_depth_inter, 0, by, false);
+            }
+        }
+
+        /// Everything after the per-slice preamble of an intra CU — shared
+        /// by the I-slice walk and intra-in-P, as the reader's intra arm
+        /// serves both slice types.
+        fn intra_cu_body(&mut self, e: &mut CabacEncoder, x0: i32, y0: i32, log2_cb: u32, by: bool) {
+            let n = 1i32 << log2_cb;
             let nxn = log2_cb == self.log2_min_cb && self.rng.chance(40);
             if log2_cb == self.log2_min_cb {
                 write_part_mode_intra(e, &mut self.cx, nxn);
@@ -1791,13 +2085,14 @@ mod write_round_trip {
             // rqt_root_cbf is not coded for intra CUs; the tree follows.
             let intra_split = nxn;
             let max_depth = self.max_depth_intra + intra_split as u32;
-            self.tt(e, x0, y0, log2_cb, 0, 0, [true; 2], intra_split, max_depth, chroma_mode, by);
+            self.tt(e, x0, y0, log2_cb, 0, 0, [true; 2], intra_split, max_depth, chroma_mode, by, true);
         }
 
         /// The writer's `transform_tree`, over the same inference
         /// conditions as the reader's.
         #[allow(clippy::too_many_arguments)]
-        fn tt(&mut self, e: &mut CabacEncoder, x0: i32, y0: i32, log2: u32, depth: u32, blk_idx: u32, parent_cbf: [bool; 2], intra_split: bool, max_depth: u32, chroma_mode: u32, bypass: bool) {
+        #[allow(clippy::too_many_arguments)]
+        fn tt(&mut self, e: &mut CabacEncoder, x0: i32, y0: i32, log2: u32, depth: u32, blk_idx: u32, parent_cbf: [bool; 2], intra_split: bool, max_depth: u32, chroma_mode: u32, bypass: bool, intra: bool) {
             let split = if log2 <= self.log2_max_tb && log2 > self.log2_min_tb && depth < max_depth && !(intra_split && depth == 0) {
                 let s = self.rng.chance(40);
                 write_split_transform_flag(e, &mut self.cx, log2, s);
@@ -1820,20 +2115,34 @@ mod write_round_trip {
             }
             if split {
                 let half = 1i32 << (log2 - 1);
-                self.tt(e, x0, y0, log2 - 1, depth + 1, 0, cbf_c, intra_split, max_depth, chroma_mode, bypass);
-                self.tt(e, x0 + half, y0, log2 - 1, depth + 1, 1, cbf_c, intra_split, max_depth, chroma_mode, bypass);
-                self.tt(e, x0, y0 + half, log2 - 1, depth + 1, 2, cbf_c, intra_split, max_depth, chroma_mode, bypass);
-                self.tt(e, x0 + half, y0 + half, log2 - 1, depth + 1, 3, cbf_c, intra_split, max_depth, chroma_mode, bypass);
+                self.tt(e, x0, y0, log2 - 1, depth + 1, 0, cbf_c, intra_split, max_depth, chroma_mode, bypass, intra);
+                self.tt(e, x0 + half, y0, log2 - 1, depth + 1, 1, cbf_c, intra_split, max_depth, chroma_mode, bypass, intra);
+                self.tt(e, x0, y0 + half, log2 - 1, depth + 1, 2, cbf_c, intra_split, max_depth, chroma_mode, bypass, intra);
+                self.tt(e, x0 + half, y0 + half, log2 - 1, depth + 1, 3, cbf_c, intra_split, max_depth, chroma_mode, bypass, intra);
                 return;
             }
-            // A leaf: cbf_luma is always coded for intra CUs. All-zero-cbf
-            // leaves are legal and must round-trip too.
-            let cbf_luma = self.rng.chance(70);
-            write_cbf_luma(e, &mut self.cx, depth, cbf_luma);
+            // A leaf. cbf_luma is always coded for intra CUs; for inter
+            // only when the leaf sits below depth 0 or one of its chroma
+            // cbfs is set — otherwise the reader infers 1, nothing may be
+            // written, and the leaf must genuinely carry luma
+            // coefficients. All-zero-cbf leaves are legal where the flag
+            // exists and must round-trip too.
+            let cbf_luma = if intra || depth != 0 || cbf_c[0] || cbf_c[1] {
+                let f = self.rng.chance(70);
+                write_cbf_luma(e, &mut self.cx, depth, f);
+                f
+            } else {
+                true
+            };
             if cbf_luma {
-                let mode = self.intra_mode[self.idx4(x0, y0)] as u32;
+                let scan = if intra {
+                    let mode = self.intra_mode[self.idx4(x0, y0)] as u32;
+                    crate::hevc::residual::residual_scan_idx(true, log2, 0, 1, mode)
+                } else {
+                    0
+                };
                 let coeffs = self.gen_coeffs(log2, bypass);
-                let p = res_params(log2, 0, crate::hevc::residual::residual_scan_idx(true, log2, 0, 1, mode), bypass);
+                let p = res_params(log2, 0, scan, bypass, intra);
                 write_residual(e, &mut self.cx, &p, &coeffs);
                 let nn = 1usize << log2;
                 PicInfo::fill4(&mut self.exp_cbf_luma, self.w4, x0 as usize, y0 as usize, nn, nn, 1);
@@ -1852,7 +2161,12 @@ mod write_round_trip {
             if let Some(log2c) = here {
                 for c in 0..2usize {
                     if cbf_c[c] {
-                        let p = res_params(log2c, 1 + c, crate::hevc::residual::residual_scan_idx(true, log2c, 1 + c, 1, chroma_mode), bypass);
+                        let scan = if intra {
+                            crate::hevc::residual::residual_scan_idx(true, log2c, 1 + c, 1, chroma_mode)
+                        } else {
+                            0
+                        };
+                        let p = res_params(log2c, 1 + c, scan, bypass, intra);
                         let coeffs = self.gen_coeffs(log2c, bypass);
                         write_residual(e, &mut self.cx, &p, &coeffs);
                     }
@@ -1934,7 +2248,7 @@ mod write_round_trip {
         }
     }
 
-    fn res_params(log2: u32, c_idx: usize, scan_idx: u32, bypass: bool) -> ResidualParams {
+    fn res_params(log2: u32, c_idx: usize, scan_idx: u32, bypass: bool, intra: bool) -> ResidualParams {
         ResidualParams {
             log2_size: log2,
             c_idx,
@@ -1942,7 +2256,7 @@ mod write_round_trip {
             bypass,
             transform_skip_allowed: false,
             sign_hiding: false,
-            intra: true,
+            intra,
             pred_mode_intra: 0,
             ts_context: false,
             implicit_rdpcm: false,
@@ -2135,6 +2449,342 @@ mod write_round_trip {
         }
         round_trip_cfg(96, 96, 33, 25, true); // 32x32 CTUs, 3x3
         round_trip_cfg(40, 40, 26, 26, true); // partial CTBs under bypass
+    }
+
+    // ------------------------------------------------------------------
+    // P slices
+    // ------------------------------------------------------------------
+
+    /// A reference picture for the P round trips: a blank frame, complete
+    /// (so nothing waits on its rows), at the given POC.
+    fn complete_reference(sps: &Sps, poc: i32) -> SharedFrame<u8> {
+        SharedFrame::new(
+            Frame::<u8>::new(sps.width as usize, sps.height as usize, ChromaFormat::Yuv420, 8),
+            poc,
+            1,
+            true,
+        )
+    }
+
+    /// The hand-written P slice segment header — the production
+    /// `write_slice_header` cannot spell one yet (its non-IDR branch emits
+    /// a placeholder `short_term_ref_pic_set_sps_flag` of 1, illegal with
+    /// the SPS's zero sets). What it must grow, in order, against this
+    /// encoder's SPS/PPS: `slice_type` P; the POC lsb; the inline
+    /// short-term RPS (`short_term_ref_pic_set_sps_flag` 0, then
+    /// `num_negative_pics` = the reference count, `num_positive_pics` 0,
+    /// and per reference `delta_poc_s0_minus1` 0 with
+    /// `used_by_curr_pic_s0_flag` 1 — each reference one picture below the
+    /// previous); `num_ref_idx_active_override_flag` 1 with
+    /// `num_ref_idx_l0_active_minus1`; and `five_minus_max_num_merge_cand`
+    /// (the merge_idx cMax contract). Everything else this encoder's
+    /// parameter sets switch off: SAO, TMVP, long-term references, list
+    /// modification, cabac_init, weighting, chroma QP offsets, deblocking
+    /// override.
+    fn write_p_header(w: &mut BitWriter, qp: i32, poc_lsb: u32, log2_max_poc_lsb: u32, nref: u32, max_merge: u32) {
+        w.bits(8, ((NAL_TRAIL_R as u32) & 0x3f) << 1);
+        w.bits(8, 1); // nuh_layer_id 0, nuh_temporal_id_plus1 1
+        w.flag(true); // first_slice_segment_in_pic_flag
+        w.ue(0); // slice_pic_parameter_set_id
+        w.ue(1); // slice_type: P
+        w.bits(log2_max_poc_lsb, poc_lsb);
+        w.flag(false); // short_term_ref_pic_set_sps_flag: an inline set
+        w.ue(nref); // num_negative_pics
+        w.ue(0); // num_positive_pics
+        for _ in 0..nref {
+            w.ue(0); // delta_poc_s0_minus1: one below the previous
+            w.flag(true); // used_by_curr_pic_s0_flag
+        }
+        w.flag(true); // num_ref_idx_active_override_flag
+        w.ue(nref - 1); // num_ref_idx_l0_active_minus1
+        w.ue(5 - max_merge); // five_minus_max_num_merge_cand
+        w.se(qp - 26); // slice_qp_delta
+        w.flag(true); // byte_alignment(): alignment_bit_equal_to_one
+        w.align_zero();
+    }
+
+    /// Parse a P header with the production parser, assemble the
+    /// production slice decoder the way `decoder.rs` does for a one-slice
+    /// P picture over copies of one complete reference, decode every CTU,
+    /// then hand the decoder to `check` for the assertions.
+    fn decode_p(rbsp: &[u8], sps: &Sps, pps: &Pps, reference: &SharedFrame<u8>, check: impl FnOnce(&SliceDec<u8>)) {
+        let nal = HevcNalHeader::parse(rbsp).expect("NAL header");
+        let psc = pps.clone();
+        let ssc = sps.clone();
+        let (hdr, pps, sps) = SliceHeader::parse(rbsp, nal, &|_| Some(psc.clone()), &|_| Some(ssc.clone()), None)
+            .expect("the hand-written P header must parse");
+        assert_eq!(hdr.slice_type, SliceType::P);
+        assert_eq!(hdr.data_bit_offset % 8, 0);
+        let nref = hdr.num_ref_idx[0] as usize;
+        assert!(nref >= 1, "a P slice needs a reference");
+        let cur_poc = hdr.poc_lsb as i32;
+        let mut frame = Frame::<u8>::new(sps.width as usize, sps.height as usize, ChromaFormat::Yuv420, 8);
+        let geo = Arc::new(PicGeometry::new(&sps, &pps));
+        let mut info = PicInfo::new(geo);
+        // SAFETY: the reference is complete; no writer remains.
+        let rf: &Frame<u8> = unsafe { reference.get() };
+        let cabac = Cabac::new(&rbsp[(hdr.data_bit_offset / 8) as usize..]);
+        let wc = sps.pic_width_in_ctbs() as usize;
+        let hc = sps.pic_height_in_ctbs() as usize;
+        let mut dec = SliceDec {
+            sps: &sps,
+            pps: &pps,
+            hdr: &hdr,
+            frame: &mut frame,
+            info: &mut info,
+            cabac,
+            cx: Contexts::new(1, hdr.slice_qp),
+            refs: RefCtx {
+                pocs: [(0..nref).map(|i| cur_poc - 1 - i as i32).collect(), Vec::new()],
+                long_term: [vec![false; nref], Vec::new()],
+                col: None,
+                cur_poc,
+                no_backward_pred: true,
+                tmvp: false,
+                max_merge_cand: hdr.max_num_merge_cand as usize,
+                log2_par_mrg_level: pps.log2_parallel_merge_level,
+                is_b: false,
+                num_ref_idx: [nref, 0],
+                col_from_l0: true,
+            },
+            ref_frames: [vec![rf; nref], Vec::new()],
+            ref_shared: [vec![reference; nref], Vec::new()],
+            col_shared: None,
+            slice_idx: 0,
+            slice_addr: 0,
+            scaling: None,
+            qp_y: hdr.slice_qp,
+            qp_y_prev: hdr.slice_qp,
+            cu_qp_delta_val: 0,
+            is_cu_qp_delta_coded: false,
+            is_cu_chroma_qp_offset_coded: false,
+            cu_qp_offset_c: [0, 0],
+            qg: (0, 0),
+            qg_qp_prev: hdr.slice_qp,
+            first_qg: true,
+            last_pu_merged: false,
+            ctb_addr_rs: 0,
+            ctb_addr_ts: 0,
+            coeffs: vec![0; 1024],
+            luma_res: Vec::new(),
+            luma_res_valid: false,
+            dsp: HevcDsp::<u8>::SCALAR,
+            mc: McScratch::new(),
+            intra: IntraScratch::default(),
+            warnings: 0,
+            trace: TraceCfg::default(),
+        };
+        for ctb in 0..wc * hc {
+            dec.decode_ctu(ctb, ctb).unwrap_or_else(|e| panic!("P CTU {ctb} did not decode: {e}"));
+            let end = dec.cabac.terminate();
+            assert_eq!(end != 0, ctb == wc * hc - 1, "end_of_slice_segment_flag at CTU {ctb}");
+        }
+        assert!(!dec.cabac.overrun(), "the decoder ran past what the writer wrote");
+        assert_eq!(dec.warnings, 0);
+        check(&dec);
+    }
+
+    /// Write a whole random P slice with the production writers, decode
+    /// it with the production slice decoder, and require every stored map
+    /// — skip, pred_mode, CtDepth, luma cbf, the intra modes of the
+    /// intra-in-P CUs, the QP map — plus the entire context state to come
+    /// back. Motion *values* are checked by the scripted tests below,
+    /// because merge and AMVP derive them from decoded neighbour state the
+    /// writer does not mirror.
+    fn p_round_trip(width: u32, height: u32, qp: i32, seed: u64, nref: u32, max_merge: u32) {
+        let cfg = Config { width, height, chroma: ChromaFormat::Yuv420, bit_depth: 8, max_refs: 4, ..Config::default() };
+        let g = EncGeometry::new(&cfg);
+        let sps = Sps::parse(&unescape_rbsp(&write_sps(&cfg, &g, 8))).expect("the encoder's SPS must parse");
+        let mut pps = Pps::parse(&unescape_rbsp(&write_pps(26, false))).expect("the encoder's PPS must parse");
+        pps.resolve_tiles(&sps).expect("one tile covering the picture");
+        let wc = sps.pic_width_in_ctbs() as usize;
+        let hc = sps.pic_height_in_ctbs() as usize;
+        let mut w = BitWriter::new();
+        write_p_header(&mut w, qp, 4, 8, nref, max_merge);
+        let mut wr = CtuWriter::for_p(&sps, qp, seed, nref, max_merge);
+        {
+            let mut e = CabacEncoder::new(&mut w);
+            for ctb in 0..wc * hc {
+                wr.write_ctu(&mut e, ctb, wc);
+                e.encode_terminate((ctb == wc * hc - 1) as u32);
+            }
+        }
+        w.align_zero();
+        let rbsp = w.into_rbsp();
+        let reference = complete_reference(&sps, 3);
+        let tag = format!("{width}x{height} qp={qp} seed={seed} nref={nref} mm={max_merge}");
+        decode_p(&rbsp, &sps, &pps, &reference, |dec| {
+            assert_eq!(dec.hdr.num_ref_idx[0], nref, "{tag}: the header must carry the list length");
+            assert_eq!(dec.hdr.max_num_merge_cand, max_merge, "{tag}: the header must carry the merge cMax");
+            assert!(wr.coded.iter().all(|&c| c), "{tag}: the writer's walk must tile the picture");
+            assert_eq!(dec.info.ct_depth, wr.ct_depth, "{tag}: CtDepth differs");
+            assert_eq!(dec.info.skip, wr.exp_skip, "{tag}: the skip map differs");
+            assert_eq!(dec.info.pred_mode, wr.exp_pred, "{tag}: the pred_mode map differs");
+            assert_eq!(dec.info.cbf_luma, wr.exp_cbf_luma, "{tag}: cbf_luma differs");
+            assert_eq!(dec.info.intra_mode, wr.intra_mode, "{tag}: intra modes differ");
+            assert!(dec.info.qp_y.iter().all(|&q| q as i32 == qp), "{tag}: QP map differs");
+            assert_eq!(dec.cx.c, wr.cx.c, "{tag}: CABAC context states diverged");
+            assert_eq!(dec.cx.stat_coeff, wr.cx.stat_coeff, "{tag}");
+        });
+    }
+
+    /// Random P slices across sizes, QPs, reference-list lengths and
+    /// merge-candidate caps — skip runs, merge, AMVP and intra-in-P mixed
+    /// by the writer's walk, partial-CTU edges included.
+    #[test]
+    fn p_round_trips() {
+        p_round_trip(64, 64, 26, 41, 1, 5);
+        p_round_trip(64, 64, 33, 42, 4, 5);
+        p_round_trip(128, 64, 26, 43, 2, 5);
+        p_round_trip(96, 96, 18, 44, 4, 1); // merge_idx never coded (cMax 1)
+        p_round_trip(40, 40, 26, 45, 2, 3); // partial CTBs
+        p_round_trip(64, 64, 51, 46, 1, 2);
+    }
+
+    /// One 32x32 picture = one CTU = one 2Nx2N AMVP CU with no residual
+    /// and no neighbours: both AMVP candidates are the zero vector, so the
+    /// decoded motion IS the written mvd — component, sign and EG1 suffix
+    /// exact — and the reference index lands in the motion map. This is
+    /// the check the context array cannot make: the mvd suffix and sign
+    /// are bypass bins and leave no context trace, so only a value that
+    /// comes back through the production derivation proves them.
+    #[test]
+    fn p_mvd_and_ref_round_trip_by_value() {
+        let mvds: [(i16, i16); 9] = [
+            (0, 0), (1, 0), (0, -1), (1, -1), (-2, 2), (7, -3), (-9, 10), (100, -1000), (32767, -32767),
+        ];
+        for &(mx, my) in mvds.iter() {
+            for (nref, ri) in [(1u32, 0u32), (2, 1), (4, 3)] {
+                scripted_amvp(mx, my, nref, ri);
+            }
+        }
+    }
+
+    fn scripted_amvp(mx: i16, my: i16, nref: u32, ri: u32) {
+        let cfg = Config { width: 32, height: 32, chroma: ChromaFormat::Yuv420, bit_depth: 8, max_refs: 4, ..Config::default() };
+        let g = EncGeometry::new(&cfg);
+        let sps = Sps::parse(&unescape_rbsp(&write_sps(&cfg, &g, 8))).expect("SPS");
+        let mut pps = Pps::parse(&unescape_rbsp(&write_pps(26, false))).expect("PPS");
+        pps.resolve_tiles(&sps).expect("one tile");
+        assert_eq!(sps.pic_width_in_ctbs() * sps.pic_height_in_ctbs(), 1, "one CTU by construction");
+        let mut w = BitWriter::new();
+        write_p_header(&mut w, 26, 4, 8, nref, 5);
+        let mut cx = Contexts::new(1, 26);
+        {
+            let mut e = CabacEncoder::new(&mut w);
+            let nb = SplitCuNb { left_depth: None, above_depth: None };
+            write_split_cu_flag(&mut e, &mut cx, &nb, 0, false);
+            write_cu_skip_flag(&mut e, &mut cx, None, None, false);
+            write_pred_mode_flag(&mut e, &mut cx, false);
+            write_part_mode_inter(&mut e, &mut cx, PartMode::P2Nx2N);
+            write_merge_flag(&mut e, &mut cx, false);
+            write_ref_idx(&mut e, &mut cx, nref, ri);
+            write_mvd(&mut e, &mut cx, Mv::new(mx, my));
+            write_mvp_flag(&mut e, &mut cx, (ri & 1) != 0);
+            write_rqt_root_cbf(&mut e, &mut cx, false);
+            e.encode_terminate(1);
+        }
+        w.align_zero();
+        let rbsp = w.into_rbsp();
+        let reference = complete_reference(&sps, 3);
+        decode_p(&rbsp, &sps, &pps, &reference, |dec| {
+            let tag = format!("mvd=({mx},{my}) nref={nref} ri={ri}");
+            let w4 = dec.frame.w4;
+            for y4 in 0..8 {
+                for x4 in 0..8 {
+                    let mi = &dec.frame.motion[y4 * w4 + x4];
+                    assert_eq!(mi.mv[0], Mv::new(mx, my), "{tag}: motion is the mvd (zero predictor)");
+                    assert_eq!(mi.ref_idx, [ri as i8, -1], "{tag}: the reference index");
+                }
+            }
+            assert_eq!(dec.cx.c, cx.c, "{tag}: context states diverged");
+        });
+    }
+
+    /// Two CTUs: the first an AMVP CU with a distinctive mvd, the second a
+    /// merge — then, separately, a skip — at index 0, whose first spatial
+    /// candidate is the left CU's motion. The second CU's decoded motion
+    /// must equal the first's: merge_flag, merge_idx, cu_skip_flag and the
+    /// candidate wiring checked by value. The merge variant also walks the
+    /// inferred-cbf_luma path: a merged 2Nx2N reads no rqt_root_cbf, its
+    /// depth-0 leaf has both chroma cbfs 0, so cbf_luma is inferred 1 and
+    /// the leaf must carry real luma coefficients.
+    #[test]
+    fn p_merge_and_skip_inherit_motion_by_value() {
+        for skip in [false, true] {
+            let cfg = Config { width: 64, height: 32, chroma: ChromaFormat::Yuv420, bit_depth: 8, max_refs: 4, ..Config::default() };
+            let g = EncGeometry::new(&cfg);
+            let sps = Sps::parse(&unescape_rbsp(&write_sps(&cfg, &g, 8))).expect("SPS");
+            let mut pps = Pps::parse(&unescape_rbsp(&write_pps(26, false))).expect("PPS");
+            pps.resolve_tiles(&sps).expect("one tile");
+            assert_eq!(sps.pic_width_in_ctbs(), 2);
+            assert_eq!(sps.pic_height_in_ctbs(), 1);
+            let mvd = Mv::new(12, -20);
+            let mut w = BitWriter::new();
+            write_p_header(&mut w, 26, 4, 8, 1, 5);
+            let mut cx = Contexts::new(1, 26);
+            {
+                let mut e = CabacEncoder::new(&mut w);
+                // CTU 0: one 32x32 AMVP CU, no residual.
+                let nb = SplitCuNb { left_depth: None, above_depth: None };
+                write_split_cu_flag(&mut e, &mut cx, &nb, 0, false);
+                write_cu_skip_flag(&mut e, &mut cx, None, None, false);
+                write_pred_mode_flag(&mut e, &mut cx, false);
+                write_part_mode_inter(&mut e, &mut cx, PartMode::P2Nx2N);
+                write_merge_flag(&mut e, &mut cx, false);
+                write_mvd(&mut e, &mut cx, mvd); // nref 1: no ref_idx bins
+                write_mvp_flag(&mut e, &mut cx, false);
+                write_rqt_root_cbf(&mut e, &mut cx, false);
+                e.encode_terminate(0);
+                // CTU 1: merge (or skip) at index 0 — the A1 candidate, the
+                // left CU's motion.
+                let nb = SplitCuNb { left_depth: Some(0), above_depth: None };
+                write_split_cu_flag(&mut e, &mut cx, &nb, 0, false);
+                write_cu_skip_flag(&mut e, &mut cx, Some(false), None, skip);
+                if skip {
+                    write_merge_idx(&mut e, &mut cx, 5, 0);
+                } else {
+                    write_pred_mode_flag(&mut e, &mut cx, false);
+                    write_part_mode_inter(&mut e, &mut cx, PartMode::P2Nx2N);
+                    write_merge_flag(&mut e, &mut cx, true);
+                    write_merge_idx(&mut e, &mut cx, 5, 0);
+                    // rqt_root_cbf is NOT written for a merged 2Nx2N — the
+                    // transform tree is inferred present.
+                    write_split_transform_flag(&mut e, &mut cx, 5, false);
+                    write_cbf_chroma(&mut e, &mut cx, 0, false);
+                    write_cbf_chroma(&mut e, &mut cx, 0, false);
+                    // cbf_luma inferred 1: nothing written, coefficients
+                    // mandatory.
+                    let mut coeffs = vec![0i16; 32 * 32];
+                    coeffs[0] = 1;
+                    let p = res_params(5, 0, 0, false, false);
+                    write_residual(&mut e, &mut cx, &p, &coeffs);
+                }
+                e.encode_terminate(1);
+            }
+            w.align_zero();
+            let rbsp = w.into_rbsp();
+            let reference = complete_reference(&sps, 3);
+            decode_p(&rbsp, &sps, &pps, &reference, |dec| {
+                let tag = format!("skip={skip}");
+                let w4 = dec.frame.w4;
+                for y4 in 0..8 {
+                    for x4 in 0..16 {
+                        let mi = &dec.frame.motion[y4 * w4 + x4];
+                        assert_eq!(mi.mv[0], mvd, "{tag}: ({x4},{y4}) motion inherited from the AMVP CU");
+                        assert_eq!(mi.ref_idx, [0, -1], "{tag}: ({x4},{y4}) reference index");
+                    }
+                }
+                let skip_map: Vec<u8> = dec.info.skip[..].to_vec();
+                for y4 in 0..8usize {
+                    for x4 in 0..16usize {
+                        let want = (skip && x4 >= 8) as u8;
+                        assert_eq!(skip_map[y4 * dec.info.w4 + x4], want, "{tag}: skip map at ({x4},{y4})");
+                    }
+                }
+                assert_eq!(dec.cx.c, cx.c, "{tag}: context states diverged");
+            });
+        }
     }
 }
 
