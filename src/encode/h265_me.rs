@@ -215,6 +215,27 @@ pub enum InterCuKind {
         /// `uLX` sum is a wrapping add, ctu.rs).
         mvd: Mv,
     },
+    /// B: AMVP in one or both lists. `idc` is `inter_pred_idc` in the
+    /// reader's own encoding — 0 `PRED_L0`, 1 `PRED_L1`, 2 `PRED_BI` — and
+    /// only the entries of `mvd` / `mvp_flag` whose list the `idc` uses
+    /// are meaningful; the other is zero and must not be written.
+    ///
+    /// What the writer spells, in `prediction_unit`'s order: `merge_flag`
+    /// 0, then `inter_pred_idc` through
+    /// `hevc::ctu::write_inter_pred_idc` (whose docblock carries the
+    /// `w + h != 12` reading), then **per list, interleaved** — L0's
+    /// `ref_idx` / `mvd` / `mvp_flag`, then L1's, not both `ref_idx`
+    /// followed by both `mvd`. `ref_idx` is absent in both lists because
+    /// each declares exactly one active reference.
+    BAmvp {
+        /// `inter_pred_idc`: 0 L0, 1 L1, 2 BI.
+        idc: u8,
+        /// `mvd_l0` / `mvd_l1`, wrapping i16 differences from the chosen
+        /// predictor of that list.
+        mvd: [Mv; 2],
+        /// `mvp_l0_flag` / `mvp_l1_flag`.
+        mvp_flag: [u8; 2],
+    },
     /// Inter lost to the flatness proxy: code this CU with the intra
     /// decision instead. Only `mv` is meaningful (callers feeding motion
     /// state must *not* use it — an intra CU's motion is
@@ -235,10 +256,19 @@ pub struct InterCuDecision {
     /// every kind including `Skip` (the writer carries no vector, but
     /// callers and tests want the motion the CU actually has).
     pub mv: Mv,
-    /// Reference index into list 0. Always 0: this module searches exactly
-    /// one reference. The field exists so the serialiser's contract does
-    /// not change when more arrive.
+    /// Reference index into list 0, or -1 when this CU does not use
+    /// list 0 (only a B CU can say that). Otherwise always 0: this module
+    /// searches exactly one reference per list. The field exists so the
+    /// serialiser's contract does not change when more arrive.
     pub ref_idx: i8,
+    /// The list-1 motion vector, quarter luma samples. Meaningful only
+    /// when [`InterCuDecision::ref_idx_l1`] is not -1, which only a B CU
+    /// can arrange; a P decision leaves this zero.
+    pub mv_l1: Mv,
+    /// Reference index into list 1, -1 when the CU does not use list 1.
+    /// Always -1 for P (a P slice has no list 1 at all) and for a B CU
+    /// whose `inter_pred_idc` is `PRED_L0`.
+    pub ref_idx_l1: i8,
     /// `rqt_root_cbf` as the *reader* resolves it: false for `Skip`, true
     /// for `Merge` (inferred, never coded), the explicit value for `Amvp`
     /// (coded). When false, no transform tree follows and every
@@ -291,6 +321,8 @@ impl Default for InterCuDecision {
             kind: InterCuKind::Skip { merge_idx: 0 },
             mv: Mv::ZERO,
             ref_idx: 0,
+            mv_l1: Mv::ZERO,
+            ref_idx_l1: -1,
             rqt_root_cbf: false,
             cbf_luma: false,
             cbf_chroma: [false; 2],
@@ -376,6 +408,9 @@ pub struct InterPicture<S: Sample> {
     swin: Vec<S>,
     stmp: Vec<i16>,
     spred14: Vec<i16>,
+    /// The second list's 14-bit prediction, for the B bi-prediction trial
+    /// (`satd_bi_at`). Unused by the P path.
+    spred14_b: Vec<i16>,
     spred: Vec<S>,
 }
 
@@ -415,6 +450,7 @@ impl<S: Sample> InterPicture<S> {
             swin: vec![S::default(); (64 + 7) * (64 + 7)],
             stmp: vec![0; crate::dsp::hevc::MC_TMP_LEN],
             spred14: vec![0; nmax],
+            spred14_b: vec![0; nmax],
             spred: vec![S::default(); nmax],
         }
     }
@@ -435,6 +471,34 @@ impl<S: Sample> InterPicture<S> {
             log2_par_mrg_level: 2,
             is_b: false,
             num_ref_idx: [1, 0],
+            col_from_l0: true,
+        }
+    }
+
+    /// The reference-list context for a B slice referencing `poc0` in
+    /// list 0 and `poc1` in list 1, one active entry each — what the
+    /// header this stream carries declares (`num_ref_idx_active_override`
+    /// 0 over PPS defaults of 0, which the reader resolves as [1, 1]).
+    ///
+    /// `no_backward_pred` is **derived** exactly as `decoder.rs` derives
+    /// `NoBackwardPredFlag` — every reference POC at or before the current
+    /// picture — rather than pasted from [`Self::ref_ctx`], which
+    /// hardcodes true because a P slice's single reference is always in
+    /// the past. For a B between two anchors it comes out false, and it
+    /// reaches `merge_candidate` through `RefCtx`.
+    fn ref_ctx_b<'a>(&self, poc0: i32, poc1: i32) -> RefCtx<'a, S> {
+        let no_backward_pred = [poc0, poc1].iter().all(|&p| p <= self.cur_poc);
+        RefCtx {
+            pocs: [vec![poc0], vec![poc1]],
+            long_term: [vec![false], vec![false]],
+            col: None,
+            cur_poc: self.cur_poc,
+            no_backward_pred,
+            tmvp: false,
+            max_merge_cand: MAX_MERGE_CAND,
+            log2_par_mrg_level: 2,
+            is_b: true,
+            num_ref_idx: [1, 1],
             col_from_l0: true,
         }
     }
@@ -560,9 +624,258 @@ impl<S: Sample> InterPicture<S> {
         // The chosen prediction, through the decoder's own MC.
         predict_block(ctx.dsp, &mut self.scratch, &mut self.recon, x0, y0, n, n, Some((refp, mv)), None, [Weighting::Default; 3]);
 
-        // Residual: one CU-sized luma TU, and per component the chroma TBs
-        // this format's `transform_unit` carries — each reconstructed in
-        // place through the decoder's inverse path.
+        let any = self.code_residual_cu(ctx, x0, y0, src, y_stride, src_cb, src_cr, c_stride, &mut out);
+        out.kind = match (merge_wins, any) {
+            (true, false) => InterCuKind::Skip { merge_idx: best_merge.expect("merge_wins").0 as u8 },
+            (true, true) => InterCuKind::Merge { merge_idx: best_merge.expect("merge_wins").0 as u8 },
+            (false, _) => InterCuKind::Amvp { mvp_flag: amvp_flag, mvd },
+        };
+
+        // Store motion and marks exactly as the decoder's `prediction_unit`
+        // does after parsing ("Store motion", src/hevc/ctu.rs): the next
+        // CUs' candidate lists read them.
+        let mut mi = MotionInfo { mv: [mv, Mv::ZERO], ref_delta: [0; 2], ref_idx: [0, -1], flags: 0, pad: 0 };
+        mi.ref_delta[0] = (self.cur_poc - refp.poc).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        fill_motion(&mut self.recon.motion, self.recon.w4, x0, y0, n, n, mi);
+        let w4 = self.info.w4;
+        PicInfo::fill4(&mut self.info.pred_mode, w4, x0, y0, n, n, 0);
+        PicInfo::fill4(&mut self.info.skip, w4, x0, y0, n, n, matches!(out.kind, InterCuKind::Skip { .. }) as u8);
+        out
+    }
+
+    /// Decide and code one CTU (== one 2Nx2N CU) of a **B** picture
+    /// against `ref0` (list 0) and `ref1` (list 1), whose borders must be
+    /// extended as the decoder pads references before MC reads them.
+    ///
+    /// The shape of the decision, and what is the decoder's rather than
+    /// this module's:
+    ///
+    /// - **The candidate lists are the decoder's.** `merge_candidate` runs
+    ///   with `is_b` true, so it returns both lists per candidate and adds
+    ///   the combined bi-predictive pairs and the bi zero candidates that
+    ///   only a B slice has. `amvp` runs per list. Neither derivation is
+    ///   mirrored here.
+    /// - **The search is per list**, each the same greedy full-sample
+    ///   descent plus two sub-sample rings the P walk uses, seeded from
+    ///   that list's own predictors and every merge candidate that uses
+    ///   that list.
+    /// - **One bi trial, at the two per-list winners**, scored through the
+    ///   decoder's `dsp.bi` (`satd_bi_at`). There is deliberately **no
+    ///   iterative bi refinement** in this version: the two vectors are
+    ///   not re-searched against each other's prediction, so a bi CU here
+    ///   is the best pair of independently searched vectors and not the
+    ///   best pair. Named because it is a quality ceiling, not a
+    ///   correctness one.
+    /// - **The prediction is the decoder's own**, uni or bi, through the
+    ///   one `predict_block` call that also gives every chroma format its
+    ///   vector — so B costs nothing extra outside 4:2:0.
+    ///
+    /// On [`InterCuKind::UseIntra`] the reconstruction planes are
+    /// untouched, exactly as in [`Self::code_ctu`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn code_ctu_b(
+        &mut self,
+        ctx: &MeCtx<'_, S>,
+        ref0: &Frame<S>,
+        ref1: &Frame<S>,
+        cu_x: usize,
+        cu_y: usize,
+        src_y: &[S],
+        y_stride: usize,
+        src_cb: &[S],
+        src_cr: &[S],
+        c_stride: usize,
+    ) -> InterCuDecision {
+        let n = 1usize << self.log2_cu;
+        let (x0, y0) = (cu_x * n, cu_y * n);
+        let mut out = InterCuDecision { log2_cu: self.log2_cu, ..InterCuDecision::default() };
+
+        let ctb = self.info.ctb_of(x0, y0);
+        self.info.ctb_slice_addr[ctb] = 0;
+        self.info.ctb_slice[ctb] = 0;
+
+        let refs = self.ref_ctx_b(ref0.poc, ref1.poc);
+        let pu = PuPos {
+            x_cb: x0 as i32,
+            y_cb: y0 as i32,
+            n_cb: n as i32,
+            x_pb: x0 as i32,
+            y_pb: y0 as i32,
+            w: n as i32,
+            h: n as i32,
+            part_idx: 0,
+        };
+
+        let merge: Vec<Cand> = (0..MAX_MERGE_CAND).map(|i| merge_candidate(&self.info, &self.recon, &refs, &pu, i)).collect();
+        let mvp: [[Mv; 2]; 2] = [
+            [amvp(&self.info, &self.recon, &refs, &pu, 0, 0, 0), amvp(&self.info, &self.recon, &refs, &pu, 0, 0, 1)],
+            [amvp(&self.info, &self.recon, &refs, &pu, 1, 0, 0), amvp(&self.info, &self.recon, &refs, &pu, 1, 0, 1)],
+        ];
+
+        let soff = y0 * y_stride + x0;
+        let src = &src_y[soff..];
+
+        // Per-list search. Each list is seeded from the zero vector, its
+        // own two AMVP predictors, and every merge candidate that uses it.
+        let mut uni = [(Mv::ZERO, u32::MAX); 2];
+        for list in 0..2usize {
+            let plane = if list == 0 { &ref0.y } else { &ref1.y };
+            let mut seeds: Vec<Mv> = vec![Mv::ZERO, mvp[list][0], mvp[list][1]];
+            seeds.extend(merge.iter().filter(|c| c.ref_idx[list] == 0).map(|c| c.mv[list]));
+            let full = self.search_full(ctx, plane, x0, y0, n, src, y_stride, &seeds);
+            uni[list] = self.refine_subpel(ctx, plane, x0, y0, n, src, y_stride, full);
+        }
+
+        let lam = lambda(ctx.qp);
+
+        // The three AMVP shapes. `inter_pred_idc` costs two bins for a uni
+        // shape and one for BI (the reader stops after a set first bin),
+        // on top of merge_flag, rqt_root_cbf and a mvp_flag per used list
+        // — the same approximate-bin-count placeholder policy as the rest
+        // of this module.
+        let mvd_for = |mv: Mv, p: Mv| Mv::new(mv.x.wrapping_sub(p.x), mv.y.wrapping_sub(p.y));
+        let mut best_mvd = [Mv::ZERO; 2];
+        let mut best_flag = [0u8; 2];
+        for list in 0..2usize {
+            let a = mvd_for(uni[list].0, mvp[list][0]);
+            let b = mvd_for(uni[list].0, mvp[list][1]);
+            let pick1 = mvd_cost(b) < mvd_cost(a);
+            best_flag[list] = u8::from(pick1);
+            best_mvd[list] = if pick1 { b } else { a };
+        }
+        // idc 0 / 1: one list, its mvd and mvp_flag.
+        let mut best: Option<(u8, u32)> = None; // (idc, satd)
+        let mut best_cost = f32::INFINITY;
+        for (list, u) in uni.iter().enumerate() {
+            let bins = 3 + 2 + mvd_cost(best_mvd[list]);
+            let cost = u.1 as f32 + lam * bins as f32;
+            if cost < best_cost {
+                best_cost = cost;
+                best = Some((list as u8, u.1));
+            }
+        }
+        // idc 2: the bi trial at the two winners.
+        let bi_satd = self.satd_bi_at(ctx, &ref0.y, &ref1.y, x0, y0, n, src, y_stride, uni[0].0, uni[1].0);
+        {
+            let bins = 3 + 1 + 1 + mvd_cost(best_mvd[0]) + mvd_cost(best_mvd[1]);
+            let cost = bi_satd as f32 + lam * bins as f32;
+            if cost < best_cost {
+                best_cost = cost;
+                best = Some((2, bi_satd));
+            }
+        }
+        let (best_idc, amvp_satd) = best.expect("three shapes were costed");
+
+        // Merge, over the decoder's own candidates. A candidate may use
+        // either list or both, and is scored the way it would be predicted.
+        let mut best_merge: Option<(usize, u32)> = None;
+        let mut best_merge_cost = f32::INFINITY;
+        let mut seen: Vec<([Mv; 2], [i8; 2])> = Vec::with_capacity(MAX_MERGE_CAND);
+        for (idx, cand) in merge.iter().enumerate() {
+            let key = (cand.mv, cand.ref_idx);
+            if cand.ref_idx == [-1, -1] || seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            let satd = match (cand.ref_idx[0] >= 0, cand.ref_idx[1] >= 0) {
+                (true, true) => self.satd_bi_at(ctx, &ref0.y, &ref1.y, x0, y0, n, src, y_stride, cand.mv[0], cand.mv[1]),
+                (true, false) => self.satd_at(ctx, &ref0.y, x0, y0, n, src, y_stride, cand.mv[0]),
+                (false, true) => self.satd_at(ctx, &ref1.y, x0, y0, n, src, y_stride, cand.mv[1]),
+                (false, false) => unreachable!("filtered above"),
+            };
+            let bins = 2 + tr_bins(idx, MAX_MERGE_CAND - 1);
+            let cost = satd as f32 + lam * bins as f32;
+            if cost < best_merge_cost {
+                best_merge_cost = cost;
+                best_merge = Some((idx, satd));
+            }
+        }
+
+        let merge_wins = best_merge.is_some_and(|_| best_merge_cost <= best_cost);
+        // The motion the winner carries, as `ref_idx` pairs the decoder
+        // would store.
+        let (mv_pair, ref_pair, inter_satd) = if merge_wins {
+            let (idx, satd) = best_merge.expect("merge_wins implies a candidate");
+            (merge[idx].mv, merge[idx].ref_idx, satd)
+        } else {
+            let mv = [uni[0].0, uni[1].0];
+            let r: [i8; 2] = match best_idc {
+                0 => [0, -1],
+                1 => [-1, 0],
+                _ => [0, 0],
+            };
+            (
+                [if r[0] >= 0 { mv[0] } else { Mv::ZERO }, if r[1] >= 0 { mv[1] } else { Mv::ZERO }],
+                r,
+                amvp_satd,
+            )
+        };
+        out.mv = mv_pair[0];
+        out.ref_idx = ref_pair[0];
+        out.mv_l1 = mv_pair[1];
+        out.ref_idx_l1 = ref_pair[1];
+
+        if prefer_intra(ctx, inter_satd, src, y_stride, n) {
+            out.kind = InterCuKind::UseIntra;
+            fill_motion(&mut self.recon.motion, self.recon.w4, x0, y0, n, n, MotionInfo::INTRA);
+            let w4 = self.info.w4;
+            PicInfo::fill4(&mut self.info.pred_mode, w4, x0, y0, n, n, 1);
+            return out;
+        }
+
+        // The chosen prediction, through the decoder's own MC — uni or bi
+        // by which lists the winner uses, and per-format chroma for free.
+        let r0 = (ref_pair[0] >= 0).then_some((ref0, mv_pair[0]));
+        let r1 = (ref_pair[1] >= 0).then_some((ref1, mv_pair[1]));
+        predict_block(ctx.dsp, &mut self.scratch, &mut self.recon, x0, y0, n, n, r0, r1, [Weighting::Default; 3]);
+
+        let any = self.code_residual_cu(ctx, x0, y0, src, y_stride, src_cb, src_cr, c_stride, &mut out);
+        out.kind = match (merge_wins, any) {
+            (true, false) => InterCuKind::Skip { merge_idx: best_merge.expect("merge_wins").0 as u8 },
+            (true, true) => InterCuKind::Merge { merge_idx: best_merge.expect("merge_wins").0 as u8 },
+            (false, _) => InterCuKind::BAmvp { idc: best_idc, mvd: best_mvd, mvp_flag: best_flag },
+        };
+
+        // Store motion and marks exactly as `prediction_unit` does after
+        // parsing ("Store motion", src/hevc/ctu.rs), both lists this time.
+        let mut mi = MotionInfo { mv: mv_pair, ref_idx: ref_pair, ref_delta: [0; 2], flags: 0, pad: 0 };
+        for list in 0..2usize {
+            if ref_pair[list] >= 0 {
+                let poc = if list == 0 { ref0.poc } else { ref1.poc };
+                mi.ref_delta[list] = (self.cur_poc - poc).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            }
+        }
+        fill_motion(&mut self.recon.motion, self.recon.w4, x0, y0, n, n, mi);
+        let w4 = self.info.w4;
+        PicInfo::fill4(&mut self.info.pred_mode, w4, x0, y0, n, n, 0);
+        PicInfo::fill4(&mut self.info.skip, w4, x0, y0, n, n, matches!(out.kind, InterCuKind::Skip { .. }) as u8);
+        out
+    }
+
+    /// The residual of one whole-CTU CU, luma then every chroma TB this
+    /// format carries, each reconstructed in place through the decoder's
+    /// inverse path. Fills `cbf_luma`, `cbf_chroma`, `cbf_chroma_bot`,
+    /// `rqt_root_cbf` and the coefficient arrays; returns `rqt_root_cbf`.
+    ///
+    /// Shared by the P and B walks precisely so the two cannot drift: the
+    /// residual does not depend on how the prediction was signalled, only
+    /// on what the prediction left behind, and a second copy of the
+    /// chroma-format placement is the drift hazard this crate keeps
+    /// finding. `predict_block` must already have written the prediction
+    /// into `recon`.
+    #[allow(clippy::too_many_arguments)]
+    fn code_residual_cu(
+        &mut self,
+        ctx: &MeCtx<'_, S>,
+        x0: usize,
+        y0: usize,
+        src: &[S],
+        y_stride: usize,
+        src_cb: &[S],
+        src_cr: &[S],
+        c_stride: usize,
+        out: &mut InterCuDecision,
+    ) -> bool {
         let qp_l = ctx.qp + 6 * (ctx.bit_depth as i32 - 8);
         let nz_l = code_residual_inter(ctx, &mut self.recon.y, x0, y0, self.log2_cu, qp_l, src, y_stride, &mut out.luma);
         let mut nz_c = 0u32;
@@ -599,26 +912,9 @@ impl<S: Sample> InterPicture<S> {
                 }
             }
         }
-
         out.cbf_luma = nz_l != 0;
-        let any = nz_l + nz_c != 0;
-        out.rqt_root_cbf = any;
-        out.kind = match (merge_wins, any) {
-            (true, false) => InterCuKind::Skip { merge_idx: best_merge.expect("merge_wins").0 as u8 },
-            (true, true) => InterCuKind::Merge { merge_idx: best_merge.expect("merge_wins").0 as u8 },
-            (false, _) => InterCuKind::Amvp { mvp_flag: amvp_flag, mvd },
-        };
-
-        // Store motion and marks exactly as the decoder's `prediction_unit`
-        // does after parsing ("Store motion", src/hevc/ctu.rs): the next
-        // CUs' candidate lists read them.
-        let mut mi = MotionInfo { mv: [mv, Mv::ZERO], ref_delta: [0; 2], ref_idx: [0, -1], flags: 0, pad: 0 };
-        mi.ref_delta[0] = (self.cur_poc - refp.poc).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-        fill_motion(&mut self.recon.motion, self.recon.w4, x0, y0, n, n, mi);
-        let w4 = self.info.w4;
-        PicInfo::fill4(&mut self.info.pred_mode, w4, x0, y0, n, n, 0);
-        PicInfo::fill4(&mut self.info.skip, w4, x0, y0, n, n, matches!(out.kind, InterCuKind::Skip { .. }) as u8);
-        out
+        out.rqt_root_cbf = nz_l + nz_c != 0;
+        out.rqt_root_cbf
     }
 
     /// Code the CTU at `(cu_x, cu_y)` as an **intra** CU inside this P
@@ -774,41 +1070,97 @@ impl<S: Sample> InterPicture<S> {
     /// default uni-prediction the decoder applies.
     #[allow(clippy::too_many_arguments)]
     fn satd_at(&mut self, ctx: &MeCtx<'_, S>, refp: &Plane16<S>, x: usize, y: usize, n: usize, src: &[S], src_stride: usize, mv: Mv) -> u32 {
-        let xi = x as i32 + (mv.x as i32 >> 2);
-        let yi = y as i32 + (mv.y as i32 >> 2);
-        let (fx, fy) = ((mv.x & 3) as usize, (mv.y & 3) as usize);
+        let InterPicture { swin, stmp, spred14, spred, .. } = self;
+        predict14(ctx, refp, x, y, n, mv, swin, stmp, spred14);
         let bd = ctx.bit_depth;
-        let shift1 = bd.min(12) as i32 - 8;
-        let shift3 = 14 - bd as i32;
-        // The filter window (3 samples before, 4 after), gathered with
-        // clamping when it leaves the padded plane — `source`'s rule.
-        let (x0, y0) = (xi - 3, yi - 3);
-        let (ww, hh) = (n + 7, n + 7);
-        let pad = refp.pad as i32;
-        let inside = x0 >= -pad && y0 >= -pad && x0 + ww as i32 <= refp.width as i32 + pad && y0 + hh as i32 <= refp.height as i32 + pad;
-        let (win, stride) = if inside {
-            (&refp.data[refp.offset(x0 as isize, y0 as isize)..], refp.stride)
-        } else {
-            for yy in 0..hh {
-                for xx in 0..ww {
-                    self.swin[yy * ww + xx] = refp.at_clamped(x0 + xx as i32, y0 + yy as i32);
-                }
-            }
-            (&self.swin[..], ww)
-        };
-        let at_block = 3 * stride + 3;
-        match (fx, fy) {
-            (0, 0) => (ctx.dsp.qpel_copy)(&mut self.spred14, &win[at_block..], stride, n, n, shift3),
-            (_, 0) => (ctx.dsp.qpel_h)(&mut self.spred14, &win[3 * stride..], stride, n, n, fx, shift1),
-            (0, _) => (ctx.dsp.qpel_v)(&mut self.spred14, &win[3..], stride, n, n, fy, shift1),
-            _ => {
-                (ctx.dsp.qpel_h)(&mut self.stmp, win, stride, n, n + 7, fx, shift1);
-                (ctx.dsp.qpel_v2)(&mut self.spred14, &self.stmp, n, n, n, fy);
+        let max = (1i32 << bd) - 1;
+        (ctx.dsp.uni)(spred, n, spred14, n, n, 14 - bd as i32, max);
+        (ctx.dist.satd)(src, src_stride, spred, n, n, n)
+    }
+
+    /// SATD of the *bi-predicted* luma block at `(mv0, mv1)`: the two
+    /// lists' 14-bit predictions combined through the decoder's own
+    /// `dsp.bi` at `15 - bit_depth`, which is the shift `predict_block`
+    /// uses for default-weighted bi-prediction (8.5.3.3.4.2). Scoring the
+    /// average rather than either half is what makes the BI trial
+    /// comparable with the two uni ones.
+    #[allow(clippy::too_many_arguments)]
+    fn satd_bi_at(
+        &mut self,
+        ctx: &MeCtx<'_, S>,
+        ref0: &Plane16<S>,
+        ref1: &Plane16<S>,
+        x: usize,
+        y: usize,
+        n: usize,
+        src: &[S],
+        src_stride: usize,
+        mv0: Mv,
+        mv1: Mv,
+    ) -> u32 {
+        let InterPicture { swin, stmp, spred14, spred14_b, spred, .. } = self;
+        predict14(ctx, ref0, x, y, n, mv0, swin, stmp, spred14);
+        predict14(ctx, ref1, x, y, n, mv1, swin, stmp, spred14_b);
+        let bd = ctx.bit_depth;
+        let max = (1i32 << bd) - 1;
+        (ctx.dsp.bi)(spred, n, spred14, spred14_b, n, n, 15 - bd as i32, max);
+        (ctx.dist.satd)(src, src_stride, spred, n, n, n)
+    }
+}
+
+/// One list's 14-bit luma prediction of the `n x n` block at `(x, y)` for
+/// vector `mv`, into `out`. The window gathering and the kernel choice are
+/// `hevc::inter`'s `source` and `interp` (3 taps before the sample, 4
+/// after; `qpel_copy` / `_h` / `_v` / `_h`+`_v2` by fraction), which is
+/// what keeps a scored candidate identical to what `predict_block` will
+/// later commit for the winner.
+///
+/// A free function rather than a method because both callers need it to
+/// write into one field of `InterPicture` while reading two others, which
+/// a `&mut self` method cannot express.
+#[allow(clippy::too_many_arguments)]
+fn predict14<S: Sample>(
+    ctx: &MeCtx<'_, S>,
+    refp: &Plane16<S>,
+    x: usize,
+    y: usize,
+    n: usize,
+    mv: Mv,
+    swin: &mut [S],
+    stmp: &mut [i16],
+    out: &mut [i16],
+) {
+    let xi = x as i32 + (mv.x as i32 >> 2);
+    let yi = y as i32 + (mv.y as i32 >> 2);
+    let (fx, fy) = ((mv.x & 3) as usize, (mv.y & 3) as usize);
+    let bd = ctx.bit_depth;
+    let shift1 = bd.min(12) as i32 - 8;
+    let shift3 = 14 - bd as i32;
+    // The filter window (3 samples before, 4 after), gathered with
+    // clamping when it leaves the padded plane — `source`'s rule.
+    let (x0, y0) = (xi - 3, yi - 3);
+    let (ww, hh) = (n + 7, n + 7);
+    let pad = refp.pad as i32;
+    let inside = x0 >= -pad && y0 >= -pad && x0 + ww as i32 <= refp.width as i32 + pad && y0 + hh as i32 <= refp.height as i32 + pad;
+    let (win, stride) = if inside {
+        (&refp.data[refp.offset(x0 as isize, y0 as isize)..], refp.stride)
+    } else {
+        for yy in 0..hh {
+            for xx in 0..ww {
+                swin[yy * ww + xx] = refp.at_clamped(x0 + xx as i32, y0 + yy as i32);
             }
         }
-        let max = (1i32 << bd) - 1;
-        (ctx.dsp.uni)(&mut self.spred, n, &self.spred14, n, n, 14 - bd as i32, max);
-        (ctx.dist.satd)(src, src_stride, &self.spred, n, n, n)
+        (&swin[..], ww)
+    };
+    let at_block = 3 * stride + 3;
+    match (fx, fy) {
+        (0, 0) => (ctx.dsp.qpel_copy)(out, &win[at_block..], stride, n, n, shift3),
+        (_, 0) => (ctx.dsp.qpel_h)(out, &win[3 * stride..], stride, n, n, fx, shift1),
+        (0, _) => (ctx.dsp.qpel_v)(out, &win[3..], stride, n, n, fy, shift1),
+        _ => {
+            (ctx.dsp.qpel_h)(stmp, win, stride, n, n + 7, fx, shift1);
+            (ctx.dsp.qpel_v2)(out, stmp, n, n, n, fy);
+        }
     }
 }
 
@@ -1104,7 +1456,7 @@ mod tests {
                     // would desync — such a CU must have been Skip.
                     assert!(d.rqt_root_cbf, "cu {i}: a zero-residual merge CU escaped becoming Skip")
                 }
-                InterCuKind::Amvp { .. } | InterCuKind::UseIntra => {}
+                InterCuKind::Amvp { .. } | InterCuKind::BAmvp { .. } | InterCuKind::UseIntra => {}
             }
         }
     }
@@ -1342,6 +1694,7 @@ mod tests {
                     let mvp = amvp(&info, &frame, &refs, &pu, 0, 0, mvp_flag as u32);
                     Mv::new(mvp.x.wrapping_add(mvd.x), mvp.y.wrapping_add(mvd.y))
                 }
+                InterCuKind::BAmvp { .. } => unreachable!("this replay drives the P walk, which never produces a B shape"),
                 InterCuKind::UseIntra => {
                     fill_motion(&mut frame.motion, frame.w4, x0, y0, n, n, MotionInfo::INTRA);
                     PicInfo::fill4(&mut info.pred_mode, w4, x0, y0, n, n, 1);

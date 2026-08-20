@@ -33,7 +33,8 @@ use crate::hevc::ctx::Contexts;
 use crate::hevc::ctu::{
     SplitCuNb, write_cbf_chroma, write_cbf_luma, write_cu_skip_flag,
     write_cu_transquant_bypass_flag, write_merge_flag, write_merge_idx, write_mvd,
-    write_mvp_flag, write_part_mode_inter, write_pred_mode_flag, write_rqt_root_cbf,
+    write_inter_pred_idc, write_mvp_flag, write_part_mode_inter, write_pred_mode_flag,
+    write_rqt_root_cbf,
     write_intra_chroma_pred_mode, write_mpm_idx, write_prev_intra_luma_pred_flag,
     write_rem_intra_luma_pred_mode, write_split_cu_flag, write_split_transform_flag,
 };
@@ -593,6 +594,33 @@ fn write_cu_inter(
             write_merge_flag(e, cx, false);
             write_mvd(e, cx, mvd);
             write_mvp_flag(e, cx, mvp_flag != 0);
+            write_rqt_root_cbf(e, cx, d.rqt_root_cbf);
+            if !d.rqt_root_cbf {
+                return;
+            }
+        }
+        InterCuKind::BAmvp { idc, mvd, mvp_flag } => {
+            write_merge_flag(e, cx, false);
+            // inter_pred_idc, then per list -- L0's mvd and mvp_flag, then
+            // L1's, interleaved as `prediction_unit` reads them rather
+            // than grouped by element. No ref_idx in either list: each
+            // declares exactly one active reference. See
+            // `write_inter_pred_idc`'s docblock for the `w + h != 12`
+            // reading; a whole-CTU CU is never 12 and is always CtDepth 0.
+            let n = 1i32 << log2;
+            write_inter_pred_idc(e, cx, n, n, 0, u32::from(idc));
+            for list in 0..2usize {
+                let uses = match idc {
+                    0 => list == 0,
+                    1 => list == 1,
+                    _ => true,
+                };
+                if !uses {
+                    continue;
+                }
+                write_mvd(e, cx, mvd[list]);
+                write_mvp_flag(e, cx, mvp_flag[list] != 0);
+            }
             write_rqt_root_cbf(e, cx, d.rqt_root_cbf);
             if !d.rqt_root_cbf {
                 return;
