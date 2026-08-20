@@ -147,6 +147,10 @@ cqp-t8x8|--codec h264 --qp 26 --gop 8 --t8x8
 cqp40-t8x8|--codec h264 --qp 40 --gop 8 --t8x8
 cavlc-t8x8|--codec h264 --qp 26 --gop 8 --cavlc --t8x8
 cavlc40-t8x8|--codec h264 --qp 40 --gop 8 --cavlc --t8x8
+cqp-subparts|--codec h264 --qp 26 --gop 8 --subparts
+cqp40-subparts|--codec h264 --qp 40 --gop 8 --subparts
+cavlc-subparts|--codec h264 --qp 26 --gop 8 --cavlc --subparts
+cavlc40-subparts|--codec h264 --qp 40 --gop 8 --cavlc --subparts
 hevc-lossless-intra|--codec h265 --lossless --gop 0
 hevc-lossless-ip|--codec h265 --lossless --gop 8
 hevc-lossless-ipb|--codec h265 --lossless --gop 8 --bframes 2
