@@ -1278,6 +1278,142 @@ mod tests {
         }
     }
 
+    /// A lossless inter picture over STATIC content, which is the only way
+    /// this suite reaches a bypassed **skip** CU.
+    ///
+    /// Why it needs its own test. `cu_transquant_bypass_flag` is the CU's
+    /// very first bin — `coding_unit` reads it before `cu_skip_flag` — so
+    /// a skipped CU spells one too. Every moving clip in the encode gate
+    /// codes lossless CUs that all carry residual (with no quantiser to
+    /// round it away, any imperfect prediction survives), so no skip ever
+    /// occurs and the ordering rule is never exercised: seeding the
+    /// mutation that omits the flag on a skip leaves the whole
+    /// `hevc-lossless-ip` row green. On identical frames the prediction is
+    /// exact, the residual really is zero, skips appear, and that same
+    /// mutation fails SELF immediately — which is how this test was
+    /// shown to be able to fail rather than assumed to be.
+    #[test]
+    fn lossless_inter_over_static_content_reaches_a_bypassed_skip() {
+        for chroma in [
+            ChromaFormat::Monochrome,
+            ChromaFormat::Yuv420,
+            ChromaFormat::Yuv422,
+            ChromaFormat::Yuv444,
+        ] {
+            // One detailed picture, repeated: motion is exactly zero and a
+            // merge candidate predicts it perfectly.
+            let one = moving_frames_n(64, 64, chroma, 1).remove(0);
+            let frames = vec![one; 4];
+
+            // The decision must actually produce a skip, or the ordering
+            // rule this test exists for is untouched.
+            assert!(
+                static_lossless_skips(&frames, chroma),
+                "{chroma:?}: no CU skipped on identical frames, so no bypassed skip was coded"
+            );
+
+            let mut e = H265Encoder::new(Config {
+                rate: super::super::RateControl::Lossless,
+                gop: 8,
+                ..cfg(64, 64, chroma)
+            })
+            .unwrap();
+            let mut units = Vec::new();
+            for f in &frames {
+                units.extend(e.push(f).expect("lossless inter should code"));
+            }
+            units.extend(e.flush().unwrap());
+            assert!(units[1..].iter().any(|u| !u.keyframe), "{chroma:?}: no inter picture");
+
+            // Exact, and what a decoder rebuilds.
+            for u in &units {
+                assert_eq!(
+                    &e.reconstructions()[u.encode_index as usize],
+                    &frames[(u.poc / 2) as usize],
+                    "{chroma:?}: poc {} is not lossless",
+                    u.poc
+                );
+            }
+            let mut dec = crate::hevc::HevcDecoder::new();
+            for u in &units {
+                dec.push_annexb(&u.data).unwrap();
+            }
+            dec.flush().unwrap();
+            for (i, want) in e.reconstructions().iter().enumerate() {
+                let got = dec.next_picture().unwrap_or_else(|| panic!("{chroma:?}: picture {i} missing"));
+                assert_eq!(&got.into_packed(), want, "{chroma:?}: picture {i} differs from the reconstruction");
+            }
+        }
+    }
+
+    /// Re-run the inter decision over identical frames and report whether
+    /// any CU came out a skip. Same inputs and context as the encoder, so
+    /// it reads the decision the encoder made.
+    fn static_lossless_skips(frames: &[Vec<u8>], chroma: ChromaFormat) -> bool {
+        let (w, h) = (64usize, 64usize);
+        let (sw, sh) = match chroma {
+            ChromaFormat::Yuv420 => (2usize, 2usize),
+            ChromaFormat::Yuv422 => (2, 1),
+            _ => (1, 1),
+        };
+        let mono = chroma == ChromaFormat::Monochrome;
+        let (cw, ch) = if mono { (0, 0) } else { (w / sw, h / sh) };
+        let config =
+            Config { rate: super::super::RateControl::Lossless, gop: 8, ..cfg(w as u32, h as u32, chroma) };
+        let g = syn::Geometry::new(&config);
+        let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&syn::write_sps(&config, &g, LOG2_MAX_POC_LSB)))
+            .unwrap();
+        let mut pps =
+            crate::hevc::pps::Pps::parse(&crate::nal::unescape_rbsp(&syn::write_pps(26, true, true))).unwrap();
+        pps.resolve_tiles(&sps).unwrap();
+
+        let cpu = Cpu::detect_honouring_env();
+        let mut dsp = HevcDsp::<u8>::SCALAR;
+        install_simd_u8(&mut dsp, cpu);
+        let enc_dsp = HevcEncDsp::new(cpu);
+        let dist = DistortionDsp::<u8>::new(cpu);
+        // Bypass, as `code_picture` builds it for a lossless stream: QP 26
+        // is what the headers carry and scaling never runs.
+        let ctx = IntraCtx {
+            dsp: &dsp,
+            enc: &enc_dsp,
+            dist: &dist,
+            qp: 26,
+            bit_depth: 8,
+            strong_smoothing: false,
+            bypass: true,
+        };
+        let split = |f: &[u8]| -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+            let (y, c) = f.split_at(w * h);
+            let (cb, cr) = c.split_at(cw * ch);
+            (y.to_vec(), cb.to_vec(), cr.to_vec())
+        };
+        let (wc, hc) = (w >> g.log2_ctb, h >> g.log2_ctb);
+
+        // Bypass is carried by the context, not the picture.
+        let mut ip = IntraPicture::<u8>::new_with_chroma(w, h, g.log2_ctb, 8, chroma);
+        let (py, pcb, pcr) = split(&frames[0]);
+        for cy in 0..hc {
+            for cx in 0..wc {
+                ip.code_ctu(&ctx, cx, cy, &py, w, &pcb, &pcr, cw);
+            }
+        }
+        let mut refp = ip.recon;
+        refp.poc = 0;
+        refp.extend_rows(0, h);
+
+        let mut pic = InterPicture::<u8>::new(&sps, &pps, 2);
+        let (py, pcb, pcr) = split(&frames[1]);
+        let mut any_skip = false;
+        for cy in 0..hc {
+            for cx in 0..wc {
+                let d = pic.code_ctu(&ctx, &refp, cx, cy, &py, w, &pcb, &pcr, cw);
+                any_skip |= matches!(d.kind, InterCuKind::Skip { .. });
+            }
+        }
+        any_skip
+    }
+
     /// Lossless (transquant bypass) reconstructs the source exactly: the
     /// encoder-held reconstruction — what SELF compares the decode against —
     /// must equal the input byte for byte, on content with real detail in
