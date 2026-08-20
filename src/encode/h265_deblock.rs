@@ -1,7 +1,7 @@
 //! Encoder-side deblocking for H.265 — the decoder's own filter, driven
 //! over the encoder's reconstruction.
 //!
-//! Today `write_pps` sets `pps_deblocking_filter_disabled_flag` purely
+//! `write_pps` once set `pps_deblocking_filter_disabled_flag` purely
 //! because the encoder did not filter what it reconstructs: a decoder
 //! filters *its* reconstruction, so an unfiltered encoder-held picture
 //! would fail SELF on every coded edge while CROSS stayed green — the
@@ -14,6 +14,10 @@
 //! mirroring exactly the bookkeeping the decoder's `transform_unit` and
 //! `coding_unit` perform — TB edge flags, per-4x4 cbf, QP, intra flags,
 //! transquant-bypass exemption.
+//!
+//! Both entry points are wired now — [`deblock_picture`] for intra
+//! pictures, [`deblock_inter_picture`] for P ones — so the flag is on for
+//! every stream this encoder emits.
 //!
 //! **Order matters and is the caller's contract**: intra prediction reads
 //! the *unfiltered* reconstruction, so [`deblock_picture`] must run after
@@ -87,7 +91,7 @@ pub fn deblock_picture<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &mut IntraPicture<
 /// A P slice may hold intra CUs, so the decisions arrive as
 /// [`PCuDecision`]s. An intra one contributes the same three things an
 /// inter one does — QP, edges, cbf — but reads its edges and its cbf off
-/// its *transform tree*, through [`luma_tbs`], exactly as the all-intra
+/// its *transform tree*, through `luma_tbs`, exactly as the all-intra
 /// builder does; the prediction-block bits are the CU boundary either
 /// way, one PU covering the CU. Its `pred_mode` 1 is already in
 /// `pic.info`, stored by the walk when it chose intra, and that is what
@@ -154,6 +158,15 @@ pub fn deblock_inter_picture<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &mut InterPi
                         for xx in (tx..tx + tn).step_by(4) {
                             pic.info.edges[(ty >> 2) * w4 + (xx >> 2)] |= 4;
                         }
+                        // Inert by construction rather than by accident,
+                        // and kept anyway: 8.7.2.4 short-circuits to bS 2
+                        // the moment either side of an edge is intra, so
+                        // no cbf of an intra CU can change a boundary
+                        // strength. Deleting this fill fails no test and
+                        // could fail none — what it buys is a `PicInfo`
+                        // that holds what a decoder's holds, which is the
+                        // rule the rest of this file follows and the one
+                        // that keeps the next reader of this state honest.
                         if cbf {
                             PicInfo::fill4(&mut pic.info.cbf_luma, w4, tx, ty, tn, tn, 1u8);
                         }

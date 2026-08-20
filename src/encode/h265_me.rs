@@ -120,9 +120,12 @@
 //!   `abs_mvd_greater0_flag`, `abs_mvd_greater1_flag`, `abs_mvd_minus2`,
 //!   `mvd_sign_flag` per component), `mvp_l0_flag`; then `rqt_root_cbf`,
 //!   and when set the same unsplit transform tree.
-//! - [`InterCuKind::UseIntra`]: code the CU with the intra decision
-//!   instead; this module's reconstruction and coefficients are
-//!   meaningless and its planes untouched. See [`prefer_intra`].
+//! - [`InterCuKind::UseIntra`]: not an inter CU at all. This decision's
+//!   coefficients are meaningless and the planes are untouched; the
+//!   caller calls [`InterPicture::code_ctu_intra`], which runs the intra
+//!   decision over this same picture's reconstruction, and serialises
+//!   the [`CuDecision`] that returns instead. See [`prefer_intra`], and
+//!   [`PCuDecision`] for the seam that carries either kind.
 //!
 //! The transform tree, at `split_transform_flag` 0 and depth 0, spells in
 //! the reader's order (`transform_tree`, then `transform_unit`):
@@ -625,7 +628,7 @@ impl<S: Sample> InterPicture<S> {
     /// decision's too.
     ///
     /// This is not a second intra encoder. It is
-    /// [`code_cu_2nx2n_intra`] — the very function
+    /// `code_cu_2nx2n_intra` — the very function
     /// [`super::h265_intra::IntraPicture::code_ctu`] calls for an I
     /// slice — pointed at *this* picture's state:
     ///

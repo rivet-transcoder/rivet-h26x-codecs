@@ -1764,7 +1764,6 @@ mod tests {
             // decoder's is-it-written check (`pred_mode != 2`) must see
             // written blocks to be comparing the same question.
             info.ctb_slice_addr.fill(0);
-            info.pred_mode.fill(1);
 
             let (pw, ph) = (sps.width as usize, sps.height as usize);
             let geo = Geo {
@@ -1775,21 +1774,71 @@ mod tests {
                 height: ph,
                 cat: sps.chroma_array_type(),
             };
-            for yc in (0..ph).step_by(4) {
-                for xc in (0..pw).step_by(4) {
-                    let ac = info.avail_ctx(xc as i32, yc as i32, pw as i32, ph as i32);
-                    for yn in (-4..ph as i32 + 4).step_by(4) {
-                        for xn in (-4..pw as i32 + 4).step_by(4) {
-                            assert_eq!(
-                                decoded_before(geo, xc, yc, xn, yn),
-                                info.available_at(&ac, xn, yn),
-                                "{w}x{h} cur=({xc},{yc}) neighbour=({xn},{yn})"
-                            );
+            // Two pictures' worth of pred_mode: an I slice, where every
+            // coded block is intra; and a P slice, where a checkerboard of
+            // CTBs is inter. The reader's own check is `pred_mode != 2` —
+            // "written", not "intra" — so the two must give the *same*
+            // answers, and that identity is what makes an inter neighbour
+            // a legal intra reference under `constrained_intra_pred_flag`
+            // 0. If it ever stopped holding, an intra CU in a P slice
+            // would predict from samples the decoder refuses.
+            for pass in ["I slice", "P slice"] {
+                for (i, m) in info.pred_mode.iter_mut().enumerate() {
+                    *m = if pass == "I slice" { 1 } else { u8::from((i / 4 + i / 64) % 2 == 0) };
+                }
+                for yc in (0..ph).step_by(4) {
+                    for xc in (0..pw).step_by(4) {
+                        let ac = info.avail_ctx(xc as i32, yc as i32, pw as i32, ph as i32);
+                        for yn in (-4..ph as i32 + 4).step_by(4) {
+                            for xn in (-4..pw as i32 + 4).step_by(4) {
+                                assert_eq!(
+                                    decoded_before(geo, xc, yc, xn, yn),
+                                    info.available_at(&ac, xn, yn),
+                                    "{pass} {w}x{h} cur=({xc},{yc}) neighbour=({xn},{yn})"
+                                );
+                            }
                         }
                     }
                 }
             }
         }
+    }
+
+    /// An **inter** neighbour contributes `INTRA_DC` to the MPM list, not
+    /// whatever mode the mode grid happens to hold at its position — the
+    /// reader's `pred_mode[i] != 1 => 1` gate (`hevc::ctu::mpm_candidates`,
+    /// ctu.rs:627), which only a P slice can exercise.
+    ///
+    /// The grid is loaded with a mode that is *not* DC precisely so the
+    /// gate is observable: an encoder that skipped it would build a
+    /// candidate list the decoder never builds, and every `mpm_idx` and
+    /// `rem_intra_luma_pred_mode` after it would name a different mode.
+    #[test]
+    fn an_inter_neighbour_contributes_dc_to_the_mpm_list() {
+        // 16x16 CTBs over 64x64: the block at (16, 0) starts CTU 1, so its
+        // left neighbour at (15, 0) sits in CTU 0 and is decoded; its
+        // above neighbour is outside the picture and is DC either way.
+        let geo = Geo::new(4, 64, 64, 1);
+        let mut modes = vec![1u8; geo.w4 * (64 / 4)];
+        let left = (0 >> 2) * geo.w4 + (15 >> 2);
+        modes[left] = 10;
+        let mut pred_mode = vec![1u8; modes.len()];
+
+        // Intra neighbour: its mode leads the list.
+        assert_eq!(mpm_candidates(geo, &modes, Some(&pred_mode), 16, 0), [10, 1, 0]);
+        // Inter neighbour: DC, exactly as if the mode grid had never been
+        // written there — which is what `[0, 1, 26]` is, the a == b < 2
+        // arm of 8.4.2.
+        pred_mode[left] = 0;
+        assert_eq!(mpm_candidates(geo, &modes, Some(&pred_mode), 16, 0), [0, 1, 26]);
+        // And `None` is the all-intra shorthand: same answer as a grid
+        // saying every neighbour is intra.
+        pred_mode[left] = 1;
+        assert_eq!(
+            mpm_candidates(geo, &modes, None, 16, 0),
+            mpm_candidates(geo, &modes, Some(&pred_mode), 16, 0),
+            "None must mean what an all-intra pred_mode grid means"
+        );
     }
 
     /// The mode-to-syntax mapping must round-trip through the decoder's

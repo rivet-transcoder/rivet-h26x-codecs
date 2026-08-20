@@ -291,11 +291,13 @@ pub fn write_pps(qp: u8, bypass: bool, deblock: bool) -> Vec<u8> {
     // our own decoder both filtered, and the encoder did not. Rather than
     // declare a filter it could not apply, the PPS turned it off.
     //
-    // It filters now for all-intra streams, through the decoder's own
-    // deblocker over the encoder's reconstruction. Inter pictures are not
-    // filtered yet, and this flag is picture-wide rather than per-slice,
-    // so a stream containing any of them keeps the filter off: declaring
-    // it would make every decoder filter pictures this encoder did not.
+    // It filters now, through the decoder's own deblocker over the
+    // encoder's reconstruction — intra pictures and P pictures alike, the
+    // latter since intra coding units inside a P slice became spellable
+    // and `deblock_inter_picture` could be called. That order mattered:
+    // the flag is picture-wide rather than per-slice, so until every
+    // picture kind could be filtered, declaring it would have made every
+    // decoder filter pictures this encoder did not.
     w.flag(true); // deblocking_filter_control_present_flag
     w.flag(false); // deblocking_filter_override_enabled_flag
     w.flag(!deblock); // pps_deblocking_filter_disabled_flag

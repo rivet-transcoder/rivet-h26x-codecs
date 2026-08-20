@@ -1307,6 +1307,238 @@ mod tests {
         );
     }
 
+    /// An intra coding unit inside a P slice: decided by the intra module
+    /// over the P picture's *own* reconstruction, spelled with
+    /// `cu_skip_flag` 0 and `pred_mode_flag` 1, and round-tripped through
+    /// the production decoder.
+    ///
+    /// The construction forces the choice rather than hoping for it. The
+    /// reference is noise; the P picture repeats it except for one flat
+    /// CTU, where `prefer_intra`'s DC proxy costs nothing and no vector
+    /// into a noisy reference can compete. The decision-level guard runs
+    /// the real decision module against the encoder's own reconstruction
+    /// of the IDR and fails loudly if no CU chooses intra — a round trip
+    /// that never reaches the new path is the vacuity class this crate
+    /// keeps rediscovering.
+    ///
+    /// What the round trip proves is the whole chain at once: the syntax
+    /// (a wrong element count desyncs CABAC and the picture comes out
+    /// garbage), the prediction (an intra CU reading inter neighbours
+    /// differently than the decoder does drifts), and the deblocker
+    /// (which sees bS 2 at this CU's edges and nowhere else in the
+    /// picture).
+    #[test]
+    fn an_intra_cu_inside_a_p_slice_round_trips() {
+        use crate::hevc::frame::Frame;
+        let (w, h) = (64usize, 64usize);
+        let mut noise = vec![0u8; w * h * 3 / 2];
+        let mut seed = 0x51deu32;
+        for v in noise.iter_mut() {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            *v = (seed >> 24) as u8;
+        }
+        // The P picture: the same content, except the bottom-right 32x32
+        // CTU is flat in all three planes.
+        let mut flat = noise.clone();
+        for y in 32..h {
+            for x in 32..w {
+                flat[y * w + x] = 128;
+            }
+        }
+        for y in 16..h / 2 {
+            for x in 16..w / 2 {
+                flat[w * h + y * (w / 2) + x] = 128;
+                flat[w * h + w * h / 4 + y * (w / 2) + x] = 128;
+            }
+        }
+
+        let config = Config {
+            rate: super::super::RateControl::ConstantQp(26),
+            gop: 8,
+            ..cfg(w as u32, h as u32, ChromaFormat::Yuv420)
+        };
+        let mut e = H265Encoder::new(config.clone()).unwrap();
+        let mut units = e.push(&noise).unwrap();
+        units.extend(e.push(&flat).unwrap());
+        units.extend(e.flush().unwrap());
+        assert_eq!(units.len(), 2, "one access unit per picture");
+
+        // Decision-level guard, on the real modules: the encoder's own
+        // reconstruction of the IDR, rebuilt as the reference frame the
+        // P picture predicts from.
+        let g = syn::Geometry::new(&config);
+        assert_eq!(g.log2_ctb, 5, "the guard assumes the writer's 32x32 CTB choice");
+        let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&syn::write_sps(&config, &g, LOG2_MAX_POC_LSB))).unwrap();
+        let mut pps = crate::hevc::pps::Pps::parse(&crate::nal::unescape_rbsp(&syn::write_pps(26, false, true))).unwrap();
+        pps.resolve_tiles(&sps).unwrap();
+        let mut refp = Frame::<u8>::new(w, h, ChromaFormat::Yuv420, 8);
+        refp.poc = 0;
+        let rec0 = &e.reconstructions()[0];
+        for (plane, (src, pw, ph)) in [&mut refp.y, &mut refp.cb, &mut refp.cr].into_iter().zip([
+            (&rec0[..w * h], w, h),
+            (&rec0[w * h..w * h + w * h / 4], w / 2, h / 2),
+            (&rec0[w * h + w * h / 4..], w / 2, h / 2),
+        ]) {
+            let o = plane.origin();
+            for y in 0..ph {
+                plane.data[o + y * plane.stride..o + y * plane.stride + pw].copy_from_slice(&src[y * pw..y * pw + pw]);
+            }
+        }
+        refp.extend_rows(0, h);
+
+        let cpu = Cpu::detect_honouring_env();
+        let mut dsp = HevcDsp::<u8>::SCALAR;
+        install_simd_u8(&mut dsp, cpu);
+        let enc_dsp = HevcEncDsp::new(cpu);
+        let dist = DistortionDsp::<u8>::new(cpu);
+        let ctx = IntraCtx { dsp: &dsp, enc: &enc_dsp, dist: &dist, qp: 26, bit_depth: 8, strong_smoothing: false, bypass: false };
+        let mut pic = InterPicture::<u8>::new(&sps, &pps, 1);
+        let (py, pc) = flat.split_at(w * h);
+        let (pcb, pcr) = pc.split_at(w * h / 4);
+        let mut intra_cus = 0usize;
+        for cy in 0..2 {
+            for cx in 0..2 {
+                let d = pic.code_ctu(&ctx, &refp, cx, cy, py, w, pcb, pcr, w / 2);
+                if matches!(d.kind, InterCuKind::UseIntra) {
+                    intra_cus += 1;
+                    // The marks `coding_unit` records before it parses any
+                    // intra syntax, which every later derivation reads.
+                    let i = pic.info.idx4(cx * 32, cy * 32);
+                    assert_eq!(pic.info.pred_mode[i], 1, "an intra CU must record pred_mode 1");
+                    assert_eq!(pic.info.skip[i], 0, "an intra CU is never skipped");
+                    let _ = pic.code_ctu_intra(&ctx, cx, cy, py, w, pcb, pcr, w / 2);
+                }
+            }
+        }
+        assert!(intra_cus > 0, "the construction was meant to make an intra CU win in the P slice; it did not, and the round trip below would be vacuous");
+
+        // SELF, in process: both pictures decode to the reconstructions
+        // the encoder holds.
+        let mut dec = crate::hevc::HevcDecoder::new();
+        for u in &units {
+            dec.push_annexb(&u.data).unwrap();
+        }
+        dec.flush().unwrap();
+        for i in 0..2 {
+            let decoded = dec.next_picture().unwrap_or_else(|| panic!("picture {i} missing"));
+            assert_eq!(decoded.into_packed(), e.reconstructions()[i], "picture {i}: decoded bytes differ from the encoder-held reconstruction");
+        }
+    }
+
+    /// An intra CU inside a P slice whose **transform tree splits** —
+    /// the shape the flat-CU case above can never produce, and the one
+    /// that makes the deblocker's per-TB edge derivation load-bearing:
+    /// a split intra CU has interior transform-block edges, every one of
+    /// them boundary strength 2, and a state builder that marked only the
+    /// CU's own boundary would leave them unfiltered while both decoders
+    /// filtered them.
+    ///
+    /// `prefer_intra` is not a flatness test in absolute terms — it asks
+    /// whether a DC prediction beats the best inter one — so a *textured*
+    /// CU wins it outright when the reference has nothing like it. Here
+    /// the reference is noise and the CU is flat with one busy quadrant:
+    /// cheap against DC, hopeless against noise, and busy enough in one
+    /// corner that four quarter-size TUs beat one.
+    ///
+    /// Both facts are asserted before the round trip, because either one
+    /// silently ceasing to hold would leave this test green and empty.
+    #[test]
+    fn a_split_intra_cu_inside_a_p_slice_round_trips() {
+        use crate::hevc::frame::Frame;
+        let (w, h) = (64usize, 64usize);
+        let mut noise = vec![0u8; w * h * 3 / 2];
+        let mut seed = 0x9e37u32;
+        for v in noise.iter_mut() {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            *v = (seed >> 24) as u8;
+        }
+        // The P picture repeats the reference except in the bottom-right
+        // CTU, which is flat but for its own bottom-right 16x16 quadrant.
+        let mut split = noise.clone();
+        for y in 32..h {
+            for x in 32..w {
+                split[y * w + x] = 128;
+            }
+        }
+        for y in 48..h {
+            for x in 48..w {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                split[y * w + x] = (seed >> 24) as u8;
+            }
+        }
+        for y in 16..h / 2 {
+            for x in 16..w / 2 {
+                split[w * h + y * (w / 2) + x] = 128;
+                split[w * h + w * h / 4 + y * (w / 2) + x] = 128;
+            }
+        }
+
+        let config = Config {
+            rate: super::super::RateControl::ConstantQp(30),
+            gop: 8,
+            ..cfg(w as u32, h as u32, ChromaFormat::Yuv420)
+        };
+        let mut e = H265Encoder::new(config.clone()).unwrap();
+        let mut units = e.push(&noise).unwrap();
+        units.extend(e.push(&split).unwrap());
+        units.extend(e.flush().unwrap());
+        assert_eq!(units.len(), 2);
+
+        // Decision-level guards on the real modules, against the
+        // encoder's own reconstruction of the IDR.
+        let g = syn::Geometry::new(&config);
+        let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&syn::write_sps(&config, &g, LOG2_MAX_POC_LSB))).unwrap();
+        let mut pps = crate::hevc::pps::Pps::parse(&crate::nal::unescape_rbsp(&syn::write_pps(30, false, true))).unwrap();
+        pps.resolve_tiles(&sps).unwrap();
+        let mut refp = Frame::<u8>::new(w, h, ChromaFormat::Yuv420, 8);
+        refp.poc = 0;
+        let rec0 = &e.reconstructions()[0];
+        for (plane, (src, pw, ph)) in [&mut refp.y, &mut refp.cb, &mut refp.cr].into_iter().zip([
+            (&rec0[..w * h], w, h),
+            (&rec0[w * h..w * h + w * h / 4], w / 2, h / 2),
+            (&rec0[w * h + w * h / 4..], w / 2, h / 2),
+        ]) {
+            let o = plane.origin();
+            for y in 0..ph {
+                plane.data[o + y * plane.stride..o + y * plane.stride + pw].copy_from_slice(&src[y * pw..y * pw + pw]);
+            }
+        }
+        refp.extend_rows(0, h);
+
+        let cpu = Cpu::detect_honouring_env();
+        let mut dsp = HevcDsp::<u8>::SCALAR;
+        install_simd_u8(&mut dsp, cpu);
+        let enc_dsp = HevcEncDsp::new(cpu);
+        let dist = DistortionDsp::<u8>::new(cpu);
+        let ctx = IntraCtx { dsp: &dsp, enc: &enc_dsp, dist: &dist, qp: 30, bit_depth: 8, strong_smoothing: false, bypass: false };
+        let mut pic = InterPicture::<u8>::new(&sps, &pps, 1);
+        let (py, pc) = split.split_at(w * h);
+        let (pcb, pcr) = pc.split_at(w * h / 4);
+        let (mut intra_cus, mut split_cus) = (0usize, 0usize);
+        for cy in 0..2 {
+            for cx in 0..2 {
+                let d = pic.code_ctu(&ctx, &refp, cx, cy, py, w, pcb, pcr, w / 2);
+                if matches!(d.kind, InterCuKind::UseIntra) {
+                    intra_cus += 1;
+                    let id = pic.code_ctu_intra(&ctx, cx, cy, py, w, pcb, pcr, w / 2);
+                    split_cus += usize::from(id.split_tu);
+                }
+            }
+        }
+        assert!(intra_cus > 0, "no CU chose intra; the round trip below would be vacuous");
+        assert!(split_cus > 0, "the intra CU never split its transform, so the per-TB edge derivation stays untested");
+
+        let mut dec = crate::hevc::HevcDecoder::new();
+        for u in &units {
+            dec.push_annexb(&u.data).unwrap();
+        }
+        dec.flush().unwrap();
+        for i in 0..2 {
+            let decoded = dec.next_picture().unwrap_or_else(|| panic!("picture {i} missing"));
+            assert_eq!(decoded.into_packed(), e.reconstructions()[i], "picture {i}: decoded bytes differ from the encoder-held reconstruction");
+        }
+    }
+
     #[test]
     fn deeper_than_eight_bits_refuses_rather_than_truncating() {
         for depth in [10u32, 12, 14] {
