@@ -67,6 +67,18 @@ fail=0
 
 # Source clips: raw planar YUV, named <name>_<W>x<H>_<fmt>.yuv so the geometry
 # travels with the file rather than living in this script.
+#
+# THE CORPUS IS NOT VERSIONED BY GIT, and that has bitten once. This reads
+# whatever clips are on disk in the work directory, not whatever the checked
+# out commit's make_encode_sources.sh would generate. The generator is
+# versioned; its output is not; the two can disagree silently.
+#
+# So a clean checkout of an older commit can fail on a clip that commit never
+# knew about — which is exactly what happened when a clip with a scene cut
+# was generated into a shared work directory before the fix for the bug it
+# found had been pushed. The commit was not broken; the environment around it
+# had moved. If a result surprises you, check `ls src_*.yuv` against the
+# generator in your checkout before believing the commit is at fault.
 SOURCES=${SOURCES:-$(ls src_*.yuv 2>/dev/null)}
 if [ -z "$SOURCES" ]; then
   echo "no source clips (src_*.yuv); nothing to verify" >&2
