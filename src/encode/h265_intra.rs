@@ -941,21 +941,32 @@ enum ModeSignal {
 ///
 /// - **Not the Lagrangian.** Doubling it made things worse again (size
 ///   +1.36%), so the imbalance is not a uniform scale error.
-/// - **Not the residual charge beside it.** The obvious suspect was
-///   [`lambda_bits`]'s flat three bins per nonzero level, since it is the
-///   larger number and the one these costs are compared against. Sweeping
-///   it to 6 and 9 with the counted mode rate enabled recovered nothing:
-///   13, 15 and 17 cells regressed at 3, 6 and 9 respectively. The scale
-///   of the residual term is not what makes a correct mode rate lose.
+/// - **Not the residual charge beside it, though that WAS wrong.** The
+///   obvious suspect was the flat three-bins-per-level residual charge
+///   these costs were compared against. Sweeping its scale to 6 and 9
+///   recovered nothing (13 / 15 / 17 cells regressing at 3 / 6 / 9) — but
+///   a scale sweep only ever tested the scale. Its *shape* was indeed
+///   wrong, and replacing it with a real count of `write_ctu_intra` was a
+///   large win on its own: 35 cells better against 4 worse, size -0.90%,
+///   PSNR +0.019 dB. It still did not rescue the counted mode rate, which
+///   was then retried on top of it and lost again, 10 cells worse against
+///   2. So the residual term was a real bug and a separate one.
 ///
-/// What that leaves is the limit named on the counting itself: these
-/// prices are taken at the slice's INITIAL probabilities, and the mode
-/// decision is a 35-way exhaustive search whose own choices are what the
-/// real contexts adapt to. `intra_chroma_pred_mode`'s context is the
-/// sharpest case — a decision that starts preferring "derived" makes
-/// "derived" cheaper still, and a static price cannot see that loop.
-/// Whoever picks this up should try an adapted context array through the
-/// decision pass before touching anything else.
+/// Three explanations tested, three out. What remains is the limit named
+/// on the counting itself: these prices are taken at the slice's INITIAL
+/// probabilities, while the mode decision is a 35-way exhaustive search
+/// whose own choices are exactly what the real contexts adapt to.
+/// `intra_chroma_pred_mode` is the sharpest case — a decision that starts
+/// preferring "derived" makes "derived" cheaper still, and a static price
+/// cannot see that loop at all. It is also consistent with where the
+/// damage lands: every regressed cell is a cqp40 row, and the counted
+/// chroma prices swing hardest with QP (ChromaExplicit is 3.69 bits at QP
+/// 26 and 5.64 at QP 40 against a flat 3 here).
+///
+/// So: an adapted context array carried through the decision pass is the
+/// next thing to try, and the only one left standing. Until then this
+/// table stays, not because it is right but because it is measurably
+/// less wrong than a correct price under a static model.
 fn mode_signalling_cost(qp: i32, signal: ModeSignal) -> f32 {
     let bins = match signal {
         ModeSignal::LumaMpm(0) => 2,
