@@ -20,7 +20,8 @@ fn die(msg: &str) -> ! {
     eprintln!(
         "usage: h26xenc --input F --size WxH [--format 400|420|422|444] --output F\n\
          \x20      [--recon F] [--codec h264|h265] [--qp N | --lossless]\n\
-         \x20      [--gop N] [--bframes N] [--cavlc] [--t8x8] [--depth N] [--threads N]"
+         \x20      [--gop N] [--bframes N] [--cavlc] [--t8x8] [--sao]\n\
+         \x20      [--depth N] [--threads N]"
     );
     std::process::exit(2);
 }
@@ -71,6 +72,9 @@ fn main() {
             // H.264 only: offer the 8x8 transform in the PPS and let the
             // decisions use it. Ignored by H.265.
             "--t8x8" => cfg.transform_8x8 = true,
+            // H.265 only: offer sample adaptive offset. Refused on H.264,
+            // which has no such filter.
+            "--sao" => cfg.sao = true,
             other => die(&format!("unknown argument {other}")),
         }
         i += 1;

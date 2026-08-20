@@ -92,6 +92,14 @@ impl H264Encoder {
                 "H.264 encode: bit depth above 8 (encoder in progress)",
             ));
         }
+        if cfg.sao {
+            // Not "in progress": H.264 has no sample adaptive offset at
+            // all. Refusing names that rather than silently ignoring a
+            // switch the caller set on purpose.
+            return Err(Error::unsupported(
+                "H.264 encode: sample adaptive offset (an H.265 tool; H.264 has none)",
+            ));
+        }
         let (sw, sh) = cfg.chroma.subsampling();
         let luma = cfg.width as usize * cfg.height as usize;
         let chroma = if cfg.chroma == crate::ChromaFormat::Monochrome {

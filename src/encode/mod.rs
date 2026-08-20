@@ -69,6 +69,7 @@ pub mod h265;
 pub mod h265_deblock;
 pub mod h265_intra;
 pub mod h265_me;
+pub(crate) mod h265_sao;
 pub mod h265_syntax;
 
 /// How lossy, and by what means.
@@ -127,6 +128,15 @@ pub struct Config {
     pub transform_8x8: bool,
     /// Worker threads; 0 asks for one per core, matching the decoders.
     pub threads: usize,
+    /// Sample adaptive offset, the second in-loop filter (H.265 only).
+    ///
+    /// Off by default and a switch rather than something always applied,
+    /// unlike deblocking: SAO costs bits per CTB and only pays where there
+    /// is quantisation noise to shape, so a caller coding at a low
+    /// quantiser wants it off. Setting it writes
+    /// `sample_adaptive_offset_enabled_flag` in the SPS, which makes one
+    /// or two more flags appear in *every* slice header.
+    pub sao: bool,
 }
 
 impl Default for Config {
@@ -143,6 +153,7 @@ impl Default for Config {
             entropy: Entropy::Cabac,
             transform_8x8: false,
             threads: 0,
+            sao: false,
         }
     }
 }

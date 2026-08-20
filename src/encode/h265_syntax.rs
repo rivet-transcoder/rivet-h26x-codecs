@@ -263,7 +263,10 @@ pub fn write_sps(cfg: &Config, g: &Geometry, log2_max_poc_lsb: u32) -> Vec<u8> {
     w.ue(2); // max_transform_hierarchy_depth_intra
     w.flag(false); // scaling_list_enabled_flag
     w.flag(false); // amp_enabled_flag
-    w.flag(false); // sample_adaptive_offset_enabled_flag
+    // Turning this on makes `slice_sao_luma_flag` (and, outside
+    // monochrome, `slice_sao_chroma_flag`) appear in EVERY slice header,
+    // I slices included - see `SliceHeader::sao`.
+    w.flag(cfg.sao); // sample_adaptive_offset_enabled_flag
     w.flag(false); // pcm_enabled_flag
     w.ue(0); // num_short_term_ref_pic_sets
     w.flag(false); // long_term_ref_pics_present_flag
@@ -360,6 +363,25 @@ pub struct SliceHeader {
     /// term reference picture set, in the order the reader expects —
     /// negatives nearest-first, then positives nearest-first.
     pub ref_deltas: Vec<i32>,
+    /// The slice's SAO switches, or `None` when the SPS leaves
+    /// `sample_adaptive_offset_enabled_flag` clear and the reader takes no
+    /// bit here at all.
+    ///
+    /// It is an `Option` rather than a pair of bools because the question
+    /// the writer must answer is not "is SAO on" but "does the reader read
+    /// a bin" — the distinction this header has been bitten by twice, once
+    /// in each direction.
+    pub sao: Option<SaoFlags>,
+}
+
+/// `slice_sao_luma_flag` and `slice_sao_chroma_flag`.
+#[derive(Debug, Clone, Copy)]
+pub struct SaoFlags {
+    /// `slice_sao_luma_flag`.
+    pub luma: bool,
+    /// `slice_sao_chroma_flag`, or `None` in monochrome, where the reader
+    /// reads no second bit (its gate is `chroma_format_idc != 0`).
+    pub chroma: Option<bool>,
 }
 
 /// Slice segment header, up to but not including the coded tree.
@@ -412,10 +434,19 @@ pub fn write_slice_header(h: &SliceHeader, pps_qp: u8, nal_type: u8, deblock: bo
         // which is also what makes the spatial candidate derivation the
         // complete one rather than a subset of it.
     }
-    // slice_sao_luma_flag / slice_sao_chroma_flag are absent: SAO is
-    // disabled in the SPS. (A flag was once written here anyway — one
-    // spurious bit that shifted everything after it, unnoticed because
-    // nothing could decode past the header until the coding tree existed.)
+    // slice_sao_luma_flag / slice_sao_chroma_flag, present exactly when
+    // the SPS enables SAO — for every slice type, this block sitting
+    // outside the non-IDR branch above. (A flag was once written here
+    // while the SPS disabled SAO: one spurious bit that shifted everything
+    // after it, unnoticed because nothing could decode past the header
+    // until the coding tree existed. `None` is that case spelled so it
+    // cannot recur.)
+    if let Some(sao) = h.sao {
+        w.flag(sao.luma);
+        if let Some(chroma) = sao.chroma {
+            w.flag(chroma);
+        }
+    }
     if matches!(h.kind, Kind::P | Kind::B) {
         // num_ref_idx_active_override_flag: 0, taking the PPS defaults.
         // Both num_ref_idx_lX_default_active_minus1 are 0 there, so the
@@ -448,13 +479,17 @@ pub fn write_slice_header(h: &SliceHeader, pps_qp: u8, nal_type: u8, deblock: bo
     }
     w.se(h.qp as i32 - pps_qp as i32); // slice_qp_delta
     // slice_loop_filter_across_slices_enabled_flag: the reader reads it
-    // only when SAO is on for the slice or deblocking is not disabled.
-    // The SPS disables SAO, so this follows the PPS's deblocking flag
-    // exactly — write it when the filter is on, and not otherwise.
+    // when `pps_loop_filter_across_slices_enabled_flag` is set AND either
+    // SAO is on for this slice or deblocking is not disabled (slice.rs).
+    // The PPS always sets the first, so the bit is present whenever either
+    // filter runs — which, since every picture is deblocked, is always.
+    // SAO changes which disjunct is true, not whether the bit exists.
+    //
     // Getting that wrong in either direction shifts every bit after it,
     // the one-spurious-bit shape this header has been bitten by twice;
     // the production parser refusing the header is what catches it.
-    if deblock {
+    let sao_on = h.sao.is_some_and(|s| s.luma || s.chroma == Some(true));
+    if deblock || sao_on {
         w.flag(true); // slice_loop_filter_across_slices_enabled_flag
     }
 }
@@ -558,6 +593,7 @@ mod tests {
                 qp: 30,
                 log2_max_poc_lsb: 16,
                 ref_deltas: deltas.clone(),
+                sao: None,
             };
             let mut w = BitWriter::with_capacity(64);
             w.bits(8, ((NAL_TRAIL_R as u32) & 0x3f) << 1);

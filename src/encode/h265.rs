@@ -21,6 +21,7 @@ use super::gop::{Coded, Kind, Scheduler};
 use super::h265_deblock::{deblock_inter_picture, deblock_picture};
 use super::h265_intra::{CuDecision, IntraCtx, IntraPicture};
 use super::h265_me::{InterCuDecision, InterCuKind, InterPicture, PCuDecision, MAX_MERGE_CAND};
+use super::h265_sao::{SaoPlan, sao_picture};
 use super::h265_syntax as syn;
 use super::{Access, Config, RateControl};
 use crate::bitwriter::BitWriter;
@@ -31,7 +32,7 @@ use crate::dsp::hevc_enc::HevcEncDsp;
 use crate::dsp::Cpu;
 use crate::hevc::ctx::Contexts;
 use crate::hevc::ctu::{
-    SplitCuNb, write_cbf_chroma, write_cbf_luma, write_cu_skip_flag,
+    SaoCtx, SaoMergeNb, SplitCuNb, write_cbf_chroma, write_cbf_luma, write_cu_skip_flag, write_sao,
     write_cu_transquant_bypass_flag, write_merge_flag, write_merge_idx, write_mvd,
     write_inter_pred_idc, write_mvp_flag, write_part_mode_inter, write_pred_mode_flag,
     write_rqt_root_cbf,
@@ -81,6 +82,16 @@ impl H265Encoder {
             // refusal that names itself.
             return Err(Error::unsupported(
                 "H.265 encode: bit depth above 8 (encoder in progress)",
+            ));
+        }
+        if cfg.sao && matches!(cfg.rate, RateControl::Lossless) {
+            // Every CU of a lossless picture is transquant-bypass, every
+            // bypass sample is exempt from both loop filters, and SAO
+            // would therefore be a declared no-op: two flags in every
+            // slice header and parameters in every CTB, buying nothing.
+            // Refusing names that rather than shipping it.
+            return Err(Error::unsupported(
+                "H.265 encode: sample adaptive offset on a lossless picture (every sample is filter-exempt)",
             ));
         }
         let (sw, sh) = cfg.chroma.subsampling();
@@ -271,6 +282,9 @@ impl H265Encoder {
                 // An IDR references nothing, so its reference picture set
                 // is empty.
                 ref_deltas: Vec::new(),
+                // Present exactly when the SPS enabled SAO, and the chroma
+                // flag only outside monochrome - the reader's two gates.
+                sao: sao_flags(self.cfg.sao, cat),
             },
             qp,
             syn::NAL_IDR_N_LP,
@@ -283,28 +297,44 @@ impl H265Encoder {
 
         let (wc, hc) = (g.ctbs_wide as usize, g.ctbs_high as usize);
         let mut cx = Contexts::new(0, qp as i32);
-        // The decisions outlive the loop: the deblocker derives its
-        // boundary strengths from them, exactly as a decoder derives them
-        // from what it just parsed.
+        // Decide first, serialise second. The two passes exist because of
+        // SAO: its parameters are not known until the whole picture has
+        // reconstructed *and* deblocked, yet the reader takes them at the
+        // START of each CTU, ahead of the coding quadtree. Splitting the
+        // walk costs nothing — no decision here ever depended on the
+        // bitstream — and it is what lets one pass write both.
+        //
+        // The decisions also outlive the loop for the deblocker, which
+        // derives its boundary strengths from them exactly as a decoder
+        // derives them from what it just parsed.
         let mut decisions = Vec::with_capacity(wc * hc);
+        for cy in 0..hc {
+            for cxu in 0..wc {
+                decisions.push(pic.code_ctu(&ictx, cxu, cy, &py, cw, &pcb, &pcr, ccw));
+            }
+        }
+        // After the whole picture reconstructs — intra prediction reads
+        // unfiltered neighbours — and before the crop, because the
+        // filtered planes are what a decoder emits and therefore what SELF
+        // compares against. Bypass CUs are exempt sample for sample, so
+        // lossless stays exact with the filter on.
+        let mut info = deblock_picture(&ictx, &mut pic, &decisions);
+        // Then SAO, over the deblocked samples, which is the order 8.7
+        // fixes and the order `decoder.rs` applies them in.
+        let plan = self.cfg.sao.then(|| {
+            let (sps, pps) = parsed_sets(&self.cfg, &g, qp, bypass, deblock);
+            sao_picture(&ictx, &mut pic.recon, &mut info, &sps, &pps, &py, cw, &pcb, &pcr, ccw)
+        });
         {
             let mut e = CabacEncoder::new(&mut w);
             for cy in 0..hc {
                 for cxu in 0..wc {
-                    let d = pic.code_ctu(&ictx, cxu, cy, &py, cw, &pcb, &pcr, ccw);
-                    write_ctu_intra(&mut e, &mut cx, &d, cxu, cy, bypass, cat);
+                    let addr = cy * wc + cxu;
+                    write_sao_for(&mut e, &mut cx, plan.as_ref(), addr, cxu, cy, qp, cat);
+                    write_ctu_intra(&mut e, &mut cx, &decisions[addr], cxu, cy, bypass, cat);
                     e.encode_terminate(u32::from(cy == hc - 1 && cxu == wc - 1));
-                    decisions.push(d);
                 }
             }
-        }
-        if deblock {
-            // After the whole picture reconstructs — intra prediction
-            // reads unfiltered neighbours — and before the crop, because
-            // the filtered planes are what a decoder emits and therefore
-            // what SELF compares against. Bypass CUs are exempt sample
-            // for sample, so lossless stays exact with the filter on.
-            deblock_picture(&ictx, &mut pic, &decisions);
         }
         w.align_zero();
         out.extend_from_slice(&syn::annexb(syn::NAL_IDR_N_LP, &w.into_nal()));
@@ -484,6 +514,8 @@ impl H265Encoder {
                     Some(f) if c.kind == Kind::B => vec![ref_poc - cur, f - cur],
                     _ => vec![ref_poc - cur],
                 },
+                // As in `code_picture`, and from the same switch.
+                sao: sao_flags(self.cfg.sao, cat),
             },
             qp,
             syn::NAL_TRAIL_R,
@@ -506,41 +538,32 @@ impl H265Encoder {
         // boundary strengths from them, as a decoder does from what it
         // has just parsed.
         let mut decisions = Vec::with_capacity(wc * hc);
-        {
-            let mut e = CabacEncoder::new(&mut w);
-            for cy in 0..hc {
-                for cxu in 0..wc {
-                    let d = match future {
-                        Some(r1) if c.kind == Kind::B => {
-                            pic.code_ctu_b(&mctx, past, r1, cxu, cy, &py, cw, &pcb, &pcr, ccw)
-                        }
-                        _ => pic.code_ctu(&mctx, past, cxu, cy, &py, cw, &pcb, &pcr, ccw),
-                    };
-                    let left = (cxu > 0).then(|| skipped[cy * wc + cxu - 1]);
-                    let above = (cy > 0).then(|| skipped[(cy - 1) * wc + cxu]);
-                    // The decision module answers `UseIntra` when its
-                    // flatness proxy says inter has lost. The CU is then
-                    // coded by the intra decision over *this* picture's
-                    // reconstruction - the same `code_cu_2nx2n_intra` an
-                    // I slice runs, reading the inter neighbours already
-                    // reconstructed beside it, which the PPS's
-                    // `constrained_intra_pred_flag` 0 makes references.
-                    let coded = if matches!(d.kind, InterCuKind::UseIntra) {
-                        PCuDecision::Intra(Box::new(pic.code_ctu_intra(&mctx, cxu, cy, &py, cw, &pcb, &pcr, ccw)))
-                    } else {
-                        PCuDecision::Inter(d)
-                    };
-                    match &coded {
-                        PCuDecision::Inter(d) => write_cu_inter(&mut e, &mut cx, d, left, above, cat),
-                        PCuDecision::Intra(d) => write_cu_intra_in_p(&mut e, &mut cx, d, left, above, 1),
+        // Decide and reconstruct first; serialise below. See the same
+        // split in `code_picture` for why SAO forces it.
+        for cy in 0..hc {
+            for cxu in 0..wc {
+                let d = match future {
+                    Some(r1) if c.kind == Kind::B => {
+                        pic.code_ctu_b(&mctx, past, r1, cxu, cy, &py, cw, &pcb, &pcr, ccw)
                     }
-                    skipped[cy * wc + cxu] = matches!(&coded, PCuDecision::Inter(d) if matches!(d.kind, InterCuKind::Skip { .. }));
-                    e.encode_terminate(u32::from(cy == hc - 1 && cxu == wc - 1));
-                    decisions.push(coded);
-                }
+                    _ => pic.code_ctu(&mctx, past, cxu, cy, &py, cw, &pcb, &pcr, ccw),
+                };
+                // The decision module answers `UseIntra` when its
+                // flatness proxy says inter has lost. The CU is then
+                // coded by the intra decision over *this* picture's
+                // reconstruction - the same `code_cu_2nx2n_intra` an
+                // I slice runs, reading the inter neighbours already
+                // reconstructed beside it, which the PPS's
+                // `constrained_intra_pred_flag` 0 makes references.
+                let coded = if matches!(d.kind, InterCuKind::UseIntra) {
+                    PCuDecision::Intra(Box::new(pic.code_ctu_intra(&mctx, cxu, cy, &py, cw, &pcb, &pcr, ccw)))
+                } else {
+                    PCuDecision::Inter(d)
+                };
+                skipped[cy * wc + cxu] = matches!(&coded, PCuDecision::Inter(d) if matches!(d.kind, InterCuKind::Skip { .. }));
+                decisions.push(coded);
             }
         }
-        w.align_zero();
         // After the whole picture reconstructs and before the crop, for
         // the same reasons the intra path gives: intra prediction — which
         // a P slice now also performs — reads unfiltered neighbours, and
@@ -548,6 +571,30 @@ impl H265Encoder {
         // SELF compares against. This picture becomes the next one's
         // reference filtered, which is what a decoder's DPB holds.
         deblock_inter_picture(&mctx, &mut pic, &decisions);
+        // Then SAO, over the deblocked samples. `InterPicture` already
+        // holds the decoder-grade state both filters read, so unlike the
+        // intra path there is nothing to hand across.
+        let plan = self.cfg.sao.then(|| {
+            let InterPicture { info, recon, .. } = &mut pic;
+            sao_picture(&mctx, recon, info, &sps, &pps, &py, cw, &pcb, &pcr, ccw)
+        });
+        {
+            let mut e = CabacEncoder::new(&mut w);
+            for cy in 0..hc {
+                for cxu in 0..wc {
+                    let addr = cy * wc + cxu;
+                    let left = (cxu > 0).then(|| skipped[addr - 1]);
+                    let above = (cy > 0).then(|| skipped[addr - wc]);
+                    write_sao_for(&mut e, &mut cx, plan.as_ref(), addr, cxu, cy, qp, cat);
+                    match &decisions[addr] {
+                        PCuDecision::Inter(d) => write_cu_inter(&mut e, &mut cx, d, left, above, cat),
+                        PCuDecision::Intra(d) => write_cu_intra_in_p(&mut e, &mut cx, d, left, above, cat),
+                    }
+                    e.encode_terminate(u32::from(cy == hc - 1 && cxu == wc - 1));
+                }
+            }
+        }
+        w.align_zero();
         let mut out = Vec::new();
         // A picture nothing will reference is a sub-layer non-reference
         // picture, and saying so lets a decoder discard it.
@@ -573,6 +620,59 @@ impl H265Encoder {
 
         Ok(Access { data: out, keyframe: false, poc: c.poc, encode_index: c.encode })
     }
+}
+
+/// The slice header's SAO switches for a picture coded with `sao` set:
+/// both components on, or `None` when SAO is off and the reader takes no
+/// bit at all. The chroma flag is itself conditional — the reader's gate
+/// is `chroma_format_idc != 0` — so monochrome carries only the luma one.
+///
+/// Both switches go on together because the decision module decides per
+/// CTB per component and can turn any of them off there for free, by
+/// choosing `type_idx` 0; a cleared slice flag would instead forbid the
+/// choice picture-wide for one bit.
+fn sao_flags(sao: bool, cat: u32) -> Option<syn::SaoFlags> {
+    sao.then(|| syn::SaoFlags { luma: true, chroma: (cat != 0).then_some(true) })
+}
+
+/// The parameter sets a picture is coded against, parsed back through the
+/// decoder's own parsers — the pattern `code_p_picture` established: the
+/// filters and the candidate derivations read decoder structures, and
+/// building them from the very bytes the stream carries is what keeps the
+/// encoder's idea of the geometry and the decoder's identical.
+fn parsed_sets(cfg: &Config, g: &syn::Geometry, qp: u8, bypass: bool, deblock: bool) -> (crate::hevc::sps::Sps, crate::hevc::pps::Pps) {
+    let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&syn::write_sps(cfg, g, LOG2_MAX_POC_LSB)))
+        .expect("the encoder's own SPS parses");
+    let mut pps = crate::hevc::pps::Pps::parse(&crate::nal::unescape_rbsp(&syn::write_pps(qp, bypass, deblock)))
+        .expect("the encoder's own PPS parses");
+    pps.resolve_tiles(&sps).expect("one tile covering the picture");
+    (sps, pps)
+}
+
+/// Write one CTB's `sao()`, or nothing when the picture carries no SAO —
+/// in which case the reader takes no bin here either, because the slice
+/// header's flags are both clear.
+///
+/// Called at the top of every CTU, ahead of the coding quadtree, which is
+/// where `decode_ctu` reads it.
+#[allow(clippy::too_many_arguments)]
+fn write_sao_for(e: &mut CabacEncoder, cx: &mut Contexts, plan: Option<&SaoPlan>, addr: usize, cxu: usize, cy: usize, qp: u8, cat: u32) {
+    let Some(plan) = plan else { return };
+    let _ = qp;
+    let sctx = SaoCtx {
+        sao_luma: true,
+        sao_chroma: cat != 0,
+        cat,
+        // Eight bits everywhere this encoder writes; `H265Encoder::new`
+        // refuses anything deeper by name.
+        cmax: (1u32 << (8u32.min(10) - 5)) - 1,
+        // No PPS range extension, so no offset scaling.
+        shift: (0, 0),
+    };
+    // One slice, one tile: the reader's availability test for the merge
+    // flags is exactly the picture edge.
+    let nb = SaoMergeNb { left: cxu > 0, up: cy > 0 };
+    write_sao(e, cx, &sctx, &nb, plan.merges[addr], &plan.params[addr]);
 }
 
 /// Serialise one inter coding unit - one whole-CTU `PART_2Nx2N` CU, in the
@@ -1623,6 +1723,96 @@ mod tests {
             let decoded = dec.next_picture().unwrap_or_else(|| panic!("picture {i} missing"));
             assert_eq!(decoded.into_packed(), e.reconstructions()[i], "picture {i}: decoded bytes differ from the encoder-held reconstruction");
         }
+    }
+
+    /// SAO end to end: the stream a decoder reads must reconstruct to the
+    /// picture the encoder filtered, for an intra picture and a P picture
+    /// alike.
+    ///
+    /// This is where the ordering invariant is actually held. SAO runs on
+    /// deblocked samples and its output is the picture; the parameters are
+    /// written at the START of each CTU but decided only after the whole
+    /// picture has reconstructed and deblocked. Get any of that wrong —
+    /// filter before deblocking, decide from unfiltered samples, write the
+    /// parameters in the wrong place — and the decoder rebuilds something
+    /// else. Nothing here asserts the order directly; the byte comparison
+    /// does it.
+    ///
+    /// The guard below keeps the test honest: on content flat enough for
+    /// SAO to decline every CTB, this would pass while exercising nothing,
+    /// so the QP is high and the content textured, and the reconstruction
+    /// must actually differ from what the same stream produces with SAO
+    /// off.
+    #[test]
+    fn sao_round_trips_for_intra_and_p_pictures() {
+        let (w, h) = (64usize, 64usize);
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        let mut seed = 0x5a01u32;
+        for f in 0..3 {
+            let mut fr = vec![0u8; w * h * 3 / 2];
+            for y in 0..h {
+                for x in 0..w {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    let tex = (x * 7 + y * 11 + f * 3) % 160;
+                    fr[y * w + x] = (30 + tex + ((seed >> 28) as usize % 12)) as u8;
+                }
+            }
+            for c in 0..2 {
+                for y in 0..h / 2 {
+                    for x in 0..w / 2 {
+                        fr[w * h + c * w * h / 4 + y * (w / 2) + x] = (100 + (x * 3 + y * 5 + c * 7) % 40) as u8;
+                    }
+                }
+            }
+            frames.push(fr);
+        }
+
+        for gop in [0u32, 8] {
+            let base = Config { rate: super::super::RateControl::ConstantQp(40), gop, ..cfg(w as u32, h as u32, ChromaFormat::Yuv420) };
+            let mut recons = Vec::new();
+            for sao in [false, true] {
+                let mut e = H265Encoder::new(Config { sao, ..base.clone() }).unwrap();
+                let mut units = Vec::new();
+                for fr in &frames {
+                    units.extend(e.push(fr).unwrap());
+                }
+                units.extend(e.flush().unwrap());
+                assert_eq!(units.len(), frames.len(), "gop={gop} sao={sao}: one access unit per picture");
+
+                // SELF, in process, through the production decoder.
+                let mut dec = crate::hevc::HevcDecoder::new();
+                for u in &units {
+                    dec.push_annexb(&u.data).unwrap();
+                }
+                dec.flush().unwrap();
+                for i in 0..frames.len() {
+                    let got = dec.next_picture().unwrap_or_else(|| panic!("gop={gop} sao={sao}: picture {i} missing"));
+                    assert_eq!(
+                        got.into_packed(),
+                        e.reconstructions()[i],
+                        "gop={gop} sao={sao}: picture {i} decoded differently than the encoder reconstructed it"
+                    );
+                }
+                recons.push(e.reconstructions().to_vec());
+            }
+            assert_ne!(recons[0], recons[1], "gop={gop}: SAO changed nothing, so the round trip above proved nothing about it");
+        }
+    }
+
+    /// `--sao` on a lossless picture refuses by name rather than shipping a
+    /// filter that cannot touch a single sample.
+    #[test]
+    fn sao_on_a_lossless_picture_refuses_rather_than_doing_nothing() {
+        let r = H265Encoder::new(Config {
+            rate: super::super::RateControl::Lossless,
+            gop: 0,
+            sao: true,
+            ..cfg(64, 64, ChromaFormat::Yuv420)
+        });
+        let Err(err) = r else { panic!("lossless + SAO must refuse") };
+        let s = format!("{err}");
+        assert!(s.contains("sample adaptive offset"), "{s}");
+        assert!(s.contains("filter-exempt"), "the refusal should say why: {s}");
     }
 
     #[test]

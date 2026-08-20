@@ -68,9 +68,16 @@ use crate::sample::Sample;
 /// decoder's own per-format grids. The slice filter parameters are the
 /// ones our headers declare: zero beta/tc offsets, zero chroma QP
 /// offsets, one slice, one tile.
-pub fn deblock_picture<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &mut IntraPicture<S>, decisions: &[CuDecision]) {
-    let info = build_info(ctx, pic, decisions);
+///
+/// Returns the `PicInfo` it derived. SAO runs next over the same picture
+/// and reads the same arrays — the CTB slice marks, the filter-exempt map,
+/// the geometry — so handing them on is what keeps the two filters
+/// agreeing about the picture rather than each building its own idea of it.
+pub fn deblock_picture<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &mut IntraPicture<S>, decisions: &[CuDecision]) -> PicInfo {
+    let mut info = build_info(ctx, pic, decisions);
     run_filter(ctx, &mut pic.recon, &info);
+    info.sao.fill([crate::hevc::pic::SaoParams::default(); 3]);
+    info
 }
 
 /// Deblock a P picture's reconstruction in place, exactly as a decoder

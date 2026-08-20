@@ -1351,11 +1351,11 @@ impl<'a, S: Sample> SliceDec<'a, S> {
 // `pred_mode_flag` in an I slice, `rqt_root_cbf` for intra CUs, the NxN
 // restriction of `part_mode` to the minimum CB size — the caller must
 // infer identically, by walking the same conditions; no writer exists for
-// an uncoded bin. Inter-slice syntax has no writers yet: they arrive with
-// inter prediction.
+// an uncoded bin.
 //
-// Nothing outside the round-trip tests calls these yet — the H.265 encoder
-// that will is being built alongside them; drop the allows when it lands.
+// `sao()` is here too, at the end. It is not coding-quadtree syntax — the
+// reader takes it at CTB start, before the tree — but it is the same kind
+// of inverse and it belongs with the others rather than alone.
 // ----------------------------------------------------------------------
 
 /// The neighbour facts `split_cu_flag`'s context derivation needs, already
@@ -1713,6 +1713,178 @@ pub(crate) fn write_mvp_flag(e: &mut CabacEncoder, cx: &mut Contexts, flag: bool
 #[allow(dead_code)]
 pub(crate) fn write_rqt_root_cbf(e: &mut CabacEncoder, cx: &mut Contexts, cbf: bool) {
     e.encode_decision(&mut cx.c[NO_RESIDUAL_DATA_FLAG_OFFSET], cbf as u32);
+}
+
+/// Which of the two `sao_merge` flags the reader will actually read for
+/// this CTB, already resolved by the caller — the same three-part test
+/// `parse_sao` performs per flag: the neighbour exists in the picture, it
+/// belongs to this slice (`ctb > slice_addr` for the left, `ctb - wc >=
+/// slice_addr` for the one above), and it shares this CTB's tile.
+///
+/// A writer that gets these wrong emits a bin the reader does not take, or
+/// omits one it does, and every bit after it in the slice shifts. In the
+/// one-slice, one-tile geometry the encoder produces today both reduce to
+/// `rx > 0` and `ry > 0`, but they arrive as arguments rather than as
+/// assumptions, so the first multi-slice stream does not silently inherit
+/// the simplification.
+#[allow(dead_code)]
+pub(crate) struct SaoMergeNb {
+    /// Whether `sao_merge_left_flag` is coded.
+    pub left: bool,
+    /// Whether `sao_merge_up_flag` is coded — the reader only reaches it
+    /// when the left flag was absent or clear.
+    pub up: bool,
+}
+
+/// Which neighbour a CTB copies its SAO parameters from, if any.
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SaoMerge {
+    /// `sao_merge_left_flag` 1: parameters come from the CTB to the left.
+    Left,
+    /// `sao_merge_up_flag` 1: parameters come from the CTB above.
+    Up,
+}
+
+/// The facts `sao()` needs that do not change from CTB to CTB.
+#[allow(dead_code)]
+pub(crate) struct SaoCtx {
+    /// `slice_sao_luma_flag`. With it clear the reader codes nothing for
+    /// component 0 and leaves its type at 0.
+    pub sao_luma: bool,
+    /// `slice_sao_chroma_flag`, likewise for components 1 and 2.
+    pub sao_chroma: bool,
+    /// `ChromaArrayType`. 0 walks one component; anything else walks three.
+    pub cat: u32,
+    /// cMax for `sao_offset_abs`: `(1 << (Min(BitDepth, 10) - 5)) - 1`,
+    /// derived from the **luma** bit depth for every component, because
+    /// that is how the reader derives it — `parse_sao` takes one
+    /// `bit_depth()` and uses it throughout. Not a simplification of ours
+    /// to fix.
+    pub cmax: u32,
+    /// `log2_sao_offset_scale` for luma and chroma, from the PPS range
+    /// extension: `SaoOffsetVal = sign * abs << scale` (7-72). Zero
+    /// without the extension, which is what our PPS writes.
+    pub shift: (u32, u32),
+}
+
+/// Write one CTB's `sao()`: the inverse of `SliceDec::parse_sao`, element
+/// for element.
+///
+/// `params` is what a decoder will hold in `PicInfo::sao[ctb]` after
+/// reading this — offsets already scaled by `shift`, exactly as the reader
+/// stores them — so an encoder hands the same array to `hevc::sao` and to
+/// this writer and cannot describe one picture while filtering another. On
+/// a merge nothing of `params` is written; arranging for it to equal the
+/// neighbour's is the caller's job, and a debug build checks it.
+///
+/// Three inference traps the reader sets, all silent:
+///
+/// - **`sao_type_idx` is coded for components 0 and 1 only.** Cr takes
+///   Cb's type, and in edge mode Cb's class too, while keeping its own
+///   four offsets. Writing a third type desyncs the slice; giving Cr a
+///   different type or class produces a stream that decodes to something
+///   other than what was filtered.
+/// - **`sao_offset_abs` is truncated unary**: `v` ones then a zero, except
+///   at `v == cmax` where the terminating zero is absent, because the
+///   reader's `while v < cmax` loop stops on the count rather than the zero.
+/// - **Edge mode codes no signs.** Offsets 0 and 1 are positive and 2 and
+///   3 negative by construction — the reader negates the last two rather
+///   than reading a bin — so an encoder that chose the other polarity has
+///   no way to spell it and must not try.
+#[allow(dead_code)]
+pub(crate) fn write_sao(
+    e: &mut CabacEncoder,
+    cx: &mut Contexts,
+    sctx: &SaoCtx,
+    nb: &SaoMergeNb,
+    merge: Option<SaoMerge>,
+    params: &[SaoParams; 3],
+) {
+    debug_assert!(merge != Some(SaoMerge::Left) || nb.left, "merging left where the reader reads no flag");
+    debug_assert!(merge != Some(SaoMerge::Up) || nb.up, "merging up where the reader reads no flag");
+    if nb.left {
+        e.encode_decision(&mut cx.c[SAO_MERGE_FLAG_OFFSET], u32::from(merge == Some(SaoMerge::Left)));
+    }
+    // A merge-left CTB codes nothing further — not even the up flag.
+    if merge == Some(SaoMerge::Left) {
+        return;
+    }
+    if nb.up {
+        e.encode_decision(&mut cx.c[SAO_MERGE_FLAG_OFFSET], u32::from(merge == Some(SaoMerge::Up)));
+    }
+    if merge == Some(SaoMerge::Up) {
+        return;
+    }
+
+    let ncomp = if sctx.cat != 0 { 3 } else { 1 };
+    for c_idx in 0..ncomp {
+        if !((sctx.sao_luma && c_idx == 0) || (sctx.sao_chroma && c_idx > 0)) {
+            continue;
+        }
+        let p = &params[c_idx];
+        if c_idx == 0 || c_idx == 1 {
+            // sao_type_idx: TR cMax 2 — first bin context-coded, second
+            // bypass and present only when the first is set.
+            e.encode_decision(&mut cx.c[SAO_TYPE_IDX_OFFSET], u32::from(p.type_idx != 0));
+            if p.type_idx != 0 {
+                e.encode_bypass(u32::from(p.type_idx == 2));
+            }
+            if c_idx == 1 {
+                debug_assert_eq!(params[2].type_idx, p.type_idx, "Cr takes Cb's sao_type_idx; no bin carries its own");
+            }
+        }
+        if p.type_idx == 0 {
+            continue;
+        }
+        let shift = if c_idx == 0 { sctx.shift.0 } else { sctx.shift.1 };
+        let unit = 1i16 << shift;
+        let mut abs = [0u32; 4];
+        for (i, a) in abs.iter_mut().enumerate() {
+            let v = p.offsets[i];
+            debug_assert_eq!(v % unit, 0, "offset {v} is not a multiple of the SAO offset scale");
+            *a = (v / unit).unsigned_abs() as u32;
+            debug_assert!(*a <= sctx.cmax, "sao_offset_abs {a} above cMax {}", sctx.cmax);
+        }
+        for a in abs {
+            write_sao_offset_abs(e, sctx.cmax, a);
+        }
+        if p.type_idx == 1 {
+            // Band: a sign per nonzero offset, then the band position.
+            for (i, a) in abs.iter().enumerate() {
+                if *a != 0 {
+                    e.encode_bypass(u32::from(p.offsets[i] < 0));
+                }
+            }
+            debug_assert!(p.band_or_class < 32, "sao_band_position is five bits");
+            e.encode_bypass_bits(5, u32::from(p.band_or_class));
+        } else {
+            debug_assert!(p.offsets[0] >= 0 && p.offsets[1] >= 0, "edge offsets 0 and 1 are positive by construction");
+            debug_assert!(p.offsets[2] <= 0 && p.offsets[3] <= 0, "edge offsets 2 and 3 are negative by construction");
+            // sao_eo_class: two bypass bits, for luma and for Cb. Cr shares
+            // Cb's and codes nothing.
+            if c_idx == 0 || c_idx == 1 {
+                debug_assert!(p.band_or_class < 4, "sao_eo_class is two bits");
+                e.encode_bypass_bits(2, u32::from(p.band_or_class));
+            }
+            if c_idx == 1 {
+                debug_assert_eq!(params[2].band_or_class, p.band_or_class, "Cr takes Cb's sao_eo_class; no bin carries its own");
+            }
+        }
+    }
+}
+
+/// `sao_offset_abs`: truncated unary in the bypass engine — `v` ones then
+/// a terminating zero, which is **absent** at `v == cmax`.
+#[allow(dead_code)]
+fn write_sao_offset_abs(e: &mut CabacEncoder, cmax: u32, v: u32) {
+    debug_assert!(v <= cmax, "sao_offset_abs {v} above cMax {cmax}");
+    for _ in 0..v {
+        e.encode_bypass(1);
+    }
+    if v < cmax {
+        e.encode_bypass(0);
+    }
 }
 
 /// `IntraPredModeC` (8.4.3): the mode `intra_chroma_pred_mode` syntax
@@ -2317,14 +2489,52 @@ mod write_round_trip {
     /// spelling), the luma cbfs, the QP map, and — the desync detector —
     /// the entire CABAC context state after the last CTU.
     fn round_trip(width: u32, height: u32, qp: i32, seed: u64) {
-        round_trip_cfg(width, height, qp, seed, false);
+        round_trip_cfg(width, height, qp, seed, false, false);
     }
 
-    fn round_trip_cfg(width: u32, height: u32, qp: i32, seed: u64, bypass: bool) {
+    /// One CTB's SAO parameters, drawn at random but only from what the
+    /// syntax can actually spell — which is most of what this is for. The
+    /// reader's shape (`parse_sao`) constrains the generator, so anything
+    /// it produces must survive the round trip:
+    ///
+    /// - Cr never carries its own `sao_type_idx`, and in edge mode never
+    ///   its own class: both come from Cb. Cr's four offsets are its own.
+    /// - Edge offsets are `[+, +, -, -]` with no sign bins; band offsets
+    ///   are signed and carry a five-bit position.
+    /// - Magnitudes are capped at cMax, `(1 << (min(bd, 10) - 5)) - 1`,
+    ///   which is 7 at eight bits.
+    fn random_sao(rng: &mut Lcg, cmax: i16) -> [SaoParams; 3] {
+        let mut params = [SaoParams::default(); 3];
+        for c in 0..3usize {
+            // Cr (c == 2) inherits Cb's type, and its class in edge mode.
+            let type_idx = if c == 2 { params[1].type_idx } else { rng.below(3) as u8 };
+            params[c].type_idx = type_idx;
+            if type_idx == 0 {
+                continue;
+            }
+            let mag = |rng: &mut Lcg| rng.below(cmax as u32 + 1) as i16;
+            if type_idx == 1 {
+                for i in 0..4 {
+                    let m = mag(rng);
+                    params[c].offsets[i] = if m != 0 && rng.chance(50) { -m } else { m };
+                }
+                params[c].band_or_class = rng.below(32) as u8;
+            } else {
+                params[c].offsets = [mag(rng), mag(rng), -mag(rng), -mag(rng)];
+                params[c].band_or_class = if c == 2 { params[1].band_or_class } else { rng.below(4) as u8 };
+            }
+        }
+        params
+    }
+
+    /// Returns how many (CTB, component) pairs took each `sao_type_idx` —
+    /// off, band, edge — so a caller can prove its corpus reached every
+    /// branch rather than assuming a small picture did.
+    fn round_trip_cfg(width: u32, height: u32, qp: i32, seed: u64, bypass: bool, sao: bool) -> [usize; 3] {
         // The configuration under test is the one the encoder actually
         // writes: parse the written SPS/PPS with the production parsers and
         // drive both sides from the result.
-        let cfg = Config { width, height, chroma: ChromaFormat::Yuv420, bit_depth: 8, ..Config::default() };
+        let cfg = Config { width, height, chroma: ChromaFormat::Yuv420, bit_depth: 8, sao, ..Config::default() };
         let g = EncGeometry::new(&cfg);
         let sps = Sps::parse(&unescape_rbsp(&write_sps(&cfg, &g, 8))).expect("the encoder's SPS must parse");
         let mut pps = Pps::parse(&unescape_rbsp(&write_pps(26, bypass, false))).expect("the encoder's PPS must parse");
@@ -2339,14 +2549,57 @@ mod write_round_trip {
         let mut w = BitWriter::new();
         w.bits(8, ((NAL_IDR_N_LP as u32) & 0x3f) << 1);
         w.bits(8, 1); // nuh_layer_id 0, nuh_temporal_id_plus1 1
-        let eh = EncSliceHeader { kind: Kind::Idr, poc_lsb: 0, qp: qp as u8, log2_max_poc_lsb: 8, ref_deltas: Vec::new() };
+        // Both switches on when SAO is under test, so the reader walks
+        // all three components and every inheritance rule is exercised.
+        let sao_flags = sao.then_some(crate::encode::h265_syntax::SaoFlags { luma: true, chroma: Some(true) });
+        let eh = EncSliceHeader { kind: Kind::Idr, poc_lsb: 0, qp: qp as u8, log2_max_poc_lsb: 8, ref_deltas: Vec::new(), sao: sao_flags };
         write_slice_header(&eh, 26, NAL_IDR_N_LP, false, &mut w);
         w.flag(true); // byte_alignment(): alignment_bit_equal_to_one
         w.align_zero();
         let mut wr = CtuWriter::new(&sps, qp, seed, bypass);
+        // The SAO parameters this slice will carry, decided up front so
+        // the assertions below have something independent to compare the
+        // decoder's against. A merge copies the neighbour's array, which
+        // is what the reader does — so `want` stays the truth for every
+        // CTB whether it coded its parameters or inherited them.
+        let sctx = SaoCtx {
+            sao_luma: true,
+            sao_chroma: true,
+            cat: sps.chroma_array_type(),
+            cmax: (1u32 << (sps.bit_depth_luma.min(10) - 5)) - 1,
+            shift: pps.log2_sao_offset_scale,
+        };
+        let mut srng = Lcg(seed ^ 0x5a0_5a0);
+        let mut want = vec![[SaoParams::default(); 3]; wc * hc];
+        let mut merges: Vec<Option<SaoMerge>> = vec![None; wc * hc];
+        if sao {
+            for ctb in 0..wc * hc {
+                let (rx, ry) = (ctb % wc, ctb / wc);
+                // One slice, one tile: the reader's availability test is
+                // exactly the picture edge.
+                let m = if rx > 0 && srng.chance(25) {
+                    Some(SaoMerge::Left)
+                } else if ry > 0 && srng.chance(25) {
+                    Some(SaoMerge::Up)
+                } else {
+                    None
+                };
+                merges[ctb] = m;
+                want[ctb] = match m {
+                    Some(SaoMerge::Left) => want[ctb - 1],
+                    Some(SaoMerge::Up) => want[ctb - wc],
+                    None => random_sao(&mut srng, sctx.cmax as i16),
+                };
+            }
+        }
         {
             let mut e = CabacEncoder::new(&mut w);
             for ctb in 0..wc * hc {
+                if sao {
+                    let (rx, ry) = (ctb % wc, ctb / wc);
+                    let nb = SaoMergeNb { left: rx > 0, up: ry > 0 };
+                    write_sao(&mut e, &mut wr.cx, &sctx, &nb, merges[ctb], &want[ctb]);
+                }
                 wr.write_ctu(&mut e, ctb, wc);
                 e.encode_terminate((ctb == wc * hc - 1) as u32);
             }
@@ -2435,11 +2688,61 @@ mod write_round_trip {
         assert_eq!(dec.info.filter_exempt, wr.exp_exempt, "{tag}: the bypass CUs (filter-exempt map) differ");
         assert!(dec.info.pred_mode.iter().all(|&p| p == 1), "{tag}: every CU is intra");
         assert!(dec.info.qp_y.iter().all(|&q| q as i32 == qp), "{tag}: QP map differs");
+        // The SAO parameters, per CTB — including the ones a merge made
+        // the reader copy rather than read. `want` is what the encoder
+        // would hand `hevc::sao`, so this is the assertion that says the
+        // stream describes the filter the encoder intends to apply.
+        if sao {
+            assert_eq!(dec.info.sao, want, "{tag}: SAO parameters differ");
+        }
         // …and the whole context state: bins can agree while states
         // diverge, and then the *next* block falls apart far from the
         // cause. This is the assertion that makes the round trip a proof.
         assert_eq!(dec.cx.c, wr.cx.c, "{tag}: CABAC context states diverged");
         assert_eq!(dec.cx.stat_coeff, wr.cx.stat_coeff, "{tag}");
+
+        let mut kinds = [0usize; 3];
+        for p in &want {
+            for c in p {
+                kinds[c.type_idx as usize] += 1;
+            }
+        }
+        kinds
+    }
+
+    /// `sao()` round-trips through the production parser: parameters
+    /// drawn at random per CTB, written ahead of each coding quadtree
+    /// where the reader takes them, and read back byte for byte —
+    /// including the merges, where the reader copies a neighbour's array
+    /// rather than reading anything.
+    ///
+    /// This is the first syntax the encoder writes whose *only* consumer
+    /// is a loop filter, so the desync it can cause is the quiet kind: a
+    /// mis-spelled offset does not break the coding tree, it just makes
+    /// every decoder filter the picture differently than the encoder did.
+    /// The CABAC context-state comparison at the end of `round_trip_cfg`
+    /// is what turns that into a loud failure, since `sao_merge_flag` and
+    /// `sao_type_idx` are context-coded and their states carry forward.
+    ///
+    /// Several geometries so the merge availability rules see a left edge,
+    /// a top edge and neither; several QPs because the context states
+    /// start from the slice QP.
+    #[test]
+    fn round_trips_sao_parameters() {
+        let mut kinds = [0usize; 3];
+        for (w, h, qp, seed) in [(64u32, 64u32, 26i32, 60u64), (128, 64, 26, 61), (96, 96, 33, 62), (40, 40, 26, 63), (64, 64, 51, 64), (24, 16, 45, 65)] {
+            let k = round_trip_cfg(w, h, qp, seed, false, true);
+            for i in 0..3 {
+                kinds[i] += k[i];
+            }
+        }
+        // Across the corpus, not within any one picture: a 24x16 frame is
+        // two CTBs and cannot be asked to cover three branches. Without
+        // this the test would still pass on a generator that had quietly
+        // stopped producing one of the modes.
+        assert!(kinds[0] > 0, "no CTB left SAO off");
+        assert!(kinds[1] > 0, "no band-offset CTB was generated");
+        assert!(kinds[2] > 0, "no edge-offset CTB was generated");
     }
 
     /// One aligned 64x64 CTU, several seeds and QPs (the initial context
@@ -2488,10 +2791,10 @@ mod write_round_trip {
     #[test]
     fn round_trips_transquant_bypass() {
         for (qp, seed) in [(26, 21u64), (26, 22), (12, 23), (51, 24)] {
-            round_trip_cfg(64, 64, qp, seed, true);
+            round_trip_cfg(64, 64, qp, seed, true, false);
         }
-        round_trip_cfg(96, 96, 33, 25, true); // 32x32 CTUs, 3x3
-        round_trip_cfg(40, 40, 26, 26, true); // partial CTBs under bypass
+        round_trip_cfg(96, 96, 33, 25, true, false); // 32x32 CTUs, 3x3
+        round_trip_cfg(40, 40, 26, 26, true, false); // partial CTBs under bypass
     }
 
     // ------------------------------------------------------------------
