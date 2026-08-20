@@ -33,7 +33,7 @@ use crate::encode::h264_deblock::FilterMb;
 use crate::encode::h264_me::{BDecision, InterDecision, InterMbKind};
 use crate::encode::h264_pic::{BMb, IntraTools, PMb, code_b_picture, code_intra_picture, code_p_picture};
 use crate::encode::h264_syntax::{Geometry, Plane, Recon};
-use crate::h264::cavlc::{SCAN_CHROMA_DC, write_residual_block_cavlc};
+use crate::h264::cavlc::{SCAN8_SUB, SCAN_CHROMA_DC, write_residual_block_cavlc};
 use crate::h264::mb::raster_of_blk;
 use crate::h264::tables::{
     GOLOMB_TO_INTER_CBP, GOLOMB_TO_INTER_CBP_GRAY, GOLOMB_TO_INTRA4X4_CBP,
@@ -169,6 +169,7 @@ fn widen_dc(levels: &[i16; 16]) -> [i32; 8] {
 /// `mb_type_offset` is what the slice type adds to an intra `mb_type`
 /// before it is coded: 0 in an I slice, 5 in a P slice, 23 in a B slice
 /// (Table 7-11's note — the reader subtracts the same constant).
+#[allow(clippy::too_many_arguments)]
 fn write_macroblock(
     w: &mut BitWriter,
     dec: &MbDecision,
@@ -177,15 +178,18 @@ fn write_macroblock(
     left: bool,
     top: bool,
     mb_type_offset: u32,
+    t8x8_mode: bool,
 ) {
     let chroma = st.rows != 0;
     let i16x16 = dec.kind == MbKind::I16x16;
     let cbp = (dec.cbp_luma | (dec.cbp_chroma << 4)) as usize;
 
-    // mb_type (Table 7-11): I_NxN is 0; the I_16x16 types encode the
-    // prediction mode and both halves of the coded block pattern.
+    // mb_type (Table 7-11): I_NxN is 0 for *both* transform sizes — which
+    // is what `transform_size_8x8_flag` below is for; the I_16x16 types
+    // encode the prediction mode and both halves of the coded block
+    // pattern.
     match dec.kind {
-        MbKind::I4x4 => w.ue(mb_type_offset),
+        MbKind::I4x4 | MbKind::I8x8 => w.ue(mb_type_offset),
         MbKind::I16x16 => w.ue(
             mb_type_offset
                 + 1
@@ -195,22 +199,48 @@ fn write_macroblock(
         ),
     }
 
-    if dec.kind == MbKind::I4x4 {
+    // `transform_size_8x8_flag`, before `mb_pred()` and only for I_NxN:
+    // the reader takes it under `ctx.transform_8x8_mode && layer.kind ==
+    // MbKind::I4x4` (`parse_mb_cavlc` in src/h264/cavlc.rs), where
+    // `I4x4` is still standing for I_NxN because the flag has not yet
+    // renamed it.
+    if t8x8_mode && dec.kind.is_nxn() {
+        w.flag(dec.transform_8x8);
+    }
+    debug_assert!(t8x8_mode || !dec.transform_8x8, "no PPS flag, no 8x8 transform");
+
+    match dec.kind {
         // The sixteen prediction modes, in luma4x4BlkIdx order — the
         // standard's 4x4 scan, not raster, which is why the raster-indexed
         // decision is walked through `raster_of_blk`.
-        for blk in 0..16 {
-            let p = dec.luma_pred[raster_of_blk(blk)];
-            w.flag(p.use_predicted);
-            if !p.use_predicted {
-                w.bits(3, p.rem as u32);
+        MbKind::I4x4 => {
+            for blk in 0..16 {
+                let p = dec.luma_pred[raster_of_blk(blk)];
+                w.flag(p.use_predicted);
+                if !p.use_predicted {
+                    w.bits(3, p.rem as u32);
+                }
             }
         }
+        // Four modes instead of sixteen, one per 8x8 quad in raster
+        // order, with the same two syntax elements; the decision stored
+        // each on all four of its quad's 4x4s, so the quad's top-left is
+        // where it is read.
+        MbKind::I8x8 => {
+            for &raster in &[0usize, 2, 8, 10] {
+                let p = dec.luma_pred[raster];
+                w.flag(p.use_predicted);
+                if !p.use_predicted {
+                    w.bits(3, p.rem as u32);
+                }
+            }
+        }
+        MbKind::I16x16 => {}
     }
     if chroma {
         w.ue(dec.chroma_mode as u32);
     }
-    if dec.kind == MbKind::I4x4 {
+    if dec.kind.is_nxn() {
         // coded_block_pattern as me(v), from the derived inverse mapping.
         let code = if chroma {
             INTRA_CBP_TO_GOLOMB[cbp]
@@ -232,6 +262,7 @@ fn write_macroblock(
         left,
         top,
         i16x16.then_some(&dec.luma_dc),
+        dec.transform_8x8,
         cbp,
         &dec.luma,
         &dec.chroma_dc,
@@ -249,6 +280,7 @@ fn write_macroblock(
 /// only reached when `num_ref_idx_active > 1` (7.3.5.1) — and this
 /// encoder's slice headers always declare one. The `debug_assert` is the
 /// tripwire for the day that stops being true.
+#[allow(clippy::too_many_arguments)]
 fn write_p16_macroblock(
     w: &mut BitWriter,
     dec: &InterDecision,
@@ -256,6 +288,7 @@ fn write_p16_macroblock(
     mb_x: usize,
     left: bool,
     top: bool,
+    t8x8_mode: bool,
 ) {
     debug_assert_eq!(dec.kind, InterMbKind::P16x16);
     debug_assert_eq!(dec.ref_idx, 0, "more than one reference needs te(v) ref_idx writing");
@@ -270,6 +303,14 @@ fn write_p16_macroblock(
         INTER_CBP_TO_GOLOMB_GRAY[cbp]
     };
     w.ue(code as u32);
+    // An inter macroblock's `transform_size_8x8_flag` comes after the
+    // coded block pattern and only when some luma block is coded;
+    // `no_sub_mb_part_less_than_8x8` holds trivially for one 16x16
+    // partition.
+    if t8x8_mode && dec.cbp_luma != 0 {
+        w.flag(dec.transform_8x8);
+    }
+    debug_assert!(!dec.transform_8x8 || (t8x8_mode && dec.cbp_luma != 0));
     // mb_qp_delta is present exactly when the reader's `has_residual` says
     // so, which for an inter macroblock is any coded block at all.
     if cbp != 0 {
@@ -282,6 +323,7 @@ fn write_p16_macroblock(
         left,
         top,
         None,
+        dec.transform_8x8,
         cbp,
         &dec.luma,
         &dec.chroma_dc,
@@ -323,6 +365,7 @@ fn write_plane_residual(
     left: bool,
     top: bool,
     dc: Option<&[i16; 16]>,
+    transform_8x8: bool,
     cbp: usize,
     levels: &[[i16; 16]; 16],
     nz: &[u8; 16],
@@ -346,6 +389,7 @@ fn write_plane_residual(
         nc_of(a, b)
     };
     if let Some(dc) = dc {
+        debug_assert!(!transform_8x8, "Intra_16x16 carries no transform_size_8x8_flag");
         // The DC block first. Its own count is not stored anywhere — the
         // reader discards it too — so the return is deliberately dropped.
         let nc = nc_at(&cur, st, 0, 0);
@@ -356,17 +400,34 @@ fn write_plane_residual(
             continue;
         }
         let (bx8, by8) = ((blk8 & 1) * 2, (blk8 >> 1) * 2);
+        // Under the 8x8 transform CAVLC still codes four blocks per 8x8,
+        // but they are not its four 4x4s: they are its sixty-four scan
+        // positions taken every fourth (`SCAN8_SUB` in src/h264/cavlc.rs,
+        // built from `ZIGZAG8X8`), each written as a sixteen-coefficient
+        // block into the *8x8*'s storage. Everything else is unchanged —
+        // the same four `nC` predictions in the same order, the same
+        // counts stored on the same 4x4s — which is exactly why this is a
+        // choice of scan and span rather than a second walk.
+        let scan8 = transform_8x8.then(|| &levels.as_flattened()[blk8 * 64..blk8 * 64 + 64]);
         for sub in 0..4 {
             let (bx, by) = (bx8 + (sub & 1), by8 + (sub >> 1));
             let raster = by * 4 + bx;
             let nc = nc_at(&cur, st, bx, by);
-            let lv = widen(&levels[raster]);
-            // I_16x16 AC blocks start at scan position one — the DC went
-            // in the block above — and so carry at most fifteen.
-            let n = if dc.is_some() {
-                write_residual_block_cavlc(w, nc, &lv, &ZIGZAG4X4, 1, 15, 15)
+            let n = if let Some(block8) = scan8 {
+                let mut lv = [0i32; 64];
+                for (o, &v) in lv.iter_mut().zip(block8) {
+                    *o = v as i32;
+                }
+                write_residual_block_cavlc(w, nc, &lv, &SCAN8_SUB[sub], 0, 15, 16)
             } else {
-                write_residual_block_cavlc(w, nc, &lv, &ZIGZAG4X4, 0, 15, 16)
+                let lv = widen(&levels[raster]);
+                // I_16x16 AC blocks start at scan position one — the DC
+                // went in the block above — and so carry at most fifteen.
+                if dc.is_some() {
+                    write_residual_block_cavlc(w, nc, &lv, &ZIGZAG4X4, 1, 15, 15)
+                } else {
+                    write_residual_block_cavlc(w, nc, &lv, &ZIGZAG4X4, 0, 15, 16)
+                }
             };
             debug_assert_eq!(
                 n, nz[raster] as usize,
@@ -398,6 +459,7 @@ fn write_mb_residual(
     left: bool,
     top: bool,
     luma_dc: Option<&[i16; 16]>,
+    transform_8x8: bool,
     cbp: usize,
     luma: &[[i16; 16]; 16],
     chroma_dc: &[[i16; 16]; 2],
@@ -411,17 +473,18 @@ fn write_mb_residual(
     // Luma, then (4:4:4) Cb and Cr coded the same way — the mirror of
     // `parse_residual_cavlc`'s plane order, each plane's `nC` from its own
     // neighbour counts (`plane_nc` in src/h264/cavlc.rs).
-    write_plane_residual(w, st, 0, mb_x, left, top, luma_dc, cbp, luma, nz_luma);
+    write_plane_residual(w, st, 0, mb_x, left, top, luma_dc, transform_8x8, cbp, luma, nz_luma);
     if st.c444 {
+        // 4:4:4's chroma planes are luma-style, transform size included.
         write_plane_residual(
             w, st, 1, mb_x, left, top,
             luma_dc.is_some().then_some(&chroma_dc[0]),
-            cbp, &chroma_ac[0], &nz_chroma[0],
+            transform_8x8, cbp, &chroma_ac[0], &nz_chroma[0],
         );
         write_plane_residual(
             w, st, 2, mb_x, left, top,
             luma_dc.is_some().then_some(&chroma_dc[1]),
-            cbp, &chroma_ac[1], &nz_chroma[1],
+            transform_8x8, cbp, &chroma_ac[1], &nz_chroma[1],
         );
     }
     if chroma && cbp & 0x30 != 0 {
@@ -498,8 +561,9 @@ pub fn write_intra_picture(
     let mbs_wide = g.mbs_wide as usize;
     let rows = if g.chroma == crate::picture::ChromaFormat::Yuv444 { 0 } else { g.chroma_mb().1 as usize / 4 };
     let mut st = NzState::new(mbs_wide, rows, g.chroma == crate::picture::ChromaFormat::Yuv444);
+    let t8x8 = tools.transform_8x8;
     code_intra_picture(g, tools, qp, planes, rec, |mb_x, mb_y, dec| {
-        write_macroblock(w, dec, &mut st, mb_x, mb_x > 0, mb_y > 0, 0);
+        write_macroblock(w, dec, &mut st, mb_x, mb_x > 0, mb_y > 0, 0, t8x8);
     })
 }
 
@@ -530,6 +594,7 @@ pub fn write_p_picture(
     // *every* coded macroblock (zero included) and a bare trailing run
     // when the slice ends in skips (7.3.4).
     let mut skip_run: u32 = 0;
+    let t8x8 = tools.transform_8x8;
     let fmbs = code_p_picture(g, tools, qp, planes, rec, refp, |mb_x, mb_y, mb| match mb {
         PMb::Skip(_) => {
             skip_run += 1;
@@ -538,14 +603,14 @@ pub fn write_p_picture(
         PMb::Coded(dec) => {
             w.ue(skip_run);
             skip_run = 0;
-            write_p16_macroblock(w, dec, &mut st, mb_x, mb_x > 0, mb_y > 0);
+            write_p16_macroblock(w, dec, &mut st, mb_x, mb_x > 0, mb_y > 0, t8x8);
         }
         PMb::Intra(idec) => {
             w.ue(skip_run);
             skip_run = 0;
             // Intra in a P slice: the same macroblock, `mb_type` shifted
             // by 5 (Table 7-11's note).
-            write_macroblock(w, idec, &mut st, mb_x, mb_x > 0, mb_y > 0, 5);
+            write_macroblock(w, idec, &mut st, mb_x, mb_x > 0, mb_y > 0, 5, t8x8);
         }
     });
     if skip_run > 0 {
@@ -560,6 +625,7 @@ pub fn write_p_picture(
 /// mvds come in list order for the lists the direction uses (7.3.5.1's
 /// prediction loops). `B_Direct_16x16` carries no motion syntax at all —
 /// `mb_type` 0, then straight to the coded block pattern.
+#[allow(clippy::too_many_arguments)]
 fn write_b16_macroblock(
     w: &mut BitWriter,
     dec: &BDecision,
@@ -568,6 +634,7 @@ fn write_b16_macroblock(
     left: bool,
     top: bool,
     direct: bool,
+    t8x8_mode: bool,
 ) {
     debug_assert!(dec.ref_idx.iter().all(|&r| r <= 0), "multi-reference lists need te(v) ref_idx");
     if direct {
@@ -595,6 +662,12 @@ fn write_b16_macroblock(
         INTER_CBP_TO_GOLOMB_GRAY[cbp]
     };
     w.ue(code as u32);
+    // `B_Direct_16x16` carries the flag too, because the SPS this encoder
+    // writes sets `direct_8x8_inference_flag`.
+    if t8x8_mode && dec.cbp_luma != 0 {
+        w.flag(dec.transform_8x8);
+    }
+    debug_assert!(!dec.transform_8x8 || (t8x8_mode && dec.cbp_luma != 0));
     if cbp != 0 {
         w.se(dec.qp_delta as i32);
     }
@@ -605,6 +678,7 @@ fn write_b16_macroblock(
         left,
         top,
         None,
+        dec.transform_8x8,
         cbp,
         &dec.luma,
         &dec.chroma_dc,
@@ -634,6 +708,7 @@ pub fn write_b_picture(
     let rows = if g.chroma == crate::picture::ChromaFormat::Yuv444 { 0 } else { g.chroma_mb().1 as usize / 4 };
     let mut st = NzState::new(mbs_wide, rows, g.chroma == crate::picture::ChromaFormat::Yuv444);
     let mut skip_run: u32 = 0;
+    let t8x8 = tools.transform_8x8;
     let fmbs = code_b_picture(g, tools, qp, planes, rec, refs, col, |mb_x, mb_y, mb| match mb {
         BMb::Skip(_) => {
             skip_run += 1;
@@ -642,19 +717,19 @@ pub fn write_b_picture(
         BMb::Direct(dec) => {
             w.ue(skip_run);
             skip_run = 0;
-            write_b16_macroblock(w, dec, &mut st, mb_x, mb_x > 0, mb_y > 0, true);
+            write_b16_macroblock(w, dec, &mut st, mb_x, mb_x > 0, mb_y > 0, true, t8x8);
         }
         BMb::Explicit(dec) => {
             w.ue(skip_run);
             skip_run = 0;
-            write_b16_macroblock(w, dec, &mut st, mb_x, mb_x > 0, mb_y > 0, false);
+            write_b16_macroblock(w, dec, &mut st, mb_x, mb_x > 0, mb_y > 0, false, t8x8);
         }
         BMb::Intra(idec) => {
             w.ue(skip_run);
             skip_run = 0;
             // Intra in a B slice: the same macroblock, `mb_type` shifted
             // by 23 (Table 7-14's note).
-            write_macroblock(w, idec, &mut st, mb_x, mb_x > 0, mb_y > 0, 23);
+            write_macroblock(w, idec, &mut st, mb_x, mb_x > 0, mb_y > 0, 23, t8x8);
         }
     });
     if skip_run > 0 {
@@ -764,7 +839,7 @@ mod tests {
 
             let mut st = NzState::new(1, 2, false);
             let mut w = BitWriter::new();
-            write_p16_macroblock(&mut w, &dec, &mut st, 0, false, false);
+            write_p16_macroblock(&mut w, &dec, &mut st, 0, false, false, false);
             w.rbsp_trailing_bits();
             let rbsp = w.into_rbsp();
 
@@ -828,7 +903,7 @@ mod tests {
 
             let mut st = NzState::new(1, 2, false);
             let mut w = BitWriter::new();
-            write_b16_macroblock(&mut w, &dec, &mut st, 0, false, false, direct);
+            write_b16_macroblock(&mut w, &dec, &mut st, 0, false, false, direct, false);
             w.rbsp_trailing_bits();
             let rbsp = w.into_rbsp();
 
@@ -880,7 +955,7 @@ mod tests {
     #[test]
     fn a_444_intra_macroblock_round_trips_through_the_reader() {
         use crate::h264::frame::LUMA_PAD;
-        let tools = IntraTools::new();
+        let tools = IntraTools::new(false);
         let mut seed = 77u32;
         let mut lcg = move || -> u8 {
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
@@ -898,6 +973,7 @@ mod tests {
                 qpc: [qpc; 2],
                 chroma_h: 16,
                 c444: true,
+                t8x8: false,
             };
             let mut rec = vec![
                 recon_plane(16, 16, LUMA_PAD),
@@ -920,7 +996,7 @@ mod tests {
 
             let mut st = NzState::new(1, 0, true);
             let mut w = BitWriter::new();
-            write_macroblock(&mut w, &dec, &mut st, 0, false, false, 0);
+            write_macroblock(&mut w, &dec, &mut st, 0, false, false, 0, false);
             w.rbsp_trailing_bits();
             let rbsp = w.into_rbsp();
 
@@ -939,6 +1015,7 @@ mod tests {
 
             match dec.kind {
                 MbKind::I4x4 => assert_eq!(layer.kind, DecKind::I4x4, "qp={qp}"),
+                MbKind::I8x8 => assert_eq!(layer.kind, DecKind::I8x8, "qp={qp}"),
                 MbKind::I16x16 => {
                     assert_eq!(layer.kind, DecKind::I16x16, "qp={qp}");
                     assert_eq!(layer.intra16_mode, dec.intra16_mode);
@@ -977,7 +1054,7 @@ mod tests {
         let mut st = NzState::new(1, 2, false);
         let mut w = BitWriter::new();
         w.ue(0); // the mb_skip_run a coded macroblock follows
-        write_macroblock(&mut w, &dec, &mut st, 0, false, false, 5);
+        write_macroblock(&mut w, &dec, &mut st, 0, false, false, 5, false);
         w.rbsp_trailing_bits();
         let rbsp = w.into_rbsp();
 
@@ -1029,7 +1106,7 @@ mod tests {
     fn round_trip(dec: &MbDecision, chosen_modes: Option<&[u8; 16]>, qp: u8) {
         let mut st = NzState::new(1, 2, false);
         let mut w = BitWriter::new();
-        write_macroblock(&mut w, dec, &mut st, 0, false, false, 0);
+        write_macroblock(&mut w, dec, &mut st, 0, false, false, 0, false);
         w.rbsp_trailing_bits();
         let rbsp = w.into_rbsp();
 
@@ -1062,7 +1139,7 @@ mod tests {
         assert!(!r.overrun());
 
         match dec.kind {
-            MbKind::I4x4 => {
+            MbKind::I4x4 | MbKind::I8x8 => {
                 assert_eq!(layer.kind, DecKind::I4x4);
                 if let Some(modes) = chosen_modes {
                     assert_eq!(&layer.intra_modes, modes, "decoded 4x4 modes");
@@ -1102,7 +1179,7 @@ mod tests {
     /// residual), across the QP range.
     #[test]
     fn coded_macroblocks_round_trip_through_the_reader() {
-        let tools = IntraTools::new();
+        let tools = IntraTools::new(false);
         let fill = |f: &mut dyn FnMut(usize, usize) -> u8| {
             let mut y = vec![0u8; 16 * 16];
             for r in 0..16 {
@@ -1145,6 +1222,7 @@ mod tests {
                     qpc: [qpc; 2],
                     chroma_h: 8,
                     c444: false,
+                    t8x8: false,
                 };
                 let mut rec = vec![
                     recon_plane(16, 16, LUMA_PAD),

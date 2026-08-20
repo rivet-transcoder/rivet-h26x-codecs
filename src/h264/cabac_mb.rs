@@ -332,7 +332,9 @@ fn write_intra_mb_type_cabac(
 #[allow(dead_code)] // the picture loop being built is the caller
 pub(crate) fn intra_mb_type_code(d: &MbDecision) -> u32 {
     match d.kind {
-        IntraKind::I4x4 => 0,
+        // Both `I_NxN` kinds are `mb_type` 0 — which is the whole reason
+        // `transform_size_8x8_flag` exists.
+        IntraKind::I4x4 | IntraKind::I8x8 => 0,
         IntraKind::I16x16 => {
             debug_assert!(
                 d.cbp_luma == 0 || d.cbp_luma == 15,
@@ -948,6 +950,13 @@ fn decode_intra_pred_mode(c: &mut Cabac, st: &mut CabacState, pred: u8) -> u8 {
 /// go out least significant first, because that is the order the reader
 /// assembles them in.
 ///
+/// `I_8x8` sends four modes instead of sixteen, in 8x8 block order, with
+/// the *same* two syntax elements and the same two contexts — the reader
+/// calls the very same [`decode_intra_pred_mode`] for both
+/// (`parse_mb_cabac`'s `MbKind::I8x8` arm). The decision stores each
+/// quad's mode on all four of its 4x4s, so the quad's top-left raster is
+/// where the writer reads it.
+///
 /// `chroma_nb` is `None` when `intra_chroma_pred_mode` is not parsed at all
 /// (monochrome — and 4:4:4, which has no writer yet), else the two
 /// condTermFlags `[left, above]` of 9.3.3.1.1.8: a side is `true` iff that
@@ -962,20 +971,28 @@ pub(crate) fn write_intra_pred_modes_cabac(
     d: &MbDecision,
     chroma_nb: Option<[bool; 2]>,
 ) {
-    if d.kind == IntraKind::I4x4 {
-        for blk in 0..16 {
-            let m = d.luma_pred[super::mb::raster_of_blk(blk)];
-            e.encode_decision(
-                &mut st.ctx[CTX_PREV_INTRA_PRED_MODE_FLAG],
-                m.use_predicted as u32,
-            );
-            if !m.use_predicted {
-                debug_assert!(m.rem < 8, "rem_intra4x4_pred_mode is three bits");
-                let rem = m.rem as u32;
-                e.encode_decision(&mut st.ctx[CTX_REM_INTRA_PRED_MODE], rem & 1);
-                e.encode_decision(&mut st.ctx[CTX_REM_INTRA_PRED_MODE], (rem >> 1) & 1);
-                e.encode_decision(&mut st.ctx[CTX_REM_INTRA_PRED_MODE], (rem >> 2) & 1);
-            }
+    // The blocks whose modes are sent, in the order the reader takes
+    // them: the standard's 4x4 scan for `I_4x4`, and for `I_8x8` the four
+    // quads in raster order at their top-left 4x4 — which is where the
+    // decision stored each quad's mode.
+    let blk_order: [usize; 16] = std::array::from_fn(super::mb::raster_of_blk);
+    let modes: &[usize] = match d.kind {
+        IntraKind::I4x4 => &blk_order[..],
+        IntraKind::I8x8 => &[0, 2, 8, 10],
+        IntraKind::I16x16 => &[],
+    };
+    for &raster in modes {
+        let m = d.luma_pred[raster];
+        e.encode_decision(
+            &mut st.ctx[CTX_PREV_INTRA_PRED_MODE_FLAG],
+            m.use_predicted as u32,
+        );
+        if !m.use_predicted {
+            debug_assert!(m.rem < 8, "rem_intra4x4_pred_mode is three bits");
+            let rem = m.rem as u32;
+            e.encode_decision(&mut st.ctx[CTX_REM_INTRA_PRED_MODE], rem & 1);
+            e.encode_decision(&mut st.ctx[CTX_REM_INTRA_PRED_MODE], (rem >> 1) & 1);
+            e.encode_decision(&mut st.ctx[CTX_REM_INTRA_PRED_MODE], (rem >> 2) & 1);
         }
     }
     if let Some([left, above]) = chroma_nb {
@@ -1082,6 +1099,12 @@ pub(crate) struct WrittenMb {
     /// The macroblock is I_16x16 (the luma-DC coded_block_flag context
     /// reads it).
     pub i16x16: bool,
+    /// `transform_size_8x8_flag`, which is what the *next* macroblock's
+    /// own flag reads of this one: [`decode_transform_8x8`]'s ctxIdxInc
+    /// counts neighbours whose flag was set. In 4:4:4 it is also what the
+    /// 8x8 coded_block_flag contexts ask of a neighbour — one transformed
+    /// 4x4 contributes zero to those whatever its counts say.
+    pub transform_8x8: bool,
     /// `coded_block_pattern` in the decoder's layout: luma bits 0..=3 (0 or
     /// 15 for I_16x16), the chroma value (0 / 1 / 2) in bits 4..
     pub cbp: u8,
@@ -1135,6 +1158,38 @@ fn gate_nz_luma(cbp_luma: u8, nz: &[u8; 16]) -> [u8; 16] {
     out
 }
 
+/// The luma nonzero counts an 8x8-transformed macroblock leaves for its
+/// neighbours: one count per 8x8 block, on all four of its 4x4s.
+///
+/// The decision side counts per 4x4 *sub-scan* — the four interleaved
+/// blocks CAVLC codes an 8x8 as — and those four counts sum to the 8x8's
+/// total, because the sub-scans partition its sixty-four positions. What
+/// the decoder's CABAC parser stores is that total, replicated
+/// (`parse_residual_luma_like_cabac`). The difference is invisible in
+/// every macroblock but one whose 8x8 has coefficients in some sub-scans
+/// and none in others — where a neighbour would read "no coefficients"
+/// from a block the decoder calls coded, and the coded_block_flag
+/// contexts would part company.
+///
+/// A 4x4-transformed macroblock passes through untouched.
+fn spread8(transform_8x8: bool, nz: &[u8; 16]) -> [u8; 16] {
+    if !transform_8x8 {
+        return *nz;
+    }
+    let mut out = [0u8; 16];
+    for blk8 in 0..4 {
+        let (bx8, by8) = ((blk8 & 1) * 2, (blk8 >> 1) * 2);
+        let idx =
+            [by8 * 4 + bx8, by8 * 4 + bx8 + 1, (by8 + 1) * 4 + bx8, (by8 + 1) * 4 + bx8 + 1];
+        let total: u32 = idx.iter().map(|&i| nz[i] as u32).sum();
+        let total = total.min(64) as u8;
+        for i in idx {
+            out[i] = total;
+        }
+    }
+    out
+}
+
 /// The chroma-DC coded_block_flags as the decoder will store them: the
 /// bits exist only when chroma residual was written at all.
 fn chroma_dc_cbf(cbp_chroma: u8, chroma_dc: &[[i16; 16]; 2]) -> u8 {
@@ -1179,9 +1234,16 @@ impl WrittenMb {
         WrittenMb {
             pcm: false,
             i16x16,
+            transform_8x8: d.transform_8x8,
             cbp: (d.cbp_luma & 15) | (d.cbp_chroma << 4),
             dc_cbf,
-            nz_luma: gate_nz_luma(d.cbp_luma, &d.nz_luma),
+            // An 8x8-transformed macroblock stores one count per 8x8 over
+            // all four of its 4x4s, because that is what the decoder's
+            // CABAC parser writes into `layer.nz`
+            // (`parse_residual_luma_like_cabac` below). The decision
+            // counts per 4x4 sub-scan — CAVLC's view — so the two are
+            // reconciled here, once, beside the contexts that read it.
+            nz_luma: gate_nz_luma(d.cbp_luma, &spread8(d.transform_8x8, &d.nz_luma)),
             nz_chroma: if c444 {
                 // The planes' luma-style counts, gated by the shared cbp
                 // exactly as plane 0's are.
@@ -1220,6 +1282,7 @@ impl WrittenMb {
                 WrittenMb {
                     pcm: false,
                     i16x16: false,
+                    transform_8x8: false,
                     cbp: 0,
                     dc_cbf: 0,
                     nz_luma: [0; 16],
@@ -1234,15 +1297,16 @@ impl WrittenMb {
             InterMbKind::P16x16 => WrittenMb {
                 pcm: false,
                 i16x16: false,
+                transform_8x8: d.transform_8x8,
                 cbp: (d.cbp_luma & 15) | (d.cbp_chroma << 4),
                 // 4:4:4 inter planes have no DC block (each 4x4 keeps its
                 // own DC), so the plane DC flags stay clear.
                 dc_cbf: if c444 { 0 } else { chroma_dc_cbf(d.cbp_chroma, &d.chroma_dc) },
-                nz_luma: gate_nz_luma(d.cbp_luma, &d.nz_luma),
+                nz_luma: gate_nz_luma(d.cbp_luma, &spread8(d.transform_8x8, &d.nz_luma)),
                 nz_chroma: if c444 {
                     [
-                        gate_nz_luma(d.cbp_luma, &d.nz_chroma[0]),
-                        gate_nz_luma(d.cbp_luma, &d.nz_chroma[1]),
+                        gate_nz_luma(d.cbp_luma, &spread8(d.transform_8x8, &d.nz_chroma[0])),
+                        gate_nz_luma(d.cbp_luma, &spread8(d.transform_8x8, &d.nz_chroma[1])),
                     ]
                 } else if d.cbp_chroma == 2 {
                     d.nz_chroma
@@ -1266,6 +1330,7 @@ impl WrittenMb {
         WrittenMb {
             pcm: true,
             i16x16: false,
+            transform_8x8: false,
             cbp: 0,
             dc_cbf: 0,
             nz_luma: [16; 16],
@@ -1296,6 +1361,7 @@ impl WrittenMb {
                 WrittenMb {
                     pcm: false,
                     i16x16: false,
+                    transform_8x8: false,
                     cbp: 0,
                     dc_cbf: 0,
                     nz_luma: [0; 16],
@@ -1310,13 +1376,14 @@ impl WrittenMb {
             BMbKind::BDirect16 | BMbKind::B16 => WrittenMb {
                 pcm: false,
                 i16x16: false,
+                transform_8x8: d.transform_8x8,
                 cbp: (d.cbp_luma & 15) | (d.cbp_chroma << 4),
                 dc_cbf: if c444 { 0 } else { chroma_dc_cbf(d.cbp_chroma, &d.chroma_dc) },
-                nz_luma: gate_nz_luma(d.cbp_luma, &d.nz_luma),
+                nz_luma: gate_nz_luma(d.cbp_luma, &spread8(d.transform_8x8, &d.nz_luma)),
                 nz_chroma: if c444 {
                     [
-                        gate_nz_luma(d.cbp_luma, &d.nz_chroma[0]),
-                        gate_nz_luma(d.cbp_luma, &d.nz_chroma[1]),
+                        gate_nz_luma(d.cbp_luma, &spread8(d.transform_8x8, &d.nz_chroma[0])),
+                        gate_nz_luma(d.cbp_luma, &spread8(d.transform_8x8, &d.nz_chroma[1])),
                     ]
                 } else if d.cbp_chroma == 2 {
                     d.nz_chroma
@@ -1478,6 +1545,36 @@ fn decode_transform_8x8(
     bin(c, st, CTX_TRANSFORM_8X8 + inc) != 0
 }
 
+/// Write `transform_size_8x8_flag`: the exact inverse of
+/// [`decode_transform_8x8`], over the writer's neighbour state.
+///
+/// One bin, one context, and the whole of the derivation is the
+/// increment: condTermFlagN is the neighbouring macroblock's own
+/// `transform_size_8x8_flag`, and zero where the neighbour is
+/// unavailable. Unlike almost every other increment in this file it does
+/// *not* fall back to the current macroblock's intra-ness — the reader's
+/// `cond` returns 0 for `None` outright — so a writer that reused the
+/// coded_block_flag habit would be wrong on the top row and the left
+/// column of every picture, which is exactly where nothing else is
+/// coded yet to notice.
+///
+/// The caller writes this where the reader takes it, and the two places
+/// differ: for `I_NxN` it comes *before* `mb_pred()` (and decides whether
+/// the four 8x8 modes or the sixteen 4x4 ones follow); for an inter
+/// macroblock it comes *after* `coded_block_pattern`, and only when some
+/// luma block is coded.
+pub(crate) fn write_transform_8x8_cabac(
+    e: &mut CabacEncoder,
+    st: &mut CabacState,
+    left: Option<&WrittenMb>,
+    above: Option<&WrittenMb>,
+    flag: bool,
+) {
+    let cond = |m: Option<&WrittenMb>| -> usize { m.is_some_and(|m| m.transform_8x8) as usize };
+    let inc = cond(left) + cond(above);
+    e.encode_decision(&mut st.ctx[CTX_TRANSFORM_8X8 + inc], flag as u32);
+}
+
 // ---------------------------------------------------------------------------
 // Residual blocks (9.3.3.1.1.9, 9.3.3.1.3)
 // ---------------------------------------------------------------------------
@@ -1606,24 +1703,33 @@ fn cbf_ctx_inc(
 /// lookups because every block's left / above neighbour inside a
 /// macroblock comes earlier in block order, so its count is what the
 /// decoder will have stored by the time it derives the same increment.
-struct CurMbResidual<'a> {
+struct CurMbResidual {
     /// The macroblock is intra (any I kind).
     intra: bool,
+    /// `transform_size_8x8_flag`: the luma-style planes are coded as four
+    /// 8x8 blocks rather than sixteen 4x4 ones, which changes the block
+    /// categories, the scan, and (outside 4:4:4) whether a
+    /// coded_block_flag exists at all.
+    transform_8x8: bool,
     /// `CodedBlockPatternLuma` (bits 0..=3).
     cbp_luma: u8,
-    /// Nonzero counts per luma 4x4 (raster): full counts for 4x4-coded
-    /// blocks, AC counts for Intra_16x16.
-    nz_luma: &'a [u8; 16],
+    /// Nonzero counts per luma 4x4 (raster) *as the decoder will store
+    /// them*: full counts for 4x4-coded blocks, AC counts for
+    /// Intra_16x16, and one 8x8's total on all four of its 4x4s under the
+    /// 8x8 transform ([`spread8`]). Owned rather than borrowed for
+    /// exactly that reason — the decision's array is the other view.
+    nz_luma: [u8; 16],
     /// Nonzero counts per chroma AC block, per component — in 4:4:4 the
     /// same field holds the Cb / Cr planes' luma-style counts (sixteen
-    /// blocks, raster), exactly as the decoder's `chroma_nz` arrays do.
-    nz_chroma: &'a [[u8; 16]; 2],
+    /// blocks, raster), exactly as the decoder's `chroma_nz` arrays do,
+    /// spread with the luma plane's when the 8x8 transform is on.
+    nz_chroma: [[u8; 16]; 2],
 }
 
-impl CurMbResidual<'_> {
+impl CurMbResidual {
     /// Plane `p`'s nonzero counts, luma-style (4:4:4's plane view).
     fn nz_plane(&self, p: usize) -> &[u8; 16] {
-        if p == 0 { self.nz_luma } else { &self.nz_chroma[p - 1] }
+        if p == 0 { &self.nz_luma } else { &self.nz_chroma[p - 1] }
     }
 }
 
@@ -1637,6 +1743,15 @@ impl CurMbResidual<'_> {
 /// `rows` is the chroma block-row count (2 for 4:2:0, 4 for 4:2:2): it
 /// picks which of the above neighbour's chroma blocks sit on the shared
 /// edge.
+///
+/// The 8x8 categories (5 / 9 / 13) are only ever *coded* in 4:4:4 —
+/// elsewhere an 8x8 luma block's coded_block_flag is inferred 1 and the
+/// caller passes no increment — and they ask a different question of a
+/// neighbouring macroblock: one that was transformed 4x4 contributes 0
+/// whatever its counts say, because there is no 8x8 transform block there
+/// to have a flag. The reader's `x264_old_444` bug-compatibility arm is
+/// deliberately not mirrored: it exists to *decode* streams old x264
+/// builds produced, and this encoder writes the standard's answer.
 #[allow(clippy::too_many_arguments)]
 fn enc_cbf_ctx_inc(
     cur: &CurMbResidual,
@@ -1651,6 +1766,7 @@ fn enc_cbf_ctx_inc(
 ) -> usize {
     let cur_intra = cur.intra as usize;
     let p = cat_plane(cat);
+    let cat_8x8 = matches!(cat, 5 | 9 | 13);
     let cond_luma = |dx: i32, dy: i32| -> usize {
         let (nx, ny) = (bx as i32 + dx, by as i32 + dy);
         if nx >= 0 && ny >= 0 {
@@ -1669,7 +1785,18 @@ fn enc_cbf_ctx_inc(
         match m {
             None => cur_intra,
             Some(m) => {
+                if cat_8x8 {
+                    if m.pcm {
+                        return 1;
+                    }
+                    if m.skip || !m.transform_8x8 {
+                        return 0;
+                    }
+                }
                 let nz = if p == 0 { &m.nz_luma } else { &m.nz_chroma[p - 1] };
+                // The counts are already gated by the neighbour's coded
+                // block pattern (`gate_nz_luma`), which is the reader's
+                // `m.cbp & (1 << b8) == 0` test.
                 (nz[edge] != 0) as usize
             }
         }
@@ -1711,13 +1838,14 @@ fn enc_cbf_ctx_inc(
         // Luma-style DC (Intra_16x16 of the plane): bit p of `dc_cbf` —
         // the mirror of `cbf_ctx_inc`'s 0 | 6 | 10 arm.
         0 | 6 | 10 => cond_dc(left, p as u8, true) + 2 * cond_dc(above, p as u8, true),
-        // Luma-style AC / 4x4 of the plane.
-        1 | 2 | 7 | 8 | 11 | 12 => cond_luma(-1, 0) + 2 * cond_luma(0, -1),
+        // Luma-style AC / 4x4 / 8x8 of the plane (the 8x8's top-left 4x4
+        // is `(bx, by)`) — the mirror of `cbf_ctx_inc`'s combined arm.
+        1 | 2 | 5 | 7 | 8 | 9 | 11 | 12 | 13 => cond_luma(-1, 0) + 2 * cond_luma(0, -1),
         CAT_CHROMA_DC => {
             cond_dc(left, 1 + comp as u8, false) + 2 * cond_dc(above, 1 + comp as u8, false)
         }
         CAT_CHROMA_AC => cond_chroma_ac(-1, 0) + 2 * cond_chroma_ac(0, -1),
-        _ => unreachable!("no category {cat} in a 4x4-transform macroblock"),
+        _ => unreachable!("category {cat} is not one a macroblock layer codes"),
     }
 }
 
@@ -2121,12 +2249,8 @@ pub(crate) fn write_intra_residual_cabac(
     left: Option<&WrittenMb>,
     above: Option<&WrittenMb>,
 ) {
-    let cur = CurMbResidual {
-        intra: true,
-        cbp_luma: d.cbp_luma,
-        nz_luma: &d.nz_luma,
-        nz_chroma: &d.nz_chroma,
-    };
+    let cur =
+        cur_residual(true, d.transform_8x8, chroma_format_idc, d.cbp_luma, &d.nz_luma, &d.nz_chroma);
     let dc = (d.kind == IntraKind::I16x16).then_some(&d.luma_dc);
     write_residual_walk_cabac(
         e, st, field, chroma_format_idc, &cur, dc, &d.luma, d.cbp_chroma, &d.chroma_dc,
@@ -2155,8 +2279,8 @@ pub(crate) fn write_inter_residual_cabac(
         "only a coded inter macroblock carries residual syntax (a skip carries none)"
     );
     write_inter_residual_fields_cabac(
-        e, st, field, chroma_format_idc, d.cbp_luma, &d.nz_luma, &d.luma, d.cbp_chroma,
-        &d.chroma_dc, &d.chroma_ac, &d.nz_chroma, left, above,
+        e, st, field, chroma_format_idc, d.transform_8x8, d.cbp_luma, &d.nz_luma, &d.luma,
+        d.cbp_chroma, &d.chroma_dc, &d.chroma_ac, &d.nz_chroma, left, above,
     );
 }
 
@@ -2170,6 +2294,7 @@ pub(crate) fn write_inter_residual_fields_cabac(
     st: &mut CabacState,
     field: bool,
     chroma_format_idc: u32,
+    transform_8x8: bool,
     cbp_luma: u8,
     nz_luma: &[u8; 16],
     luma: &[[i16; 16]; 16],
@@ -2180,34 +2305,62 @@ pub(crate) fn write_inter_residual_fields_cabac(
     left: Option<&WrittenMb>,
     above: Option<&WrittenMb>,
 ) {
-    let cur = CurMbResidual {
-        intra: false,
-        cbp_luma,
-        nz_luma,
-        nz_chroma,
-    };
+    debug_assert!(
+        !transform_8x8 || cbp_luma != 0,
+        "an inter macroblock with no coded luma block carries no transform_size_8x8_flag, so a decoder infers it zero"
+    );
+    let cur =
+        cur_residual(false, transform_8x8, chroma_format_idc, cbp_luma, nz_luma, nz_chroma);
     write_residual_walk_cabac(
         e, st, field, chroma_format_idc, &cur, None, luma, cbp_chroma, chroma_dc, chroma_ac,
         left, above,
     );
 }
 
-/// The residual walk behind [`write_intra_residual_cabac`] and
-/// [`write_inter_residual_cabac`] — one body, because the reader it
-/// inverts ([`parse_residual_cabac`]) likewise serves both and two copies
-/// of the walk could drift apart invisibly. `luma_dc` is `Some` exactly
-/// for Intra_16x16: its DC block is written first, unconditionally (the
-/// coded_block_flag may be zero), and the 4x4 blocks become
-/// 15-coefficient AC; every other shape's blocks carry all 16
-/// coefficients with the DC in place. Then, when the chroma cbp is
-/// nonzero, both components' chroma DC; at chroma cbp 2, every chroma AC
-/// block.
-#[allow(clippy::too_many_arguments)]
+/// The current macroblock as its own residual contexts read it, from a
+/// decision's fields.
+///
+/// The one thing it does beyond copying is [`spread8`]: the decision
+/// counts an 8x8's four CAVLC sub-scans separately and the decoder stores
+/// their total on all four blocks, and it is *that* view the contexts
+/// want. Only the luma-style planes are ever 8x8-transformed — 4:2:0 and
+/// 4:2:2 chroma has no 8x8 transform at all — so the chroma counts are
+/// spread only in 4:4:4, where they are luma-style planes themselves.
+fn cur_residual(
+    intra: bool,
+    transform_8x8: bool,
+    chroma_format_idc: u32,
+    cbp_luma: u8,
+    nz_luma: &[u8; 16],
+    nz_chroma: &[[u8; 16]; 2],
+) -> CurMbResidual {
+    let c444 = chroma_format_idc == 3;
+    CurMbResidual {
+        intra,
+        transform_8x8,
+        cbp_luma,
+        nz_luma: spread8(transform_8x8, nz_luma),
+        nz_chroma: [
+            spread8(transform_8x8 && c444, &nz_chroma[0]),
+            spread8(transform_8x8 && c444, &nz_chroma[1]),
+        ],
+    }
+}
+
+/// An 8x8 block's whole nonzero count, out of counts already spread over
+/// its four 4x4s — which is what the one CABAC residual block for that
+/// 8x8 must come out with.
+fn quad_total(nz: &[u8; 16], blk8: usize) -> usize {
+    let (bx8, by8) = ((blk8 & 1) * 2, (blk8 >> 1) * 2);
+    nz[by8 * 4 + bx8] as usize
+}
+
 /// One luma-like plane's residual bins — the DC block for `Intra_16x16`,
-/// then the coded 8x8s' 4x4 blocks — with plane `p`'s own categories
-/// ([`PLANE_CATS`]) and coded_block_flag contexts. Luma is plane 0; in
-/// 4:4:4 Cb and Cr are planes 1 and 2 coded the same way, gated by the
-/// *same* luma coded-block-pattern bits, exactly as
+/// then the coded 8x8s' blocks, which are four 4x4s or one 8x8 by the
+/// macroblock's `transform_size_8x8_flag` — with plane `p`'s own
+/// categories ([`PLANE_CATS`]) and coded_block_flag contexts. Luma is
+/// plane 0; in 4:4:4 Cb and Cr are planes 1 and 2 coded the same way,
+/// gated by the *same* luma coded-block-pattern bits, exactly as
 /// `parse_residual_luma_like_cabac` reads them.
 #[allow(clippy::too_many_arguments)]
 fn write_plane_residual_cabac(
@@ -2218,14 +2371,17 @@ fn write_plane_residual_cabac(
     left: Option<&WrittenMb>,
     above: Option<&WrittenMb>,
     rows: usize,
+    c444: bool,
     p: usize,
     dc: Option<&[i16; 16]>,
     levels: &[[i16; 16]; 16],
 ) {
-    let [cat_dc, cat_ac, cat_4x4, _] = PLANE_CATS[p];
+    let [cat_dc, cat_ac, cat_4x4, cat_8x8] = PLANE_CATS[p];
     let scan4: &[u8; 16] = if field { &FIELD_SCAN4X4 } else { &ZIGZAG4X4 };
+    let scan8: &[u8; 64] = if field { &FIELD_SCAN8X8 } else { &ZIGZAG8X8 };
     let mut buf = [0i32; 16];
     if let Some(dc) = dc {
+        debug_assert!(!cur.transform_8x8, "Intra_16x16 carries no transform_size_8x8_flag");
         for (o, &v) in buf.iter_mut().zip(dc) {
             *o = v as i32;
         }
@@ -2241,6 +2397,32 @@ fn write_plane_residual_cabac(
                     levels[raster].iter().all(|&v| v == 0)
                 }),
                 "plane {p} 8x8 {blk8} has coefficients but no cbp bit — they would be lost"
+            );
+            continue;
+        }
+        if cur.transform_8x8 {
+            // One block of sixty-four, out of the storage `levels` shares
+            // between the two transform layouts (quad `blk8` at flat
+            // offset `blk8 * 64`), taken in the 8x8 scan.
+            //
+            // The coded_block_flag exists only in 4:4:4; everywhere else
+            // it is inferred 1, which is what makes an 8x8 with a cbp bit
+            // and no coefficient unspellable — the decision has to clear
+            // the bit instead, and `write_residual_block_cabac` asserts
+            // so rather than emitting a block the reader cannot parse.
+            let mut buf8 = [0i32; 64];
+            for (o, &v) in
+                buf8.iter_mut().zip(&levels.as_flattened()[blk8 * 64..blk8 * 64 + 64])
+            {
+                *o = v as i32;
+            }
+            let cbf = c444
+                .then(|| enc_cbf_ctx_inc(cur, left, above, rows, cat_8x8, bx8, by8, 0, 0));
+            let n = write_residual_block_cabac(e, st, field, cat_8x8, cbf, &buf8, scan8, 0, 64);
+            debug_assert_eq!(
+                n,
+                quad_total(cur.nz_plane(p), blk8),
+                "plane {p} 8x8 {blk8}: the decision's counts disagree with the writer's"
             );
             continue;
         }
@@ -2267,6 +2449,17 @@ fn write_plane_residual_cabac(
     }
 }
 
+/// The residual walk behind [`write_intra_residual_cabac`] and
+/// [`write_inter_residual_cabac`] — one body, because the reader it
+/// inverts ([`parse_residual_cabac`]) likewise serves both and two copies
+/// of the walk could drift apart invisibly. `luma_dc` is `Some` exactly
+/// for Intra_16x16: its DC block is written first, unconditionally (the
+/// coded_block_flag may be zero), and the 4x4 blocks become
+/// 15-coefficient AC; every other shape's blocks carry all 16
+/// coefficients with the DC in place. Then, when the chroma cbp is
+/// nonzero, both components' chroma DC; at chroma cbp 2, every chroma AC
+/// block.
+#[allow(clippy::too_many_arguments)]
 fn write_residual_walk_cabac(
     e: &mut CabacEncoder,
     st: &mut CabacState,
@@ -2287,11 +2480,12 @@ fn write_residual_walk_cabac(
     // Luma, then (4:4:4) Cb and Cr coded the same way — the mirror of
     // `parse_residual_cabac`'s plane order, each plane's contexts its own
     // ([`PLANE_CATS`]).
-    write_plane_residual_cabac(e, st, field, cur, left, above, rows, 0, luma_dc, luma);
-    if chroma_format_idc == 3 {
+    let c444 = chroma_format_idc == 3;
+    write_plane_residual_cabac(e, st, field, cur, left, above, rows, c444, 0, luma_dc, luma);
+    if c444 {
         for p in 1..3usize {
             write_plane_residual_cabac(
-                e, st, field, cur, left, above, rows, p,
+                e, st, field, cur, left, above, rows, c444, p,
                 luma_dc.is_some().then_some(&chroma_dc[p - 1]),
                 &chroma_ac[p - 1],
             );
@@ -2877,6 +3071,7 @@ mod mb_round_trip {
         d.kind = force
             .unwrap_or(if rng() % 2 == 0 { IntraKind::I4x4 } else { IntraKind::I16x16 });
         match d.kind {
+            IntraKind::I8x8 => unreachable!("the 8x8 transform has its own synthesiser"),
             IntraKind::I4x4 => {
                 for r in 0..16 {
                     d.luma_pred[r] = if rng() % 2 == 0 {
@@ -3258,6 +3453,16 @@ mod mb_round_trip {
     /// decoder stores, which is the proof of `from_decision`.
     fn check_mb(addr: usize, d: &MbDecision, layer: &MbLayer, syntax: &[(bool, u8); 16], ctx: &SliceCtx) {
         match d.kind {
+            IntraKind::I8x8 => {
+                assert_eq!(layer.kind, MbKind::I8x8, "mb {addr} kind");
+                // Four modes, at each quad's top-left 4x4, and the reader
+                // replicates each over its quad.
+                for (i, raster) in [0usize, 2, 8, 10].into_iter().enumerate() {
+                    let p = d.luma_pred[raster];
+                    let want = (p.use_predicted, if p.use_predicted { 0 } else { p.rem });
+                    assert_eq!(syntax[i], want, "mb {addr} quad {i} pred-mode syntax");
+                }
+            }
             IntraKind::I4x4 => {
                 assert_eq!(layer.kind, MbKind::I4x4, "mb {addr} kind");
                 for r in 0..16 {

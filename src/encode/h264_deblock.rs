@@ -59,6 +59,14 @@ pub struct FilterMb {
     /// (src/h264/recon.rs): one bit per block with a nonzero count. Zero
     /// for a skipped macroblock. See [`nz_mask_of`].
     pub nz_mask: u16,
+    /// `transform_size_8x8_flag`: which of a macroblock's internal edges
+    /// are transform edges at all. Under the 8x8 transform the odd
+    /// internal luma edges are not, and the filter skips them
+    /// (`internal_odd` in src/h264/deblock.rs, and `filter_luma_style`'s
+    /// `step`); 4:2:2 chroma still filters at those positions. Wrong here
+    /// and the encoder's reconstruction is smoothed where a decoder's is
+    /// not, which SELF reports on the first coded 8x8 next to an edge.
+    pub transform_8x8: bool,
     /// The list-0 vector when the macroblock predicts from list 0 — for
     /// `PSkip` the *derived* skip vector, for B kinds whatever the mode
     /// decision (or the direct derivation) settled on — because that is
@@ -70,14 +78,26 @@ pub struct FilterMb {
 }
 
 /// The nonzero mask of [`FilterMb`] from a decision's per-block counts:
-/// the `derive()` formula for a 4x4-transform macroblock
-/// (src/h264/recon.rs — this encoder has no 8x8 transform to spread).
-pub fn nz_mask_of(nz: &[u8; 16]) -> u16 {
+/// `derive()`'s own formula (src/h264/recon.rs, where `MbInfo::nz_mask`
+/// is built), including its 8x8 case.
+///
+/// A 4x4-transform macroblock sets one bit per block with coefficients.
+/// An 8x8-transform one spreads each 8x8's answer over all four of its
+/// 4x4s — quoting the decoder's constants rather than deriving them
+/// again, since the point is to be the same mask and not merely an
+/// equivalent one. That matters even though the caller's counts are
+/// per-sub-scan: an 8x8 whose coefficients all land in one sub-scan is
+/// coded for the whole 8x8, and the filter must see it that way.
+pub fn nz_mask_of(nz: &[u8; 16], transform_8x8: bool) -> u16 {
     let mut mask = 0u16;
     for (b, &n) in nz.iter().enumerate() {
         mask |= ((n != 0) as u16) << b;
     }
-    mask
+    if !transform_8x8 {
+        return mask;
+    }
+    let q = |bits: u16| -> u16 { if bits != 0 { 0x33 } else { 0 } };
+    q(mask & 0x0033) | (q(mask & 0x00cc) << 2) | (q(mask & 0x3300) << 8) | (q(mask & 0xcc00) << 10)
 }
 
 /// Run the decoder's deblocking filter over a coded picture's
@@ -122,10 +142,10 @@ pub fn deblock_recon(dsp: &H264Dsp<u8>, g: &Geometry, qp: u8, mbs: &[FilterMb], 
         mi.qp = qp as i8;
         mi.qpc = [qpc, qpc];
         mi.nz_mask = m.nz_mask;
+        mi.transform_8x8 = m.transform_8x8;
         // `part_edges` stays [0, 0] — the derivation's statement that one
         // partition covers the macroblock, which is true of everything
-        // this encoder codes (INVARIANT(16x16-only) above) — and
-        // `transform_8x8` stays false.
+        // this encoder codes (INVARIANT(16x16-only) above).
         //
         // One motion per list for all sixteen blocks, reference index 0 of
         // that list's one reference. `ref_id` is an identity the filter
@@ -161,13 +181,33 @@ mod tests {
     #[test]
     fn the_nz_mask_matches_the_derivations_formula() {
         let mut nz = [0u8; 16];
-        assert_eq!(nz_mask_of(&nz), 0);
+        assert_eq!(nz_mask_of(&nz, false), 0);
         nz[0] = 3;
         nz[7] = 1;
         nz[15] = 16;
-        assert_eq!(nz_mask_of(&nz), 1 | (1 << 7) | (1 << 15));
+        assert_eq!(nz_mask_of(&nz, false), 1 | (1 << 7) | (1 << 15));
         let full = [1u8; 16];
-        assert_eq!(nz_mask_of(&full), 0xffff);
+        assert_eq!(nz_mask_of(&full, false), 0xffff);
+    }
+
+    /// Under the 8x8 transform each 8x8's answer covers all four of its
+    /// 4x4s — the decoder's `derive()` spread, checked against blocks
+    /// picked so that a mask which merely *looked* right per-block would
+    /// be wrong: one coefficient in one corner of an 8x8 lights the whole
+    /// 8x8, and an empty 8x8 stays dark beside it.
+    #[test]
+    fn the_nz_mask_spreads_over_an_8x8() {
+        let mut nz = [0u8; 16];
+        // 8x8 block 0 (rasters 0,1,4,5): one coefficient, in its
+        // bottom-right 4x4.
+        nz[5] = 1;
+        // 8x8 block 3 (rasters 10,11,14,15): one, in its top-left.
+        nz[10] = 4;
+        assert_eq!(nz_mask_of(&nz, true), 0x0033 | 0xcc00);
+        // The same counts without the flag light only the two blocks.
+        assert_eq!(nz_mask_of(&nz, false), (1 << 5) | (1 << 10));
+        assert_eq!(nz_mask_of(&[0; 16], true), 0);
+        assert_eq!(nz_mask_of(&[1; 16], true), 0xffff);
     }
 
     /// A picture of skipped macroblocks with one shared vector filters to
@@ -200,7 +240,13 @@ mod tests {
         }
         let before: Vec<Vec<u8>> = rec.iter().map(|p| p.data.clone()).collect();
         let mbs = vec![
-            FilterMb { kind: MbKind::PSkip, nz_mask: 0, l0: Some(Mv::new(6, -2)), l1: None };
+            FilterMb {
+                kind: MbKind::PSkip,
+                nz_mask: 0,
+                transform_8x8: false,
+                l0: Some(Mv::new(6, -2)),
+                l1: None,
+            };
             9
         ];
         deblock_recon(&dsp, &g, 26, &mbs, &mut rec);
@@ -244,7 +290,13 @@ mod tests {
         }
         let before = rec[0].data.clone();
         let mbs = vec![
-            FilterMb { kind: MbKind::I4x4, nz_mask: 0xffff, l0: None, l1: None };
+            FilterMb {
+                kind: MbKind::I4x4,
+                nz_mask: 0xffff,
+                transform_8x8: false,
+                l0: None,
+                l1: None,
+            };
             9
         ];
         deblock_recon(&dsp, &g, 26, &mbs, &mut rec);

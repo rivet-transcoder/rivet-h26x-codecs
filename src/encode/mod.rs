@@ -116,6 +116,15 @@ pub struct Config {
     pub rate: RateControl,
     /// See [`Entropy`]. Ignored by H.265, which is always CABAC.
     pub entropy: Entropy,
+    /// H.264: offer the 8x8 transform (`transform_8x8_mode_flag` in the
+    /// PPS, and the per-macroblock `transform_size_8x8_flag` the encoder
+    /// may then set). Off by default, so a stream that does not ask for
+    /// it is byte-identical to one from an encoder that never had it.
+    ///
+    /// It needs a High profile, which every profile this encoder claims
+    /// already is, and it is ignored by H.265 — whose transform sizes are
+    /// a different mechanism entirely.
+    pub transform_8x8: bool,
     /// Worker threads; 0 asks for one per core, matching the decoders.
     pub threads: usize,
 }
@@ -132,6 +141,7 @@ impl Default for Config {
             max_refs: 1,
             rate: RateControl::ConstantQp(26),
             entropy: Entropy::Cabac,
+            transform_8x8: false,
             threads: 0,
         }
     }

@@ -1008,7 +1008,10 @@ static SCAN8_SUB_FIELD: [[u8; 16]; 4] = {
     t
 };
 
-static SCAN8_SUB: [[u8; 16]; 4] = {
+/// See [`SCAN8_SUB_FIELD`]: the frame scan. Crate-visible because the
+/// encoder's 8x8 residual writer hands the reader's own sub-scans to
+/// [`write_residual_block_cavlc`] — one definition, both directions.
+pub(crate) static SCAN8_SUB: [[u8; 16]; 4] = {
     let mut t = [[0u8; 16]; 4];
     let mut sub = 0;
     while sub < 4 {
@@ -1026,6 +1029,28 @@ static SCAN8_SUB: [[u8; 16]; 4] = {
 /// encoder's macroblock writer hands the same scan to the residual writer
 /// below — one definition, both directions.
 pub(crate) static SCAN_CHROMA_DC: [u8; 4] = [0, 1, 2, 3];
+
+/// How many nonzero levels each of an 8x8 block's four CAVLC sub-blocks
+/// carries, given the block in 8x8 raster order.
+///
+/// These are the counts the reader stores in `layer.nz` as it decodes the
+/// four interleaved blocks above, and therefore the counts the *next*
+/// block's `nC` predictor reads (9.2.1). They live here rather than in
+/// the encoder because they are a property of [`SCAN8_SUB`]: the four
+/// sub-scans are not the 8x8's four spatial quadrants but its scan
+/// positions taken every fourth, and counting them anywhere else would be
+/// a second, silently divergent, spelling of that.
+///
+/// Frame scan only — a field macroblock interleaves [`SCAN8_SUB_FIELD`]
+/// instead, and the encoder that calls this codes frames.
+pub(crate) fn sub_block_counts_8x8(levels: &[i16]) -> [u8; 4] {
+    debug_assert_eq!(levels.len(), 64, "an 8x8 block has sixty-four coefficients");
+    let mut n = [0u8; 4];
+    for (sub, count) in n.iter_mut().enumerate() {
+        *count = SCAN8_SUB[sub].iter().filter(|&&pos| levels[pos as usize] != 0).count() as u8;
+    }
+    n
+}
 
 /// `residual_luma()` (7.3.5.3.1) for colour plane `p`: the luma plane, or
 /// Cb / Cr in 4:4:4, which are coded exactly like it.

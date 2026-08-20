@@ -201,6 +201,20 @@ pub fn write_pps(cfg: &Config, qp: u8) -> Vec<u8> {
     w.flag(true); // deblocking_filter_control_present_flag
     w.flag(false); // constrained_intra_pred_flag
     w.flag(false); // redundant_pic_cnt_present_flag
+    // The PPS extension (7.3.2.2). The reader takes it only when
+    // `more_rbsp_data()` says the RBSP has not reached its stop bit
+    // (src/h264/pps.rs:119), so writing nothing at all is what leaves a
+    // PPS that offers no 8x8 transform byte-identical to the one this
+    // encoder wrote before the transform existed — and that identity is
+    // what makes "everything not using it is unchanged" checkable.
+    //
+    // `transform_8x8_mode_flag` needs a High profile, which every profile
+    // `profile_idc` claims already is.
+    if cfg.transform_8x8 {
+        w.flag(true); // transform_8x8_mode_flag
+        w.flag(false); // pic_scaling_matrix_present_flag
+        w.se(0); // second_chroma_qp_index_offset, matching the first
+    }
     w.rbsp_trailing_bits();
     w.into_nal()
 }
@@ -514,6 +528,40 @@ mod tests {
         let (left, right, top, bottom) = parsed.crop;
         assert_eq!(g.coded_width - left - right, 50);
         assert_eq!(g.coded_height - top - bottom, 34);
+    }
+
+    /// The picture parameter set has to survive the crate's own parser
+    /// too, and `transform_8x8_mode_flag` has to arrive as what was
+    /// written — it lives behind `more_rbsp_data()`, so a writer that
+    /// forgot the extension would be read back as "off" rather than
+    /// rejected.
+    #[test]
+    fn the_decoder_parses_the_picture_parameter_set() {
+        let (cfg, _) = geom(64, 64, ChromaFormat::Yuv420);
+        let sps = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&write_sps(
+            &cfg,
+            &Geometry::new(&cfg),
+            4,
+            4,
+        )))
+        .expect("SPS");
+        for t8x8 in [false, true] {
+            let cfg = Config { transform_8x8: t8x8, ..cfg.clone() };
+            let pps = write_pps(&cfg, 26);
+            let look = |_id: u32| Some(sps.clone());
+            let parsed = crate::h264::pps::Pps::parse(&crate::nal::unescape_rbsp(&pps), &look)
+                .unwrap_or_else(|e| panic!("t8x8={t8x8}: PPS rejected: {e}"));
+            assert_eq!(parsed.transform_8x8_mode, t8x8);
+            assert_eq!(parsed.pic_init_qp, 26);
+            assert_eq!(parsed.second_chroma_qp_index_offset, 0);
+        }
+        // And the PPS of a stream that does not ask for the 8x8 transform
+        // is byte-identical to one from before the field existed: the
+        // extension is absent, not present-and-zero.
+        let off = write_pps(&Config { transform_8x8: false, ..cfg.clone() }, 26);
+        let on = write_pps(&Config { transform_8x8: true, ..cfg }, 26);
+        assert_ne!(off, on, "the flag has to reach the bitstream");
+        assert_eq!(off.len(), 3, "no extension means the historical three-byte PPS");
     }
 
     #[test]

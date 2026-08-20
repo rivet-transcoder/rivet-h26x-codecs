@@ -96,6 +96,11 @@ pub struct InterDecision {
     /// reconstruction, which this module has not touched in that case — is
     /// what gets coded.
     pub kind: InterMbKind,
+    /// `transform_size_8x8_flag`. The syntax carries it only when some
+    /// luma block is coded (`cbp_luma != 0`) — a decoder reading no flag
+    /// infers 0 — so it is false whenever `cbp_luma` is, and the writers
+    /// assert as much.
+    pub transform_8x8: bool,
     /// The chosen motion vector, quarter luma samples, list 0. Filled for
     /// every kind, including `PSkip` (the derived skip vector), because
     /// the next macroblock's prediction and the deblocking filter need the
@@ -123,6 +128,10 @@ pub struct InterDecision {
     /// the entropy writer, exactly as with `MbDecision`. Inter blocks keep
     /// their own DC at position 0 — there is no Intra_16x16-style DC
     /// split, so there is no `luma_dc` field.
+    ///
+    /// Under the 8x8 transform the same storage holds four blocks of
+    /// sixty-four at flat offset `blk8 * 64` — see
+    /// [`MbDecision::luma`](crate::encode::h264_intra::MbDecision::luma).
     pub luma: [[i16; 16]; 16],
     /// Chroma DC levels per component: four entries used in 4:2:0, eight
     /// in 4:2:2. Same layout as `MbDecision::chroma_dc`.
@@ -133,6 +142,8 @@ pub struct InterDecision {
     pub chroma_ac: [[[i16; 16]; 16]; 2],
     /// Nonzero count per luma 4x4 block (raster), which CAVLC's `nC` needs
     /// from the neighbours and which is free to count while quantising.
+    /// Under the 8x8 transform these are the four sub-scan counts — see
+    /// [`MbDecision::nz_luma`](crate::encode::h264_intra::MbDecision::nz_luma).
     pub nz_luma: [u8; 16],
     /// The same per chroma 4x4 block.
     pub nz_chroma: [[u8; 16]; 2],
@@ -142,6 +153,7 @@ impl Default for InterDecision {
     fn default() -> Self {
         InterDecision {
             kind: InterMbKind::P16x16,
+            transform_8x8: false,
             mv: Mv::ZERO,
             mvd: Mv::ZERO,
             ref_idx: 0,
@@ -852,6 +864,12 @@ pub struct BDecision {
     /// field except the motion is meaningless, exactly as with
     /// [`InterMbKind::UseIntra`].
     pub kind: BMbKind,
+    /// `transform_size_8x8_flag`, as in
+    /// [`InterDecision::transform_8x8`]: present in the syntax only when
+    /// some luma block is coded, and therefore false whenever `cbp_luma`
+    /// is. `B_Direct_16x16` may carry it because the SPS this encoder
+    /// writes sets `direct_8x8_inference_flag` (7.3.5).
+    pub transform_8x8: bool,
     /// Which lists predict. `B16`: the searched direction (`[true,false]`
     /// L0, `[false,true]` L1, `[true,true]` bi). `BSkip` / `BDirect16`:
     /// the derived direct references — which is `[true,true]` whenever any
@@ -891,6 +909,7 @@ impl Default for BDecision {
     fn default() -> Self {
         BDecision {
             kind: BMbKind::B16,
+            transform_8x8: false,
             used: [true, false],
             mv: [Mv::ZERO; 2],
             mvd: [Mv::ZERO; 2],
@@ -1135,6 +1154,7 @@ mod tests {
                 qpc: [qp, qp],
                 chroma_h: 8,
                 c444: false,
+                t8x8: false,
             }
         }
     }
@@ -1461,6 +1481,7 @@ mod tests {
                 let col = FilterMb {
                     kind: if col_intra { DecKind::I16x16 } else { DecKind::Inter16x16 },
                     nz_mask: 0,
+                    transform_8x8: false,
                     l0: (!col_intra && !col_list1_only).then_some(col_mv),
                     l1: (!col_intra).then_some(col_mv),
                 };

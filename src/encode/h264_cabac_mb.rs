@@ -46,7 +46,7 @@ use crate::h264::cabac_mb::{
     CabacState, WrittenMb, intra_mb_type_code, write_cbp_cabac, write_intra_pred_modes_cabac,
     write_intra_residual_cabac, write_inter_residual_cabac, write_inter_residual_fields_cabac,
     write_mb_qp_delta_cabac, write_mb_skip_cabac, write_mb_type_b_cabac, write_mb_type_i_cabac,
-    write_mb_type_p_cabac, write_mvd_16x16_cabac,
+    write_mb_type_p_cabac, write_mvd_16x16_cabac, write_transform_8x8_cabac,
 };
 use crate::picture::ChromaFormat;
 
@@ -81,6 +81,7 @@ fn write_intra_body(
     left: Option<&Coded>,
     above: Option<&Coded>,
     cfi: u32,
+    t8x8_mode: bool,
 ) {
     let chroma = cfi == 1 || cfi == 2;
     let chroma_nb = chroma.then(|| {
@@ -89,10 +90,20 @@ fn write_intra_body(
             above.is_some_and(|m| m.chroma_nonzero),
         ]
     });
-    write_intra_pred_modes_cabac(e, st, d, chroma_nb);
     let lnb = left.map(|m| &m.nb);
     let anb = above.map(|m| &m.nb);
-    if d.kind == MbKind::I4x4 {
+    // `transform_size_8x8_flag` comes *before* `mb_pred()` for I_NxN — it
+    // is what decides whether four 8x8 modes follow or sixteen 4x4 ones —
+    // and does not exist for I_16x16 at all (`parse_mb_cabac` reads it
+    // under `layer.kind == MbKind::I4x4`, which is I_NxN before the flag
+    // has renamed it). The inter placement is the other one, after the
+    // coded block pattern.
+    if t8x8_mode && d.kind.is_nxn() {
+        write_transform_8x8_cabac(e, st, lnb, anb, d.transform_8x8);
+    }
+    debug_assert!(t8x8_mode || !d.transform_8x8, "no PPS flag, no 8x8 transform");
+    write_intra_pred_modes_cabac(e, st, d, chroma_nb);
+    if d.kind.is_nxn() {
         write_cbp_cabac(e, st, lnb, anb, d.cbp_luma | (d.cbp_chroma << 4), chroma);
     }
     let has_residual = d.kind == MbKind::I16x16 || d.cbp_luma != 0 || d.cbp_chroma != 0;
@@ -109,6 +120,7 @@ fn write_intra_body(
 /// (no `ref_idx` — exactly one reference is active, so the element is
 /// absent, as in the CAVLC writer), cbp, then qp_delta and residual when
 /// any block coded.
+#[allow(clippy::too_many_arguments)]
 fn write_p16_body(
     e: &mut CabacEncoder,
     st: &mut CabacState,
@@ -116,6 +128,7 @@ fn write_p16_body(
     left: Option<&Coded>,
     above: Option<&Coded>,
     cfi: u32,
+    t8x8_mode: bool,
 ) {
     debug_assert_eq!(d.kind, InterMbKind::P16x16);
     debug_assert_eq!(d.ref_idx, 0, "more than one reference needs ref_idx writing");
@@ -124,6 +137,13 @@ fn write_p16_body(
     let anb = above.map(|m| &m.nb);
     write_mvd_16x16_cabac(e, st, lnb, anb, 0, d.mvd);
     write_cbp_cabac(e, st, lnb, anb, d.cbp_luma | (d.cbp_chroma << 4), cfi == 1 || cfi == 2);
+    // An inter macroblock's flag comes after the coded block pattern and
+    // only when some luma block is coded — `no_sub_mb_part_less_than_8x8`
+    // holds trivially for a single 16x16 partition.
+    if t8x8_mode && d.cbp_luma != 0 {
+        write_transform_8x8_cabac(e, st, lnb, anb, d.transform_8x8);
+    }
+    debug_assert!(!d.transform_8x8 || (t8x8_mode && d.cbp_luma != 0));
     if d.cbp_luma != 0 || d.cbp_chroma != 0 {
         write_mb_qp_delta_cabac(e, st, d.qp_delta as i32);
         st.prev_qp_delta_nonzero = d.qp_delta != 0;
@@ -149,6 +169,7 @@ pub fn write_intra_picture_cabac(
     let mbw = g.mbs_wide as usize;
     let total = mbw * g.mbs_high as usize;
     let cfi = cfi_of(g.chroma);
+    let t8x8 = tools.transform_8x8;
     w.align_one(); // cabac_alignment_one_bit
     let mut st = CabacState::new(SliceType::I, 0, qp as i32);
     let mut e = CabacEncoder::new(w);
@@ -159,10 +180,10 @@ pub fn write_intra_picture_cabac(
         let above = (mb_y > 0).then(|| &coded[idx - mbw]);
         let inc = left.map_or(0, |m| m.not_nxn as usize) + above.map_or(0, |m| m.not_nxn as usize);
         write_mb_type_i_cabac(&mut e, &mut st, inc, intra_mb_type_code(dec));
-        write_intra_body(&mut e, &mut st, dec, left, above, cfi);
+        write_intra_body(&mut e, &mut st, dec, left, above, cfi, t8x8);
         coded.push(Coded {
             nb: WrittenMb::from_decision(dec, cfi == 3),
-            not_nxn: dec.kind != MbKind::I4x4,
+            not_nxn: !dec.kind.is_nxn(),
             chroma_nonzero: dec.chroma_mode != 0,
         });
         e.encode_terminate((coded.len() == total) as u32); // end_of_slice_flag
@@ -189,6 +210,7 @@ pub fn write_p_picture_cabac(
     let mbw = g.mbs_wide as usize;
     let total = mbw * g.mbs_high as usize;
     let cfi = cfi_of(g.chroma);
+    let t8x8 = tools.transform_8x8;
     w.align_one();
     let mut st = CabacState::new(SliceType::P, 0, qp as i32);
     let mut e = CabacEncoder::new(w);
@@ -215,7 +237,7 @@ pub fn write_p_picture_cabac(
                 }
             }
             PMb::Coded(dec) => {
-                write_p16_body(&mut e, &mut st, dec, left, above, cfi);
+                write_p16_body(&mut e, &mut st, dec, left, above, cfi, t8x8);
                 Coded {
                     nb: WrittenMb::from_inter_decision(dec, cfi == 3),
                     not_nxn: true,
@@ -226,10 +248,10 @@ pub fn write_p_picture_cabac(
                 // Intra in a P slice: the same macroblock, `mb_type`
                 // shifted by 5 (Table 7-11's note).
                 write_mb_type_p_cabac(&mut e, &mut st, 5 + intra_mb_type_code(idec));
-                write_intra_body(&mut e, &mut st, idec, left, above, cfi);
+                write_intra_body(&mut e, &mut st, idec, left, above, cfi, t8x8);
                 Coded {
                     nb: WrittenMb::from_decision(idec, cfi == 3),
-                    not_nxn: idec.kind != MbKind::I4x4,
+                    not_nxn: !idec.kind.is_nxn(),
                     chroma_nonzero: idec.chroma_mode != 0,
                 }
             }
@@ -264,6 +286,7 @@ pub fn write_b_picture_cabac(
     let mbw = g.mbs_wide as usize;
     let total = mbw * g.mbs_high as usize;
     let cfi = cfi_of(g.chroma);
+    let t8x8 = tools.transform_8x8;
     w.align_one();
     let mut st = CabacState::new(SliceType::B, 0, qp as i32);
     let mut e = CabacEncoder::new(w);
@@ -321,12 +344,19 @@ pub fn write_b_picture_cabac(
                     dec.cbp_luma | (dec.cbp_chroma << 4),
                     cfi == 1 || cfi == 2,
                 );
+                // `B_Direct_16x16` carries the flag too, because the SPS
+                // this encoder writes sets `direct_8x8_inference_flag`.
+                if t8x8 && dec.cbp_luma != 0 {
+                    write_transform_8x8_cabac(&mut e, &mut st, lnb, anb, dec.transform_8x8);
+                }
+                debug_assert!(!dec.transform_8x8 || (t8x8 && dec.cbp_luma != 0));
                 if dec.cbp_luma != 0 || dec.cbp_chroma != 0 {
                     write_mb_qp_delta_cabac(&mut e, &mut st, dec.qp_delta as i32);
                     st.prev_qp_delta_nonzero = dec.qp_delta != 0;
                     write_inter_residual_fields_cabac(
-                        &mut e, &mut st, false, cfi, dec.cbp_luma, &dec.nz_luma, &dec.luma,
-                        dec.cbp_chroma, &dec.chroma_dc, &dec.chroma_ac, &dec.nz_chroma, lnb, anb,
+                        &mut e, &mut st, false, cfi, dec.transform_8x8, dec.cbp_luma,
+                        &dec.nz_luma, &dec.luma, dec.cbp_chroma, &dec.chroma_dc, &dec.chroma_ac,
+                        &dec.nz_chroma, lnb, anb,
                     );
                 } else {
                     st.prev_qp_delta_nonzero = false;
@@ -341,10 +371,10 @@ pub fn write_b_picture_cabac(
                 // Intra in a B slice: the same macroblock behind the B
                 // prefix, `mb_type` shifted by 23.
                 write_mb_type_b_cabac(&mut e, &mut st, inc, 23 + intra_mb_type_code(idec));
-                write_intra_body(&mut e, &mut st, idec, left, above, cfi);
+                write_intra_body(&mut e, &mut st, idec, left, above, cfi, t8x8);
                 Coded {
                     nb: WrittenMb::from_decision(idec, cfi == 3),
-                    not_nxn: idec.kind != MbKind::I4x4,
+                    not_nxn: !idec.kind.is_nxn(),
                     chroma_nonzero: idec.chroma_mode != 0,
                 }
             }

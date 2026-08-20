@@ -34,20 +34,31 @@ use crate::h264::transform::Dequant;
 use crate::picture::ChromaFormat;
 
 /// The kernels and derived tables the transform paths run on, built once
-/// per encoder and shared by both entropy coders.
+/// per encoder and shared by both entropy coders — and, beside them, the
+/// one coding-tool switch that has to reach every decision walk.
 pub struct IntraTools {
     pub(crate) dsp: H264Dsp<u8>,
     pub(crate) enc: H264EncDsp,
     pub(crate) dist: DistortionDsp<u8>,
     pub(crate) quant: Quant,
     pub(crate) dequant: Dequant,
+    /// `transform_8x8_mode_flag`, as the PPS writes it. A decision may
+    /// only produce `transform_size_8x8_flag` when this is true, because
+    /// otherwise the element is not in the bitstream at all. It rides
+    /// here rather than through six picture-writer signatures because it
+    /// is what it looks like: one constant per encoder, shared by every
+    /// walk, and impossible to pass to one path and forget on another.
+    pub(crate) transform_8x8: bool,
 }
 
 impl IntraTools {
-    /// Build for the running CPU. The scaling lists are flat sixteens
-    /// because the parameter sets this encoder writes carry no scaling
-    /// matrices, which makes flat the lists a decoder will derive.
-    pub fn new() -> Self {
+    /// Build for the running CPU, offering the 8x8 transform or not. The
+    /// scaling lists are flat sixteens because the parameter sets this
+    /// encoder writes carry no scaling matrices, which makes flat the
+    /// lists a decoder will derive — and that is as true of the 8x8 lists
+    /// as of the 4x4 ones, since the PPS declares
+    /// `pic_scaling_matrix_present_flag` zero either way.
+    pub fn new(transform_8x8: bool) -> Self {
         let lists = ScalingLists { list4x4: [[16; 16]; 6], list8x8: [[16; 64]; 6] };
         let cpu = Cpu::detect_honouring_env();
         IntraTools {
@@ -56,13 +67,50 @@ impl IntraTools {
             dist: DistortionDsp::new(cpu),
             quant: Quant::new(&lists),
             dequant: Dequant::new(&lists),
+            transform_8x8,
         }
     }
 }
 
 impl Default for IntraTools {
     fn default() -> Self {
-        Self::new()
+        Self::new(false)
+    }
+}
+
+/// The decoder's name for an intra decision's kind — what the loop
+/// filter's boundary-strength derivation switches on.
+fn filter_kind(kind: MbKind) -> crate::h264::mb::MbKind {
+    match kind {
+        MbKind::I4x4 => crate::h264::mb::MbKind::I4x4,
+        MbKind::I8x8 => crate::h264::mb::MbKind::I8x8,
+        MbKind::I16x16 => crate::h264::mb::MbKind::I16x16,
+    }
+}
+
+/// What an intra macroblock leaves along its right and bottom edges for
+/// the next macroblocks' prediction-mode derivation (8.3.1.1), as
+/// `(left_modes, top_modes)`.
+///
+/// `I_NxN` — 4x4 and 8x8 alike — leaves its own modes: `modes` is
+/// raster-indexed over the sixteen 4x4 blocks, and an 8x8 macroblock has
+/// already replicated each of its four modes over its quad, exactly as
+/// the decoder replicates `intra_modes`. So the same four positions
+/// answer for both, which is *also* what makes an 8x8 block's own
+/// prediction read the right neighbour: 8.3.2.1 picks the neighbouring
+/// 8x8's sub-block adjacent to the shared edge, and outside MBAFF that
+/// is the very block on the edge.
+///
+/// Everything else leaves `Some(2)`: an available macroblock that is not
+/// `I_NxN` predicts DC.
+fn edge_modes(kind: MbKind, modes: &[u8; 16]) -> ([Option<u8>; 4], [Option<u8>; 4]) {
+    if kind.is_nxn() {
+        (
+            [Some(modes[3]), Some(modes[7]), Some(modes[11]), Some(modes[15])],
+            [Some(modes[12]), Some(modes[13]), Some(modes[14]), Some(modes[15])],
+        )
+    } else {
+        ([Some(2); 4], [Some(2); 4])
     }
 }
 
@@ -124,6 +172,7 @@ impl<'a> PicCoding<'a> {
             qpc: [qpc; 2],
             chroma_h,
             c444: g.chroma == ChromaFormat::Yuv444,
+            t8x8: tools.transform_8x8,
         };
         let (mbs_wide, mbs_high) = (g.mbs_wide as usize, g.mbs_high as usize);
         let luma_stride = g.coded_width as usize;
@@ -215,21 +264,13 @@ pub(crate) fn code_intra_picture(
             );
             emit(mb_x, mb_y, &dec);
             fmbs.push(FilterMb {
-                kind: match dec.kind {
-                    MbKind::I4x4 => crate::h264::mb::MbKind::I4x4,
-                    MbKind::I16x16 => crate::h264::mb::MbKind::I16x16,
-                },
-                nz_mask: nz_mask_of(&dec.nz_luma),
+                kind: filter_kind(dec.kind),
+                nz_mask: nz_mask_of(&dec.nz_luma, dec.transform_8x8),
+                transform_8x8: dec.transform_8x8,
                 l0: None,
                 l1: None,
             });
-            (left_modes, top_modes[mb_x]) = match dec.kind {
-                MbKind::I4x4 => (
-                    [Some(modes[3]), Some(modes[7]), Some(modes[11]), Some(modes[15])],
-                    [Some(modes[12]), Some(modes[13]), Some(modes[14]), Some(modes[15])],
-                ),
-                MbKind::I16x16 => ([Some(2); 4], [Some(2); 4]),
-            };
+            (left_modes, top_modes[mb_x]) = edge_modes(dec.kind, &modes);
         }
     }
     // The loop filter, last: the whole picture is reconstructed (intra
@@ -318,6 +359,7 @@ pub(crate) fn code_p_picture(
                     fmbs.push(FilterMb {
                         kind: crate::h264::mb::MbKind::PSkip,
                         nz_mask: 0,
+                        transform_8x8: false,
                         l0: Some(dec.mv),
                         l1: None,
                     });
@@ -331,7 +373,8 @@ pub(crate) fn code_p_picture(
                     emit(mb_x, mb_y, PMb::Coded(&dec));
                     fmbs.push(FilterMb {
                         kind: crate::h264::mb::MbKind::Inter16x16,
-                        nz_mask: nz_mask_of(&dec.nz_luma),
+                        nz_mask: nz_mask_of(&dec.nz_luma, dec.transform_8x8),
+                        transform_8x8: dec.transform_8x8,
                         l0: Some(dec.mv),
                         l1: None,
                     });
@@ -363,23 +406,15 @@ pub(crate) fn code_p_picture(
                     );
                     emit(mb_x, mb_y, PMb::Intra(&idec));
                     fmbs.push(FilterMb {
-                        kind: match idec.kind {
-                            MbKind::I4x4 => crate::h264::mb::MbKind::I4x4,
-                            MbKind::I16x16 => crate::h264::mb::MbKind::I16x16,
-                        },
-                        nz_mask: nz_mask_of(&idec.nz_luma),
+                        kind: filter_kind(idec.kind),
+                        nz_mask: nz_mask_of(&idec.nz_luma, idec.transform_8x8),
+                        transform_8x8: idec.transform_8x8,
                         l0: None,
                         l1: None,
                     });
                     left_motion = nb_intra();
                     top_motion[mb_x] = nb_intra();
-                    (left_modes, top_modes[mb_x]) = match idec.kind {
-                        MbKind::I4x4 => (
-                            [Some(modes[3]), Some(modes[7]), Some(modes[11]), Some(modes[15])],
-                            [Some(modes[12]), Some(modes[13]), Some(modes[14]), Some(modes[15])],
-                        ),
-                        MbKind::I16x16 => ([Some(2); 4], [Some(2); 4]),
-                    };
+                    (left_modes, top_modes[mb_x]) = edge_modes(idec.kind, &modes);
                 }
             }
         }
@@ -486,11 +521,9 @@ pub(crate) fn code_b_picture(
                 );
                 emit(mb_x, mb_y, BMb::Intra(&idec));
                 fmbs.push(FilterMb {
-                    kind: match idec.kind {
-                        MbKind::I4x4 => crate::h264::mb::MbKind::I4x4,
-                        MbKind::I16x16 => crate::h264::mb::MbKind::I16x16,
-                    },
-                    nz_mask: nz_mask_of(&idec.nz_luma),
+                    kind: filter_kind(idec.kind),
+                    nz_mask: nz_mask_of(&idec.nz_luma, idec.transform_8x8),
+                    transform_8x8: idec.transform_8x8,
                     l0: None,
                     l1: None,
                 });
@@ -498,13 +531,7 @@ pub(crate) fn code_b_picture(
                     left_motion[l] = nb_intra();
                     top_motion[l][mb_x] = nb_intra();
                 }
-                (left_modes, top_modes[mb_x]) = match idec.kind {
-                    MbKind::I4x4 => (
-                        [Some(modes[3]), Some(modes[7]), Some(modes[11]), Some(modes[15])],
-                        [Some(modes[12]), Some(modes[13]), Some(modes[14]), Some(modes[15])],
-                    ),
-                    MbKind::I16x16 => ([Some(2); 4], [Some(2); 4]),
-                };
+                (left_modes, top_modes[mb_x]) = edge_modes(idec.kind, &modes);
                 continue;
             }
             emit(
@@ -523,7 +550,8 @@ pub(crate) fn code_b_picture(
                     BMbKind::BDirect16 => crate::h264::mb::MbKind::BDirect16x16,
                     _ => crate::h264::mb::MbKind::Inter16x16,
                 },
-                nz_mask: nz_mask_of(&dec.nz_luma),
+                nz_mask: nz_mask_of(&dec.nz_luma, dec.transform_8x8),
+                transform_8x8: dec.transform_8x8,
                 l0: dec.used[0].then_some(dec.mv[0]),
                 l1: dec.used[1].then_some(dec.mv[1]),
             });

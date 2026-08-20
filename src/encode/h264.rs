@@ -111,6 +111,12 @@ impl H264Encoder {
         if cfg.bframes > 0 {
             cfg.max_refs = cfg.max_refs.max(2);
         }
+        // The 8x8 transform is a High-profile tool and every profile this
+        // encoder claims is one, so nothing gates it but the caller —
+        // except lossless, where the transform is bypassed entirely and
+        // the picture codes as I_PCM, and the flag would describe a
+        // transform nothing runs.
+        cfg.transform_8x8 = cfg.transform_8x8 && cfg.rate != RateControl::Lossless;
         let geom = syn::Geometry::new(&cfg);
         let mut plane_dims = vec![(cfg.width, cfg.height)];
         if cfg.chroma != crate::ChromaFormat::Monochrome {
@@ -119,6 +125,7 @@ impl H264Encoder {
             plane_dims.push((cw, chh));
             plane_dims.push((cw, chh));
         }
+        let tools = super::h264_pic::IntraTools::new(cfg.transform_8x8);
         Ok(Self {
             cfg,
             sched,
@@ -131,7 +138,7 @@ impl H264Encoder {
             frame_num: 0,
             idr_pic_id: 0,
             plane_dims,
-            tools: super::h264_pic::IntraTools::new(),
+            tools,
         })
     }
 
@@ -323,6 +330,7 @@ impl H264Encoder {
                 super::h264_deblock::FilterMb {
                     kind,
                     nz_mask: if kind == crate::h264::mb::MbKind::IPcm { 0xffff } else { 0 },
+                    transform_8x8: false,
                     l0: l0.then_some(crate::h264::frame::Mv::ZERO),
                     l1: l1.then_some(crate::h264::frame::Mv::ZERO),
                 };
