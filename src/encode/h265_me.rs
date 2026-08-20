@@ -1366,6 +1366,35 @@ impl Rate {
 /// flatness proxy (`super::h264_me::placeholder_inter_or_intra`) at CU
 /// size and generic sample width — a DC prediction costing one SATD and no
 /// reconstruction state, with all of that function's stated limits.
+///
+/// # It carries no rate term, and measurement says that is fine
+///
+/// Every other decision in this encoder now prices its candidates in real
+/// bits. This one does not, and the obvious next step — give it a rate
+/// term like the rest — was measured before being written, and would
+/// change nothing. Over 808 CU decisions (three clips, two quantisers,
+/// the encoder's own CU size rather than a chosen one):
+///
+/// - intra wins 1.0% of the time;
+/// - **0.0% of decisions fall within 10%** of the boundary, and 0.2%
+///   within 25%;
+/// - the median separation is 1.22, meaning the two sides typically
+///   differ by more than the whole inter SATD.
+///
+/// A Lagrangian rate term moves a comparison by lambda times a bit
+/// difference. Nothing that size flips a decision separated by more than
+/// 100%, so adding one would cost work and change no output.
+///
+/// # What that probe does NOT bound, stated because it is the same trap
+///
+/// It measures how marginal the comparison *as written* is, so it bounds
+/// the effect of adding a term to that comparison. It says nothing about
+/// replacing the DC-flat distortion proxy, because a bad proxy can sit
+/// far from the boundary and still be on the wrong side of it — being
+/// unmarginal is not being right. If this decision is ever worth
+/// improving, the proxy is the thing to attack, and testing that needs a
+/// different probe: code both candidates properly and compare real costs,
+/// rather than asking whether the existing numbers are close.
 pub fn prefer_intra<S: Sample>(ctx: &MeCtx<'_, S>, inter_satd: u32, src: &[S], src_stride: usize, n: usize) -> bool {
     let mut sum = 0u64;
     for y in 0..n {
