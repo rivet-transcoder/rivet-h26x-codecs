@@ -25,10 +25,14 @@ use crate::encode::h264_deblock::{FilterMb, deblock_recon, nz_mask_of};
 use crate::encode::h264_intra::{IntraCtx, MbAvail, MbDecision, MbKind, code_macroblock};
 use crate::encode::h264_me::{
     BDecision, BMbKind, InterDecision, InterMbKind, MotionNeighbours, code_macroblock_b16,
-    code_macroblock_p16, nb_inter, nb_intra,
+    code_macroblock_p16, mv_predictor_16x16, nb_inter, nb_intra, skip_mv_16x16,
+    spatial_direct_ref_idx_mirror,
 };
 use crate::encode::h264_syntax::{Geometry, Plane, Recon};
-use crate::h264::mb::{NbMotion, chroma_qp};
+use crate::h264::frame::{BlockMotion, Frame, Mv};
+use crate::h264::mb::{
+    MbInfo, MbMotion, MbNeighbours, MotionCache, NbMotion, PicInfo, chroma_qp,
+};
 use crate::h264::sps::ScalingLists;
 use crate::h264::transform::Dequant;
 use crate::picture::ChromaFormat;
@@ -77,6 +81,152 @@ impl Default for IntraTools {
         Self::new(false)
     }
 }
+
+/// The motion state of the picture being coded, in the *decoder's* own
+/// layout — kept so that the decoder's derivations can be **called**
+/// rather than mirrored.
+///
+/// The encoder has always mirrored 8.4.1.3 instead, through
+/// [`MotionNeighbours`]: four macroblock-level neighbours, one motion
+/// each. That is expressible only while every partition is the whole
+/// macroblock. The neighbours of a smaller partition are 4x4 *blocks*,
+/// and for every partition after the first they are blocks of this same
+/// macroblock, already derived and gated by a `done` bitmask
+/// (`block_available`, src/h264/mb.rs) — which a per-macroblock summary
+/// cannot represent at all. So rather than grow the mirror into a second,
+/// larger thing to keep in step, the encoder keeps what the decoder
+/// keeps: [`MbInfo`] per macroblock and [`BlockMotion`] per 4x4, which is
+/// precisely what [`MbNeighbours::derive_into`] and
+/// [`MotionCache::gather`] read.
+///
+/// The `Frame` is plane-less on purpose: `gather`'s progressive path
+/// touches `frame.motion` and `info.mbs[].kind` and nothing else, so
+/// carrying the reconstruction here would be a second copy of it for no
+/// gain.
+pub(crate) struct PicMotion {
+    /// Per-macroblock info — neighbour availability and the intra test.
+    pub info: PicInfo,
+    /// Per-4x4 motion per list, inside a decoder frame so that
+    /// [`MotionCache::gather`] takes it directly.
+    pub frame: Frame<u8>,
+}
+
+impl PicMotion {
+    /// Empty state for a picture `mbs_wide` by `mbs_high` macroblocks.
+    pub fn new(mbs_wide: usize, mbs_high: usize) -> Self {
+        let n = mbs_wide * mbs_high;
+        let mut frame = Frame::<u8>::empty();
+        frame.mb_width = mbs_wide;
+        frame.mb_height = mbs_high;
+        frame.motion = [
+            vec![BlockMotion::default(); n * 16],
+            vec![BlockMotion::default(); n * 16],
+        ];
+        frame.mb_intra = vec![false; n];
+        PicMotion { info: PicInfo::new(mbs_wide, mbs_high), frame }
+    }
+
+    /// The neighbours and gathered motion cache for macroblock `addr`,
+    /// derived exactly as the decoder's slice loop derives them. The
+    /// macroblock itself is still undecoded at this point, which is what
+    /// keeps it out of its own neighbour set.
+    pub fn cache_for(&self, addr: usize, nb: &mut MbNeighbours, cache: &mut MotionCache) {
+        nb.derive_into(&self.info, addr, 0);
+        cache.gather(nb, &self.frame, &self.info);
+    }
+
+    /// Commit one coded macroblock: the kind its neighbours will test for
+    /// intra-ness, and its per-4x4 motion. `mot` is in the decoder's
+    /// raster layout, one entry per 4x4 per list — an intra macroblock
+    /// commits [`BlockMotion::default`] throughout, as `derive()` does.
+    pub fn commit(&mut self, addr: usize, kind: crate::h264::mb::MbKind, mot: &MbMotion) {
+        let m = &mut self.info.mbs[addr];
+        *m = MbInfo { kind, decoded: true, slice: 0, ..MbInfo::default() };
+        self.frame.mb_intra[addr] = kind.is_intra();
+        for l in 0..2 {
+            self.frame.motion[l][addr * 16..addr * 16 + 16].copy_from_slice(&mot[l]);
+        }
+    }
+}
+
+/// One macroblock's motion in the decoder's layout, from the single
+/// 16x16 record this encoder's inter decisions still produce.
+///
+/// Transitional: every partition being the whole macroblock is what makes
+/// one vector per list a faithful record (INVARIANT(16x16-only) on
+/// [`FilterMb`]). It exists so the decoder-shaped state can be filled and
+/// cross-checked before the shapes that break that premise land.
+pub(crate) fn mb_motion_16x16(l0: Option<Mv>, l1: Option<Mv>) -> MbMotion {
+    let mut mot: MbMotion = [[BlockMotion::default(); 16]; 2];
+    for (l, mv) in [(0usize, l0), (1usize, l1)] {
+        let Some(mv) = mv else { continue };
+        // `ref_id` is an identity the derivations only compare for
+        // equality; one reference per list makes 1 and 2 distinct names,
+        // as `deblock_recon` already spells them.
+        mot[l] = [BlockMotion {
+            mv,
+            ref_idx: 0,
+            ref_parity: crate::h264::frame::PARITY_FRAME,
+            ref_id: 1 + l as u16,
+        }; 16];
+    }
+    mot
+}
+
+/// Assert that the mirrored 16x16 derivations agree with the decoder's
+/// own, over the state actually being coded.
+///
+/// The unit test `the_predictor_and_skip_mv_agree_with_the_decoders_derivation`
+/// already holds the mirror against `predict_mv` and `p_skip_mv` over
+/// synthetic neighbour sets. This is the same comparison over every
+/// macroblock of every clip the gate encodes, and it is here for one
+/// reason: it is the evidence that `PicMotion` can *replace* the mirror
+/// rather than merely sit beside it. Once it has, this goes, along with
+/// [`MotionNeighbours`].
+///
+/// Debug-only, because it is scaffolding and because the state it reads
+/// is maintained whether or not anything checks it.
+#[cfg(debug_assertions)]
+fn cross_check_16x16(cache: &MotionCache, nbm: &MotionNeighbours, list: usize) {
+    let cur: MbMotion = [[BlockMotion::default(); 16]; 2];
+    let want = crate::h264::mb::predict_mv(cache, &cur, 0, list, 0, 0, 0, 16, 16);
+    assert_eq!(
+        mv_predictor_16x16(nbm),
+        want,
+        "list {list}: the mirrored 16x16 predictor disagrees with the decoder's"
+    );
+    if list == 0 {
+        assert_eq!(
+            skip_mv_16x16(nbm),
+            crate::h264::mb::p_skip_mv(cache, &cur),
+            "the mirrored P_Skip vector disagrees with the decoder's"
+        );
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn cross_check_16x16(_cache: &MotionCache, _nbm: &MotionNeighbours, _list: usize) {}
+
+/// The same for spatial direct's reference indices (8.4.1.2.2's
+/// `min_positive` over the three neighbours per list), against the
+/// decoder's [`crate::h264::mb::spatial_direct_ref_idx`].
+///
+/// The vectors are not compared here: the encoder's derivation reads
+/// colZeroFlag out of a per-macroblock `FilterMb`, and the decoder's
+/// reads it per 8x8 out of the colocated picture's own motion — the two
+/// agree only because of INVARIANT(16x16-only), which is the premise
+/// this work removes. That comparison arrives with the colocated
+/// storage.
+#[cfg(debug_assertions)]
+fn cross_check_direct_ref_idx(cache: &MotionCache, nbm: &[MotionNeighbours; 2]) {
+    let cur: MbMotion = [[BlockMotion::default(); 16]; 2];
+    let want = crate::h264::mb::spatial_direct_ref_idx(cache, &cur);
+    let mine = spatial_direct_ref_idx_mirror(nbm);
+    assert_eq!(mine, want, "the mirrored spatial-direct reference indices disagree");
+}
+
+#[cfg(not(debug_assertions))]
+fn cross_check_direct_ref_idx(_cache: &MotionCache, _nbm: &[MotionNeighbours; 2]) {}
 
 /// The decoder's name for an intra decision's kind — what the loop
 /// filter's boundary-strength derivation switches on.
@@ -323,6 +473,13 @@ pub(crate) fn code_p_picture(
     let mut fmbs: Vec<FilterMb> = Vec::with_capacity(mbs_wide * mbs_high);
     let mut top_modes: Vec<[Option<u8>; 4]> = vec![[None; 4]; mbs_wide];
     let mut top_motion: Vec<NbMotion> = vec![NbMotion::NONE; mbs_wide];
+    // The decoder-shaped motion state, maintained beside the mirrored
+    // neighbours and cross-checked against them per macroblock: see
+    // `PicMotion`. Nothing reads it yet — this is the proof that it can
+    // replace the mirror before anything depends on that.
+    let mut pm = PicMotion::new(mbs_wide, mbs_high);
+    let mut dnb = MbNeighbours::default();
+    let mut dcache = MotionCache::default();
     for mb_y in 0..mbs_high {
         let mut left_modes: [Option<u8>; 4] = [None; 4];
         let mut left_motion = NbMotion::NONE;
@@ -338,6 +495,9 @@ pub(crate) fn code_p_picture(
                 },
                 d: topleft_motion,
             };
+            let addr = mb_y * mbs_wide + mb_x;
+            pm.cache_for(addr, &mut dnb, &mut dcache);
+            cross_check_16x16(&dcache, &nbm, 0);
             let dec = code_macroblock_p16(
                 ctx,
                 rec,
@@ -353,6 +513,18 @@ pub(crate) fn code_p_picture(
             // The above-left of the *next* column is what stands in this
             // column's row entry now, before this macroblock replaces it.
             topleft_motion = if mb_y > 0 { top_motion[mb_x] } else { NbMotion::NONE };
+            pm.commit(
+                addr,
+                match dec.kind {
+                    InterMbKind::PSkip => crate::h264::mb::MbKind::PSkip,
+                    InterMbKind::P16x16 => crate::h264::mb::MbKind::Inter16x16,
+                    InterMbKind::UseIntra => crate::h264::mb::MbKind::I16x16,
+                },
+                &match dec.kind {
+                    InterMbKind::UseIntra => [[BlockMotion::default(); 16]; 2],
+                    _ => mb_motion_16x16(Some(dec.mv), None),
+                },
+            );
             match dec.kind {
                 InterMbKind::PSkip => {
                     emit(mb_x, mb_y, PMb::Skip(&dec));
@@ -468,6 +640,9 @@ pub(crate) fn code_b_picture(
     let mut top_modes: Vec<[Option<u8>; 4]> = vec![[None; 4]; mbs_wide];
     let mut top_motion: [Vec<NbMotion>; 2] =
         [vec![NbMotion::NONE; mbs_wide], vec![NbMotion::NONE; mbs_wide]];
+    let mut pm = PicMotion::new(mbs_wide, mbs_high);
+    let mut dnb = MbNeighbours::default();
+    let mut dcache = MotionCache::default();
     for mb_y in 0..mbs_high {
         let mut left_modes: [Option<u8>; 4] = [None; 4];
         let mut left_motion = [NbMotion::NONE; 2];
@@ -483,6 +658,12 @@ pub(crate) fn code_b_picture(
                 },
                 d: topleft_motion[l],
             });
+            let addr = mb_y * mbs_wide + mb_x;
+            pm.cache_for(addr, &mut dnb, &mut dcache);
+            for l in 0..2 {
+                cross_check_16x16(&dcache, &nbm[l], l);
+            }
+            cross_check_direct_ref_idx(&dcache, &nbm);
             let dec = code_macroblock_b16(
                 ctx,
                 rec,
@@ -495,6 +676,22 @@ pub(crate) fn code_b_picture(
                 pc.chroma_stride,
                 &nbm,
                 &col[mb_y * mbs_wide + mb_x],
+            );
+            pm.commit(
+                addr,
+                match dec.kind {
+                    BMbKind::BSkip => crate::h264::mb::MbKind::BSkip,
+                    BMbKind::BDirect16 => crate::h264::mb::MbKind::BDirect16x16,
+                    BMbKind::B16 => crate::h264::mb::MbKind::Inter16x16,
+                    BMbKind::UseIntra => crate::h264::mb::MbKind::I16x16,
+                },
+                &match dec.kind {
+                    BMbKind::UseIntra => [[BlockMotion::default(); 16]; 2],
+                    _ => mb_motion_16x16(
+                        dec.used[0].then_some(dec.mv[0]),
+                        dec.used[1].then_some(dec.mv[1]),
+                    ),
+                },
             );
             for l in 0..2 {
                 topleft_motion[l] = if mb_y > 0 { top_motion[l][mb_x] } else { NbMotion::NONE };

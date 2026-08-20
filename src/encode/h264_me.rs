@@ -1107,6 +1107,20 @@ fn min_positive(a: i8, b: i8) -> i8 {
     if a >= 0 && b >= 0 { a.min(b) } else { a.max(b) }
 }
 
+/// The reference indices spatial direct derives (8.4.1.2.2): `MinPositive`
+/// over the macroblock-level neighbours A, B, C of each list, with C
+/// falling back to D. The mirror of the decoder's
+/// [`crate::h264::mb::spatial_direct_ref_idx`], split out so the picture
+/// walk can hold the two against each other on real pictures.
+pub(crate) fn spatial_direct_ref_idx_mirror(nb: &[MotionNeighbours; 2]) -> [i8; 2] {
+    let mut ref_idx = [0i8; 2];
+    for (l, n) in nb.iter().enumerate() {
+        let c = if n.c.avail { n.c } else { n.d };
+        ref_idx[l] = min_positive(n.a.ref_idx, min_positive(n.b.ref_idx, c.ref_idx));
+    }
+    ref_idx
+}
+
 /// The spatial direct motion of a 16x16 B macroblock (8.4.1.2.2),
 /// returning the reference index and vector per list.
 ///
@@ -1131,11 +1145,7 @@ fn min_positive(a: i8, b: i8) -> i8 {
 /// construction. Long-term references do not exist here, so the
 /// long-term guard on colZeroFlag is vacuously satisfied.
 pub fn spatial_direct_16x16(nb: &[MotionNeighbours; 2], col: &FilterMb) -> ([i8; 2], [Mv; 2]) {
-    let mut ref_idx = [0i8; 2];
-    for (l, n) in nb.iter().enumerate() {
-        let c = if n.c.avail { n.c } else { n.d };
-        ref_idx[l] = min_positive(n.a.ref_idx, min_positive(n.b.ref_idx, c.ref_idx));
-    }
+    let mut ref_idx = spatial_direct_ref_idx_mirror(nb);
     let mut mvp = [Mv::ZERO; 2];
     if ref_idx[0] < 0 && ref_idx[1] < 0 {
         ref_idx = [0, 0];
