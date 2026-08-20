@@ -10,16 +10,20 @@
 //! # State of it
 //!
 //! Configuration, picture typing and coding order, the access-unit envelope,
-//! and now the first real compression: all-intra CAVLC pictures go through
-//! prediction, transform and quantisation
-//! ([`super::h264_cavlc_mb::write_intra_picture`]). What still codes as
-//! `I_PCM` does so for a stated reason each — lossless, because PCM *is* the
-//! exact mode and the transform path is lossy; 4:4:4, which the intra coder
-//! does not cover yet; and CABAC intra, whose macroblock writer is not built.
-//! Inter pictures are all-skip through CAVLC, and CABAC inter refuses with
-//! `Unsupported` by name. `tools/verify_encode.sh` reports each hole as what
-//! it is, which is the honest state: the plumbing is proven and every hole
-//! has a name.
+//! and real compression on both picture types: all-intra CAVLC pictures go
+//! through prediction, transform and quantisation
+//! ([`super::h264_cavlc_mb::write_intra_picture`]), and CAVLC P pictures
+//! carry real motion — search, P_Skip where it is legal, the intra decision
+//! where inter loses ([`super::h264_cavlc_mb::write_p_picture`]). What still
+//! codes as `I_PCM` does so for a stated reason each — lossless, because PCM
+//! *is* the exact mode and the transform path is lossy; 4:4:4, which the
+//! intra coder does not cover yet; and CABAC intra, whose macroblock writer
+//! is not built. B pictures are all-skip — and so are the P pictures of a
+//! stream that *has* B pictures, because an all-skip B assumes zero motion
+//! in its colocated picture (see `transform_p` below). CABAC inter refuses
+//! with `Unsupported` by name. `tools/verify_encode.sh` reports each hole as
+//! what it is, which is the honest state: the plumbing is proven and every
+//! hole has a name.
 
 use super::gop::{Coded, Kind, Scheduler};
 use super::h264_syntax as syn;
@@ -246,6 +250,20 @@ impl H264Encoder {
             && self.cfg.entropy == Entropy::Cavlc
             && matches!(self.cfg.rate, RateControl::ConstantQp(_))
             && self.cfg.chroma != crate::ChromaFormat::Yuv444;
+        // Whether a P picture takes the motion-search path rather than
+        // all-skip. The same envelope as the intra transform path, plus
+        // `bframes == 0`: a stream with B pictures must keep its P motion
+        // zero, because the all-skip B reconstruction below assumes the
+        // colocated picture's motion is zero — temporal direct reads the
+        // future reference's vectors, and a B_Skip over a P with real
+        // motion reconstructs *from those vectors* in a decoder. Coding
+        // real B pictures (or replicating direct derivation) lifts this.
+        let transform_p = !idr
+            && c.kind == Kind::P
+            && self.cfg.bframes == 0
+            && self.cfg.entropy == Entropy::Cavlc
+            && matches!(self.cfg.rate, RateControl::ConstantQp(_))
+            && self.cfg.chroma != crate::ChromaFormat::Yuv444;
         let mut out = Vec::new();
         out.extend_from_slice(&syn::annexb(
             syn::NAL_SPS,
@@ -265,7 +283,12 @@ impl H264Encoder {
                 log2_max_frame_num: LOG2_MAX_FRAME_NUM,
                 log2_max_poc_lsb: LOG2_MAX_POC_LSB,
                 reference: c.reference,
-                deblock: !transform_intra,
+                // The transform paths write bitstreams whose reconstruction
+                // this encoder does not deblock, so the slice header turns
+                // the loop filter off — the same temporary switch for intra
+                // and inter, and it flips on when the encoder learns to run
+                // the filter over its own reconstruction.
+                deblock: !(transform_intra || transform_p),
             },
             qp,
             &mut w,
@@ -289,11 +312,27 @@ impl H264Encoder {
                 }
                 w.rbsp_trailing_bits();
             }
+        } else if transform_p {
+            // A real P picture: motion search, skip where it is legal and
+            // free, the intra decision where inter loses.
+            let p0 = past.expect("checked above");
+            super::h264_cavlc_mb::write_p_picture(
+                &mut w,
+                &g,
+                &self.tools,
+                qp,
+                &planes,
+                &mut recon,
+                &self.refs[p0].1,
+            );
+            w.rbsp_trailing_bits();
         } else {
-            // Every macroblock skipped. `P_Skip` carries no motion vector
-            // difference and no residual: the vector is the median prediction
-            // of its neighbours, which in an all-skip picture is zero
-            // everywhere, so the reconstruction is the reference unchanged.
+            // Every macroblock skipped — still what B pictures do, and what
+            // P pictures fall back to outside the transform envelope.
+            // `P_Skip` carries no motion vector difference and no residual:
+            // the vector is the median prediction of its neighbours, which
+            // in an all-skip picture is zero everywhere, so the
+            // reconstruction is the reference unchanged.
             //
             // Deblocking does not disturb it either: every edge has matching
             // motion, the same reference and no coefficients, so every
@@ -343,6 +382,10 @@ impl H264Encoder {
             self.idr_pic_id ^= 1;
         }
         if c.reference {
+            // Replicate the borders motion compensation reads — once, here,
+            // so every stored reference is search-ready and the P path never
+            // has to wonder whether a plane's border is stale.
+            crate::encode::h264_me::prepare_reference(&mut recon);
             self.refs.push((c.poc, recon));
             // The DPB the SPS declares. Dropping the oldest keeps the encoder
             // inside what it told the decoder to allocate.
