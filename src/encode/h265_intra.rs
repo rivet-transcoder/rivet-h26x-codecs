@@ -645,12 +645,42 @@ impl<S: Sample> IntraPicture<S> {
     }
 }
 
+/// Every luma transform block a decision describes, as `(x, y, log2,
+/// cbf)` in coding order with absolute positions given the CU's origin —
+/// the one enumeration of the transform tree, for consumers that walk a
+/// coded CU's blocks after the fact (the deblocking state builder
+/// mirrors `transform_unit`'s per-TB bookkeeping over exactly this).
+pub(crate) fn luma_tbs(d: &CuDecision, x0: usize, y0: usize) -> Vec<(usize, usize, u32, bool)> {
+    let mut out = Vec::with_capacity(16);
+    if d.nxn {
+        for pb in 0..4 {
+            out.push((x0 + (pb & 1) * 4, y0 + (pb >> 1) * 4, 2, d.cbf_luma[4 * pb]));
+        }
+    } else if !d.split_tu {
+        out.push((x0, y0, d.log2_cu, d.cbf_luma[0]));
+    } else {
+        let h = 1usize << (d.log2_cu - 1);
+        for (i, &deeper) in d.split_child.iter().enumerate() {
+            let (tx, ty) = (x0 + (i & 1) * h, y0 + (i >> 1) * h);
+            if !deeper {
+                out.push((tx, ty, d.log2_cu - 1, d.cbf_luma[4 * i]));
+            } else {
+                let hh = h / 2;
+                for j in 0..4 {
+                    out.push((tx + (j & 1) * hh, ty + (j >> 1) * hh, d.log2_cu - 2, d.cbf_luma[4 * i + j]));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// z-scan address of the 4x4 block holding luma sample `(x, y)` within its
 /// CTB — the within-CTB part of `Geometry::min_tb_addr_zs` (6.5.2),
 /// computed by the same bit interleave that table is built from: bit `i`
 /// of the 4x4 x-coordinate contributes `4^i`, of the y-coordinate
 /// `2 * 4^i`.
-fn z_within_ctb(log2_ctb: u32, x: usize, y: usize) -> u32 {
+pub(crate) fn z_within_ctb(log2_ctb: u32, x: usize, y: usize) -> u32 {
     let mask = (1usize << log2_ctb) - 1;
     let x4 = (x & mask) >> 2;
     let y4 = (y & mask) >> 2;

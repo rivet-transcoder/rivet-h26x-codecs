@@ -66,6 +66,7 @@ pub mod h264_me;
 pub mod h264_pic;
 pub mod h264_syntax;
 pub mod h265;
+pub mod h265_deblock;
 pub mod h265_intra;
 pub mod h265_me;
 pub mod h265_syntax;
