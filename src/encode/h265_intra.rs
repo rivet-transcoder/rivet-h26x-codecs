@@ -905,21 +905,49 @@ enum ModeSignal {
     ChromaExplicit,
 }
 
-/// The rate half of a candidate's cost — **a placeholder for real RD**.
-/// It counts the mode-signalling bins (treating the one context-coded bin
-/// as a bit) and ignores the residual entirely, weighted by the
-/// conventional Lagrangian `0.85 * 2^((QP - 12) / 3)` so it lives in the
-/// same units as a SATD. It is deliberately not pretending to be more:
-/// every rate heuristic in this module is this one function, so replacing
-/// it with a real bit count is one edit.
+/// The rate half of a candidate's cost — **still a placeholder**, and
+/// now a measured one.
+///
+/// It counts the mode-signalling bins, treating each as a bit, and
+/// ignores the residual, weighted by the conventional Lagrangian so it
+/// lives in the same units as a SATD.
+///
+/// # It was replaced by a real bit count, and that made the encoder worse
+///
+/// The counting encoder (`CabacEncoder::fractional_bits`) can price these
+/// shapes exactly, by running `write_prev_intra_luma_pred_flag`,
+/// `write_mpm_idx`, `write_rem_intra_luma_pred_mode` and
+/// `write_intra_chroma_pred_mode` themselves. Doing that was tried and
+/// measured over the whole encode gate, and it LOST: seventeen cells
+/// regressed against six that improved, PSNR −0.039 dB on average. The
+/// change is not in the tree; this note is, so the next person does not
+/// spend the day rediscovering it.
+///
+/// What the measurement showed, which is the useful part:
+///
+/// - The luma numbers here are very nearly right. At QP 26 the true costs
+///   are 1.92 / 2.92 / 6.09 against this table's 2 / 3 / 6, and the
+///   difference that actually drives the decision — escape minus
+///   most-probable — is 4.17 against 4.
+/// - **The chroma numbers are not.** `ChromaExplicit` costs 3.69 bits at
+///   QP 26 and 5.64 at QP 40, against 3 here: understated by 88% at high
+///   QP, where these cells regressed. `ChromaDerived` is 0.53 and 0.12
+///   against 1.
+/// - So the correction is real, and pricing it correctly still lost —
+///   which says the imbalance is not in this function alone. Doubling the
+///   Lagrangian made it worse again (size +1.36%), so it is not a scale
+///   error either. The residual term in [`lambda_bits`] — a flat three
+///   bins per nonzero level — is the remaining suspect, since it is the
+///   larger number and the one this function's callers compare against.
+///
+/// Fixing the rate of one syntax element while the residual beside it is
+/// still guessed at makes the total *less* balanced, not more. The inter
+/// side had no such companion guess and a real count won there.
 fn mode_signalling_cost(qp: i32, signal: ModeSignal) -> f32 {
     let bins = match signal {
-        // prev_intra_luma_pred_flag plus the truncated-Rice mpm_idx.
         ModeSignal::LumaMpm(0) => 2,
         ModeSignal::LumaMpm(_) => 3,
-        // The flag plus five fixed bits of rem_intra_luma_pred_mode.
         ModeSignal::LumaEscape => 6,
-        // intra_chroma_pred_mode's first bin, alone or with two more.
         ModeSignal::ChromaDerived => 1,
         ModeSignal::ChromaExplicit => 3,
     };

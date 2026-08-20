@@ -95,6 +95,10 @@ impl Out<'_> {
 /// writing them — see [`Out`].
 pub struct CabacEncoder<'a> {
     w: Out<'a>,
+    /// Fractional bits this encoder has consumed, accumulated from the
+    /// coder's own interval arithmetic — see
+    /// [`CabacEncoder::fractional_bits`].
+    frac: f64,
     /// `codILow`.
     low: u32,
     /// `codIRange`.
@@ -112,7 +116,7 @@ impl<'a> CabacEncoder<'a> {
     /// H.264 that means after `cabac_alignment_one_bit`.
     pub fn new(w: &'a mut BitWriter) -> Self {
         debug_assert!(w.byte_aligned(), "CABAC data starts on a byte boundary");
-        Self { w: Out::Bits(w), low: 0, range: 510, outstanding: 0, first: true }
+        Self { w: Out::Bits(w), frac: 0.0, low: 0, range: 510, outstanding: 0, first: true }
     }
 
     /// An encoder that counts the bits it would write and produces none.
@@ -135,7 +139,7 @@ impl<'a> CabacEncoder<'a> {
     /// offset cancels. Callers wanting an absolute figure should count the
     /// whole slice.
     pub fn counting() -> CabacEncoder<'static> {
-        CabacEncoder { w: Out::Count(0), low: 0, range: 510, outstanding: 0, first: true }
+        CabacEncoder { w: Out::Count(0), frac: 0.0, low: 0, range: 510, outstanding: 0, first: true }
     }
 
     /// `PutBit(b)` (9.3.4.3): emit `b`, then settle every outstanding bit as
@@ -182,6 +186,7 @@ impl<'a> CabacEncoder<'a> {
         let p = (state >> 1) as usize;
         let mps = (state & 1) as u32;
         let lps = LPS_RANGE[p][((self.range >> 6) & 3) as usize] as u32;
+        let before = self.range;
         self.range -= lps;
         if bin != mps {
             // The LPS sub-interval sits above the MPS one, so the low end
@@ -193,6 +198,10 @@ impl<'a> CabacEncoder<'a> {
         } else {
             *ctx = (NEXT_STATE_MPS[p] << 1) | mps as u8;
         }
+        // The bin's own information content: the interval it survived
+        // divided by the interval it left. Renormalisation only rescales
+        // both, so charging it here and not again below is exact.
+        self.frac += (before as f64 / self.range as f64).log2();
         self.renorm();
     }
 
@@ -200,6 +209,8 @@ impl<'a> CabacEncoder<'a> {
     /// range is untouched and `low` takes the doubling instead.
     pub fn encode_bypass(&mut self, bin: u32) {
         debug_assert!(bin <= 1);
+        // A bypass bin halves the interval by construction: one bit, exactly.
+        self.frac += 1.0;
         self.low <<= 1;
         if bin != 0 {
             self.low += self.range;
@@ -228,7 +239,14 @@ impl<'a> CabacEncoder<'a> {
     /// and flushes; nothing may be encoded afterwards.
     pub fn encode_terminate(&mut self, bin: u32) {
         debug_assert!(bin <= 1);
+        let before = self.range;
         self.range -= 2;
+        self.frac += if bin != 0 {
+            // Ending the codeword costs what the 2/range sub-interval is worth.
+            (before as f64 / 2.0).log2()
+        } else {
+            (before as f64 / self.range as f64).log2()
+        };
         if bin != 0 {
             self.low += self.range;
             self.flush();
@@ -262,6 +280,31 @@ impl<'a> CabacEncoder<'a> {
     /// header, so prefer taking a difference of `position`.
     pub fn bits_counted(&self) -> u64 {
         self.w.position()
+    }
+
+    /// What the bins encoded so far actually cost, in fractional bits.
+    ///
+    /// **This is the figure a decision should compare candidates on**, and
+    /// [`CabacEncoder::bits_counted`] is not — a fact that cost a wrong
+    /// answer before it was written down here. An arithmetic coder emits
+    /// no output at all until its interval has narrowed past a byte, so a
+    /// short fragment counted by emitted bits reads as ZERO. Pricing intra
+    /// mode syntax that way made every most-probable-mode shape cost 0
+    /// bits, deleted the rate term from the decision, and made the encoder
+    /// measurably worse while looking like a more accurate model.
+    ///
+    /// The accounting is the coder's own, not a probability table: every
+    /// context-coded bin is charged `log2(range_before / range_after)` —
+    /// the interval it survived over the interval it left, which IS its
+    /// information content — and every bypass bin exactly one bit.
+    /// Renormalisation rescales both sides of that ratio, so it neither
+    /// adds nor hides cost. Nothing here models what a bin "usually"
+    /// costs; it reads what this bin cost in this state.
+    ///
+    /// Summed over a whole codeword it agrees with the emitted bit count
+    /// to within the flush's few bits, which the round trip asserts.
+    pub fn fractional_bits(&self) -> f64 {
+        self.frac
     }
 }
 
@@ -335,6 +378,16 @@ mod tests {
         }
         c.encode_terminate(1);
         assert_eq!(c.bits_counted(), written, "counted bits differ from the bits written");
+        // And the fractional accounting agrees with the emitted count to
+        // within the flush. It is the fractional figure a decision must
+        // compare on: emitted bits read as ZERO for a fragment shorter
+        // than the coder's first output byte, which silently deletes the
+        // rate term from a decision rather than making it inaccurate.
+        let frac = c.fractional_bits();
+        assert!(
+            (frac - written as f64).abs() <= 8.0,
+            "fractional cost {frac:.2} and emitted bits {written} disagree by more than the flush"
+        );
         assert_eq!(cnt_ctx, enc_ctx, "counting advanced the contexts differently from writing");
 
         let mut dec_ctx = contexts();

@@ -1399,11 +1399,14 @@ mod tests {
         let log2 = 5u32;
         // Bits `write_cu_inter` emits for `d`, counted rather than
         // written, against the neutral neighbour context `Rate` prices in.
-        let emitted = |d: &InterCuDecision, qp: i32| -> u32 {
+        // Fractional bits, the figure the decision actually compares on.
+        // Comparing emitted bits here would assert almost nothing: a skip
+        // is short enough that the coder emits none of them.
+        let emitted = |d: &InterCuDecision, qp: i32| -> f32 {
             let mut cx = Contexts::new(1, qp);
             let mut e = CabacEncoder::counting();
             write_cu_inter(&mut e, &mut cx, d, None, None, 1, false);
-            e.bits_counted() as u32
+            e.fractional_bits() as f32
         };
 
         for qp in [22i32, 26, 34, 40] {

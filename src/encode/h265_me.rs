@@ -605,7 +605,7 @@ impl<S: Sample> InterPicture<S> {
             // candidate becomes a skip, so price each at the shape it
             // would actually take.
             let bits = rate.skip(idx as u8).min(rate.merge(idx as u8));
-            let cost = satd as f32 + lam * bits as f32;
+            let cost = satd as f32 + lam * bits;
             if cost < best_merge_cost {
                 best_merge_cost = cost;
                 best_merge = Some((idx, satd));
@@ -619,7 +619,7 @@ impl<S: Sample> InterPicture<S> {
         let mvd = mvd_for(mvp[amvp_flag as usize]);
         // merge_flag 0, mvp_l0_flag, rqt_root_cbf, plus the mvd bins
         // (cu_skip_flag and pred_mode/part_mode surround both shapes).
-        let amvp_cost = satd_me as f32 + lam * rate.amvp(mvd, amvp_flag, true) as f32;
+        let amvp_cost = satd_me as f32 + lam * rate.amvp(mvd, amvp_flag, true);
 
         let merge_wins = best_merge.is_some_and(|_| best_merge_cost <= amvp_cost);
         let (mv, inter_satd) = if merge_wins {
@@ -785,7 +785,7 @@ impl<S: Sample> InterPicture<S> {
             let mut fl = [0u8; 2];
             fl[list] = best_flag[list];
             let bits = rate.amvp_b(list as u8, mvd, fl, true);
-            let cost = u.1 as f32 + lam * bits as f32;
+            let cost = u.1 as f32 + lam * bits;
             if cost < best_cost {
                 best_cost = cost;
                 best = Some((list as u8, u.1));
@@ -795,7 +795,7 @@ impl<S: Sample> InterPicture<S> {
         let bi_satd = self.satd_bi_at(ctx, &ref0.y, &ref1.y, x0, y0, n, src, y_stride, uni[0].0, uni[1].0);
         {
             let bits = rate.amvp_b(2, best_mvd, best_flag, true);
-            let cost = bi_satd as f32 + lam * bits as f32;
+            let cost = bi_satd as f32 + lam * bits;
             if cost < best_cost {
                 best_cost = cost;
                 best = Some((2, bi_satd));
@@ -821,7 +821,7 @@ impl<S: Sample> InterPicture<S> {
                 (false, false) => unreachable!("filtered above"),
             };
             let bits = rate.skip(idx as u8).min(rate.merge(idx as u8));
-            let cost = satd as f32 + lam * bits as f32;
+            let cost = satd as f32 + lam * bits;
             if cost < best_merge_cost {
                 best_merge_cost = cost;
                 best_merge = Some((idx, satd));
@@ -1260,11 +1260,16 @@ impl Rate {
     }
 
     /// Run `f` over a counting encoder and a private copy of the contexts.
-    fn count(&self, f: impl FnOnce(&mut CabacEncoder<'static>, &mut Contexts)) -> u32 {
+    /// Fractional bits, not emitted ones: a shape short enough to fit
+    /// inside the arithmetic coder's first output byte emits nothing at
+    /// all, so `bits_counted` would price several distinct shapes at zero
+    /// and delete the rate term from the comparison. See
+    /// `CabacEncoder::fractional_bits`.
+    fn count(&self, f: impl FnOnce(&mut CabacEncoder<'static>, &mut Contexts)) -> f32 {
         let mut cx = self.cx.clone();
         let mut e = CabacEncoder::counting();
         f(&mut e, &mut cx);
-        e.bits_counted() as u32
+        e.fractional_bits() as f32
     }
 
     /// The elements every inter CU spells before its shape diverges:
@@ -1277,7 +1282,7 @@ impl Rate {
     }
 
     /// `cu_skip_flag` 1 and a `merge_idx`; the reader infers the rest.
-    pub(crate) fn skip(&self, merge_idx: u8) -> u32 {
+    pub(crate) fn skip(&self, merge_idx: u8) -> f32 {
         self.count(|e, cx| {
             Self::prefix(e, cx, true);
             write_merge_idx(e, cx, MAX_MERGE_CAND as u32, u32::from(merge_idx));
@@ -1286,7 +1291,7 @@ impl Rate {
 
     /// A non-skip 2Nx2N merge CU. `rqt_root_cbf` is not coded — the reader
     /// infers it — so nothing stands in for it here either.
-    pub(crate) fn merge(&self, merge_idx: u8) -> u32 {
+    pub(crate) fn merge(&self, merge_idx: u8) -> f32 {
         self.count(|e, cx| {
             Self::prefix(e, cx, false);
             write_pred_mode_flag(e, cx, false);
@@ -1300,7 +1305,7 @@ impl Rate {
     /// `rqt_root_cbf` — whose value is a parameter because it is a coded
     /// bin with a cost, and because it is what lets a test price exactly
     /// the shape `write_cu_inter` emits.
-    pub(crate) fn amvp(&self, mvd: Mv, mvp_flag: u8, root_cbf: bool) -> u32 {
+    pub(crate) fn amvp(&self, mvd: Mv, mvp_flag: u8, root_cbf: bool) -> f32 {
         self.count(|e, cx| {
             Self::prefix(e, cx, false);
             write_pred_mode_flag(e, cx, false);
@@ -1315,7 +1320,7 @@ impl Rate {
     /// B-slice AMVP: `inter_pred_idc`, then per list — interleaved as
     /// `prediction_unit` reads them — the `mvd` and `mvp_lX_flag` of each
     /// list the shape uses.
-    pub(crate) fn amvp_b(&self, idc: u8, mvd: [Mv; 2], mvp_flag: [u8; 2], root_cbf: bool) -> u32 {
+    pub(crate) fn amvp_b(&self, idc: u8, mvd: [Mv; 2], mvp_flag: [u8; 2], root_cbf: bool) -> f32 {
         let n = 1i32 << self.log2_cu;
         self.count(|e, cx| {
             Self::prefix(e, cx, false);
