@@ -36,7 +36,7 @@
 //! - **One CU per CTU, no coding quadtree.** The CU size *is* the CTB
 //!   size, `log2_cu` in 3..=5. Pictures must be whole multiples of it.
 //! - **Partitioning per size, one transform-split level.** `log2_cu` 4 or
-//!   5 codes `PART_2Nx2N`, and when [`IntraPicture::try_split`] is on the
+//!   5 codes `PART_2Nx2N`, and when [`IntraPicture::split_depth`] allows the
 //!   decision tries one level of transform split — four quarter-size TUs
 //!   against the single CU-sized one, chroma splitting alongside as the
 //!   decoder's `transform_tree` dictates. The split search is **off by
@@ -363,13 +363,23 @@ pub struct IntraPicture<S: Sample> {
     pub recon: Frame<S>,
     /// log2 of the fixed CU size, 3..=5.
     pub log2_cu: u32,
-    /// Search the one-level transform split for `PART_2Nx2N` CUs. **Off
-    /// by default, deliberately**: the coding-tree writer in
-    /// `encode::h265` serialises only the unsplit shape today, and a
-    /// split decision fed to it would desync the arithmetic coder — the
-    /// wiring step that spells the split shape flips this on. Off, the
-    /// decision behaves exactly as before this field existed.
-    pub try_split: bool,
+    /// How deep the `PART_2Nx2N` transform-split search may go — what
+    /// used to be `try_split`, grown a level:
+    /// - `0` — never split (a single CU-sized TU always);
+    /// - `1` — try the one-level split, bit-identical to the old
+    ///   `try_split = true` (the cost accounting reduces to exactly the
+    ///   old formula when no child subdivides);
+    /// - `2` — additionally let each child of a split CU try subdividing
+    ///   into four leaf TBs, decided greedily child by child in decode
+    ///   order (each child's structure is final before the next one
+    ///   codes, because the next one predicts from its reconstruction).
+    ///
+    /// **Defaults to 0**: the coding-tree writer in `encode::h265` must
+    /// spell whichever shapes this permits, and a decision it cannot
+    /// serialise would desync the arithmetic coder — the wiring flips it
+    /// to what the writer supports. Values above 2 are a bug (the SPS's
+    /// `max_transform_hierarchy_depth_intra` is 2) and assert.
+    pub split_depth: u32,
     /// Chosen luma mode per 4x4 block — the encoder's copy of the
     /// decoder's `PicInfo::intra_mode`, and like it filled per prediction
     /// block as modes are chosen so the MPM derivation for later blocks
@@ -417,7 +427,7 @@ impl<S: Sample> IntraPicture<S> {
         IntraPicture {
             recon: Frame::new(width, height, chroma, bit_depth),
             log2_cu,
-            try_split: false,
+            split_depth: 0,
             // 1 (DC) everywhere, as the decoder initialises intra_mode; the
             // availability test keeps uncoded entries from ever being read.
             modes: vec![1; w4 * h4],
@@ -444,7 +454,7 @@ impl<S: Sample> IntraPicture<S> {
         c_stride: usize,
     ) -> CuDecision {
         let geo = self.geo;
-        let try_split = self.try_split;
+        let split_depth = self.split_depth;
         let n = 1usize << geo.log2_cu;
         let (x0, y0) = (cu_x * n, cu_y * n);
         // Monochrome codes no chroma at all — the reader's chroma work is
@@ -568,21 +578,54 @@ impl<S: Sample> IntraPicture<S> {
             let cmode = out.chroma_mode;
 
             // The transform structure: one CU-sized TU, or — when the
-            // writer-side knob allows — four quarter TUs, judged by
-            // reconstruction SSD plus the placeholder rate term. The
-            // trials overwrite each other in the plane and the decision;
-            // a trial reads only samples outside the CU or samples it
-            // wrote itself, so no state needs saving — whichever loses is
-            // simply recomputed, the way the H.264 side puts back the
-            // I_4x4 coding its I_16x16 trials overwrote.
+            // writer-side knob allows — a split, judged by reconstruction
+            // SSD plus the placeholder rate terms. The trials overwrite
+            // each other in the plane and the decision; a trial reads
+            // only samples outside the CU or samples it wrote itself, so
+            // no state needs saving — whichever loses is simply
+            // recomputed, the way the H.264 side puts back the I_4x4
+            // coding its I_16x16 trials overwrote.
             let (ssd_u, nz_u) = code_cu_2nx2n(
                 ctx, geo, recon, scratch, x0, y0, mode, cmode, false, [false; 4], &src_y[soff..], y_stride, scb, scr, c_stride, &mut out,
             );
-            if try_split {
+            if split_depth >= 1 {
+                assert!(split_depth <= 2, "split_depth {split_depth} above the SPS transform depth of 2");
                 let cost_u = ssd_u as f32 + tu_structure_cost(geo.cat, ctx.qp, &out, nz_u);
-                let (ssd_s, nz_s) = code_cu_2nx2n(
-                    ctx, geo, recon, scratch, x0, y0, mode, cmode, true, [false; 4], &src_y[soff..], y_stride, scb, scr, c_stride, &mut out,
-                );
+                // The split trial, children in decode order. With the
+                // deeper search on, each child is coded unsplit, re-coded
+                // subdivided, and settled — losing structure recomputed —
+                // BEFORE the next child codes, because the next child
+                // predicts from this one's final reconstruction; a joint
+                // search over the sixteen child-shape combinations is a
+                // refinement real RD might want, greedy is the
+                // simplification taken here. At split_depth 1 this loop
+                // is code_cu_2nx2n's own split path verbatim, so the
+                // decisions are bit-identical to the one-level search.
+                clear_for_trial(&mut out, true);
+                let (mut ssd_s, mut nz_s) = (0u64, 0u32);
+                for i in 0..4 {
+                    let (mut ssd_i, mut nz_i) = code_child(ctx, geo, recon, scratch, x0, y0, i, false, mode, cmode, &src_y[soff..], y_stride, scb, scr, c_stride, &mut out);
+                    if split_depth >= 2 {
+                        let cost_a = ssd_i as f32 + lambda_bits(ctx.qp, child_structure_bins(geo.cat, geo.log2_cu, false), nz_i);
+                        let (ssd_b, nz_b) = code_child(ctx, geo, recon, scratch, x0, y0, i, true, mode, cmode, &src_y[soff..], y_stride, scb, scr, c_stride, &mut out);
+                        let cost_b = ssd_b as f32 + lambda_bits(ctx.qp, child_structure_bins(geo.cat, geo.log2_cu, true), nz_b);
+                        if cost_a <= cost_b {
+                            let (sa, na) = code_child(ctx, geo, recon, scratch, x0, y0, i, false, mode, cmode, &src_y[soff..], y_stride, scb, scr, c_stride, &mut out);
+                            ssd_i = sa;
+                            nz_i = na;
+                        } else {
+                            ssd_i = ssd_b;
+                            nz_i = nz_b;
+                        }
+                    }
+                    ssd_s += ssd_i;
+                    nz_s += nz_i;
+                }
+                if geo.cat != 0 {
+                    for comp in 0..2 {
+                        out.cbf_chroma[comp] = out.cbf_chroma_tu[comp].iter().any(|&f| f) || out.cbf_chroma_tu_bot[comp].iter().any(|&f| f);
+                    }
+                }
                 let cost_s = ssd_s as f32 + tu_structure_cost(geo.cat, ctx.qp, &out, nz_s);
                 if cost_u <= cost_s {
                     let _ = code_cu_2nx2n(
@@ -759,8 +802,45 @@ fn mode_signalling_cost(qp: i32, signal: ModeSignal) -> f32 {
         ModeSignal::ChromaDerived => 1,
         ModeSignal::ChromaExplicit => 3,
     };
+    lambda_bits(qp, bins, 0)
+}
+
+/// The Lagrangian core every structure and mode cost shares — **a
+/// placeholder for real RD**, and the one place the heuristic constants
+/// live: the conventional `0.85 * 2^((QP - 12) / 3)` multiplier, and a
+/// flat three bins per nonzero level standing in for residual bits. Bin
+/// counts arrive from the callers, which count exact syntax elements;
+/// what is heuristic is pricing them all at one bit and the residual at
+/// a constant, which a real bit count replaces in this one function.
+fn lambda_bits(qp: i32, bins: u32, nz: u32) -> f32 {
+    const LEVEL_BINS: f32 = 3.0;
     let lambda = 0.85f32 * ((qp - 12) as f32 / 3.0).exp2();
-    lambda * bins as f32
+    lambda * (bins as f32 + LEVEL_BINS * nz as f32)
+}
+
+/// The signalling bins one child of a split CU costs with each
+/// structure, for the greedy per-child depth choice: its own split flag,
+/// its cbf_luma bins (one, or four leaves), and its chroma bins as this
+/// geometry codes them — per leaf where chroma subdivides, at the child
+/// otherwise, doubled for 4:2:2 pairs. Exact syntax counts except that
+/// the parent-gate conditioning of chroma bins is ignored (counted as if
+/// always coded); the pricing itself is [`lambda_bits`]'s business.
+fn child_structure_bins(cat: u32, log2_cu: u32, deeper: bool) -> u32 {
+    let halves = if cat == 2 { 2 } else { 1 };
+    let mut bins = 1; // the child's split_transform_flag
+    if !deeper {
+        bins += 1; // cbf_luma
+        if cat != 0 {
+            bins += halves;
+        }
+    } else {
+        bins += 4; // cbf_luma per leaf
+        if cat != 0 {
+            let per_leaf = log2_cu - 2 > 2 || cat == 3;
+            bins += if per_leaf { 4 * halves } else { halves };
+        }
+    }
+    bins
 }
 
 /// Forward-code and reconstruct one transform block whose *prediction is
@@ -1055,6 +1135,24 @@ fn code_chroma_tb<S: Sample>(
     code_residual(ctx, plane, cx, cy, log2c, c_idx, qp_c, src, c_stride, levels)
 }
 
+/// A fresh slate for a structure trial: the previous trial may have
+/// filled a different shape, and the layout promises zeros beyond the
+/// described TBs.
+fn clear_for_trial(out: &mut CuDecision, split: bool) {
+    out.split_tu = split;
+    out.split_child = [false; 4];
+    out.cbf_luma = [false; 16];
+    out.cbf_chroma = [false; 2];
+    out.cbf_chroma_bot = [false; 2];
+    out.cbf_chroma_tu = [[false; 4]; 2];
+    out.cbf_chroma_tu_bot = [[false; 4]; 2];
+    out.cbf_chroma_leaf = [[false; 16]; 2];
+    out.cbf_chroma_leaf_bot = [[false; 16]; 2];
+    out.luma.fill(0);
+    out.chroma[0].fill(0);
+    out.chroma[1].fill(0);
+}
+
 /// Code one depth-1 child of a split CU: its luma as a single quarter TB
 /// or — when `deeper` — as four leaf TBs at `log2_cu - 2` in z-order,
 /// and its chroma in whichever shape `transform_unit` gives this
@@ -1230,20 +1328,7 @@ fn code_cu_2nx2n<S: Sample>(
     out: &mut CuDecision,
 ) -> (u64, u32) {
     let n = 1usize << geo.log2_cu;
-    // A fresh slate: the other trial may have filled a different shape,
-    // and the layout promises zeros beyond the described TBs.
-    out.split_tu = split;
-    out.split_child = [false; 4];
-    out.cbf_luma = [false; 16];
-    out.cbf_chroma = [false; 2];
-    out.cbf_chroma_bot = [false; 2];
-    out.cbf_chroma_tu = [[false; 4]; 2];
-    out.cbf_chroma_tu_bot = [[false; 4]; 2];
-    out.cbf_chroma_leaf = [[false; 16]; 2];
-    out.cbf_chroma_leaf_bot = [[false; 16]; 2];
-    out.luma.fill(0);
-    out.chroma[0].fill(0);
-    out.chroma[1].fill(0);
+    clear_for_trial(out, split);
     let mut nz_total = 0u32;
 
     if split {
@@ -1319,9 +1404,12 @@ fn tu_structure_cost(cat: u32, qp: i32, d: &CuDecision, nz: u32) -> f32 {
     // costs: one per child, two in 4:2:2 (the stacked pair).
     let halves = if cat == 2 { 2 } else { 1 };
     if d.split_tu {
-        // Each child spells its own (zero) split flag, then cbf_luma; the
+        // Each child spells its own split flag, then cbf_luma; the
         // parent chroma gate bins are followed by the child bins of every
-        // component that carried anything.
+        // component that carried anything. This arm reduces to exactly
+        // the pre-depth-2 accounting when no child subdivides, which is
+        // what keeps split_depth 1 decisions bit-identical to the old
+        // one-level search.
         bins += 4 + 4;
         if cat != 0 {
             bins += 2;
@@ -1331,14 +1419,27 @@ fn tu_structure_cost(cat: u32, qp: i32, d: &CuDecision, nz: u32) -> f32 {
                 }
             }
         }
+        // The depth-2 delta: a subdivided child spells three more
+        // cbf_luma bins, and where its chroma follows the leaves, three
+        // more chroma bin sets per component that carried anything.
+        let per_leaf = d.log2_cu - 2 > 2 || cat == 3;
+        for &deeper in &d.split_child {
+            if deeper {
+                bins += 3;
+                if cat != 0 && per_leaf {
+                    for comp in 0..2 {
+                        if d.cbf_chroma[comp] {
+                            bins += 3 * halves;
+                        }
+                    }
+                }
+            }
+        }
     } else {
         // cbf_luma and the depth-0 chroma bins the format has.
         bins += 1 + if cat == 0 { 0 } else { 2 * halves };
     }
-    // Roughly what a nonzero level costs to code, hand-waved.
-    const LEVEL_BINS: f32 = 3.0;
-    let lambda = 0.85f32 * ((qp - 12) as f32 / 3.0).exp2();
-    lambda * (bins as f32 + LEVEL_BINS * nz as f32)
+    lambda_bits(qp, bins, nz)
 }
 
 #[cfg(test)]
@@ -1387,14 +1488,14 @@ mod tests {
         w: usize,
         h: usize,
         log2_cu: u32,
-        try_split: bool,
+        split_depth: u32,
         chroma: ChromaFormat,
         src_y: &[u8],
         src_cb: &[u8],
         src_cr: &[u8],
     ) -> (IntraPicture<u8>, Vec<CuDecision>) {
         let mut pic = IntraPicture::new_with_chroma(w, h, log2_cu, 8, chroma);
-        pic.try_split = try_split;
+        pic.split_depth = split_depth;
         let n = 1usize << log2_cu;
         let cs = if chroma == ChromaFormat::Yuv444 { w } else { w / 2 };
         let mut decisions = Vec::new();
@@ -1421,6 +1522,33 @@ mod tests {
                     for x in 0..n {
                         let in_quadrant = x >= n / 2 && y >= n / 2;
                         if !quadrant_only || in_quadrant {
+                            v[(cy * n + y) * w + cx * n + x] = lcg(&mut s) as u8;
+                        }
+                    }
+                }
+            }
+        }
+        v
+    }
+
+    /// Three content flavours per CTU by raster index: noise (nothing to
+    /// isolate), a busy half-size quadrant (one split level isolates it),
+    /// and a busy quarter-size island in the far corner (only the second
+    /// level isolates it) — so a depth-2 walk over this picture must
+    /// produce all three structures.
+    fn mixed_source3(w: usize, h: usize, n: usize, seed: u64) -> Vec<u8> {
+        let mut v = vec![128u8; w * h];
+        let mut s = seed;
+        for cy in 0..h / n {
+            for cx in 0..w / n {
+                let busy_from = match (cy * (w / n) + cx) % 3 {
+                    0 => 0,
+                    1 => n / 2,
+                    _ => 3 * n / 4,
+                };
+                for y in 0..n {
+                    for x in 0..n {
+                        if x >= busy_from && y >= busy_from {
                             v[(cy * n + y) * w + cx * n + x] = lcg(&mut s) as u8;
                         }
                     }
@@ -1609,7 +1737,7 @@ mod tests {
 
             let y = vec![128u8; w * h];
             let c = vec![128u8; w * h / 4];
-            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, false, ChromaFormat::Yuv420, &y, &c, &c);
+            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, 0, ChromaFormat::Yuv420, &y, &c, &c);
             for d in &decisions {
                 assert!(d.cbf_luma.iter().all(|&f| !f), "log2_cu={log2_cu}");
                 assert!(d.cbf_chroma.iter().all(|&f| !f));
@@ -1665,7 +1793,7 @@ mod tests {
             let y = mixed_source(w, h, n, 0x5eed ^ ((log2_cu as u64) << 8) ^ qp as u64);
             let cbs = noise(w / 2, h / 2, 0xcb);
             let crs = noise(w / 2, h / 2, 0xc7);
-            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, true, ChromaFormat::Yuv420, &y, &cbs, &crs);
+            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, 1, ChromaFormat::Yuv420, &y, &cbs, &crs);
             if log2_cu > 3 {
                 assert!(
                     decisions.iter().any(|d| d.split_tu) && decisions.iter().any(|d| !d.split_tu),
@@ -1718,7 +1846,7 @@ mod tests {
             // gradient clip. Exactness must survive either choice; the
             // split shape under bypass is pinned content-independently by
             // lossless_bypass_composes_with_the_split_shape.
-            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, true, ChromaFormat::Yuv420, &y, &cbs, &crs);
+            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, 1, ChromaFormat::Yuv420, &y, &cbs, &crs);
             for (name, plane, src, pw, ph) in [
                 ("y", &pic.recon.y, &y, w, h),
                 ("cb", &pic.recon.cb, &cbs, w / 2, h / 2),
@@ -1754,7 +1882,7 @@ mod tests {
             let y = mixed_source(w, h, n, 0xcbf ^ log2_cu as u64);
             let cbs = noise(w / 2, h / 2, 1);
             let crs = noise(w / 2, h / 2, 2);
-            let (_, decisions) = code_picture(&ctx, w, h, log2_cu, true, ChromaFormat::Yuv420, &y, &cbs, &crs);
+            let (_, decisions) = code_picture(&ctx, w, h, log2_cu, 1, ChromaFormat::Yuv420, &y, &cbs, &crs);
             if log2_cu > 3 {
                 assert!(
                     decisions.iter().any(|d| d.split_tu) && decisions.iter().any(|d| !d.split_tu),
@@ -1832,7 +1960,7 @@ mod tests {
             let n = 1usize << log2_cu;
             let (w, h) = (4 * n, 2 * n);
             let y = mixed_source(w, h, n, 0x400 ^ ((log2_cu as u64) << 8) ^ qp as u64);
-            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, true, ChromaFormat::Monochrome, &y, &[], &[]);
+            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, 1, ChromaFormat::Monochrome, &y, &[], &[]);
             if log2_cu > 3 {
                 assert!(
                     decisions.iter().any(|d| d.split_tu) && decisions.iter().any(|d| !d.split_tu),
@@ -1873,7 +2001,7 @@ mod tests {
             let n = 1usize << log2_cu;
             let (w, h) = (2 * n, 2 * n);
             let y = noise(w, h, 0x400b + log2_cu as u64);
-            let (pic, _) = code_picture(&ctx, w, h, log2_cu, true, ChromaFormat::Monochrome, &y, &[], &[]);
+            let (pic, _) = code_picture(&ctx, w, h, log2_cu, 1, ChromaFormat::Monochrome, &y, &[], &[]);
             let off = pic.recon.y.origin();
             for yy in 0..h {
                 for xx in 0..w {
@@ -1900,7 +2028,7 @@ mod tests {
             let y = mixed_source(w, h, n, 0x422 ^ ((log2_cu as u64) << 8) ^ qp as u64);
             let cbs = noise(w / 2, h, 0x422cb);
             let crs = noise(w / 2, h, 0x422c7);
-            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, true, ChromaFormat::Yuv422, &y, &cbs, &crs);
+            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, 1, ChromaFormat::Yuv422, &y, &cbs, &crs);
             if log2_cu > 3 {
                 assert!(
                     decisions.iter().any(|d| d.split_tu) && decisions.iter().any(|d| !d.split_tu),
@@ -1942,7 +2070,7 @@ mod tests {
             let y = noise(w, h, 0x422b + log2_cu as u64);
             let cbs = noise(w / 2, h, 0xb1);
             let crs = noise(w / 2, h, 0xb2);
-            let (pic, _) = code_picture(&ctx, w, h, log2_cu, true, ChromaFormat::Yuv422, &y, &cbs, &crs);
+            let (pic, _) = code_picture(&ctx, w, h, log2_cu, 1, ChromaFormat::Yuv422, &y, &cbs, &crs);
             for (name, plane, src, pw, ph) in [
                 ("y", &pic.recon.y, &y, w, h),
                 ("cb", &pic.recon.cb, &cbs, w / 2, h),
@@ -1981,7 +2109,7 @@ mod tests {
                     crs[yy * w / 2 + xx] = lcg(&mut s) as u8;
                 }
             }
-            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, true, ChromaFormat::Yuv422, &y, &cbs, &crs);
+            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, 1, ChromaFormat::Yuv422, &y, &cbs, &crs);
             let d = &decisions[0];
             assert!(!d.split_tu, "flat luma split anyway");
             let q = (n / 2) * (n / 2);
@@ -2011,7 +2139,7 @@ mod tests {
             let y = mixed_source(w, h, n, 0x422cbf ^ log2_cu as u64);
             let cbs = noise(w / 2, h, 11);
             let crs = noise(w / 2, h, 12);
-            let (_, decisions) = code_picture(&ctx, w, h, log2_cu, true, ChromaFormat::Yuv422, &y, &cbs, &crs);
+            let (_, decisions) = code_picture(&ctx, w, h, log2_cu, 1, ChromaFormat::Yuv422, &y, &cbs, &crs);
             if log2_cu > 3 {
                 assert!(decisions.iter().any(|d| d.split_tu) && decisions.iter().any(|d| !d.split_tu));
             }
@@ -2070,7 +2198,7 @@ mod tests {
             let y = mixed_source(w, h, n, 0x444 ^ ((log2_cu as u64) << 8) ^ qp as u64);
             let cbs = noise(w, h, 0x444cb);
             let crs = noise(w, h, 0x444c7);
-            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, true, ChromaFormat::Yuv444, &y, &cbs, &crs);
+            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, 1, ChromaFormat::Yuv444, &y, &cbs, &crs);
             assert!(
                 decisions.iter().any(|d| d.split_tu) && decisions.iter().any(|d| !d.split_tu),
                 "log2_cu={log2_cu} qp={qp}: only one structure occurred"
@@ -2110,7 +2238,7 @@ mod tests {
             let y = noise(w, h, 0x444b + log2_cu as u64);
             let cbs = noise(w, h, 0xc1);
             let crs = noise(w, h, 0xc2);
-            let (pic, _) = code_picture(&ctx, w, h, log2_cu, true, ChromaFormat::Yuv444, &y, &cbs, &crs);
+            let (pic, _) = code_picture(&ctx, w, h, log2_cu, 1, ChromaFormat::Yuv444, &y, &cbs, &crs);
             for (name, plane, src) in [("y", &pic.recon.y, &y), ("cb", &pic.recon.cb, &cbs), ("cr", &pic.recon.cr, &crs)] {
                 let off = plane.origin();
                 for yy in 0..h {
@@ -2144,7 +2272,7 @@ mod tests {
                 }
             }
             let c = vec![128u8; w * h / 4];
-            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, true, ChromaFormat::Yuv420, &y, &c, &c);
+            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, 1, ChromaFormat::Yuv420, &y, &c, &c);
             let d = &decisions[0];
             assert!(d.split_tu, "log2_cu={log2_cu}: the busy quadrant did not force a split");
             // Positional cbf slots: the three flat children's first slots
@@ -2175,8 +2303,9 @@ mod tests {
             let (w, h) = (n, n);
             let y = noise(w, h, 0x0451 + log2_cu as u64);
             let c = vec![128u8; w * h / 4];
-            let (_, decisions) = code_picture(&ctx, w, h, log2_cu, true, ChromaFormat::Yuv420, &y, &c, &c);
+            let (_, decisions) = code_picture(&ctx, w, h, log2_cu, 2, ChromaFormat::Yuv420, &y, &c, &c);
             assert!(!decisions[0].split_tu, "log2_cu={log2_cu}: uniform noise split anyway");
+            assert_eq!(decisions[0].split_child, [false; 4]);
         }
     }
 
@@ -2218,6 +2347,97 @@ mod tests {
             assert!(d.split_tu);
             let replayed = replay(&ctx, w, h, log2_cu, ChromaFormat::Yuv420, &[d]);
             assert_planes_equal(&pic.recon, &replayed, log2_cu, qp);
+        }
+    }
+
+    /// The construction the second level exists for: a CU flat but for a
+    /// busy quarter-size island in the far corner. One split level puts
+    /// the island inside a child that is still three-quarters flat; the
+    /// second level isolates it into a single leaf, so the decision must
+    /// subdivide exactly that child and put every nonzero level in its
+    /// last leaf. At a 16 CTB in 4:2:0 — production geometry — the
+    /// subdivided child's leaves are 4x4 luma, so this is also the
+    /// assertion that the DST now carries production traffic: the leaf
+    /// levels were forward-DST'd, and the replay's inverse-DST plus the
+    /// distortion bound would expose a mismatched transform, as the
+    /// mutation record shows.
+    #[test]
+    fn an_isolated_island_earns_the_second_level() {
+        let kit = Kit::new();
+        let ctx = kit.ctx(30, false);
+        for log2_cu in 4..=5u32 {
+            let n = 1usize << log2_cu;
+            let (w, h) = (n, n);
+            let mut y = vec![128u8; w * h];
+            let mut s = 0x151a4du64;
+            for yy in 3 * n / 4..n {
+                for xx in 3 * n / 4..n {
+                    y[yy * w + xx] = lcg(&mut s) as u8;
+                }
+            }
+            let c = vec![128u8; w * h / 4];
+            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, 2, ChromaFormat::Yuv420, &y, &c, &c);
+            let d = &decisions[0];
+            assert!(d.split_tu, "log2_cu={log2_cu}: the island did not force a split at all");
+            assert_eq!(d.split_child, [false, false, false, true], "log2_cu={log2_cu}: the island's child did not subdivide");
+            // Every nonzero level sits in the island's leaf — the last
+            // leaf of the last child — and only its cbf slot is set.
+            let mut want = [false; 16];
+            want[15] = true;
+            assert_eq!(d.cbf_luma, want, "log2_cu={log2_cu}");
+            let q = (n / 2) * (n / 2);
+            assert!(d.luma[..3 * q + 3 * (q / 4)].iter().all(|&v| v == 0));
+            assert!(d.luma[3 * q + 3 * (q / 4)..4 * q].iter().any(|&v| v != 0));
+            let replayed = replay(&ctx, w, h, log2_cu, ChromaFormat::Yuv420, &decisions);
+            assert_planes_equal(&pic.recon, &replayed, log2_cu, 30);
+        }
+    }
+
+    /// A depth-2 walk over content with all three flavours must produce
+    /// all three structures and still replay byte-identically within the
+    /// distortion bound — the decision-produced counterpart of the
+    /// forced-shape anchor, and the non-vacuity guard for the deeper
+    /// search (a sweep where no child ever subdivided would test
+    /// nothing new).
+    #[test]
+    fn depth2_decisions_replay_across_content() {
+        let kit = Kit::new();
+        for &(log2_cu, qp) in &[(4u32, 26i32), (4, 40), (5, 30)] {
+            let ctx = kit.ctx(qp, false);
+            let n = 1usize << log2_cu;
+            let (w, h) = (6 * n, 2 * n);
+            let y = mixed_source3(w, h, n, 0xdee9e4 ^ ((log2_cu as u64) << 8) ^ qp as u64);
+            let cbs = noise(w / 2, h / 2, 41);
+            let crs = noise(w / 2, h / 2, 42);
+            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, 2, ChromaFormat::Yuv420, &y, &cbs, &crs);
+            assert!(decisions.iter().any(|d| !d.split_tu), "log2_cu={log2_cu} qp={qp}: no unsplit CU");
+            assert!(
+                decisions.iter().any(|d| d.split_child.iter().any(|&f| f)),
+                "log2_cu={log2_cu} qp={qp}: no child ever subdivided, the deeper search is untested"
+            );
+            // Mixed shapes — a split CU carrying subdivided and plain
+            // children side by side — are where the positional layout and
+            // the per-child walk earn their keep; require them rather
+            // than hope. (Pure one-level CUs need not occur at every QP:
+            // a flat child beside a noisy neighbour picks up edge
+            // residual, and isolating that into one leaf can genuinely
+            // win — the depth-1 regression tests pin the pure shapes.)
+            assert!(
+                decisions.iter().any(|d| d.split_tu && d.split_child.iter().any(|&f| f) && d.split_child.iter().any(|&f| !f)),
+                "log2_cu={log2_cu} qp={qp}: no mixed-shape CU occurred"
+            );
+            let replayed = replay(&ctx, w, h, log2_cu, ChromaFormat::Yuv420, &decisions);
+            assert_planes_equal(&pic.recon, &replayed, log2_cu, qp);
+            let step = 1i32 << (qp / 6);
+            let off = pic.recon.y.origin();
+            let mut worst = 0i32;
+            for yy in 0..h {
+                for xx in 0..w {
+                    let dd = pic.recon.y.data[off + yy * pic.recon.y.stride + xx] as i32 - y[yy * w + xx] as i32;
+                    worst = worst.max(dd.abs());
+                }
+            }
+            assert!(worst <= 8 * step + 16, "log2_cu={log2_cu} qp={qp} worst={worst}");
         }
     }
 
