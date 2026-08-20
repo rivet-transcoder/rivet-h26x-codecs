@@ -178,6 +178,22 @@ fi
 # prove nothing about the filter. detail and motion are where the filter
 # actually runs. A row is only as strong as the clips that make it do
 # something.
+#
+# The third instance of that, and the sharpest, is about a shape rather
+# than a filter. H.264's sub-16x16 partitions were built against a corpus
+# that could barely exercise them: across every clip here before the one
+# with a hard cut, the whole gate produced FOUR Inter8x8 macroblocks. Add
+# a clip whose halves genuinely move differently and the same encoder at
+# the same quantiser produces 204 Inter16x8, 74 Inter8x16 and 164
+# Inter8x8. Nothing about the configuration list changed; a cut is simply
+# a lot of macroblocks that one vector cannot describe.
+#
+# So this is now three for three - SAO, lossless, and the partition
+# shapes - and the general form is worth stating: a configuration row
+# turns a code path ON, and only the source decides whether anything
+# TAKES it. Where a feature is chosen per block rather than set per
+# stream, a row proves the syntax and a clip proves the feature. Reach
+# for the corpus before reaching for the configuration list.
 CONFIGS=${CONFIGS:-"
 lossless-intra|--codec h264 --lossless --gop 0
 cqp-intra|--codec h264 --qp 26 --gop 0
