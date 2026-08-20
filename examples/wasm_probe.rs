@@ -135,8 +135,9 @@ fn lcg(seed: &mut u64) -> u32 {
 
 /// Compare every entry of the installed 8-bit HEVC kernel table against the
 /// scalar reference over randomized inputs — all the block shapes the
-/// dispatch serves, every fractional position, and the clipping corners —
-/// returning the number of comparisons that disagreed (0 = bit-exact).
+/// dispatch serves, every fractional position, the fused kernels at every
+/// (fx, fy), the deblocking filters, and the clipping corners — returning
+/// the number of comparisons that disagreed (0 = bit-exact).
 ///
 /// This is the `#[cfg(test)]` module the wasm kernel files cannot have:
 /// `wasm32-unknown-unknown` has no test harness, so the sweep is exported
@@ -298,6 +299,81 @@ pub extern "C" fn h26x_hevc_dsp_check() -> u32 {
             (d.sao_edge)(&mut b, &src, origin, stride, w, h, na, nb, &off, 255);
             fails += (a != b) as u32;
         }
+    }
+
+    // Fused interpolation + prediction, against the scalar composition.
+    let mut seed = 37u64;
+    {
+        let stride = 128;
+        let src: Vec<u8> = (0..stride * 128).map(|_| lcg(&mut seed) as u8).collect();
+        let mut ta = vec![0i16; h26x::dsp::hevc::MC_TMP_LEN];
+        let mut tb = vec![0i16; h26x::dsp::hevc::MC_TMP_LEN];
+        for &(w, h) in &SIZES {
+            let other: Vec<i16> = (0..w * h).map(|_| (lcg(&mut seed) % 32768) as i16 - 16384).collect();
+            let ds = w + 9;
+            let mut a = vec![0u8; ds * h];
+            let mut b = vec![0u8; ds * h];
+            for fx in 0..4 {
+                for fy in 0..4 {
+                    (s.qpel_uni)(&mut a, ds, &src, stride, w, h, fx, fy, &mut ta, 8);
+                    (d.qpel_uni)(&mut b, ds, &src, stride, w, h, fx, fy, &mut tb, 8);
+                    fails += (a != b) as u32;
+                    (s.qpel_bi)(&mut a, ds, &src, stride, w, h, fx, fy, &mut ta, &other, 8);
+                    (d.qpel_bi)(&mut b, ds, &src, stride, w, h, fx, fy, &mut tb, &other, 8);
+                    fails += (a != b) as u32;
+                }
+            }
+            for fx in 0..8 {
+                for fy in 0..8 {
+                    (s.epel_uni)(&mut a, ds, &src, stride, w, h, fx, fy, &mut ta, 8);
+                    (d.epel_uni)(&mut b, ds, &src, stride, w, h, fx, fy, &mut tb, 8);
+                    fails += (a != b) as u32;
+                    (s.epel_bi)(&mut a, ds, &src, stride, w, h, fx, fy, &mut ta, &other, 8);
+                    (d.epel_bi)(&mut b, ds, &src, stride, w, h, fx, fy, &mut tb, &other, 8);
+                    fails += (a != b) as u32;
+                }
+            }
+        }
+    }
+
+    // Deblocking: near-flat planes with a random base and spread so every
+    // path — untouched, weak, strong, and the per-side exemptions — comes up.
+    let mut seed = 53u64;
+    let stride = 48;
+    for trial in 0..500 {
+        let base = lcg(&mut seed) % 256;
+        let spread = 1 + lcg(&mut seed) % 48;
+        let plane: Vec<u8> = (0..stride * 32).map(|_| ((base + lcg(&mut seed) % spread).min(255)) as u8).collect();
+        let beta = [(lcg(&mut seed) % 64) as i32, (lcg(&mut seed) % 64) as i32];
+        let tc = [(lcg(&mut seed) % 20) as i32, (lcg(&mut seed) % 20) as i32];
+        let bl = |v: u32| v % 2 == 0;
+        let no_p = [bl(lcg(&mut seed)), bl(lcg(&mut seed))];
+        let no_q = [bl(lcg(&mut seed)), bl(lcg(&mut seed))];
+        let tc4 = [tc[0], tc[1], (lcg(&mut seed) % 20) as i32, (lcg(&mut seed) % 20) as i32];
+        let np4 = [no_p[0], no_p[1], bl(lcg(&mut seed)), bl(lcg(&mut seed))];
+        let nq4 = [no_q[0], no_q[1], bl(lcg(&mut seed)), bl(lcg(&mut seed))];
+        let off = 8 * stride + 8;
+        let mut a = plane.clone();
+        let mut b = plane;
+        match trial % 4 {
+            0 => {
+                (s.deblock_luma_v)(&mut a, off, stride, beta, tc, no_p, no_q, 255);
+                (d.deblock_luma_v)(&mut b, off, stride, beta, tc, no_p, no_q, 255);
+            }
+            1 => {
+                (s.deblock_luma_h)(&mut a, off, stride, beta, tc, no_p, no_q, 255);
+                (d.deblock_luma_h)(&mut b, off, stride, beta, tc, no_p, no_q, 255);
+            }
+            2 => {
+                (s.deblock_chroma_v)(&mut a, off, stride, tc4, np4, nq4, 255);
+                (d.deblock_chroma_v)(&mut b, off, stride, tc4, np4, nq4, 255);
+            }
+            _ => {
+                (s.deblock_chroma_h)(&mut a, off, stride, tc4, np4, nq4, 255);
+                (d.deblock_chroma_h)(&mut b, off, stride, tc4, np4, nq4, 255);
+            }
+        }
+        fails += (a != b) as u32;
     }
 
     fails

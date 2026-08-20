@@ -43,6 +43,17 @@
 //!   `max/cmpeq/andnot` dance for `sign(v − a)` collapses to two compares;
 //!   and `u8x16_swizzle` is the SSSE3 `pshufb` offset lookup (its
 //!   zero-on-out-of-range semantics never trigger — edgeIdx is 0..=4).
+//! - The deblocking filters follow `hevc_x86_128.rs`'s shared i32-lane
+//!   shape with byte loads and stores: four lines of an edge are four i32
+//!   lanes per sample position, one luma segment per filter call, two
+//!   chroma segments per vector; the arithmetic is sample-size independent
+//!   and ports instruction for instruction.
+//! - The fused MC entries (`fused_mc = true`) follow `hevc_x86_128.rs`'s
+//!   `Out`/`emit` driver: the same FIR loops serve the two-pass and the
+//!   fused kernels, with the output stage — 14-bit store, default uni, or
+//!   default bi — selected per instantiation, so the fused path writes
+//!   samples straight out of the filter instead of taking a second pass
+//!   over a 14-bit prediction.
 //!
 //! One structural improvement over the x86-128 shapes: the second stage's
 //! 14-bit input rows are stored contiguously (stride = width), so when they
@@ -59,11 +70,6 @@
 //!
 //! What stays on the scalar reference, deliberately:
 //!
-//! - **Deblocking** — out of scope for this pass, exactly as the H.264 tier
-//!   left its deblocking scalar; it follows.
-//! - **The fused MC entries** (`qpel_uni` … `epel_bi`; `fused_mc` stays
-//!   `false`) — the decoder's two-pass path runs on the kernels here, so
-//!   nothing is lost but the fused kernels' second-pass saving. A follow-up.
 //! - **`idst4`** and the 4x4 IDCT — the scalar butterfly is 4 lines
 //!   (`hevc_x86_128.rs` reaches the same verdict for the 4x4).
 //! - **The `u16` table** — wasm decode is 8-bit today; the 10/12-bit
@@ -106,10 +112,18 @@ pub fn install(d: &mut HevcDsp<u8>) {
     d.bi = bi;
     d.weighted_uni = weighted_uni;
     d.weighted_bi = weighted_bi;
+    d.qpel_uni = qpel_uni;
+    d.epel_uni = epel_uni;
+    d.qpel_bi = qpel_bi;
+    d.epel_bi = epel_bi;
+    d.fused_mc = true;
     d.sao_band = sao_band;
     d.sao_edge = sao_edge;
-    // idst4, the fused MC entries and the deblocking filters keep the scalar
-    // reference — see the module header for why each one does.
+    d.deblock_luma_v = deblock_luma_v;
+    d.deblock_luma_h = deblock_luma_h;
+    d.deblock_chroma_v = deblock_chroma_v;
+    d.deblock_chroma_h = deblock_chroma_h;
+    // idst4 keeps the scalar reference — see the module header for why.
 }
 
 // ----------------------------------------------------------------------
@@ -316,10 +330,60 @@ unsafe fn fir16(p: *const u8, step: usize, t: &Taps) -> (v128, v128) {
     }
 }
 
-/// Horizontal FIR with `TAPS` taps over bytes, into 14-bit predictions of
-/// stride `w`.
+/// What a FIR stage produces, per output kind (`MODE_*`) — the shape the
+/// x86-128 fused path uses, so the same FIR loops serve the two-pass and
+/// the fused kernels.
+#[derive(Clone, Copy)]
+struct Out {
+    /// `MODE_I16`: 14-bit predictions, stride `w`.
+    i16: *mut i16,
+    /// `MODE_UNI` / `MODE_BI`: samples, stride `stride`.
+    u8: *mut u8,
+    /// Sample stride.
+    stride: usize,
+    /// `MODE_BI`: the other list's 14-bit prediction, stride `w`.
+    other: *const i16,
+    /// Block width (the stride of `i16` and `other`).
+    w: usize,
+}
+
+/// 14-bit predictions (the two-pass path and the first stage of hv).
+const MODE_I16: u8 = 0;
+/// Default-weighted uni-prediction samples: `(v + 32) >> 6`.
+const MODE_UNI: u8 = 1;
+/// Default-weighted bi-prediction samples: `(v + other + 64) >> 7`.
+const MODE_BI: u8 = 2;
+
+/// Emit 8 lanes of a stage's output (`v`, 14-bit) at (`row`, `x`), the
+/// first `n` lanes.
 #[inline]
-unsafe fn fir_h<const TAPS: usize>(dst: *mut i16, src: *const u8, src_stride: usize, w: usize, h: usize, taps: &[i8], shift: i32) {
+unsafe fn emit<const MODE: u8>(out: &Out, row: usize, x: usize, v: v128, n: usize) {
+    unsafe {
+        match MODE {
+            MODE_I16 => store_i16_n(out.i16.add(row * out.w + x), v, n),
+            MODE_UNI => {
+                let r = i16x8_shr(i16x8_add_sat(v, i16x8_splat(32)), 6);
+                store_bytes(out.u8.add(row * out.stride + x), pack8(r), n);
+            }
+            _ => {
+                // Saturating sums, exact after the clip (see `bi`).
+                let o = load_i16_n(out.other.add(row * out.w + x), n);
+                let r = i16x8_shr(i16x8_add_sat(i16x8_add_sat(v, o), i16x8_splat(64)), 7);
+                store_bytes(out.u8.add(row * out.stride + x), pack8(r), n);
+            }
+        }
+    }
+}
+
+/// An [`Out`] for the two-pass kernels: 14-bit predictions only.
+#[inline]
+fn i16_out(dst: &mut [i16], w: usize) -> Out {
+    Out { i16: dst.as_mut_ptr(), u8: std::ptr::null_mut(), stride: 0, other: std::ptr::null(), w }
+}
+
+/// Horizontal FIR with `TAPS` taps over bytes.
+#[inline]
+unsafe fn fir_h<const TAPS: usize, const MODE: u8>(out: &Out, src: *const u8, src_stride: usize, w: usize, h: usize, taps: &[i8], shift: i32) {
     unsafe {
         let t = taps_load(taps, TAPS);
         let sh = shift as u32;
@@ -327,20 +391,19 @@ unsafe fn fir_h<const TAPS: usize>(dst: *mut i16, src: *const u8, src_stride: us
             // Narrow blocks: 8-byte loads, one vector per row.
             for y in 0..h {
                 let acc = fir8(src.add(y * src_stride), 1, &t);
-                store_i16_n(dst.add(y * w), i16x8_shr(acc, sh), w);
+                emit::<MODE>(out, y, 0, i16x8_shr(acc, sh), w);
             }
             return;
         }
         for y in 0..h {
             let s = src.add(y * src_stride);
-            let d = dst.add(y * w);
             let mut x = 0;
             while x < w {
                 let (lo, hi) = fir16(s.add(x), 1, &t);
                 let n = w - x;
-                store_i16_n(d.add(x), i16x8_shr(lo, sh), n.min(8));
+                emit::<MODE>(out, y, x, i16x8_shr(lo, sh), n.min(8));
                 if n > 8 {
-                    store_i16_n(d.add(x + 8), i16x8_shr(hi, sh), (n - 8).min(8));
+                    emit::<MODE>(out, y, x + 8, i16x8_shr(hi, sh), (n - 8).min(8));
                 }
                 x += 16;
             }
@@ -350,7 +413,7 @@ unsafe fn fir_h<const TAPS: usize>(dst: *mut i16, src: *const u8, src_stride: us
 
 /// Vertical FIR with `TAPS` taps over byte rows.
 #[inline]
-unsafe fn fir_v<const TAPS: usize>(dst: *mut i16, src: *const u8, src_stride: usize, w: usize, h: usize, taps: &[i8], shift: i32) {
+unsafe fn fir_v<const TAPS: usize, const MODE: u8>(out: &Out, src: *const u8, src_stride: usize, w: usize, h: usize, taps: &[i8], shift: i32) {
     unsafe {
         let t = taps_load(taps, TAPS);
         let sh = shift as u32;
@@ -358,7 +421,7 @@ unsafe fn fir_v<const TAPS: usize>(dst: *mut i16, src: *const u8, src_stride: us
         if w <= 8 {
             for y in 0..h {
                 let acc = fir8(row(y), src_stride, &t);
-                store_i16_n(dst.add(y * w), i16x8_shr(acc, sh), w);
+                emit::<MODE>(out, y, 0, i16x8_shr(acc, sh), w);
             }
             return;
         }
@@ -367,9 +430,9 @@ unsafe fn fir_v<const TAPS: usize>(dst: *mut i16, src: *const u8, src_stride: us
             while x < w {
                 let (lo, hi) = fir16(row(y).add(x), src_stride, &t);
                 let n = w - x;
-                store_i16_n(dst.add(y * w + x), i16x8_shr(lo, sh), n.min(8));
+                emit::<MODE>(out, y, x, i16x8_shr(lo, sh), n.min(8));
                 if n > 8 {
-                    store_i16_n(dst.add(y * w + x + 8), i16x8_shr(hi, sh), (n - 8).min(8));
+                    emit::<MODE>(out, y, x + 8, i16x8_shr(hi, sh), (n - 8).min(8));
                 }
                 x += 16;
             }
@@ -386,7 +449,7 @@ unsafe fn fir_v<const TAPS: usize>(dst: *mut i16, src: *const u8, src_stride: us
 /// outputs: output `i` is `Σ tapₖ · src[i + k·w]` for every flat index, so
 /// every lane is busy at every block width. See the module header.
 #[inline]
-unsafe fn fir_v2<const TAPS: usize>(dst: *mut i16, src: *const i16, src_stride: usize, w: usize, h: usize, taps: &[i8]) {
+unsafe fn fir_v2<const TAPS: usize, const MODE: u8>(out: &Out, src: *const i16, src_stride: usize, w: usize, h: usize, taps: &[i8]) {
     unsafe {
         let mut c = [i32x4_splat(0); 4];
         for k in 0..TAPS / 2 {
@@ -403,11 +466,14 @@ unsafe fn fir_v2<const TAPS: usize>(dst: *mut i16, src: *const i16, src_stride: 
             }
             i16x8_narrow_i32x4(i32x4_shr(lo, 6), i32x4_shr(hi, 6))
         };
-        if src_stride == w {
+        // The flat loop is for 14-bit output only: a chunk of eight may
+        // cross a row boundary, which a contiguous i16 store can absorb but
+        // a strided sample store cannot.
+        if MODE == MODE_I16 && src_stride == w {
             let total = w * h;
             let mut i = 0;
             while i < total {
-                store_i16_n(dst.add(i), dot8(src.add(i), w), (total - i).min(8));
+                store_i16_n(out.i16.add(i), dot8(src.add(i), w), (total - i).min(8));
                 i += 8;
             }
             return;
@@ -415,7 +481,7 @@ unsafe fn fir_v2<const TAPS: usize>(dst: *mut i16, src: *const i16, src_stride: 
         for y in 0..h {
             let mut x = 0;
             while x < w {
-                store_i16_n(dst.add(y * w + x), dot8(src.add(y * src_stride + x), src_stride), (w - x).min(8));
+                emit::<MODE>(out, y, x, dot8(src.add(y * src_stride + x), src_stride), (w - x).min(8));
                 x += 8;
             }
         }
@@ -457,42 +523,165 @@ fn qpel_h(dst: &mut [i16], src: &[u8], src_stride: usize, w: usize, h: usize, fr
     if !fits_b(src.len(), src_stride, h, w, 7) || dst.len() < w * h {
         return (HevcDsp::<u8>::SCALAR.qpel_h)(dst, src, src_stride, w, h, frac, shift);
     }
-    unsafe { fir_h::<8>(dst.as_mut_ptr(), src.as_ptr(), src_stride, w, h, &QPEL_FILTERS[frac][..8], shift) }
+    let out = i16_out(dst, w);
+    unsafe { fir_h::<8, MODE_I16>(&out, src.as_ptr(), src_stride, w, h, &QPEL_FILTERS[frac][..8], shift) }
 }
 
 fn qpel_v(dst: &mut [i16], src: &[u8], src_stride: usize, w: usize, h: usize, frac: usize, shift: i32) {
     if !fits_b(src.len(), src_stride, h + 7, w, 0) || dst.len() < w * h {
         return (HevcDsp::<u8>::SCALAR.qpel_v)(dst, src, src_stride, w, h, frac, shift);
     }
-    unsafe { fir_v::<8>(dst.as_mut_ptr(), src.as_ptr(), src_stride, w, h, &QPEL_FILTERS[frac][..8], shift) }
+    let out = i16_out(dst, w);
+    unsafe { fir_v::<8, MODE_I16>(&out, src.as_ptr(), src_stride, w, h, &QPEL_FILTERS[frac][..8], shift) }
 }
 
 fn qpel_v2(dst: &mut [i16], src: &[i16], src_stride: usize, w: usize, h: usize, frac: usize) {
     if !fits_v2(src.len(), src_stride, w, h, 8) || dst.len() < w * h {
         return (HevcDsp::<u8>::SCALAR.qpel_v2)(dst, src, src_stride, w, h, frac);
     }
-    unsafe { fir_v2::<8>(dst.as_mut_ptr(), src.as_ptr(), src_stride, w, h, &QPEL_FILTERS[frac][..8]) }
+    let out = i16_out(dst, w);
+    unsafe { fir_v2::<8, MODE_I16>(&out, src.as_ptr(), src_stride, w, h, &QPEL_FILTERS[frac][..8]) }
 }
 
 fn epel_h(dst: &mut [i16], src: &[u8], src_stride: usize, w: usize, h: usize, frac: usize, shift: i32) {
     if !fits_b(src.len(), src_stride, h, w, 3) || dst.len() < w * h {
         return (HevcDsp::<u8>::SCALAR.epel_h)(dst, src, src_stride, w, h, frac, shift);
     }
-    unsafe { fir_h::<4>(dst.as_mut_ptr(), src.as_ptr(), src_stride, w, h, &EPEL_FILTERS[frac], shift) }
+    let out = i16_out(dst, w);
+    unsafe { fir_h::<4, MODE_I16>(&out, src.as_ptr(), src_stride, w, h, &EPEL_FILTERS[frac], shift) }
 }
 
 fn epel_v(dst: &mut [i16], src: &[u8], src_stride: usize, w: usize, h: usize, frac: usize, shift: i32) {
     if !fits_b(src.len(), src_stride, h + 3, w, 0) || dst.len() < w * h {
         return (HevcDsp::<u8>::SCALAR.epel_v)(dst, src, src_stride, w, h, frac, shift);
     }
-    unsafe { fir_v::<4>(dst.as_mut_ptr(), src.as_ptr(), src_stride, w, h, &EPEL_FILTERS[frac], shift) }
+    let out = i16_out(dst, w);
+    unsafe { fir_v::<4, MODE_I16>(&out, src.as_ptr(), src_stride, w, h, &EPEL_FILTERS[frac], shift) }
 }
 
 fn epel_v2(dst: &mut [i16], src: &[i16], src_stride: usize, w: usize, h: usize, frac: usize) {
     if !fits_v2(src.len(), src_stride, w, h, 4) || dst.len() < w * h {
         return (HevcDsp::<u8>::SCALAR.epel_v2)(dst, src, src_stride, w, h, frac);
     }
-    unsafe { fir_v2::<4>(dst.as_mut_ptr(), src.as_ptr(), src_stride, w, h, &EPEL_FILTERS[frac]) }
+    let out = i16_out(dst, w);
+    unsafe { fir_v2::<4, MODE_I16>(&out, src.as_ptr(), src_stride, w, h, &EPEL_FILTERS[frac]) }
+}
+
+// ----------------------------------------------------------------------
+// Fused interpolation + prediction
+// ----------------------------------------------------------------------
+
+/// Copy a `w x h` byte block (whole-sample uni-prediction: the prediction
+/// is the reference block).
+unsafe fn copy_rows_u8(dst: *mut u8, dst_stride: usize, src: *const u8, src_stride: usize, w: usize, h: usize) {
+    unsafe {
+        for y in 0..h {
+            let s = src.add(y * src_stride);
+            let d = dst.add(y * dst_stride);
+            let mut x = 0;
+            while x < w {
+                let n = w - x;
+                if n >= 16 {
+                    v128_store(d.add(x) as *mut v128, v128_load(s.add(x) as *const v128));
+                    x += 16;
+                } else if n >= 8 {
+                    std::ptr::write_unaligned(d.add(x) as *mut u64, std::ptr::read_unaligned(s.add(x) as *const u64));
+                    x += 8;
+                } else if n >= 4 {
+                    std::ptr::write_unaligned(d.add(x) as *mut u32, std::ptr::read_unaligned(s.add(x) as *const u32));
+                    x += 4;
+                } else {
+                    std::ptr::write_unaligned(d.add(x) as *mut u16, std::ptr::read_unaligned(s.add(x) as *const u16));
+                    x += 2;
+                }
+            }
+        }
+    }
+}
+
+/// Whether the second stage's `w`-stride 14-bit rows can be read 8 lanes
+/// at a time for `rows` rows within `len`.
+#[inline]
+fn fits_i16(len: usize, w: usize, rows: usize) -> bool {
+    let last_x = if w <= 8 { 0 } else { (w - 1) / 8 * 8 };
+    (rows - 1) * w + last_x + 8 <= len
+}
+
+/// The fused kernels: `TAPS` (8 luma / 4 chroma), `MODE_UNI` or `MODE_BI`.
+#[allow(clippy::too_many_arguments)]
+fn fused<const TAPS: usize, const MODE: u8>(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], other: &[i16]) {
+    let reach = TAPS / 2 - 1;
+    let at_block = reach * src_stride + reach;
+    let hh = h + TAPS - 1;
+    let ok = w >= 2
+        && h >= 1
+        && (h - 1) * dst_stride + w <= dst.len()
+        && (MODE != MODE_BI || other.len() >= w * h)
+        && tmp.len() >= super::hevc::MC_TMP_LEN
+        && match (fx, fy) {
+            (0, 0) => (h - 1) * src_stride + w + at_block <= src.len(),
+            (_, 0) => src.len() > reach * src_stride && fits_b(src.len() - reach * src_stride, src_stride, h, w, TAPS - 1),
+            (0, _) => src.len() > reach && fits_b(src.len() - reach, src_stride, hh, w, 0),
+            _ => fits_b(src.len(), src_stride, hh, w, TAPS - 1) && fits_i16(super::hevc::MC_TMP_LEN, w, hh),
+        };
+    if !ok {
+        let s = HevcDsp::<u8>::SCALAR;
+        return match (TAPS, MODE) {
+            (8, MODE_UNI) => (s.qpel_uni)(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, 8),
+            (8, _) => (s.qpel_bi)(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, other, 8),
+            (_, MODE_UNI) => (s.epel_uni)(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, 8),
+            _ => (s.epel_bi)(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, other, 8),
+        };
+    }
+    let (tx, ty): (&[i8], &[i8]) = if TAPS == 8 { (&QPEL_FILTERS[fx][..8], &QPEL_FILTERS[fy][..8]) } else { (&EPEL_FILTERS[fx], &EPEL_FILTERS[fy]) };
+    let out = Out { i16: std::ptr::null_mut(), u8: dst.as_mut_ptr(), stride: dst_stride, other: other.as_ptr(), w };
+    unsafe {
+        match (fx, fy) {
+            (0, 0) => {
+                if MODE == MODE_UNI {
+                    copy_rows_u8(dst.as_mut_ptr(), dst_stride, src.as_ptr().add(at_block), src_stride, w, h);
+                } else {
+                    // Whole-sample bi: widen, then the usual average.
+                    let (pred, _) = tmp.split_at_mut(w * h);
+                    copy(pred, &src[at_block..], src_stride, w, h, 6);
+                    bi(dst, dst_stride, other, pred, w, h, 7, 255);
+                }
+            }
+            (_, 0) => fir_h::<TAPS, MODE>(&out, src.as_ptr().add(reach * src_stride), src_stride, w, h, tx, 0),
+            (0, _) => fir_v::<TAPS, MODE>(&out, src.as_ptr().add(reach), src_stride, w, h, ty, 0),
+            _ => {
+                let mid = i16_out(tmp, w);
+                fir_h::<TAPS, MODE_I16>(&mid, src.as_ptr(), src_stride, w, hh, tx, 0);
+                fir_v2::<TAPS, MODE>(&out, tmp.as_ptr(), w, w, h, ty);
+            }
+        }
+    }
+}
+
+fn qpel_uni(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], bit_depth: u32) {
+    debug_assert_eq!(bit_depth, 8);
+    let _ = bit_depth;
+    fused::<8, MODE_UNI>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, &[])
+}
+
+fn epel_uni(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], bit_depth: u32) {
+    debug_assert_eq!(bit_depth, 8);
+    let _ = bit_depth;
+    fused::<4, MODE_UNI>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, &[])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qpel_bi(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], other: &[i16], bit_depth: u32) {
+    debug_assert_eq!(bit_depth, 8);
+    let _ = bit_depth;
+    fused::<8, MODE_BI>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, other)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn epel_bi(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], other: &[i16], bit_depth: u32) {
+    debug_assert_eq!(bit_depth, 8);
+    let _ = bit_depth;
+    fused::<4, MODE_BI>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, other)
 }
 
 // ----------------------------------------------------------------------
@@ -933,3 +1122,334 @@ fn sao_edge(dst: &mut [u8], src: &[u8], origin: usize, stride: usize, w: usize, 
         }
     }
 }
+
+// ----------------------------------------------------------------------
+// Deblocking
+// ----------------------------------------------------------------------
+//
+// The shared i32-lane filters of `hevc_x86_128.rs` with byte loads and
+// stores: four lines of an edge are four i32 lanes per sample position
+// (p3..q3), and four lines is exactly one luma segment, so the filter runs
+// once per segment and the per-segment lane masks of the 256-bit kernel
+// collapse to scalar booleans. Chroma segments are two lines, so a vector
+// holds two of them.
+
+/// Eight consecutive bytes as two vectors of 4 x i32 (lines 0..3, 4..7).
+#[inline]
+unsafe fn ld8_u8_i32(p: *const u8) -> (v128, v128) {
+    unsafe {
+        let v = u16x8_extend_low_u8x16(v128_load64_zero(p as *const u64));
+        (u32x4_extend_low_u16x8(v), u32x4_extend_high_u16x8(v))
+    }
+}
+
+/// Two vectors of 4 x i32 back to eight u16.
+///
+/// Signed saturation: every lane the deblocking filters produce is a
+/// sample in `0..=max` — the untouched positions are originals, the weak
+/// filter clips explicitly, and the strong filter's `Clip3(p ± 2tc, avg)`
+/// cannot leave the range because `avg` is in it — so the saturation never
+/// fires and the narrow is exact.
+#[inline]
+fn pack8_i32_u16(lo: v128, hi: v128) -> v128 {
+    i16x8_narrow_i32x4(lo, hi)
+}
+
+/// Two vectors of 4 x i32 (each within a byte) to eight bytes in the low
+/// half.
+#[inline]
+fn pack8_i32_u8(lo: v128, hi: v128) -> v128 {
+    let p = pack8_i32_u16(lo, hi);
+    u8x16_narrow_i16x8(p, p)
+}
+
+/// `unpacklo_epi32`.
+#[inline]
+fn zip_lo32(a: v128, b: v128) -> v128 {
+    i32x4_shuffle::<0, 4, 1, 5>(a, b)
+}
+
+/// `unpackhi_epi32`.
+#[inline]
+fn zip_hi32(a: v128, b: v128) -> v128 {
+    i32x4_shuffle::<2, 6, 3, 7>(a, b)
+}
+
+/// `unpacklo_epi64`.
+#[inline]
+fn zip_lo64(a: v128, b: v128) -> v128 {
+    i64x2_shuffle::<0, 2>(a, b)
+}
+
+/// `unpackhi_epi64`.
+#[inline]
+fn zip_hi64(a: v128, b: v128) -> v128 {
+    i64x2_shuffle::<1, 3>(a, b)
+}
+
+/// Transpose eight 8-lane u16 rows.
+#[inline]
+fn transpose8_u16(r: &mut [v128; 8]) {
+    let a0 = zip_lo16(r[0], r[1]);
+    let a1 = zip_hi16(r[0], r[1]);
+    let a2 = zip_lo16(r[2], r[3]);
+    let a3 = zip_hi16(r[2], r[3]);
+    let a4 = zip_lo16(r[4], r[5]);
+    let a5 = zip_hi16(r[4], r[5]);
+    let a6 = zip_lo16(r[6], r[7]);
+    let a7 = zip_hi16(r[6], r[7]);
+    let b0 = zip_lo32(a0, a2);
+    let b1 = zip_hi32(a0, a2);
+    let b2 = zip_lo32(a1, a3);
+    let b3 = zip_hi32(a1, a3);
+    let b4 = zip_lo32(a4, a6);
+    let b5 = zip_hi32(a4, a6);
+    let b6 = zip_lo32(a5, a7);
+    let b7 = zip_hi32(a5, a7);
+    r[0] = zip_lo64(b0, b4);
+    r[1] = zip_hi64(b0, b4);
+    r[2] = zip_lo64(b1, b5);
+    r[3] = zip_hi64(b1, b5);
+    r[4] = zip_lo64(b2, b6);
+    r[5] = zip_hi64(b2, b6);
+    r[6] = zip_lo64(b3, b7);
+    r[7] = zip_hi64(b3, b7);
+}
+
+/// `m ? b : a` per bit.
+#[inline]
+fn sel(a: v128, b: v128, m: v128) -> v128 {
+    v128_bitselect(b, a, m)
+}
+
+/// The luma filter on one four-line segment, in place.
+fn luma_filter4(v: &mut [v128; 8], beta: i32, tc: i32, no_p: bool, no_q: bool, max: i32) {
+    if beta == 0 && tc == 0 {
+        return;
+    }
+    let [p3, p2, p1, p0, q0, q1, q2, q3] = *v;
+    let add = i32x4_add;
+    let sub = i32x4_sub;
+    let dbl = |a| i32x4_shl(a, 1);
+    let absd = |a, b| i32x4_abs(i32x4_sub(a, b));
+    // Lane-wise measures.
+    let dpv = i32x4_abs(add(sub(p2, dbl(p1)), p0));
+    let dqv = i32x4_abs(add(sub(q2, dbl(q1)), q0));
+    let ev = add(absd(p3, p0), absd(q0, q3));
+    let fv = absd(p0, q0);
+    let mut dp = [0i32; 4];
+    let mut dq = [0i32; 4];
+    let mut e = [0i32; 4];
+    let mut f = [0i32; 4];
+    unsafe {
+        v128_store(dp.as_mut_ptr() as *mut v128, dpv);
+        v128_store(dq.as_mut_ptr() as *mut v128, dqv);
+        v128_store(e.as_mut_ptr() as *mut v128, ev);
+        v128_store(f.as_mut_ptr() as *mut v128, fv);
+    }
+    // The segment's decisions, from its lines 0 and 3.
+    let dpq0 = dp[0] + dq[0];
+    let dpq3 = dp[3] + dq[3];
+    if dpq0 + dpq3 >= beta {
+        return;
+    }
+    let dsam = |l: usize, dpq: i32| dpq < (beta >> 2) && e[l] < (beta >> 3) && f[l] < ((5 * tc + 1) >> 1);
+    let strong = dsam(0, 2 * dpq0) && dsam(3, 2 * dpq3);
+    let side = (beta + (beta >> 1)) >> 3;
+    let dep = dp[0] + dp[3] < side;
+    let deq = dq[0] + dq[3] < side;
+    let zero = i32x4_splat(0);
+    let m = |b: bool| i32x4_splat(-(b as i32));
+    let strong_m = m(strong);
+    let dep_m = m(dep);
+    let deq_m = m(deq);
+    let wp_m = m(!no_p);
+    let wq_m = m(!no_q);
+    let tcv = i32x4_splat(tc);
+    let tc2 = dbl(tcv);
+    let tch = i32x4_shr(tcv, 1);
+    // 10·tc, 9·x and 3·x as shifts and adds, as the x86-128 file does.
+    let tc10 = add(i32x4_shl(tcv, 3), i32x4_shl(tcv, 1));
+    let maxv = i32x4_splat(max);
+    let clamp = |x, lo, hi| i32x4_min(i32x4_max(x, lo), hi);
+    let two = i32x4_splat(2);
+    let four = i32x4_splat(4);
+    // Strong.
+    let p0q0 = add(p0, q0);
+    let sp0 = clamp(i32x4_shr(add(add(p2, dbl(add(p1, p0q0))), add(q1, four)), 3), sub(p0, tc2), add(p0, tc2));
+    let sp1 = clamp(i32x4_shr(add(add(p2, p1), add(p0q0, two)), 2), sub(p1, tc2), add(p1, tc2));
+    let sp2 = clamp(i32x4_shr(add(add(dbl(p3), add(p2, dbl(p2))), add(add(p1, p0q0), four)), 3), sub(p2, tc2), add(p2, tc2));
+    let sq0 = clamp(i32x4_shr(add(add(p1, dbl(add(p0q0, q1))), add(q2, four)), 3), sub(q0, tc2), add(q0, tc2));
+    let sq1 = clamp(i32x4_shr(add(add(p0q0, q1), add(q2, two)), 2), sub(q1, tc2), add(q1, tc2));
+    let sq2 = clamp(i32x4_shr(add(add(p0q0, q1), add(add(q2, dbl(q2)), add(dbl(q3), four))), 3), sub(q2, tc2), add(q2, tc2));
+    // Weak.
+    let d0 = sub(q0, p0);
+    let d1 = sub(q1, p1);
+    let d0x9 = add(i32x4_shl(d0, 3), d0);
+    let d1x3 = add(i32x4_shl(d1, 1), d1);
+    let delta = i32x4_shr(add(sub(d0x9, d1x3), i32x4_splat(8)), 4);
+    let w_m = i32x4_gt(tc10, i32x4_abs(delta));
+    let delta = clamp(delta, sub(zero, tcv), tcv);
+    let wp0 = clamp(add(p0, delta), zero, maxv);
+    let wq0 = clamp(sub(q0, delta), zero, maxv);
+    let one = i32x4_splat(1);
+    let dpv2 = clamp(i32x4_shr(add(sub(i32x4_shr(add(add(p2, p0), one), 1), p1), delta), 1), sub(zero, tch), tch);
+    let dqv2 = clamp(i32x4_shr(sub(sub(i32x4_shr(add(add(q2, q0), one), 1), q1), delta), 1), sub(zero, tch), tch);
+    let wp1 = clamp(add(p1, dpv2), zero, maxv);
+    let wq1 = clamp(add(q1, dqv2), zero, maxv);
+    // Combine: strong wins over weak; weak needs its per-line test.
+    let np0 = sel(sel(p0, wp0, w_m), sp0, strong_m);
+    let nq0 = sel(sel(q0, wq0, w_m), sq0, strong_m);
+    let np1 = sel(sel(p1, wp1, v128_and(w_m, dep_m)), sp1, strong_m);
+    let nq1 = sel(sel(q1, wq1, v128_and(w_m, deq_m)), sq1, strong_m);
+    let np2 = sel(p2, sp2, strong_m);
+    let nq2 = sel(q2, sq2, strong_m);
+    v[1] = sel(p2, np2, wp_m);
+    v[2] = sel(p1, np1, wp_m);
+    v[3] = sel(p0, np0, wp_m);
+    v[4] = sel(q0, nq0, wq_m);
+    v[5] = sel(q1, nq1, wq_m);
+    v[6] = sel(q2, nq2, wq_m);
+}
+
+/// The chroma filter on four lines (two segments): `[p1, p0, q0, q1]`.
+fn chroma_filter4(v: &mut [v128; 4], tc: [i32; 2], no_p: [bool; 2], no_q: [bool; 2], max: i32) {
+    let [p1, p0, q0, q1] = *v;
+    let tcv = i32x4(tc[0], tc[0], tc[1], tc[1]);
+    let m = |a: [bool; 2]| {
+        let x = |b: bool| -(b as i32);
+        i32x4(x(a[0]), x(a[0]), x(a[1]), x(a[1]))
+    };
+    let zero = i32x4_splat(0);
+    let on = i32x4_gt(tcv, zero);
+    let wp = v128_andnot(on, m(no_p));
+    let wq = v128_andnot(on, m(no_q));
+    let maxv = i32x4_splat(max);
+    let d = i32x4_shr(i32x4_add(i32x4_add(i32x4_shl(i32x4_sub(q0, p0), 2), i32x4_sub(p1, q1)), i32x4_splat(4)), 3);
+    let d = i32x4_min(i32x4_max(d, i32x4_sub(zero, tcv)), tcv);
+    let np0 = i32x4_min(i32x4_max(i32x4_add(p0, d), zero), maxv);
+    let nq0 = i32x4_min(i32x4_max(i32x4_sub(q0, d), zero), maxv);
+    v[1] = sel(p0, np0, wp);
+    v[2] = sel(q0, nq0, wq);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deblock_luma_v(data: &mut [u8], off: usize, stride: usize, beta: [i32; 2], tc: [i32; 2], no_p: [bool; 2], no_q: [bool; 2], max: i32) {
+    if (beta[0] == 0 && tc[0] == 0) && (beta[1] == 0 && tc[1] == 0) {
+        return;
+    }
+    assert!(off >= 4 && off + 7 * stride + 4 <= data.len());
+    unsafe {
+        let data = data.as_mut_ptr().add(off);
+        let mut r = [i32x4_splat(0); 8];
+        for (i, v) in r.iter_mut().enumerate() {
+            *v = u16x8_extend_low_u8x16(v128_load64_zero(data.add(i * stride).sub(4) as *const u64));
+        }
+        transpose8_u16(&mut r);
+        let mut v0 = [i32x4_splat(0); 8];
+        let mut v1 = [i32x4_splat(0); 8];
+        for k in 0..8 {
+            v0[k] = u32x4_extend_low_u16x8(r[k]);
+            v1[k] = u32x4_extend_high_u16x8(r[k]);
+        }
+        luma_filter4(&mut v0, beta[0], tc[0], no_p[0], no_q[0], max);
+        luma_filter4(&mut v1, beta[1], tc[1], no_p[1], no_q[1], max);
+        for k in 0..8 {
+            r[k] = pack8_i32_u16(v0[k], v1[k]);
+        }
+        transpose8_u16(&mut r);
+        for (i, v) in r.iter().enumerate() {
+            v128_store64_lane::<0>(u8x16_narrow_i16x8(*v, *v), data.add(i * stride).sub(4) as *mut u64);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deblock_luma_h(data: &mut [u8], off: usize, stride: usize, beta: [i32; 2], tc: [i32; 2], no_p: [bool; 2], no_q: [bool; 2], max: i32) {
+    if (beta[0] == 0 && tc[0] == 0) && (beta[1] == 0 && tc[1] == 0) {
+        return;
+    }
+    assert!(off >= 4 * stride && off + 3 * stride + 8 <= data.len());
+    unsafe {
+        let data = data.as_mut_ptr().add(off);
+        let mut v0 = [i32x4_splat(0); 8];
+        let mut v1 = [i32x4_splat(0); 8];
+        for k in 0..8 {
+            let (a, b) = ld8_u8_i32(data.offset((k as isize - 4) * stride as isize));
+            v0[k] = a;
+            v1[k] = b;
+        }
+        luma_filter4(&mut v0, beta[0], tc[0], no_p[0], no_q[0], max);
+        luma_filter4(&mut v1, beta[1], tc[1], no_p[1], no_q[1], max);
+        for k in 1..7 {
+            v128_store64_lane::<0>(pack8_i32_u8(v0[k], v1[k]), data.offset((k as isize - 4) * stride as isize) as *mut u64);
+        }
+    }
+}
+
+fn deblock_chroma_v(data: &mut [u8], off: usize, stride: usize, tc: [i32; 4], no_p: [bool; 4], no_q: [bool; 4], max: i32) {
+    if tc.iter().all(|&t| t == 0) {
+        return;
+    }
+    assert!(off >= 2 && off + 7 * stride + 2 <= data.len());
+    unsafe {
+        let data = data.as_mut_ptr().add(off);
+        let mut r = [i32x4_splat(0); 8];
+        for (i, v) in r.iter_mut().enumerate() {
+            let q = std::ptr::read_unaligned(data.add(i * stride).sub(2) as *const u32);
+            *v = u16x8_extend_low_u8x16(u32x4(q, 0, 0, 0));
+        }
+        let a0 = zip_lo16(r[0], r[1]);
+        let a1 = zip_lo16(r[2], r[3]);
+        let a2 = zip_lo16(r[4], r[5]);
+        let a3 = zip_lo16(r[6], r[7]);
+        let b0 = zip_lo32(a0, a1); // p1 r0..3 | p0 r0..3
+        let b1 = zip_hi32(a0, a1); // q0 r0..3 | q1 r0..3
+        let b2 = zip_lo32(a2, a3); // rows 4..7
+        let b3 = zip_hi32(a2, a3);
+        let mut v0 = [
+            u32x4_extend_low_u16x8(b0),
+            u32x4_extend_high_u16x8(b0),
+            u32x4_extend_low_u16x8(b1),
+            u32x4_extend_high_u16x8(b1),
+        ];
+        let mut v1 = [
+            u32x4_extend_low_u16x8(b2),
+            u32x4_extend_high_u16x8(b2),
+            u32x4_extend_low_u16x8(b3),
+            u32x4_extend_high_u16x8(b3),
+        ];
+        chroma_filter4(&mut v0, [tc[0], tc[1]], [no_p[0], no_p[1]], [no_q[0], no_q[1]], max);
+        chroma_filter4(&mut v1, [tc[2], tc[3]], [no_p[2], no_p[3]], [no_q[2], no_q[3]], max);
+        // (p0, q0) byte pairs per row.
+        let p0 = pack8_i32_u16(v0[1], v1[1]);
+        let q0 = pack8_i32_u16(v0[2], v1[2]);
+        let pairs = u8x16_narrow_i16x8(zip_lo16(p0, q0), zip_hi16(p0, q0));
+        let mut t = [0u16; 8];
+        v128_store(t.as_mut_ptr() as *mut v128, pairs);
+        for (i, &pq) in t.iter().enumerate() {
+            std::ptr::write_unaligned(data.add(i * stride).sub(1) as *mut u16, pq);
+        }
+    }
+}
+
+fn deblock_chroma_h(data: &mut [u8], off: usize, stride: usize, tc: [i32; 4], no_p: [bool; 4], no_q: [bool; 4], max: i32) {
+    if tc.iter().all(|&t| t == 0) {
+        return;
+    }
+    assert!(off >= 2 * stride && off + stride + 8 <= data.len());
+    unsafe {
+        let data = data.as_mut_ptr().add(off);
+        let (a0, a1) = ld8_u8_i32(data.sub(2 * stride));
+        let (b0, b1) = ld8_u8_i32(data.sub(stride));
+        let (c0, c1) = ld8_u8_i32(data);
+        let (d0, d1) = ld8_u8_i32(data.add(stride));
+        let mut v0 = [a0, b0, c0, d0];
+        let mut v1 = [a1, b1, c1, d1];
+        chroma_filter4(&mut v0, [tc[0], tc[1]], [no_p[0], no_p[1]], [no_q[0], no_q[1]], max);
+        chroma_filter4(&mut v1, [tc[2], tc[3]], [no_p[2], no_p[3]], [no_q[2], no_q[3]], max);
+        v128_store64_lane::<0>(pack8_i32_u8(v0[1], v1[1]), data.sub(stride) as *mut u64);
+        v128_store64_lane::<0>(pack8_i32_u8(v0[2], v1[2]), data as *mut u64);
+    }
+}
+
