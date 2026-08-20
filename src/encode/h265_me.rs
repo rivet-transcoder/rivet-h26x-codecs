@@ -1379,6 +1379,39 @@ mod tests {
         (y, cb, cr)
     }
 
+    /// The average of two references, each shifted by its own full-sample
+    /// vector: the content a B picture between them carries. `d0` is the
+    /// list-0 motion and `d1` the list-1 motion, in luma samples; chroma
+    /// shifts by the same vector divided by this format's (SubWidthC,
+    /// SubHeightC), so an even vector stays integral in every format.
+    /// Monochrome returns empty chroma planes.
+    fn bi_translated(r0: &Frame<u8>, d0: (i32, i32), r1: &Frame<u8>, d1: (i32, i32)) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let (w, h) = (r0.width, r0.height);
+        let mut y = vec![0u8; w * h];
+        for yy in 0..h {
+            for xx in 0..w {
+                let a = r0.y.at_clamped(xx as i32 + d0.0, yy as i32 + d0.1) as i32;
+                let b = r1.y.at_clamped(xx as i32 + d1.0, yy as i32 + d1.1) as i32;
+                y[yy * w + xx] = ((a + b + 1) >> 1) as u8;
+            }
+        }
+        let (sw, sh) = r0.chroma.subsampling();
+        let (sw, sh) = (sw as i32, sh as i32);
+        let (cw, ch) = (r0.cb.width, r0.cb.height);
+        let mut cb = vec![0u8; cw * ch];
+        let mut cr = vec![0u8; cw * ch];
+        for yy in 0..ch {
+            for xx in 0..cw {
+                for (plane0, plane1, dst) in [(&r0.cb, &r1.cb, &mut cb), (&r0.cr, &r1.cr, &mut cr)] {
+                    let a = plane0.at_clamped(xx as i32 + d0.0 / sw, yy as i32 + d0.1 / sh) as i32;
+                    let b = plane1.at_clamped(xx as i32 + d1.0 / sw, yy as i32 + d1.1 / sh) as i32;
+                    dst[yy * cw + xx] = ((a + b + 1) >> 1) as u8;
+                }
+            }
+        }
+        (y, cb, cr)
+    }
+
     fn code_picture(
         ctx: &MeCtx<'_, u8>,
         sps: &Sps,
@@ -1565,6 +1598,212 @@ mod tests {
             assert_eq!(d.mv, want, "cu {i}: {:?}", d.kind);
             assert!(!d.rqt_root_cbf, "cu {i}: the exact interpolation left residual");
         }
+    }
+
+    /// The B anchor: every B decision replayed through the decoder's own
+    /// candidate derivation over an independently maintained state, once
+    /// per chroma format.
+    ///
+    /// This is [`every_decision_replays_through_an_independent_decoder_state`]
+    /// for the two-list case, and it proves the same thing plus what only
+    /// B has: that `merge_candidate` with `is_b` re-derives the *pair* of
+    /// vectors and reference indices the decision recorded, that a
+    /// per-list AMVP replays through `amvp(list)` and the wrapping mvd
+    /// sum, and that the bi reconstruction the encoder holds is the one
+    /// `predict_block` builds from both lists.
+    ///
+    /// The vacuity guards matter as much as the replay: content that never
+    /// chose BI, or never chose merge, would let a broken second list pass
+    /// unnoticed, so both are asserted to have occurred.
+    #[test]
+    fn every_b_decision_replays_through_an_independent_decoder_state() {
+        for chroma in [ChromaFormat::Monochrome, ChromaFormat::Yuv420, ChromaFormat::Yuv422, ChromaFormat::Yuv444] {
+            replay_b_one_format(chroma);
+        }
+    }
+
+    fn replay_b_one_format(chroma: ChromaFormat) {
+        let kit = Kit::new();
+        let ctx = kit.ctx(30);
+        let (sps, pps) = parsed_sets_fmt(64, 64, chroma);
+        let cat = sps.chroma_array_type();
+        // Two anchors around the current picture: POC 1 in the past, POC 3
+        // in the future, current POC 2 — a real B, so NoBackwardPredFlag
+        // is false and both lists are live.
+        let mut ref0 = reference_fmt(64, 64, 17, chroma);
+        ref0.poc = 1;
+        ref0.extend_rows(0, 64);
+        // The future anchor is the same content shifted, so the two lists
+        // genuinely disagree and averaging them is not the same as either.
+        let mut ref1 = reference_fmt(64, 64, 23, chroma);
+        for y in 0..64usize {
+            for x in 0..64usize {
+                let off = ref1.y.offset(x as isize, y as isize);
+                let v = ref1.y.data[off] as i32;
+                ref1.y.data[off] = (v + 9).clamp(0, 255) as u8;
+            }
+        }
+        ref1.poc = 3;
+        ref1.extend_rows(0, 64);
+
+        // Source: what a picture midway between the two anchors actually
+        // looks like — each anchor's content moved toward it and the two
+        // averaged, which is precisely what default-weighted
+        // bi-prediction produces. A source that were an exact translation
+        // of ONE anchor would make that list win every CU and leave the
+        // bi path untested; the vacuity guard below caught exactly that
+        // while this test was being written.
+        let (mut sy, scb, scr) = bi_translated(&ref0, (2, 1), &ref1, (-2, -1));
+        let mut s = 41u64;
+        for yy in 0..64usize {
+            for xx in 0..64usize {
+                if (xx / 16 + yy / 16) % 3 == 0 {
+                    let d = (lcg(&mut s) % 40) as i32 - 20;
+                    let v = &mut sy[yy * 64 + xx];
+                    *v = (*v as i32 + d).clamp(0, 255) as u8;
+                }
+            }
+        }
+
+        let (w, h) = (64usize, 64usize);
+        let n = 1usize << sps.log2_ctb_size;
+        let (sw, _) = sub_wh(cat);
+        let c_stride = if cat == 0 { 0 } else { w / sw };
+        let mut pic = InterPicture::new(&sps, &pps, 2);
+        let mut decisions = Vec::new();
+        for cy in 0..h / n {
+            for cx in 0..w / n {
+                decisions.push(pic.code_ctu_b(&ctx, &ref0, &ref1, cx, cy, &sy, w, &scb, &scr, c_stride));
+            }
+        }
+        assert_invariants(&decisions, cat);
+        assert!(
+            decisions.iter().any(|d| matches!(d.kind, InterCuKind::BAmvp { idc: 2, .. }) || d.ref_idx >= 0 && d.ref_idx_l1 >= 0),
+            "{chroma:?}: no CU used both lists — the bi path is untested here"
+        );
+        assert!(
+            decisions.iter().any(|d| d.ref_idx_l1 >= 0),
+            "{chroma:?}: list 1 was never used at all"
+        );
+
+        // The independent state.
+        let geo = std::sync::Arc::new(Geometry::new(&sps, &pps));
+        let mut info = PicInfo::new(geo);
+        let mut frame = Frame::<u8>::new(64, 64, chroma, 8);
+        frame.poc = 2;
+        let mut scratch = McScratch::new();
+        let no_backward_pred = [ref0.poc, ref1.poc].iter().all(|&p| p <= 2);
+        assert!(!no_backward_pred, "a future anchor must make NoBackwardPredFlag false");
+        let refs = RefCtx::<u8> {
+            pocs: [vec![ref0.poc], vec![ref1.poc]],
+            long_term: [vec![false], vec![false]],
+            col: None,
+            cur_poc: 2,
+            no_backward_pred,
+            tmvp: false,
+            max_merge_cand: MAX_MERGE_CAND,
+            log2_par_mrg_level: 2,
+            is_b: true,
+            num_ref_idx: [1, 1],
+            col_from_l0: true,
+        };
+        for (i, d) in decisions.iter().enumerate() {
+            let (cx, cy) = (i % (64 / n), i / (64 / n));
+            let (x0, y0) = (cx * n, cy * n);
+            let ctb = info.ctb_of(x0, y0);
+            info.ctb_slice_addr[ctb] = 0;
+            info.ctb_slice[ctb] = 0;
+            let pu = PuPos {
+                x_cb: x0 as i32,
+                y_cb: y0 as i32,
+                n_cb: n as i32,
+                x_pb: x0 as i32,
+                y_pb: y0 as i32,
+                w: n as i32,
+                h: n as i32,
+                part_idx: 0,
+            };
+            let w4 = info.w4;
+            let (mv, ref_idx) = match d.kind {
+                InterCuKind::Skip { merge_idx } | InterCuKind::Merge { merge_idx } => {
+                    let cand = merge_candidate(&info, &frame, &refs, &pu, merge_idx as usize);
+                    (cand.mv, cand.ref_idx)
+                }
+                InterCuKind::BAmvp { idc, mvd, mvp_flag } => {
+                    let r: [i8; 2] = match idc {
+                        0 => [0, -1],
+                        1 => [-1, 0],
+                        _ => [0, 0],
+                    };
+                    let mut mv = [Mv::ZERO; 2];
+                    for list in 0..2usize {
+                        if r[list] >= 0 {
+                            let p = amvp(&info, &frame, &refs, &pu, list, 0, mvp_flag[list] as u32);
+                            mv[list] = Mv::new(p.x.wrapping_add(mvd[list].x), p.y.wrapping_add(mvd[list].y));
+                        }
+                    }
+                    (mv, r)
+                }
+                InterCuKind::Amvp { .. } => unreachable!("the B walk never produces the P shape"),
+                InterCuKind::UseIntra => {
+                    fill_motion(&mut frame.motion, frame.w4, x0, y0, n, n, MotionInfo::INTRA);
+                    PicInfo::fill4(&mut info.pred_mode, w4, x0, y0, n, n, 1);
+                    continue;
+                }
+            };
+            assert_eq!(ref_idx, [d.ref_idx, d.ref_idx_l1], "cu {i}: replayed lists differ ({:?})", d.kind);
+            assert_eq!([mv[0], mv[1]], [d.mv, d.mv_l1], "cu {i}: signalling does not replay to the chosen vectors ({:?})", d.kind);
+
+            let r0 = (ref_idx[0] >= 0).then_some((&ref0, mv[0]));
+            let r1 = (ref_idx[1] >= 0).then_some((&ref1, mv[1]));
+            predict_block(&kit.dsp, &mut scratch, &mut frame, x0, y0, n, n, r0, r1, [Weighting::Default; 3]);
+            if d.rqt_root_cbf {
+                let bd_shift = 20 - 8i32;
+                let mut work = [0i16; 1024];
+                if d.cbf_luma {
+                    work[..n * n].copy_from_slice(&d.luma[..n * n]);
+                    let log2 = d.log2_cu;
+                    scale_coefficients(&mut work, log2, ctx.qp, 8, ScalingSource::Flat, false, n - 1, n - 1);
+                    (kit.dsp.idct[(log2 - 2) as usize])(&mut work, bd_shift, n - 1, n - 1);
+                    let off = frame.y.offset(x0 as isize, y0 as isize);
+                    (kit.dsp.add_residual)(&mut frame.y.data[off..], frame.y.stride, &work, n, 255);
+                }
+                if cat != 0 {
+                    let qp_c = chroma_qp(cat, ctx.qp.clamp(0, 57));
+                    let (sw, sh) = sub_wh(cat);
+                    let (tbs, ntb, log2c) = chroma_tbs(cat, x0, y0, d.log2_cu);
+                    let nc = 1usize << log2c;
+                    let nc2 = nc * nc;
+                    for comp in 0..2 {
+                        for (t, &(ax, ay)) in tbs[..ntb].iter().enumerate() {
+                            let cbf = if t == 0 { d.cbf_chroma[comp] } else { d.cbf_chroma_bot[comp] };
+                            if !cbf {
+                                continue;
+                            }
+                            work[..nc2].copy_from_slice(&d.chroma[comp][t * nc2..(t + 1) * nc2]);
+                            scale_coefficients(&mut work, log2c, qp_c, 8, ScalingSource::Flat, false, nc - 1, nc - 1);
+                            (kit.dsp.idct[(log2c - 2) as usize])(&mut work, bd_shift, nc - 1, nc - 1);
+                            let plane = if comp == 0 { &mut frame.cb } else { &mut frame.cr };
+                            let off = plane.offset((ax / sw) as isize, (ay / sh) as isize);
+                            (kit.dsp.add_residual)(&mut plane.data[off..], plane.stride, &work, nc, 255);
+                        }
+                    }
+                }
+            }
+            let mut mi = MotionInfo { mv, ref_idx, ref_delta: [0; 2], flags: 0, pad: 0 };
+            for list in 0..2usize {
+                if ref_idx[list] >= 0 {
+                    let poc = if list == 0 { ref0.poc } else { ref1.poc };
+                    mi.ref_delta[list] = (2 - poc).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                }
+            }
+            fill_motion(&mut frame.motion, frame.w4, x0, y0, n, n, mi);
+            PicInfo::fill4(&mut info.pred_mode, w4, x0, y0, n, n, 0);
+        }
+        assert_eq!(frame.y.data, pic.recon.y.data, "{chroma:?}: luma reconstruction differs from the replay");
+        assert_eq!(frame.cb.data, pic.recon.cb.data, "{chroma:?}: cb reconstruction differs from the replay");
+        assert_eq!(frame.cr.data, pic.recon.cr.data, "{chroma:?}: cr reconstruction differs from the replay");
+        assert_eq!(frame.motion, pic.recon.motion, "{chroma:?}: motion grids diverged");
     }
 
     /// The anchor: every decision, replayed through the decoder's own
