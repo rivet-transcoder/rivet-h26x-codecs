@@ -60,17 +60,27 @@ fi
 # redundancy: it lets inter prediction be verified without waiting for CABAC
 # slice writing and vice versa, so two people can make progress against this
 # gate at the same time without one of them being blocked behind the other.
+#
+# The high-QP rows exist because a fixed quantiser hides a whole class of bug.
+# Coding H.264's chroma planes at the luma quantiser — plainly wrong — passed
+# every row of this gate, because the chroma QP mapping is the identity up to
+# 29 and every row lived below that. At QP 40 the same mutation fails SELF on
+# both entropy coders at once. Any table the codec indexes by QP has the same
+# shape, so one row per codec sits high enough to leave the identity region.
 CONFIGS=${CONFIGS:-"
 lossless-intra|--codec h264 --lossless --gop 0
 cqp-intra|--codec h264 --qp 26 --gop 0
 cqp-ip|--codec h264 --qp 26 --gop 8
 cqp-ipb|--codec h264 --qp 26 --gop 8 --bframes 2
+cqp40-ip|--codec h264 --qp 40 --gop 8
 cavlc-intra|--codec h264 --qp 26 --gop 0 --cavlc
 cavlc-ip|--codec h264 --qp 26 --gop 8 --cavlc
 cavlc-ipb|--codec h264 --qp 26 --gop 8 --bframes 2 --cavlc
+cavlc40-intra|--codec h264 --qp 40 --gop 0 --cavlc
 hevc-lossless-intra|--codec h265 --lossless --gop 0
 hevc-cqp-intra|--codec h265 --qp 26 --gop 0
 hevc-cqp-ip|--codec h265 --qp 26 --gop 8
+hevc-cqp40-intra|--codec h265 --qp 40 --gop 0
 "}
 
 one() {
