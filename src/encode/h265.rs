@@ -258,9 +258,17 @@ impl H265Encoder {
             syn::NAL_SPS,
             &syn::write_sps(&self.cfg, &g, LOG2_MAX_POC_LSB),
         ));
-        // Inter pictures are not filtered yet and the PPS flag is
-        // picture-wide, so only an all-intra stream may declare the
-        // deblocking filter it actually applies.
+        // Intra pictures are filtered; inter pictures are not, and the
+        // PPS flag is picture-wide, so a stream containing any of them
+        // keeps the filter off rather than declaring one the encoder does
+        // not apply to every picture.
+        //
+        // The inter deblocker exists and is tested — see
+        // `h265_deblock::deblock_inter_picture` — but wiring it changes
+        // the reconstruction P pictures predict from, which changes their
+        // decisions, and on one clip the decision then asks for an intra
+        // coding unit inside a P slice, which this encoder cannot yet
+        // spell. Both halves land together when that hole closes.
         let deblock = self.cfg.gop == 0;
         out.extend_from_slice(&syn::annexb(syn::NAL_PPS, &syn::write_pps(qp, bypass, deblock)));
 
@@ -420,9 +428,8 @@ impl H265Encoder {
             },
             qp,
             syn::NAL_TRAIL_R,
-            // Inter pictures are not filtered by this encoder yet, so the
-            // PPS this stream carries has the filter off and the header
-            // must agree.
+            // Inter pictures are unfiltered for now, and the header must
+            // agree with the PPS this stream carries.
             false,
             &mut w,
         );
@@ -436,6 +443,10 @@ impl H265Encoder {
         // cu_skip_flag's context counts *skipped* available neighbours, so
         // the walk carries what it decided, one entry per CTU.
         let mut skipped = vec![false; wc * hc];
+        // The decisions outlive the loop: the deblocker derives its
+        // boundary strengths from them, as a decoder does from what it
+        // has just parsed.
+        let mut decisions = Vec::with_capacity(wc * hc);
         {
             let mut e = CabacEncoder::new(&mut w);
             for cy in 0..hc {
@@ -456,10 +467,15 @@ impl H265Encoder {
                     write_cu_inter(&mut e, &mut cx, &d, left, above);
                     skipped[cy * wc + cxu] = matches!(d.kind, InterCuKind::Skip { .. });
                     e.encode_terminate(u32::from(cy == hc - 1 && cxu == wc - 1));
+                    decisions.push(d);
                 }
             }
         }
         w.align_zero();
+        // deblock_inter_picture(&mctx, &mut pic, &decisions) belongs here,
+        // once an intra coding unit inside a P slice can be spelled: see
+        // the note beside `deblock` in code_picture.
+        let _ = &decisions;
         let mut out = Vec::new();
         out.extend_from_slice(&syn::annexb(syn::NAL_TRAIL_R, &w.into_nal()));
 

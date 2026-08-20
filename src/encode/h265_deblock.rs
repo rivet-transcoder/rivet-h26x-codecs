@@ -434,7 +434,7 @@ mod tests {
         let cfg = crate::encode::Config { width: w, height: h, gop: 8, ..crate::encode::Config::default() };
         let syn = SynGeometry::new(&cfg);
         let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &syn, 16))).unwrap();
-        let mut pps = Pps::parse(&crate::nal::unescape_rbsp(&write_pps(26, false))).unwrap();
+        let mut pps = Pps::parse(&crate::nal::unescape_rbsp(&write_pps(26, false, true))).unwrap();
         pps.resolve_tiles(&sps).unwrap();
         (sps, pps)
     }
