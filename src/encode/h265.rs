@@ -18,6 +18,7 @@
 //! proven against the crate's own conformance-tested parsers.
 
 use super::gop::{Coded, Kind, Scheduler};
+use super::h265_deblock::deblock_picture;
 use super::h265_intra::{CuDecision, IntraCtx, IntraPicture};
 use super::h265_me::{InterCuDecision, InterCuKind, InterPicture, MAX_MERGE_CAND};
 use super::h265_syntax as syn;
@@ -257,7 +258,11 @@ impl H265Encoder {
             syn::NAL_SPS,
             &syn::write_sps(&self.cfg, &g, LOG2_MAX_POC_LSB),
         ));
-        out.extend_from_slice(&syn::annexb(syn::NAL_PPS, &syn::write_pps(qp, bypass)));
+        // Inter pictures are not filtered yet and the PPS flag is
+        // picture-wide, so only an all-intra stream may declare the
+        // deblocking filter it actually applies.
+        let deblock = self.cfg.gop == 0;
+        out.extend_from_slice(&syn::annexb(syn::NAL_PPS, &syn::write_pps(qp, bypass, deblock)));
 
         let mut w = BitWriter::with_capacity(cw * ch / 2);
         syn::write_slice_header(
@@ -272,6 +277,7 @@ impl H265Encoder {
             },
             qp,
             syn::NAL_IDR_N_LP,
+            deblock,
             &mut w,
         );
         // byte_alignment(): one, then zeros to the byte.
@@ -280,6 +286,10 @@ impl H265Encoder {
 
         let (wc, hc) = (g.ctbs_wide as usize, g.ctbs_high as usize);
         let mut cx = Contexts::new(0, qp as i32);
+        // The decisions outlive the loop: the deblocker derives its
+        // boundary strengths from them, exactly as a decoder derives them
+        // from what it just parsed.
+        let mut decisions = Vec::with_capacity(wc * hc);
         {
             let mut e = CabacEncoder::new(&mut w);
             for cy in 0..hc {
@@ -287,8 +297,17 @@ impl H265Encoder {
                     let d = pic.code_ctu(&ictx, cxu, cy, &py, cw, &pcb, &pcr, ccw);
                     write_ctu_intra(&mut e, &mut cx, &d, cxu, cy, bypass, cat);
                     e.encode_terminate(u32::from(cy == hc - 1 && cxu == wc - 1));
+                    decisions.push(d);
                 }
             }
+        }
+        if deblock {
+            // After the whole picture reconstructs — intra prediction
+            // reads unfiltered neighbours — and before the crop, because
+            // the filtered planes are what a decoder emits and therefore
+            // what SELF compares against. Bypass CUs are exempt sample
+            // for sample, so lossless stays exact with the filter on.
+            deblock_picture(&ictx, &mut pic, &decisions);
         }
         w.align_zero();
         out.extend_from_slice(&syn::annexb(syn::NAL_IDR_N_LP, &w.into_nal()));
@@ -361,7 +380,7 @@ impl H265Encoder {
         // them from the very bytes the stream carries is what keeps the
         // encoder's idea of the geometry and the decoder's identical.
         let sps_rbsp = syn::write_sps(&self.cfg, &g, LOG2_MAX_POC_LSB);
-        let pps_rbsp = syn::write_pps(qp, false);
+        let pps_rbsp = syn::write_pps(qp, false, false);
         let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&sps_rbsp))?;
         let mut pps = crate::hevc::pps::Pps::parse(&crate::nal::unescape_rbsp(&pps_rbsp))?;
         pps.resolve_tiles(&sps)?;
@@ -401,6 +420,10 @@ impl H265Encoder {
             },
             qp,
             syn::NAL_TRAIL_R,
+            // Inter pictures are not filtered by this encoder yet, so the
+            // PPS this stream carries has the filter off and the header
+            // must agree.
+            false,
             &mut w,
         );
         w.flag(true); // byte_alignment()

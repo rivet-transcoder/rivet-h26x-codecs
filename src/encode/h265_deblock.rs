@@ -65,7 +65,7 @@ pub fn deblock_picture<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &mut IntraPicture<
     // `loop_filter_across_tiles`, but it wants the real struct: parse the
     // PPS our own writer emits, which is also the header a decoder of
     // this stream will hold.
-    let pps = Pps::parse(&crate::nal::unescape_rbsp(&crate::encode::h265_syntax::write_pps(ctx.qp.clamp(0, 51) as u8, ctx.bypass)))
+    let pps = Pps::parse(&crate::nal::unescape_rbsp(&crate::encode::h265_syntax::write_pps(ctx.qp.clamp(0, 51) as u8, ctx.bypass, true)))
         .expect("the encoder's own PPS parses");
     let mut scratch = DeblockScratch::default();
     deblock_rows(ctx.dsp, &mut scratch, &mut pic.recon, &info, &pps, ctx.bit_depth, ctx.bit_depth, 0, h4);

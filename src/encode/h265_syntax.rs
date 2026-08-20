@@ -257,7 +257,7 @@ pub fn write_sps(cfg: &Config, g: &Geometry, log2_max_poc_lsb: u32) -> Vec<u8> {
 /// It changes nothing else here or in the slice header (the parser reads no
 /// other syntax conditionally on it); what it changes is the coding tree,
 /// where every CU then carries a `cu_transquant_bypass_flag`.
-pub fn write_pps(qp: u8, bypass: bool) -> Vec<u8> {
+pub fn write_pps(qp: u8, bypass: bool, deblock: bool) -> Vec<u8> {
     let mut w = BitWriter::with_capacity(32);
     w.ue(0); // pps_pic_parameter_set_id
     w.ue(0); // pps_seq_parameter_set_id
@@ -281,18 +281,33 @@ pub fn write_pps(qp: u8, bypass: bool) -> Vec<u8> {
     w.flag(false); // tiles_enabled_flag
     w.flag(false); // entropy_coding_sync_enabled_flag
     w.flag(true); // pps_loop_filter_across_slices_enabled_flag
-    // The deblocking filter is disabled picture-wide, and the reason is the
-    // SELF property, not taste: the encoder does not yet run the filter over
-    // its own reconstruction, and a decoder that filters against an encoder
-    // that does not desyncs on exactly the samples the filter touches — a
-    // first H.265 stream failed SELF on 24 luma samples, every one within
-    // three of the 8-sample deblocking grid, while libavcodec and our
-    // decoder agreed with each other perfectly. When the encoder learns to
-    // deblock its reconstruction, these three bits flip for the quality the
-    // filter buys.
+    // The deblocking filter, on when the encoder filters its own
+    // reconstruction and off when it cannot.
+    //
+    // It was disabled picture-wide for a while, and the reason is worth
+    // keeping: the first H.265 stream this encoder produced was
+    // CROSS-identical but failed SELF on exactly 24 luma samples, every
+    // one within three of the 8-sample deblocking grid — libavcodec and
+    // our own decoder both filtered, and the encoder did not. Rather than
+    // declare a filter it could not apply, the PPS turned it off.
+    //
+    // It filters now for all-intra streams, through the decoder's own
+    // deblocker over the encoder's reconstruction. Inter pictures are not
+    // filtered yet, and this flag is picture-wide rather than per-slice,
+    // so a stream containing any of them keeps the filter off: declaring
+    // it would make every decoder filter pictures this encoder did not.
     w.flag(true); // deblocking_filter_control_present_flag
     w.flag(false); // deblocking_filter_override_enabled_flag
-    w.flag(true); // pps_deblocking_filter_disabled_flag
+    w.flag(!deblock); // pps_deblocking_filter_disabled_flag
+    if deblock {
+        // Clearing that flag makes two more elements appear — the filter
+        // offsets — and forgetting them truncates the PPS. The encoder's
+        // own parser refused the header the first time this was written,
+        // which is the fourth instance of the same shape: a flag whose
+        // value decides what syntax follows it.
+        w.se(0); // pps_beta_offset_div2
+        w.se(0); // pps_tc_offset_div2
+    }
     w.flag(false); // pps_scaling_list_data_present_flag
     w.flag(false); // lists_modification_present_flag
     w.ue(0); // log2_parallel_merge_level_minus2
@@ -322,7 +337,7 @@ pub struct SliceHeader {
 }
 
 /// Slice segment header, up to but not including the coded tree.
-pub fn write_slice_header(h: &SliceHeader, pps_qp: u8, nal_type: u8, w: &mut BitWriter) {
+pub fn write_slice_header(h: &SliceHeader, pps_qp: u8, nal_type: u8, deblock: bool, w: &mut BitWriter) {
     w.flag(true); // first_slice_segment_in_pic_flag
     if (16..=23).contains(&nal_type) {
         w.flag(false); // no_output_of_prior_pics_flag
@@ -406,12 +421,16 @@ pub fn write_slice_header(h: &SliceHeader, pps_qp: u8, nal_type: u8, w: &mut Bit
         w.ue(0); // five_minus_max_num_merge_cand -> MaxNumMergeCand 5
     }
     w.se(h.qp as i32 - pps_qp as i32); // slice_qp_delta
-    // slice_loop_filter_across_slices_enabled_flag is NOT written: the
-    // reader reads it only when SAO is on for the slice or deblocking is
-    // not disabled, and this encoder's PPS disables deblocking while its
-    // SPS disables SAO. Writing it anyway shifts every bit after it — the
-    // same one-spurious-bit shape as the SAO flag this header once wrote,
-    // caught the same way, by the production parser refusing the header.
+    // slice_loop_filter_across_slices_enabled_flag: the reader reads it
+    // only when SAO is on for the slice or deblocking is not disabled.
+    // The SPS disables SAO, so this follows the PPS's deblocking flag
+    // exactly — write it when the filter is on, and not otherwise.
+    // Getting that wrong in either direction shifts every bit after it,
+    // the one-spurious-bit shape this header has been bitten by twice;
+    // the production parser refusing the header is what catches it.
+    if deblock {
+        w.flag(true); // slice_loop_filter_across_slices_enabled_flag
+    }
 }
 
 #[cfg(test)]
