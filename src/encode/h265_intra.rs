@@ -33,13 +33,22 @@
 //! This is a first cut with a deliberately fixed geometry, and every one of
 //! these is a simplification to be lifted, not a design position:
 //!
-//! - **One CU per CTU, no quadtree.** The CU size *is* the CTB size,
-//!   `log2_cu` in 3..=5. Pictures must be whole multiples of it.
-//! - **Fixed partitioning per size.** `log2_cu` 4 or 5 codes `PART_2Nx2N`
-//!   with a single luma TU the size of the CU; `log2_cu` 3 codes
-//!   `PART_NxN` with four 4x4 luma TUs — the standard's only route to the
-//!   4x4 DST, which keeps that path honest. No `split_transform_flag`
-//!   choices are searched.
+//! - **One CU per CTU, no coding quadtree.** The CU size *is* the CTB
+//!   size, `log2_cu` in 3..=5. Pictures must be whole multiples of it.
+//! - **Partitioning per size, one transform-split level.** `log2_cu` 4 or
+//!   5 codes `PART_2Nx2N`, and when [`IntraPicture::try_split`] is on the
+//!   decision tries one level of transform split — four quarter-size TUs
+//!   against the single CU-sized one, chroma splitting alongside as the
+//!   decoder's `transform_tree` dictates. The split search is **off by
+//!   default** because the coding-tree writer does not spell the split
+//!   shape yet; producing it into today's serialiser would desync the
+//!   stream. One level from a 16/32 CTB bottoms out at 8x8/16x16 luma, so
+//!   the 4x4 DST is *still* only reached by `log2_cu` 3's `PART_NxN`
+//!   (four 4x4 luma TUs); the second split level, which the SPS's
+//!   `max_transform_hierarchy_depth_intra` of 2 already permits, is what
+//!   will make it reachable from production geometry — and brings the
+//!   chroma-at-the-parent rule (`transform_unit`'s `blk_idx == 3` case)
+//!   that one level never triggers.
 //! - **4:2:0 only** (`chroma_array_type` 1), one chroma TU per component
 //!   at half the CU size.
 //! - **One slice, one tile, raster CTU order.** Availability reduces to
@@ -93,8 +102,28 @@ pub struct CuDecision {
     pub log2_cu: u32,
     /// `part_mode`: true is `PART_NxN` (four 4x4 luma PBs/TUs, only ever
     /// produced at `log2_cu == 3`), false is `PART_2Nx2N` (one luma PB and
-    /// one luma TU the size of the CU).
+    /// one luma TU the size of the CU — or four quarter TUs, see
+    /// `split_tu`).
     pub nxn: bool,
+    /// `split_transform_flag` at depth 0: the CU's residual is carried by
+    /// four quarter-size TUs in z-order instead of one CU-sized TU. Only
+    /// ever produced for `PART_2Nx2N` (`log2_cu` 4 or 5), never with
+    /// `nxn`. What the writer emits for this shape, read off the
+    /// decoder's `transform_tree`: `split_transform_flag` 1 at depth 0;
+    /// `cbf_cb`/`cbf_cr` once at depth 0 (from `cbf_chroma`); then four
+    /// depth-1 subtrees in z-order, each spelling its own
+    /// `split_transform_flag` 0 (still coded — the child size is above
+    /// the 4x4 minimum and depth 1 is below the SPS's
+    /// `max_transform_hierarchy_depth_intra` of 2), `cbf_cb`/`cbf_cr`
+    /// (from `cbf_chroma_tu`, coded only where the depth-0 flag for that
+    /// component is set), `cbf_luma`, and the residuals: luma at
+    /// `log2_cu - 1`, then that child's chroma pair at `log2_cu - 2` —
+    /// chroma follows the luma split because the children are larger
+    /// than 8x8 luma (`transform_unit` codes chroma at every TU with
+    /// `log2 > 2`; the coded-at-the-parent `blk_idx == 3` rule only
+    /// exists for 4x4 luma children, which one split level from a 16/32
+    /// CTB never produces).
+    pub split_tu: bool,
     /// `cu_transquant_bypass_flag`. When set, every `luma` / `chroma`
     /// entry is a raw spatial residual sample (source minus prediction,
     /// raster), not a transform level.
@@ -118,19 +147,38 @@ pub struct CuDecision {
     /// TUs does not re-derive it.
     pub chroma_mode: u8,
     /// `cbf_luma` per luma TU in z-order: whether the TU carries any
-    /// nonzero level. `PART_2Nx2N` uses only `[0]`; the rest stay false.
+    /// nonzero level. Four entries are meaningful when the CU holds four
+    /// luma TUs (`nxn` or `split_tu`); a single-TU CU uses only `[0]` and
+    /// the rest stay false.
     pub cbf_luma: [bool; 4],
-    /// `cbf_cb`, `cbf_cr` for the single chroma TU of each component.
+    /// The depth-0 `cbf_cb`, `cbf_cr` bins: whether the component carries
+    /// any coded residual anywhere in the CU. For an unsplit CU this is
+    /// the single chroma TU's own cbf; under `split_tu` it is the OR of
+    /// `cbf_chroma_tu[comp]` (an invariant a test holds), and the writer
+    /// emits the per-child bins only where this is set — exactly the
+    /// reader's `depth == 0 || parent_cbf` gate in `transform_tree`.
     pub cbf_chroma: [bool; 2],
-    /// Quantised luma levels (or raw residual when `bypass`). One TU of
-    /// `n*n` entries at `[0..n*n]` for `PART_2Nx2N` (`n = 1 << log2_cu`);
-    /// four 4x4 TUs at `[16*i..16*i + 16]` in z-order for `PART_NxN`.
-    /// Raster order within each TU. Entries beyond the described TUs are
-    /// zero and meaningless.
+    /// The depth-1 `cbf_cb`/`cbf_cr` per component per child TU in
+    /// z-order. Meaningful only when `split_tu`; all false otherwise.
+    pub cbf_chroma_tu: [[bool; 4]; 2],
+    /// Quantised luma levels (or raw residual when `bypass`), raster
+    /// within each TU, TUs concatenated in z-order:
+    /// - `PART_2Nx2N` unsplit: one TU of `n*n` entries at `[0..n*n]`,
+    ///   `n = 1 << log2_cu`;
+    /// - `PART_2Nx2N` with `split_tu`: four TUs of `q*q` entries at
+    ///   `[i*q*q..(i+1)*q*q]`, `q = n/2`;
+    /// - `PART_NxN`: four 4x4 TUs at `[16*i..16*i + 16]`.
+    ///
+    /// Entries beyond the described TUs are zero and meaningless.
     pub luma: [i16; 1024],
-    /// Quantised chroma levels per component (`[0]` Cb, `[1]` Cr), one TU
-    /// of `nc*nc` entries at `[0..nc*nc]`, `nc = 1 << (log2_cu - 1)`,
-    /// raster within the TU. Raw residual when `bypass`.
+    /// Quantised chroma levels per component (`[0]` Cb, `[1]` Cr), raster
+    /// within each TU, raw residual when `bypass`:
+    /// - unsplit (and `PART_NxN`): one TU of `nc*nc` entries at
+    ///   `[0..nc*nc]`, `nc = 1 << (log2_cu - 1)`;
+    /// - `split_tu`: four child TUs of `qc*qc` entries at
+    ///   `[i*qc*qc..(i+1)*qc*qc]` in z-order, `qc = 1 << (log2_cu - 2)`
+    ///   (8x8 for a 32 CTB, 4x4 for a 16 CTB — the 4x4 chroma children
+    ///   scan mode-dependently, like every other 4x4 TU).
     pub chroma: [[i16; 256]; 2],
 }
 
@@ -139,6 +187,7 @@ impl Default for CuDecision {
         CuDecision {
             log2_cu: 0,
             nxn: false,
+            split_tu: false,
             bypass: false,
             luma_modes: [1; 4],
             luma_syntax: [LumaModeSyntax::default(); 4],
@@ -146,6 +195,7 @@ impl Default for CuDecision {
             chroma_mode: 1,
             cbf_luma: [false; 4],
             cbf_chroma: [false; 2],
+            cbf_chroma_tu: [[false; 4]; 2],
             luma: [0; 1024],
             chroma: [[0; 256]; 2],
         }
@@ -218,6 +268,13 @@ pub struct IntraPicture<S: Sample> {
     pub recon: Frame<S>,
     /// log2 of the fixed CU size, 3..=5.
     pub log2_cu: u32,
+    /// Search the one-level transform split for `PART_2Nx2N` CUs. **Off
+    /// by default, deliberately**: the coding-tree writer in
+    /// `encode::h265` serialises only the unsplit shape today, and a
+    /// split decision fed to it would desync the arithmetic coder — the
+    /// wiring step that spells the split shape flips this on. Off, the
+    /// decision behaves exactly as before this field existed.
+    pub try_split: bool,
     /// Chosen luma mode per 4x4 block — the encoder's copy of the
     /// decoder's `PicInfo::intra_mode`, and like it filled per prediction
     /// block as modes are chosen so the MPM derivation for later blocks
@@ -241,6 +298,7 @@ impl<S: Sample> IntraPicture<S> {
         IntraPicture {
             recon: Frame::new(width, height, ChromaFormat::Yuv420, bit_depth),
             log2_cu,
+            try_split: false,
             // 1 (DC) everywhere, as the decoder initialises intra_mode; the
             // availability test keeps uncoded entries from ever being read.
             modes: vec![1; w4 * h4],
@@ -267,89 +325,119 @@ impl<S: Sample> IntraPicture<S> {
         c_stride: usize,
     ) -> CuDecision {
         let geo = self.geo;
+        let try_split = self.try_split;
         let n = 1usize << geo.log2_cu;
         let (x0, y0) = (cu_x * n, cu_y * n);
+        let coff = (y0 / 2) * c_stride + x0 / 2;
         let mut out = CuDecision { log2_cu: geo.log2_cu, bypass: ctx.bypass, ..CuDecision::default() };
 
-        // Luma: PART_NxN with four 4x4 DST TUs at the smallest size,
-        // PART_2Nx2N with one CU-sized TU otherwise (see the module docs).
         let IntraPicture { recon, modes, scratch, .. } = self;
         if geo.log2_cu == 3 {
+            // PART_NxN: four 4x4 luma PBs/TUs (the DST path) and one 4x4
+            // chroma TU pair. No transform-split choice exists here — the
+            // tree is forced by IntraSplitFlag.
             out.nxn = true;
             for pb in 0..4 {
                 // z-order within the CU, which is decode order: each block
                 // predicts from the reconstruction of those before it.
                 let (px, py) = (x0 + (pb & 1) * 4, y0 + (pb >> 1) * 4);
-                fill_ref_avail(geo, &mut scratch.avail, px, py, 4, 1, 1);
                 let cands = mpm_candidates(geo, modes, px, py);
                 let soff = py * y_stride + px;
-                let (mode, cbf) = decide_luma_tu(
+                let mode = search_luma_mode(ctx, geo, &mut recon.y, scratch, px, py, 2, &src_y[soff..], y_stride, cands);
+                let nz = code_luma_tb(
                     ctx,
+                    geo,
                     &mut recon.y,
                     scratch,
                     px,
                     py,
                     2,
+                    mode,
                     &src_y[soff..],
                     y_stride,
-                    cands,
                     &mut out.luma[pb * 16..pb * 16 + 16],
                 );
                 out.luma_modes[pb] = mode;
                 out.luma_syntax[pb] = as_syntax(mode, cands);
-                out.cbf_luma[pb] = cbf;
+                out.cbf_luma[pb] = nz != 0;
                 // The decoder records each PU's mode as it derives it, so
                 // the next PU's MPM list sees this one; mirror that.
                 PicInfo::fill4(modes, geo.w4, px, py, 4, 4, mode);
             }
-        } else {
-            fill_ref_avail(geo, &mut scratch.avail, x0, y0, n, 1, 1);
-            let cands = mpm_candidates(geo, modes, x0, y0);
-            let soff = y0 * y_stride + x0;
-            let (mode, cbf) = decide_luma_tu(
+            let (csyn, cmode) = search_chroma_mode(
                 ctx,
-                &mut recon.y,
+                geo,
+                &mut recon.cb,
+                &mut recon.cr,
                 scratch,
                 x0,
                 y0,
-                geo.log2_cu,
-                &src_y[soff..],
-                y_stride,
-                cands,
-                &mut out.luma[..n * n],
+                2,
+                out.luma_modes[0],
+                &src_cb[coff..],
+                &src_cr[coff..],
+                c_stride,
             );
+            out.chroma_syntax = csyn;
+            out.chroma_mode = cmode;
+            for (comp, plane) in [&mut recon.cb, &mut recon.cr].into_iter().enumerate() {
+                let src = if comp == 0 { &src_cb[coff..] } else { &src_cr[coff..] };
+                let nz = code_chroma_tb(ctx, geo, plane, scratch, x0, y0, 2, 1 + comp, cmode, src, c_stride, &mut out.chroma[comp][..16]);
+                out.cbf_chroma[comp] = nz != 0;
+            }
+        } else {
+            // PART_2Nx2N. The luma mode is chosen once, by SATD on the
+            // unsplit CU-sized prediction, and both transform structures
+            // reuse it — a per-structure mode search would be fairer and
+            // costs double, a simplification to lift with real RD. The
+            // chroma mode likewise, on the parent-size prediction.
+            let cands = mpm_candidates(geo, modes, x0, y0);
+            let soff = y0 * y_stride + x0;
+            let mode = search_luma_mode(ctx, geo, &mut recon.y, scratch, x0, y0, geo.log2_cu, &src_y[soff..], y_stride, cands);
             out.luma_modes = [mode; 4];
             out.luma_syntax[0] = as_syntax(mode, cands);
-            out.cbf_luma[0] = cbf;
             PicInfo::fill4(modes, geo.w4, x0, y0, n, n, mode);
-        }
+            let (csyn, cmode) = search_chroma_mode(
+                ctx,
+                geo,
+                &mut recon.cb,
+                &mut recon.cr,
+                scratch,
+                x0,
+                y0,
+                geo.log2_cu - 1,
+                mode,
+                &src_cb[coff..],
+                &src_cr[coff..],
+                c_stride,
+            );
+            out.chroma_syntax = csyn;
+            out.chroma_mode = cmode;
 
-        // Chroma: one TU per component at half the CU size, mode from the
-        // standard candidate set against the first luma mode. Its reference
-        // samples all lie outside the CU, so unlike the decoder's TU walk
-        // (which predicts chroma after the last luma TU) the order against
-        // luma does not matter.
-        let nc = n / 2;
-        let (cx, cy) = (x0 / 2, y0 / 2);
-        // Availability is derived in luma coordinates with the 4:2:0
-        // subsampling, as intra_predict_block does; one derivation serves
-        // both components because their geometry is identical.
-        fill_ref_avail(geo, &mut scratch.avail, x0, y0, nc, 2, 2);
-        let coff = cy * c_stride + cx;
-        decide_chroma(
-            ctx,
-            &mut recon.cb,
-            &mut recon.cr,
-            scratch,
-            cx,
-            cy,
-            geo.log2_cu - 1,
-            out.luma_modes[0],
-            &src_cb[coff..],
-            &src_cr[coff..],
-            c_stride,
-            &mut out,
-        );
+            // The transform structure: one CU-sized TU, or — when the
+            // writer-side knob allows — four quarter TUs, judged by
+            // reconstruction SSD plus the placeholder rate term. The
+            // trials overwrite each other in the plane and the decision;
+            // a trial reads only samples outside the CU or samples it
+            // wrote itself, so no state needs saving — whichever loses is
+            // simply recomputed, the way the H.264 side puts back the
+            // I_4x4 coding its I_16x16 trials overwrote.
+            let (ssd_u, nz_u) = code_cu_2nx2n(
+                ctx, geo, recon, scratch, x0, y0, mode, cmode, false, &src_y[soff..], y_stride, &src_cb[coff..], &src_cr[coff..], c_stride, &mut out,
+            );
+            if try_split {
+                let cost_u = ssd_u as f32 + tu_structure_cost(ctx.qp, &out, nz_u);
+                let (ssd_s, nz_s) = code_cu_2nx2n(
+                    ctx, geo, recon, scratch, x0, y0, mode, cmode, true, &src_y[soff..], y_stride, &src_cb[coff..], &src_cr[coff..], c_stride, &mut out,
+                );
+                let cost_s = ssd_s as f32 + tu_structure_cost(ctx.qp, &out, nz_s);
+                if cost_u <= cost_s {
+                    let _ = code_cu_2nx2n(
+                        ctx, geo, recon, scratch, x0, y0, mode, cmode, false, &src_y[soff..], y_stride, &src_cb[coff..], &src_cr[coff..], c_stride, &mut out,
+                    );
+                }
+            }
+        }
         out
     }
 
@@ -529,7 +617,9 @@ fn mode_signalling_cost(qp: i32, signal: ModeSignal) -> f32 {
 /// inverse transform and `add_residual` — the path `residual_block` in
 /// `hevc::ctu` takes, so the two cannot disagree. Under `bypass` the
 /// residual is carried and added raw, which is what the decoder does with
-/// a `cu_transquant_bypass` block. Returns the TU's cbf.
+/// a `cu_transquant_bypass` block. Returns the count of nonzero levels;
+/// the TU's cbf is that count being nonzero, and the count itself feeds
+/// the structure decision's rate placeholder.
 #[allow(clippy::too_many_arguments)]
 fn code_residual<S: Sample>(
     ctx: &IntraCtx<'_, S>,
@@ -542,7 +632,7 @@ fn code_residual<S: Sample>(
     src: &[S],
     src_stride: usize,
     levels: &mut [i16],
-) -> bool {
+) -> u32 {
     let n = 1usize << log2;
     let off = plane.offset(x as isize, y as isize);
     let stride = plane.stride;
@@ -563,7 +653,7 @@ fn code_residual<S: Sample>(
         // add_residual never bites and the round trip is exact.
         levels[..n * n].copy_from_slice(&work[..n * n]);
         (ctx.dsp.add_residual)(&mut plane.data[off..], stride, &work, n, max);
-        return levels[..n * n].iter().any(|&v| v != 0);
+        return levels[..n * n].iter().filter(|&&v| v != 0).count() as u32;
     }
 
     if c_idx == 0 && log2 == 2 {
@@ -592,18 +682,19 @@ fn code_residual<S: Sample>(
         (ctx.dsp.idct[(log2 - 2) as usize])(&mut work, bd_shift, n - 1, n - 1);
     }
     (ctx.dsp.add_residual)(&mut plane.data[off..], stride, &work, n, max);
-    nz != 0
+    nz
 }
 
-/// Choose the luma mode for one transform block by SATD over all 35
-/// candidate predictions, then code and reconstruct the winner. The
-/// availability in `sc.avail` must already describe this block. Trial
-/// predictions are written into the reconstruction plane and scored
-/// before the next overwrites them; the block's own reference samples lie
-/// outside it, so the trials never disturb what they read.
+/// Choose the luma mode for one prediction block by SATD over all 35
+/// candidate predictions against the reconstruction plane. Trial
+/// predictions are written into the plane and scored before the next
+/// overwrites them; the block's own reference samples lie outside it, so
+/// the trials never disturb what they read. The plane is left holding the
+/// *last* trial, not the winner — coding re-predicts.
 #[allow(clippy::too_many_arguments)]
-fn decide_luma_tu<S: Sample>(
+fn search_luma_mode<S: Sample>(
     ctx: &IntraCtx<'_, S>,
+    geo: Geo,
     plane: &mut Plane16<S>,
     sc: &mut IntraScratch,
     x: usize,
@@ -612,10 +703,10 @@ fn decide_luma_tu<S: Sample>(
     src: &[S],
     src_stride: usize,
     cands: [u32; 3],
-    levels: &mut [i16],
-) -> (u8, bool) {
+) -> u8 {
     let n = 1usize << log2;
     let off = plane.offset(x as isize, y as isize);
+    fill_ref_avail(geo, &mut sc.avail, x, y, n, 1, 1);
     let mut best = (f32::MAX, 1u8);
     for mode in 0..35u8 {
         // The decoder's flags for a luma block under this SPS: reference
@@ -632,12 +723,37 @@ fn decide_luma_tu<S: Sample>(
             best = (cost, mode);
         }
     }
-    let mode = best.1;
-    // Re-predict the winner (the plane holds the last trial), then code.
+    best.1
+}
+
+/// Predict one luma transform block with the CU's chosen mode and code
+/// its residual — the per-transform-block behaviour of the decoder's
+/// `transform_unit`, which predicts every TB from the reconstruction as
+/// it stands when that TB is reached, so under a transform split the
+/// later TBs of a CU predict from the reconstructed earlier ones. An
+/// encoder that predicted the whole CU once and split only the residual
+/// would desync — and both sides of a private round trip would agree
+/// about it, which is why the replay test predicts per-TB too. Returns
+/// the nonzero-level count.
+#[allow(clippy::too_many_arguments)]
+fn code_luma_tb<S: Sample>(
+    ctx: &IntraCtx<'_, S>,
+    geo: Geo,
+    plane: &mut Plane16<S>,
+    sc: &mut IntraScratch,
+    x: usize,
+    y: usize,
+    log2: u32,
+    mode: u8,
+    src: &[S],
+    src_stride: usize,
+    levels: &mut [i16],
+) -> u32 {
+    let n = 1usize << log2;
+    fill_ref_avail(geo, &mut sc.avail, x, y, n, 1, 1);
     predict(plane, sc, x, y, n, mode as u32, 0, true, true, ctx.bit_depth, ctx.strong_smoothing);
     let qp = ctx.qp + 6 * (ctx.bit_depth as i32 - 8);
-    let cbf = code_residual(ctx, plane, x, y, log2, 0, qp, src, src_stride, levels);
-    (mode, cbf)
+    code_residual(ctx, plane, x, y, log2, 0, qp, src, src_stride, levels)
 }
 
 /// The derived chroma mode (`IntraPredModeC`, 8.4.3) for a syntax value
@@ -656,25 +772,30 @@ fn chroma_mode_for(syntax: u8, luma: u8) -> u8 {
 }
 
 /// Choose the chroma mode over the five codable candidates by SATD summed
-/// across both components, then code and reconstruct each. `sc.avail`
-/// must already describe the chroma block (one derivation serves both
-/// planes — their geometry is identical).
+/// across both components, predicting at the parent (unsplit) size —
+/// which is also what a split CU's chroma mode search uses, since one
+/// mode serves all four child TUs. `(xl, yl)` are luma coordinates of the
+/// CU; availability is derived here once and serves both planes, their
+/// geometry being identical. Returns `(intra_chroma_pred_mode,
+/// IntraPredModeC)`.
 #[allow(clippy::too_many_arguments)]
-fn decide_chroma<S: Sample>(
+fn search_chroma_mode<S: Sample>(
     ctx: &IntraCtx<'_, S>,
+    geo: Geo,
     cb: &mut Plane16<S>,
     cr: &mut Plane16<S>,
     sc: &mut IntraScratch,
-    cx: usize,
-    cy: usize,
+    xl: usize,
+    yl: usize,
     log2c: u32,
     luma0: u8,
     src_cb: &[S],
     src_cr: &[S],
     c_stride: usize,
-    out: &mut CuDecision,
-) {
+) -> (u8, u8) {
     let nc = 1usize << log2c;
+    let (cx, cy) = (xl / 2, yl / 2);
+    fill_ref_avail(geo, &mut sc.avail, xl, yl, nc, 2, 2);
     let mut best = (f32::MAX, 4u8);
     for syntax in 0..5u8 {
         let mode = chroma_mode_for(syntax, luma0) as u32;
@@ -692,29 +813,179 @@ fn decide_chroma<S: Sample>(
             best = (cost, syntax);
         }
     }
-    let syntax = best.1;
-    let mode = chroma_mode_for(syntax, luma0);
+    (best.1, chroma_mode_for(best.1, luma0))
+}
+
+/// Predict and code one chroma transform block of component `c_idx` at
+/// the block whose *luma* position is `(xl, yl)` — availability is a luma
+/// question, exactly as `intra_predict_block` poses it. Per-TB like its
+/// luma counterpart: under a split, later chroma children predict from
+/// the reconstructed earlier ones. Returns the nonzero-level count.
+#[allow(clippy::too_many_arguments)]
+fn code_chroma_tb<S: Sample>(
+    ctx: &IntraCtx<'_, S>,
+    geo: Geo,
+    plane: &mut Plane16<S>,
+    sc: &mut IntraScratch,
+    xl: usize,
+    yl: usize,
+    log2c: u32,
+    c_idx: usize,
+    mode: u8,
+    src: &[S],
+    c_stride: usize,
+    levels: &mut [i16],
+) -> u32 {
+    let nc = 1usize << log2c;
+    let (cx, cy) = (xl / 2, yl / 2);
+    fill_ref_avail(geo, &mut sc.avail, xl, yl, nc, 2, 2);
+    predict(plane, sc, cx, cy, nc, mode as u32, c_idx, false, false, ctx.bit_depth, ctx.strong_smoothing);
     // QP for chroma as the decoder derives it: the bit-depth offset comes
     // off, Table 8-10 maps, and it goes back on. No PPS or slice offsets.
     let bd_off = 6 * (ctx.bit_depth as i32 - 8);
     let qp_c = chroma_qp(1, ctx.qp.clamp(-bd_off, 57)) + bd_off;
-    for (comp, (plane, src)) in [(&mut *cb, src_cb), (&mut *cr, src_cr)].into_iter().enumerate() {
-        predict(plane, sc, cx, cy, nc, mode as u32, 1 + comp, false, false, ctx.bit_depth, ctx.strong_smoothing);
-        out.cbf_chroma[comp] = code_residual(
-            ctx,
-            plane,
-            cx,
-            cy,
-            log2c,
-            1 + comp,
-            qp_c,
-            src,
-            c_stride,
-            &mut out.chroma[comp][..nc * nc],
-        );
+    code_residual(ctx, plane, cx, cy, log2c, c_idx, qp_c, src, c_stride, levels)
+}
+
+/// Code the residual of one `PART_2Nx2N` CU with the given modes and
+/// transform structure, filling the decision's level arrays and cbf
+/// flags. Unsplit is one luma TU and one chroma TU per component; split
+/// is four quarter luma TUs and four chroma child TU pairs, coded in
+/// z-order with each transform block predicted from the reconstruction
+/// as it stands — the decoder's `transform_tree` order. (The decoder
+/// interleaves each child's luma and chroma; coding all luma children
+/// then all chroma children is identical, because the planes are
+/// disjoint and each child reads only children before it in z-order.)
+/// Returns the CU's reconstruction SSD against the source over all three
+/// components, and the total nonzero-level count — the two inputs the
+/// structure comparison wants. Callable twice with either structure over
+/// the same state: everything a trial reads is either outside the CU or
+/// written by that trial before it reads it, so trials simply overwrite
+/// one another.
+#[allow(clippy::too_many_arguments)]
+fn code_cu_2nx2n<S: Sample>(
+    ctx: &IntraCtx<'_, S>,
+    geo: Geo,
+    recon: &mut Frame<S>,
+    sc: &mut IntraScratch,
+    x0: usize,
+    y0: usize,
+    mode: u8,
+    chroma_mode: u8,
+    split: bool,
+    src_y: &[S],
+    y_stride: usize,
+    src_cb: &[S],
+    src_cr: &[S],
+    c_stride: usize,
+    out: &mut CuDecision,
+) -> (u64, u32) {
+    let n = 1usize << geo.log2_cu;
+    // A fresh slate: the other trial may have filled a different shape,
+    // and the layout promises zeros beyond the described TUs.
+    out.split_tu = split;
+    out.cbf_luma = [false; 4];
+    out.cbf_chroma = [false; 2];
+    out.cbf_chroma_tu = [[false; 4]; 2];
+    out.luma.fill(0);
+    out.chroma = [[0; 256]; 2];
+    let mut nz_total = 0u32;
+
+    if split {
+        let h = n / 2;
+        let q = h * h;
+        for i in 0..4 {
+            let (tx, ty) = (x0 + (i & 1) * h, y0 + (i >> 1) * h);
+            let soff = (ty - y0) * y_stride + (tx - x0);
+            let nz = code_luma_tb(ctx, geo, &mut recon.y, sc, tx, ty, geo.log2_cu - 1, mode, &src_y[soff..], y_stride, &mut out.luma[i * q..(i + 1) * q]);
+            out.cbf_luma[i] = nz != 0;
+            nz_total += nz;
+        }
+        let qc = (h / 2) * (h / 2);
+        for (comp, plane) in [&mut recon.cb, &mut recon.cr].into_iter().enumerate() {
+            for i in 0..4 {
+                let (tx, ty) = (x0 + (i & 1) * h, y0 + (i >> 1) * h);
+                let src = if comp == 0 { src_cb } else { src_cr };
+                let soff = (ty - y0) / 2 * c_stride + (tx - x0) / 2;
+                let nz = code_chroma_tb(
+                    ctx,
+                    geo,
+                    plane,
+                    sc,
+                    tx,
+                    ty,
+                    geo.log2_cu - 2,
+                    1 + comp,
+                    chroma_mode,
+                    &src[soff..],
+                    c_stride,
+                    &mut out.chroma[comp][i * qc..(i + 1) * qc],
+                );
+                out.cbf_chroma_tu[comp][i] = nz != 0;
+                nz_total += nz;
+            }
+            // The depth-0 bin is "any child coded", which is what gates
+            // the per-child bins in the reader.
+            out.cbf_chroma[comp] = out.cbf_chroma_tu[comp].iter().any(|&f| f);
+        }
+    } else {
+        let nz = code_luma_tb(ctx, geo, &mut recon.y, sc, x0, y0, geo.log2_cu, mode, src_y, y_stride, &mut out.luma[..n * n]);
+        out.cbf_luma[0] = nz != 0;
+        nz_total += nz;
+        let nc = n / 2;
+        for (comp, plane) in [&mut recon.cb, &mut recon.cr].into_iter().enumerate() {
+            let src = if comp == 0 { src_cb } else { src_cr };
+            let nz = code_chroma_tb(ctx, geo, plane, sc, x0, y0, geo.log2_cu - 1, 1 + comp, chroma_mode, src, c_stride, &mut out.chroma[comp][..nc * nc]);
+            out.cbf_chroma[comp] = nz != 0;
+            nz_total += nz;
+        }
     }
-    out.chroma_syntax = syntax;
-    out.chroma_mode = mode;
+
+    // The trial's distortion: SSD of the reconstruction against the
+    // source over the whole CU, all three components.
+    let yoff = recon.y.offset(x0 as isize, y0 as isize);
+    let mut ssd = (ctx.dist.ssd)(src_y, y_stride, &recon.y.data[yoff..], recon.y.stride, n, n);
+    let nc = n / 2;
+    for (plane, src) in [(&recon.cb, src_cb), (&recon.cr, src_cr)] {
+        let off = plane.offset((x0 / 2) as isize, (y0 / 2) as isize);
+        ssd += (ctx.dist.ssd)(src, c_stride, &plane.data[off..], plane.stride, nc, nc);
+    }
+    (ssd, nz_total)
+}
+
+/// The rate half of the split-vs-unsplit comparison — **a placeholder for
+/// real RD**, and the one function that heuristic lives in. It counts the
+/// signalling bins the two structures actually differ by, read off the
+/// freshly coded decision (the four child split flags, per-TU `cbf_luma`,
+/// the parent-gated child chroma cbfs), plus a flat charge per nonzero
+/// level standing in for residual bits — the crudest rate model that
+/// still sees the real mechanism, which is that a split isolates a busy
+/// quadrant so the flat ones code nothing while an unsplit transform
+/// smears that quadrant's energy across the whole block's spectrum. The
+/// Lagrangian is the same conventional `0.85 * 2^((QP - 12) / 3)` as
+/// [`mode_signalling_cost`], here paired with SSD rather than SATD, which
+/// a real RD pass would want to revisit along with everything else in
+/// this function.
+fn tu_structure_cost(qp: i32, d: &CuDecision, nz: u32) -> f32 {
+    // split_transform_flag itself is one bin either way.
+    let mut bins = 1u32;
+    if d.split_tu {
+        // Each child spells its own (zero) split flag, then cbf_luma; the
+        // parent chroma pair is followed by four child bins per component
+        // that carried anything.
+        bins += 4 + 4 + 2;
+        for comp in 0..2 {
+            if d.cbf_chroma[comp] {
+                bins += 4;
+            }
+        }
+    } else {
+        bins += 1 + 2; // cbf_luma and the chroma pair
+    }
+    // Roughly what a nonzero level costs to code, hand-waved.
+    const LEVEL_BINS: f32 = 3.0;
+    let lambda = 0.85f32 * ((qp - 12) as f32 / 3.0).exp2();
+    lambda * (bins as f32 + LEVEL_BINS * nz as f32)
 }
 
 #[cfg(test)]
@@ -757,16 +1028,19 @@ mod tests {
 
     /// Code a whole picture in raster CTU order, returning the state and
     /// the decisions.
+    #[allow(clippy::too_many_arguments)]
     fn code_picture(
         ctx: &IntraCtx<'_, u8>,
         w: usize,
         h: usize,
         log2_cu: u32,
+        try_split: bool,
         src_y: &[u8],
         src_cb: &[u8],
         src_cr: &[u8],
     ) -> (IntraPicture<u8>, Vec<CuDecision>) {
         let mut pic = IntraPicture::new(w, h, log2_cu, 8);
+        pic.try_split = try_split;
         let n = 1usize << log2_cu;
         let mut decisions = Vec::new();
         for cy in 0..h / n {
@@ -775,6 +1049,47 @@ mod tests {
             }
         }
         (pic, decisions)
+    }
+
+    /// A luma plane built to make the structure decision take both
+    /// answers within one picture: CTUs at even raster index are noise
+    /// throughout (nothing for a split to isolate), odd ones are flat
+    /// with a noisy bottom-right quadrant (everything for a split to
+    /// isolate).
+    fn mixed_source(w: usize, h: usize, n: usize, seed: u64) -> Vec<u8> {
+        let mut v = vec![128u8; w * h];
+        let mut s = seed;
+        for cy in 0..h / n {
+            for cx in 0..w / n {
+                let quadrant_only = (cy * (w / n) + cx) % 2 == 1;
+                for y in 0..n {
+                    for x in 0..n {
+                        let in_quadrant = x >= n / 2 && y >= n / 2;
+                        if !quadrant_only || in_quadrant {
+                            v[(cy * n + y) * w + cx * n + x] = lcg(&mut s) as u8;
+                        }
+                    }
+                }
+            }
+        }
+        v
+    }
+
+    /// The decoder's mode-from-syntax rule: index the MPM list, or sort
+    /// it and bump the remainder past each candidate it reaches.
+    fn mode_from_syntax(s: LumaModeSyntax, cands: [u32; 3]) -> u32 {
+        if s.prev_flag {
+            return cands[s.mpm_idx as usize];
+        }
+        let mut sorted = cands;
+        sorted.sort_unstable();
+        let mut m = s.rem as u32;
+        for c in sorted {
+            if m >= c {
+                m += 1;
+            }
+        }
+        m
     }
 
     /// Every claim of an available neighbour must point at a block that
@@ -938,7 +1253,7 @@ mod tests {
 
             let y = vec![128u8; w * h];
             let c = vec![128u8; w * h / 4];
-            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, &y, &c, &c);
+            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, false, &y, &c, &c);
             for d in &decisions {
                 assert!(d.cbf_luma.iter().all(|&f| !f), "log2_cu={log2_cu}");
                 assert!(d.cbf_chroma.iter().all(|&f| !f));
@@ -987,10 +1302,20 @@ mod tests {
             let ctx = kit.ctx(qp, false);
             let n = 1usize << log2_cu;
             let (w, h) = (4 * n, 2 * n);
-            let y = noise(w, h, 0x5eed ^ ((log2_cu as u64) << 8) ^ qp as u64);
+            // Content that pushes the structure decision both ways within
+            // one picture, so the replay covers split and unsplit CUs in
+            // the same walk (at log2_cu 3 the split does not exist and
+            // this is simply varied content).
+            let y = mixed_source(w, h, n, 0x5eed ^ ((log2_cu as u64) << 8) ^ qp as u64);
             let cbs = noise(w / 2, h / 2, 0xcb);
             let crs = noise(w / 2, h / 2, 0xc7);
-            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, &y, &cbs, &crs);
+            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, true, &y, &cbs, &crs);
+            if log2_cu > 3 {
+                assert!(
+                    decisions.iter().any(|d| d.split_tu) && decisions.iter().any(|d| !d.split_tu),
+                    "log2_cu={log2_cu} qp={qp}: only one structure occurred, the replay is not covering both"
+                );
+            }
             let replayed = replay(&ctx, w, h, log2_cu, &decisions);
             assert_planes_equal(&pic.recon, &replayed, log2_cu, qp);
 
@@ -1028,7 +1353,12 @@ mod tests {
             let y = noise(w, h, 99 + log2_cu as u64);
             let cbs = noise(w / 2, h / 2, 7);
             let crs = noise(w / 2, h / 2, 8);
-            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, &y, &cbs, &crs);
+            // The split trial runs (and under bypass reliably loses: the
+            // residual is spatial, so partitioning it moves no energy and
+            // the extra signalling decides) — exactness must survive the
+            // trial machinery either way. The split *shape* under bypass
+            // is exercised by lossless_bypass_composes_with_the_split_shape.
+            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, true, &y, &cbs, &crs);
             for (name, plane, src, pw, ph) in [
                 ("y", &pic.recon.y, &y, w, h),
                 ("cb", &pic.recon.cb, &cbs, w / 2, h / 2),
@@ -1057,34 +1387,203 @@ mod tests {
     #[test]
     fn cbf_flags_state_exactly_which_tus_hold_levels() {
         let kit = Kit::new();
-        for &(log2_cu, qp) in &[(3u32, 30i32), (4, 40), (5, 51)] {
+        for &(log2_cu, qp) in &[(3u32, 30i32), (4, 32), (5, 40)] {
             let ctx = kit.ctx(qp, false);
             let n = 1usize << log2_cu;
-            let (w, h) = (2 * n, 2 * n);
-            let y = noise(w, h, 0xcbf ^ log2_cu as u64);
+            let (w, h) = (4 * n, 2 * n);
+            let y = mixed_source(w, h, n, 0xcbf ^ log2_cu as u64);
             let cbs = noise(w / 2, h / 2, 1);
             let crs = noise(w / 2, h / 2, 2);
-            let (_, decisions) = code_picture(&ctx, w, h, log2_cu, &y, &cbs, &crs);
+            let (_, decisions) = code_picture(&ctx, w, h, log2_cu, true, &y, &cbs, &crs);
+            if log2_cu > 3 {
+                assert!(
+                    decisions.iter().any(|d| d.split_tu) && decisions.iter().any(|d| !d.split_tu),
+                    "log2_cu={log2_cu} qp={qp}: only one structure occurred, the split bookkeeping is untested"
+                );
+            }
             let mut some_set = false;
             let mut some_clear = false;
             for d in &decisions {
-                let tus: &[(usize, usize)] = if d.nxn { &[(0, 16), (16, 32), (32, 48), (48, 64)] } else { &[(0, n * n)] };
+                // Luma: the TU slices each shape describes, and zeros
+                // beyond them (the layout's promise to the serialiser).
+                let q = (n / 2) * (n / 2);
+                let (tus, end): (&[(usize, usize)], usize) = if d.nxn {
+                    (&[(0, 16), (16, 32), (32, 48), (48, 64)], 64)
+                } else if d.split_tu {
+                    (&[(0, q), (q, 2 * q), (2 * q, 3 * q), (3 * q, 4 * q)], 4 * q)
+                } else {
+                    (&[(0, n * n)], n * n)
+                };
                 for (i, &(s, e)) in tus.iter().enumerate() {
                     let any = d.luma[s..e].iter().any(|&v| v != 0);
                     assert_eq!(d.cbf_luma[i], any, "luma tu {i} log2_cu={log2_cu} qp={qp}");
                     some_set |= any;
                     some_clear |= !any;
                 }
-                let nc = n / 2;
+                for i in tus.len()..4 {
+                    assert!(!d.cbf_luma[i], "cbf beyond the shape's TUs");
+                }
+                assert!(d.luma[end..].iter().all(|&v| v == 0), "levels beyond the shape's TUs");
+
+                // Chroma: per-child flags under a split, with the depth-0
+                // flag their OR; a single TU's own flag otherwise.
                 for comp in 0..2 {
-                    let any = d.chroma[comp][..nc * nc].iter().any(|&v| v != 0);
-                    assert_eq!(d.cbf_chroma[comp], any, "chroma {comp} log2_cu={log2_cu} qp={qp}");
+                    if d.split_tu {
+                        let qc = (n / 4) * (n / 4);
+                        for i in 0..4 {
+                            let any = d.chroma[comp][i * qc..(i + 1) * qc].iter().any(|&v| v != 0);
+                            assert_eq!(d.cbf_chroma_tu[comp][i], any, "chroma {comp} child {i} log2_cu={log2_cu} qp={qp}");
+                        }
+                        assert!(d.chroma[comp][4 * qc..].iter().all(|&v| v == 0));
+                        assert_eq!(
+                            d.cbf_chroma[comp],
+                            d.cbf_chroma_tu[comp].iter().any(|&f| f),
+                            "the depth-0 chroma cbf is not the OR of its children"
+                        );
+                    } else {
+                        let nc = n / 2;
+                        let any = d.chroma[comp][..nc * nc].iter().any(|&v| v != 0);
+                        assert_eq!(d.cbf_chroma[comp], any, "chroma {comp} log2_cu={log2_cu} qp={qp}");
+                        assert!(d.chroma[comp][nc * nc..].iter().all(|&v| v == 0));
+                        assert_eq!(d.cbf_chroma_tu[comp], [false; 4], "child flags outside a split");
+                    }
                 }
             }
             // The test only means something if both flag values occurred
-            // somewhere across the sweep; noise at these QPs produces both.
-            assert!(some_set, "qp={qp}: nothing coded, the check is vacuous");
-            let _ = some_clear;
+            // somewhere across the sweep; the mixed content at these QPs
+            // produces both.
+            assert!(some_set && some_clear, "log2_cu={log2_cu} qp={qp}: cbf never varied, the check is vacuous");
+        }
+    }
+
+    /// The construction the split exists for: three flat quadrants and a
+    /// busy one. Unsplit, the big transform smears the busy quadrant's
+    /// energy across the whole block's spectrum; split, three TUs code
+    /// nothing and the levels concentrate in the fourth — so the decision
+    /// must split, put every nonzero level in the last-in-z-order TU,
+    /// and clear the other three cbfs. The busy quadrant sits bottom-right
+    /// so the flat TBs precede it in z-order and predict flat exactly.
+    #[test]
+    fn a_busy_quadrant_splits_the_transform() {
+        let kit = Kit::new();
+        let ctx = kit.ctx(30, false);
+        for log2_cu in 4..=5u32 {
+            let n = 1usize << log2_cu;
+            let (w, h) = (n, n);
+            let mut y = vec![128u8; w * h];
+            let mut s = 0xb1257u64;
+            for yy in n / 2..n {
+                for xx in n / 2..n {
+                    y[yy * w + xx] = lcg(&mut s) as u8;
+                }
+            }
+            let c = vec![128u8; w * h / 4];
+            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, true, &y, &c, &c);
+            let d = &decisions[0];
+            assert!(d.split_tu, "log2_cu={log2_cu}: the busy quadrant did not force a split");
+            assert_eq!(d.cbf_luma, [false, false, false, true], "log2_cu={log2_cu}");
+            assert_eq!(d.cbf_chroma, [false; 2], "flat chroma coded something");
+            let q = (n / 2) * (n / 2);
+            assert!(d.luma[..3 * q].iter().all(|&v| v == 0));
+            assert!(d.luma[3 * q..4 * q].iter().any(|&v| v != 0));
+            // And the shape replays to the same picture, within the bound.
+            let replayed = replay(&ctx, w, h, log2_cu, &decisions);
+            assert_planes_equal(&pic.recon, &replayed, log2_cu, 30);
+        }
+    }
+
+    /// The other direction: content with no structure for a split to
+    /// exploit. Uniform noise puts comparable levels in either shape, so
+    /// the split buys nothing and its extra signalling loses; the CU must
+    /// keep the single TU.
+    #[test]
+    fn uniform_content_keeps_the_single_tu() {
+        let kit = Kit::new();
+        let ctx = kit.ctx(30, false);
+        for log2_cu in 4..=5u32 {
+            let n = 1usize << log2_cu;
+            let (w, h) = (n, n);
+            let y = noise(w, h, 0x0451 + log2_cu as u64);
+            let c = vec![128u8; w * h / 4];
+            let (_, decisions) = code_picture(&ctx, w, h, log2_cu, true, &y, &c, &c);
+            assert!(!decisions[0].split_tu, "log2_cu={log2_cu}: uniform noise split anyway");
+        }
+    }
+
+    /// The per-TB prediction anchor, on content that can actually catch
+    /// it. In every split the *decision* produces, the earlier TBs are
+    /// flat (that is what makes splitting win), so their reconstruction
+    /// matches almost any prediction and a stale-neighbour bug hides; and
+    /// under bypass the reconstruction is the source whatever the
+    /// prediction was. So: force the split shape on lossy noise through
+    /// the same function the trial uses. Now TB1 must predict from TB0's
+    /// *reconstructed* (quantised) samples, TB2 from TB0/TB1's, chroma
+    /// children likewise — an encoder that predicted the CU in one pass,
+    /// or from the source, or in the wrong order, lands on a different
+    /// picture than the z-order replay and fails here.
+    #[test]
+    fn a_forced_split_on_noise_replays_exactly() {
+        let kit = Kit::new();
+        for &(log2_cu, qp) in &[(4u32, 20i32), (4, 37), (5, 30)] {
+            let ctx = kit.ctx(qp, false);
+            let n = 1usize << log2_cu;
+            let (w, h) = (n, n);
+            let y = noise(w, h, 0xf0ced ^ ((log2_cu as u64) << 8) ^ qp as u64);
+            let cbs = noise(w / 2, h / 2, 5);
+            let crs = noise(w / 2, h / 2, 6);
+            let mut pic = IntraPicture::<u8>::new(w, h, log2_cu, 8);
+            let geo = pic.geo;
+            let IntraPicture { recon, modes, scratch, .. } = &mut pic;
+            let cands = mpm_candidates(geo, modes, 0, 0);
+            // An angular mode, so the prediction really propagates
+            // neighbour samples rather than averaging them away.
+            let mode = 26u8;
+            let mut d = CuDecision { log2_cu, ..CuDecision::default() };
+            d.luma_modes = [mode; 4];
+            d.luma_syntax[0] = as_syntax(mode, cands);
+            d.chroma_syntax = 4;
+            d.chroma_mode = chroma_mode_for(4, mode);
+            PicInfo::fill4(modes, geo.w4, 0, 0, n, n, mode);
+            let _ = code_cu_2nx2n(&ctx, geo, recon, scratch, 0, 0, mode, d.chroma_mode, true, &y, w, &cbs, &crs, w / 2, &mut d);
+            assert!(d.split_tu);
+            let replayed = replay(&ctx, w, h, log2_cu, &[d]);
+            assert_planes_equal(&pic.recon, &replayed, log2_cu, qp);
+        }
+    }
+
+    /// Transquant bypass composed with the split shape: the residual is
+    /// carried raw per TB and prediction runs per TB over the exact
+    /// reconstruction, so a split CU is exactly lossless too. The public
+    /// decision never picks a split under bypass (partitioning a spatial
+    /// residual moves no energy, so the extra signalling always loses),
+    /// so this codes the split shape directly through the same function
+    /// the trial uses, then replays it fresh.
+    #[test]
+    fn lossless_bypass_composes_with_the_split_shape() {
+        let kit = Kit::new();
+        let ctx = kit.ctx(26, true);
+        for log2_cu in 4..=5u32 {
+            let n = 1usize << log2_cu;
+            let (w, h) = (n, n);
+            let y = noise(w, h, 0x10551e55 + log2_cu as u64);
+            let cbs = noise(w / 2, h / 2, 3);
+            let crs = noise(w / 2, h / 2, 4);
+            let mut pic = IntraPicture::<u8>::new(w, h, log2_cu, 8);
+            let geo = pic.geo;
+            let IntraPicture { recon, modes, scratch, .. } = &mut pic;
+            let cands = mpm_candidates(geo, modes, 0, 0);
+            let mode = 1u8; // DC; any legal mode serves
+            let mut d = CuDecision { log2_cu, bypass: true, ..CuDecision::default() };
+            d.luma_modes = [mode; 4];
+            d.luma_syntax[0] = as_syntax(mode, cands);
+            d.chroma_syntax = 4;
+            d.chroma_mode = chroma_mode_for(4, mode);
+            PicInfo::fill4(modes, geo.w4, 0, 0, n, n, mode);
+            let (ssd, _) = code_cu_2nx2n(&ctx, geo, recon, scratch, 0, 0, mode, d.chroma_mode, true, &y, w, &cbs, &crs, w / 2, &mut d);
+            assert!(d.split_tu);
+            assert_eq!(ssd, 0, "log2_cu={log2_cu}: bypass with a split is not exact");
+            let replayed = replay(&ctx, w, h, log2_cu, &[d]);
+            assert_planes_equal(&pic.recon, &replayed, log2_cu, 26);
         }
     }
 
@@ -1107,46 +1606,67 @@ mod tests {
                 let d = &decisions[di];
                 di += 1;
                 let (x0, y0) = (cx * n, cy * n);
+                let half = n / 2;
                 let IntraPicture { recon, modes, scratch, .. } = &mut pic;
-                let luma_tus: &[(usize, usize, usize, u32)] = if d.nxn {
-                    &[(x0, y0, 0, 2), (x0 + 4, y0, 1, 2), (x0, y0 + 4, 2, 2), (x0 + 4, y0 + 4, 3, 2)]
+                if d.nxn {
+                    // Four prediction blocks, each its own mode; derive
+                    // every one from the syntax, the decoder's way, and
+                    // hold it against what the encoder said it chose.
+                    for pb in 0..4 {
+                        let (px, py) = (x0 + (pb & 1) * 4, y0 + (pb >> 1) * 4);
+                        let cands = mpm_candidates(geo, modes, px, py);
+                        let mode = mode_from_syntax(d.luma_syntax[pb], cands);
+                        assert_eq!(mode, d.luma_modes[pb] as u32, "syntax and mode disagree at ({px},{py})");
+                        fill_ref_avail(geo, &mut scratch.avail, px, py, 4, 1, 1);
+                        predict(&mut recon.y, scratch, px, py, 4, mode, 0, true, true, ctx.bit_depth, ctx.strong_smoothing);
+                        add_tu(ctx, &mut recon.y, px, py, 2, 0, qp_y, d.bypass, &d.luma[pb * 16..pb * 16 + 16]);
+                        PicInfo::fill4(modes, geo.w4, px, py, 4, 4, mode as u8);
+                    }
                 } else {
-                    &[(x0, y0, 0, log2_cu)]
-                };
-                for &(px, py, pb, log2) in luma_tus {
-                    let tn = 1usize << log2;
-                    // Derive the mode from the syntax, the decoder's way,
-                    // and hold it against what the encoder said it chose.
-                    let cands = mpm_candidates(geo, modes, px, py);
-                    let s = d.luma_syntax[pb];
-                    let mode = if s.prev_flag {
-                        cands[s.mpm_idx as usize]
+                    // One prediction block; one or four transform blocks.
+                    // With a split, each TB is predicted afresh from the
+                    // reconstruction as it stands — the decoder's per-TB
+                    // behaviour, and the thing this replay anchors.
+                    let cands = mpm_candidates(geo, modes, x0, y0);
+                    let mode = mode_from_syntax(d.luma_syntax[0], cands);
+                    assert_eq!(mode, d.luma_modes[0] as u32, "syntax and mode disagree at ({x0},{y0})");
+                    PicInfo::fill4(modes, geo.w4, x0, y0, n, n, mode as u8);
+                    let lg = if d.split_tu { log2_cu - 1 } else { log2_cu };
+                    let tus: &[(usize, usize, usize)] = if d.split_tu {
+                        &[(x0, y0, 0), (x0 + half, y0, 1), (x0, y0 + half, 2), (x0 + half, y0 + half, 3)]
                     } else {
-                        let mut sorted = cands;
-                        sorted.sort_unstable();
-                        let mut m = s.rem as u32;
-                        for c in sorted {
-                            if m >= c {
-                                m += 1;
-                            }
-                        }
-                        m
+                        &[(x0, y0, 0)]
                     };
-                    assert_eq!(mode, d.luma_modes[pb] as u32, "syntax and mode disagree at ({px},{py})");
-                    fill_ref_avail(geo, &mut scratch.avail, px, py, tn, 1, 1);
-                    predict(&mut recon.y, scratch, px, py, tn, mode, 0, true, true, ctx.bit_depth, ctx.strong_smoothing);
-                    let base = if d.nxn { pb * 16 } else { 0 };
-                    add_tu(ctx, &mut recon.y, px, py, log2, 0, qp_y, d.bypass, &d.luma[base..base + tn * tn]);
-                    PicInfo::fill4(modes, geo.w4, px, py, tn, tn, mode as u8);
+                    for &(px, py, tu) in tus {
+                        let tn = 1usize << lg;
+                        let q = tn * tn;
+                        fill_ref_avail(geo, &mut scratch.avail, px, py, tn, 1, 1);
+                        predict(&mut recon.y, scratch, px, py, tn, mode, 0, true, true, ctx.bit_depth, ctx.strong_smoothing);
+                        add_tu(ctx, &mut recon.y, px, py, lg, 0, qp_y, d.bypass, &d.luma[tu * q..(tu + 1) * q]);
+                    }
                 }
                 let mode = chroma_mode_for(d.chroma_syntax, d.luma_modes[0]);
                 assert_eq!(mode, d.chroma_mode, "chroma syntax and mode disagree");
-                let nc = n / 2;
-                let (ccx, ccy) = (x0 / 2, y0 / 2);
-                fill_ref_avail(geo, &mut scratch.avail, x0, y0, nc, 2, 2);
-                for (comp, plane) in [&mut recon.cb, &mut recon.cr].into_iter().enumerate() {
-                    predict(plane, scratch, ccx, ccy, nc, mode as u32, 1 + comp, false, false, ctx.bit_depth, ctx.strong_smoothing);
-                    add_tu(ctx, plane, ccx, ccy, log2_cu - 1, 1 + comp, qp_c, d.bypass, &d.chroma[comp][..nc * nc]);
+                if d.split_tu {
+                    // Chroma followed the luma split: four child TU pairs,
+                    // each predicted per-TB like the luma ones.
+                    let cn = half / 2;
+                    let qc = cn * cn;
+                    for (comp, plane) in [&mut recon.cb, &mut recon.cr].into_iter().enumerate() {
+                        for i in 0..4 {
+                            let (px, py) = (x0 + (i & 1) * half, y0 + (i >> 1) * half);
+                            fill_ref_avail(geo, &mut scratch.avail, px, py, cn, 2, 2);
+                            predict(plane, scratch, px / 2, py / 2, cn, mode as u32, 1 + comp, false, false, ctx.bit_depth, ctx.strong_smoothing);
+                            add_tu(ctx, plane, px / 2, py / 2, log2_cu - 2, 1 + comp, qp_c, d.bypass, &d.chroma[comp][i * qc..(i + 1) * qc]);
+                        }
+                    }
+                } else {
+                    let nc = n / 2;
+                    fill_ref_avail(geo, &mut scratch.avail, x0, y0, nc, 2, 2);
+                    for (comp, plane) in [&mut recon.cb, &mut recon.cr].into_iter().enumerate() {
+                        predict(plane, scratch, x0 / 2, y0 / 2, nc, mode as u32, 1 + comp, false, false, ctx.bit_depth, ctx.strong_smoothing);
+                        add_tu(ctx, plane, x0 / 2, y0 / 2, log2_cu - 1, 1 + comp, qp_c, d.bypass, &d.chroma[comp][..nc * nc]);
+                    }
                 }
             }
         }
