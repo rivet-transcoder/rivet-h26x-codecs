@@ -223,7 +223,7 @@ impl H265Encoder {
         // The transform-split search is on: a CU may carry four quarter-size
         // TUs where that wins the decision module's cost comparison, and the
         // writer below spells both shapes.
-        pic.try_split = true;
+        pic.split_depth = 1;
 
         // Parameter sets, then the one slice.
         let mut out = Vec::new();
@@ -399,8 +399,13 @@ fn write_ctu_intra(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, ctu_
                     }
                 }
             }
-            write_cbf_luma(e, cx, 1, d.cbf_luma[i]);
-            if d.cbf_luma[i] {
+            // Positional cbf_luma: quadrant `i` owns `[4i..4i+4]`, and a
+            // quadrant that is a single leaf — which every quadrant is at
+            // this one split level — uses its first slot. The decision
+            // module's layout is positional precisely so no slot depends
+            // on a sibling's structure.
+            write_cbf_luma(e, cx, 1, d.cbf_luma[4 * i]);
+            if d.cbf_luma[4 * i] {
                 write_residual(e, cx, &params(log2 - 1, 0, d.luma_modes[0]), &d.luma[i * q..(i + 1) * q]);
             }
             if cat != 0 {
@@ -603,7 +608,7 @@ mod tests {
             bypass: false,
         };
         let mut pic = IntraPicture::<u8>::new(64, 64, 5, 8);
-        pic.try_split = true;
+        pic.split_depth = 1;
         let (py, pc) = frame.split_at(w * h);
         let (pcb, pcr) = pc.split_at(w * h / 4);
         let mut splits = 0usize;

@@ -1017,16 +1017,12 @@ fn chroma_tbs(cat: u32, xl: usize, yl: usize, log2: u32) -> ([(usize, usize); 2]
     }
 }
 
-/// The 4:2:2 chroma intra mode mapping (Table 8-3), by `modeIdc` — a
-/// **byte-for-byte copy of `hevc::ctu::MODE_422`**. That table is private
-/// and its file is frozen under a concurrent merge, so it cannot be
-/// exported from here; when the file thaws, export the decoder's and
-/// delete this copy — two copies of one table is exactly the drift hazard
-/// this module exists to avoid, which is why the copy is flagged rather
-/// than silent. Until then the CROSS gate is what holds them together.
-const MODE_422: [u8; 35] = [
-    0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 12, 13, 15, 17, 18, 19, 20, 21, 22, 23, 23, 24, 24, 25, 25, 26, 27, 27, 28, 28, 29, 29, 30, 31,
-];
+/// The 4:2:2 chroma intra mode mapping (Table 8-3), by `modeIdc` — the
+/// decoder's own table, not a copy. It was copied here while
+/// `hevc::ctu` was frozen under a concurrent merge, with a note to
+/// unify when the file thawed; this is that unification. Two copies of
+/// one table is the drift hazard this module exists to avoid.
+use crate::hevc::ctu::MODE_422;
 
 /// The derived chroma mode (`IntraPredModeC`, 8.4.3) for a syntax value
 /// against the luma mode — the mapping `hevc::ctu::coding_unit` applies:
@@ -1042,7 +1038,7 @@ fn chroma_mode_for(cat: u32, syntax: u8, luma: u8) -> u8 {
         _ => luma,
     };
     let m = if syntax < 4 && m == luma { 34 } else { m };
-    if cat == 2 { MODE_422[m as usize] } else { m }
+    if cat == 2 { MODE_422[m as usize] as u8 } else { m }
 }
 
 /// Choose the chroma mode over the five codable candidates by SATD
