@@ -95,6 +95,13 @@ hevc-cqp-ip|--codec h265 --qp 26 --gop 8
 hevc-cqp40-intra|--codec h265 --qp 40 --gop 0
 hevc-cqp40-ip|--codec h265 --qp 40 --gop 8
 hevc-cqp-ipb|--codec h265 --qp 26 --gop 8 --bframes 2
+# The SAO rows are carried by two of the seven clips, and it is worth
+# knowing which. On the gradient and odd clips the decision selects "off"
+# for every component of every coding tree block — correctly, there is no
+# quantisation structure there to shape — so those cells prove the syntax
+# and prove nothing about the filter. detail and motion are where the
+# filter actually runs. A row is only as strong as the clips that make it
+# do something.
 hevc-cqp40-sao-intra|--codec h265 --qp 40 --gop 0 --sao
 hevc-cqp40-sao-ip|--codec h265 --qp 40 --gop 8 --sao
 "}
