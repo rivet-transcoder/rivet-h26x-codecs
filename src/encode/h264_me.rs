@@ -72,8 +72,10 @@ use crate::encode::h264_deblock::FilterMb;
 use crate::encode::h264_intra::{IntraCtx, code_block_8x8, lambda, quad_rasters, reconstruct_8x8};
 use crate::h264::cavlc::sub_block_counts_8x8;
 use crate::encode::h264_syntax::Recon;
-use crate::h264::frame::Mv;
-use crate::h264::mb::{NbMotion, median_mvp};
+use crate::h264::frame::{BlockMotion, Frame, Mv, PARITY_FRAME};
+use crate::h264::mb::{
+    MbMotion, MbNeighbours, MotionCache, PicInfo, fill_motion, p_skip_mv, predict_mv,
+};
 use crate::h264::transform::{chroma_dc_transform_420, chroma_dc_transform_422};
 
 /// Everything inter coding needs that does not change per macroblock —
@@ -186,74 +188,106 @@ pub enum InterMbKind {
     UseIntra,
 }
 
-/// The neighbouring motion a 16x16 partition predicts from: the
-/// macroblocks holding luma samples (-1, 0), (0, -1), (16, -1) and
-/// (-1, -1) — A, B, C, D of 6.4.11.7. This module's coding is 16x16-only,
-/// so a neighbour's motion is its whole macroblock's motion, and the
-/// caller (which walks the picture) supplies the four values via
-/// [`nb_inter`], [`nb_intra`] and [`nb_absent`].
-#[derive(Clone, Copy)]
-pub struct MotionNeighbours {
-    /// Left (the macroblock holding sample (-1, 0)).
-    pub a: NbMotion,
-    /// Above (sample (0, -1)).
-    pub b: NbMotion,
-    /// Above-right (sample (16, -1)).
-    pub c: NbMotion,
-    /// Above-left (sample (-1, -1)) — the fallback when C is unavailable.
-    pub d: NbMotion,
-}
-
-/// A neighbour coded inter with `ref_idx` 0 (the only reference this
-/// module uses) and the given vector.
-pub fn nb_inter(mv: Mv) -> NbMotion {
-    NbMotion { avail: true, ref_idx: 0, mv }
-}
-
-/// A neighbour coded intra: available, but "not used for inter prediction"
-/// — reference index -1, zero vector — exactly the value the decoder's
-/// `MotionCache::gather` (src/h264/mb.rs) stores for one.
-pub fn nb_intra() -> NbMotion {
-    NbMotion { avail: true, ref_idx: -1, mv: Mv::ZERO }
-}
-
-/// A neighbour that does not exist: outside the picture, or not yet coded
-/// in this slice.
-pub fn nb_absent() -> NbMotion {
-    NbMotion::NONE
-}
-
-/// The median motion vector prediction for a 16x16 partition (8.4.1.3).
+/// The motion one macroblock's partitions predict from: the neighbours
+/// gathered from the picture, the blocks of this macroblock derived so
+/// far, and a mask of which those are.
 ///
-/// Mirrors `prediction_neighbours` in `src/h264/mb.rs` — C falling back to
-/// D when unavailable — and then runs the decoder's own `median_mvp`
-/// (src/h264/mb.rs, 8.4.1.3.1) rather than restating the median rules.
-/// `prediction_neighbours` itself is not called because it reads a
-/// `MotionCache` only the decoder's slice loop can fill; the test
-/// `the_predictor_and_skip_mv_agree_with_the_decoders_derivation` holds
-/// this mirror against the real thing.
-pub fn mv_predictor_16x16(nb: &MotionNeighbours) -> Mv {
-    let c = if nb.c.avail { nb.c } else { nb.d };
-    median_mvp(nb.a, nb.b, c, 0)
+/// This is the decoder's own working set — `MotionCache`, `MbMotion`
+/// and the `done` bitmask that `derive_motion` (src/h264/recon.rs)
+/// carries through a macroblock — held so that every prediction here is a
+/// *call* to `predict_mv` rather than a mirror of it. That matters most
+/// for partitions smaller than the macroblock, whose A / B / C neighbours
+/// are frequently blocks of this same macroblock: `done` is what makes an
+/// already-derived one readable and a not-yet-derived one absent, and
+/// there is no way to say that with a per-macroblock summary.
+pub struct MbMotionState {
+    cache: MotionCache,
+    cur: MbMotion,
+    done: u16,
 }
 
-/// The P_Skip motion vector (8.4.1.1): the zero vector when either edge
-/// neighbour is missing or is a zero-motion reference-0 block, else the
-/// 16x16 median prediction.
-///
-/// Mirrors the decoder's `p_skip_mv` in `src/h264/mb.rs`, which the same
-/// test holds this against. Getting this wrong is the classic desync: a
-/// decoder *derives* the skip vector, so an encoder that skips with any
-/// other vector has silently told the decoder a lie it cannot detect.
-pub fn skip_mv_16x16(nb: &MotionNeighbours) -> Mv {
-    if !nb.a.avail
-        || !nb.b.avail
-        || (nb.a.ref_idx == 0 && nb.a.mv == Mv::ZERO)
-        || (nb.b.ref_idx == 0 && nb.b.mv == Mv::ZERO)
-    {
-        return Mv::ZERO;
+impl Default for MbMotionState {
+    fn default() -> Self {
+        Self::new()
     }
-    mv_predictor_16x16(nb)
+}
+
+impl MbMotionState {
+    /// Empty state; `start` fills it per macroblock.
+    pub fn new() -> Self {
+        MbMotionState {
+            cache: MotionCache::default(),
+            cur: [[BlockMotion::default(); 16]; 2],
+            done: 0,
+        }
+    }
+
+    /// Begin macroblock `addr`: gather its neighbours from the picture
+    /// coded so far, and clear the per-macroblock part. `nb` is scratch.
+    pub fn start(
+        &mut self,
+        frame: &Frame<u8>,
+        info: &PicInfo,
+        addr: usize,
+        nb: &mut MbNeighbours,
+    ) {
+        nb.derive_into(info, addr, 0);
+        self.cache.gather(nb, frame, info);
+        self.cur = [[BlockMotion::default(); 16]; 2];
+        self.done = 0;
+    }
+
+    /// 8.4.1.3 for a partition at `(x, y)` of size `w` by `h` samples —
+    /// the decoder's own `predict_mv`, directional cases and C-to-D
+    /// fallback included.
+    pub fn predict(&self, list: usize, ref_idx: i8, x: usize, y: usize, w: usize, h: usize) -> Mv {
+        predict_mv(&self.cache, &self.cur, self.done, list, ref_idx, x, y, w, h)
+    }
+
+    /// 8.4.1.1's `P_Skip` vector, through the decoder's own `p_skip_mv`.
+    pub fn skip_mv(&self) -> Mv {
+        p_skip_mv(&self.cache, &self.cur)
+    }
+
+    /// Record a partition's derived motion, which later partitions of the
+    /// same macroblock predict from. Both lists are written before any
+    /// `done` bit is set, exactly as `derive_motion` orders it — an
+    /// unused list stores the default, which is what a decoder holds for
+    /// one.
+    pub fn commit_part(&mut self, x: usize, y: usize, w: usize, h: usize, per_list: [Option<Mv>; 2]) {
+        for (list, mv) in per_list.iter().enumerate() {
+            let m = match mv {
+                Some(mv) => BlockMotion {
+                    mv: *mv,
+                    ref_idx: 0,
+                    ref_parity: PARITY_FRAME,
+                    // An identity the derivations only compare for
+                    // equality; one reference per list makes 1 and 2
+                    // distinct names for "the list-0 picture" and "the
+                    // list-1 picture".
+                    ref_id: 1 + list as u16,
+                },
+                None => BlockMotion::default(),
+            };
+            fill_motion(&mut self.cur, list, x, y, w, h, m);
+        }
+        for by in y / 4..(y + h) / 4 {
+            for bx in x / 4..(x + w) / 4 {
+                self.done |= 1 << (by * 4 + bx);
+            }
+        }
+    }
+
+    /// The macroblock's motion so far, in the decoder's raster layout.
+    pub fn motion(&self) -> &MbMotion {
+        &self.cur
+    }
+
+    /// Spatial direct's reference indices (8.4.1.2.2), through the
+    /// decoder's own `spatial_direct_ref_idx`.
+    pub fn direct_ref_idx(&self) -> [i8; 2] {
+        crate::h264::mb::spatial_direct_ref_idx(&self.cache, &self.cur)
+    }
 }
 
 /// Replicate every reference plane's edges into its border, which is the
@@ -953,9 +987,9 @@ pub fn placeholder_inter_or_intra(dist: &DistortionDsp<u8>, inter_satd: u32, src
 /// `rec` and `refp` are the current and reference pictures' planes in the
 /// same layout the intra module uses (luma, then Cb, Cr when present);
 /// the reference must have been through [`prepare_reference`]. `nb` is the
-/// neighbouring motion (see [`MotionNeighbours`]); the caller feeds the
-/// returned `mv` back into later macroblocks' neighbours whatever the
-/// kind, because even a skipped macroblock has motion.
+/// motion state ([`MbMotionState`], gathered from the picture coded so
+/// far); the caller commits the returned `mv` into that state whatever
+/// the kind, because even a skipped macroblock has motion.
 ///
 /// On [`InterMbKind::UseIntra`] the reconstruction planes are untouched:
 /// the caller runs the intra decision, which writes them itself.
@@ -970,13 +1004,15 @@ pub fn code_macroblock_p16(
     luma_stride: usize,
     src_chroma: [&[u8]; 2],
     chroma_stride: usize,
-    nb: &MotionNeighbours,
+    st: &MbMotionState,
 ) -> InterDecision {
     let (px, py) = (mb_x * 16, mb_y * 16);
     let soff = py * luma_stride + px;
     let mut out = InterDecision::default();
 
-    let pred = mv_predictor_16x16(nb);
+    // 8.4.1.3 through the decoder's own derivation, over the state it
+    // would itself hold at this point in the picture.
+    let pred = st.predict(0, 0, 0, 0, 16, 16);
     let (mv, satd) = search_16x16(ctx, &refp[0], px as i32, py as i32, &src_luma[soff..], luma_stride, pred);
     out.mv = mv;
     out.mvd = Mv::new(mv.x - pred.x, mv.y - pred.y);
@@ -1006,7 +1042,7 @@ pub fn code_macroblock_p16(
     // surviving residual. Either alone is a different macroblock — a zero
     // residual at another vector is P_16x16 with cbp 0, and the skip
     // vector with residual is P_16x16 with mvd 0.
-    if out.cbp_luma == 0 && out.cbp_chroma == 0 && mv == skip_mv_16x16(nb) {
+    if out.cbp_luma == 0 && out.cbp_chroma == 0 && mv == st.skip_mv() {
         out.kind = InterMbKind::PSkip;
     }
     out
@@ -1100,27 +1136,6 @@ impl Default for BDecision {
     }
 }
 
-/// `MinPositive` of two reference indices — the mirror of `min_positive`
-/// in `src/h264/mb.rs` (private there), which `spatial_direct_ref_idx`
-/// folds over the neighbours.
-fn min_positive(a: i8, b: i8) -> i8 {
-    if a >= 0 && b >= 0 { a.min(b) } else { a.max(b) }
-}
-
-/// The reference indices spatial direct derives (8.4.1.2.2): `MinPositive`
-/// over the macroblock-level neighbours A, B, C of each list, with C
-/// falling back to D. The mirror of the decoder's
-/// [`crate::h264::mb::spatial_direct_ref_idx`], split out so the picture
-/// walk can hold the two against each other on real pictures.
-pub(crate) fn spatial_direct_ref_idx_mirror(nb: &[MotionNeighbours; 2]) -> [i8; 2] {
-    let mut ref_idx = [0i8; 2];
-    for (l, n) in nb.iter().enumerate() {
-        let c = if n.c.avail { n.c } else { n.d };
-        ref_idx[l] = min_positive(n.a.ref_idx, min_positive(n.b.ref_idx, c.ref_idx));
-    }
-    ref_idx
-}
-
 /// The spatial direct motion of a 16x16 B macroblock (8.4.1.2.2),
 /// returning the reference index and vector per list.
 ///
@@ -1144,16 +1159,18 @@ pub(crate) fn spatial_direct_ref_idx_mirror(nb: &[MotionNeighbours; 2]) -> [i8; 
 /// one motion per macroblock, so the four corner reads agree by
 /// construction. Long-term references do not exist here, so the
 /// long-term guard on colZeroFlag is vacuously satisfied.
-pub fn spatial_direct_16x16(nb: &[MotionNeighbours; 2], col: &FilterMb) -> ([i8; 2], [Mv; 2]) {
-    let mut ref_idx = spatial_direct_ref_idx_mirror(nb);
+pub fn spatial_direct_16x16(st: &MbMotionState, col: &FilterMb) -> ([i8; 2], [Mv; 2]) {
+    let mut ref_idx = st.direct_ref_idx();
     let mut mvp = [Mv::ZERO; 2];
     if ref_idx[0] < 0 && ref_idx[1] < 0 {
         ref_idx = [0, 0];
     } else {
-        for (l, n) in nb.iter().enumerate() {
+        for l in 0..2 {
             if ref_idx[l] >= 0 {
-                let c = if n.c.avail { n.c } else { n.d };
-                mvp[l] = median_mvp(n.a, n.b, c, ref_idx[l]);
+                // The whole-macroblock median at this list's derived
+                // reference index — `predict_mv`'s 16x16 case, which is
+                // the plain median with no directional rule.
+                mvp[l] = st.predict(l, ref_idx[l], 0, 0, 16, 16);
             }
         }
     }
@@ -1224,7 +1241,7 @@ pub fn code_macroblock_b16(
     luma_stride: usize,
     src_chroma: [&[u8]; 2],
     chroma_stride: usize,
-    nb: &[MotionNeighbours; 2],
+    st: &MbMotionState,
     col: &FilterMb,
 ) -> BDecision {
     let (px, py) = (mb_x * 16, mb_y * 16);
@@ -1233,7 +1250,7 @@ pub fn code_macroblock_b16(
     let mut out = BDecision::default();
 
     // Direct first: it wins ties, because it costs no motion syntax.
-    let (dref, dmv) = spatial_direct_16x16(nb, col);
+    let (dref, dmv) = spatial_direct_16x16(st, col);
     let dused = [dref[0] >= 0, dref[1] >= 0];
     let mut best_cost = b_luma_satd(ctx, refs, px as i32, py as i32, src, luma_stride, dused, dmv);
     out.kind = BMbKind::BDirect16;
@@ -1243,7 +1260,7 @@ pub fn code_macroblock_b16(
 
     // Explicit candidates: one search per list around that list's median
     // predictor, then the bi combination of the two winners.
-    let pred = [mv_predictor_16x16(&nb[0]), mv_predictor_16x16(&nb[1])];
+    let pred = [st.predict(0, 0, 0, 0, 16, 16), st.predict(1, 0, 0, 0, 16, 16)];
     let (mv0, _) = search_16x16(ctx, &refs[0][0], px as i32, py as i32, src, luma_stride, pred[0]);
     let (mv1, _) = search_16x16(ctx, &refs[1][0], px as i32, py as i32, src, luma_stride, pred[1]);
     for (used, label_mv) in [
@@ -1301,7 +1318,7 @@ mod tests {
     use crate::dsp::h264_enc::{H264EncDsp, Quant};
     use crate::encode::h264_syntax::recon_plane;
     use crate::h264::frame::{BlockMotion, Frame, LUMA_PAD, CHROMA_PAD, PARITY_FRAME};
-    use crate::h264::mb::{MbKind as DecKind, MbNeighbours, MotionCache, PicInfo, p_skip_mv, predict_mv};
+    use crate::h264::mb::{MbKind as DecKind, MbNeighbours, MotionCache, PicInfo};
     use crate::h264::sps::ScalingLists;
     use crate::h264::transform::{Dequant, dequant4x4, idct4x4};
     use crate::picture::ChromaFormat;
@@ -1459,13 +1476,65 @@ mod tests {
         ]
     }
 
-    fn absent_nb() -> MotionNeighbours {
-        MotionNeighbours { a: nb_absent(), b: nb_absent(), c: nb_absent(), d: nb_absent() }
+    /// A macroblock with no neighbours at all: every cache entry absent,
+    /// nothing of the macroblock itself derived. Which is exactly what a
+    /// fresh state is, so this names the intent rather than building
+    /// anything.
+    fn absent_state() -> MbMotionState {
+        MbMotionState::new()
+    }
+
+    /// A state whose four neighbouring macroblocks all carry `motion`
+    /// per list — built the way the picture walk builds one, out of a
+    /// real `Frame` and `PicInfo` gathered through the decoder's own
+    /// `MotionCache`, so the test exercises the same path the encoder
+    /// runs rather than a convenient stand-in.
+    ///
+    /// The centre macroblock of a 3x3 picture is address 4; A, B, C and D
+    /// are 3, 1, 2 and 0.
+    fn state_with_neighbours(per_mb: &[(usize, [Option<Mv>; 2])]) -> MbMotionState {
+        let mut frame = Frame::<u8>::empty();
+        frame.mb_width = 3;
+        frame.mb_height = 3;
+        frame.motion = [vec![BlockMotion::default(); 9 * 16], vec![BlockMotion::default(); 9 * 16]];
+        frame.mb_intra = vec![false; 9];
+        let mut info = PicInfo::new(3, 3);
+        for &(addr, per_list) in per_mb {
+            info.mbs[addr].decoded = true;
+            info.mbs[addr].slice = 0;
+            info.mbs[addr].kind =
+                if per_list.iter().all(|m| m.is_none()) { DecKind::I16x16 } else { DecKind::Inter16x16 };
+            for (l, mv) in per_list.iter().enumerate() {
+                let Some(mv) = mv else { continue };
+                let bm = BlockMotion {
+                    mv: *mv,
+                    ref_idx: 0,
+                    ref_parity: PARITY_FRAME,
+                    ref_id: 1 + l as u16,
+                };
+                frame.motion[l][addr * 16..addr * 16 + 16].fill(bm);
+            }
+        }
+        let mut st = MbMotionState::new();
+        let mut nb = MbNeighbours::default();
+        st.start(&frame, &info, 4, &mut nb);
+        st
+    }
+
+    /// All four neighbours of the centre macroblock carrying one list-0
+    /// vector each.
+    fn state_all(a: Mv, b: Mv, c: Mv, d: Mv) -> MbMotionState {
+        state_with_neighbours(&[
+            (3, [Some(a), None]),
+            (1, [Some(b), None]),
+            (2, [Some(c), None]),
+            (0, [Some(d), None]),
+        ])
     }
 
     /// Code the centre macroblock of the 3x3 test picture.
-    fn code_centre(ctx: &MeCtx, rec: &mut [Recon], refp: &[Recon], srcy: &[u8], srcc: [&[u8]; 2], nb: &MotionNeighbours) -> InterDecision {
-        code_macroblock_p16(ctx, rec, refp, 1, 1, srcy, 48, srcc, 24, nb)
+    fn code_centre(ctx: &MeCtx, rec: &mut [Recon], refp: &[Recon], srcy: &[u8], srcc: [&[u8]; 2], st: &MbMotionState) -> InterDecision {
+        code_macroblock_p16(ctx, rec, refp, 1, 1, srcy, 48, srcc, 24, st)
     }
 
     /// A reference translated by whole samples is found exactly: the
@@ -1489,9 +1558,9 @@ mod tests {
             // All neighbours carrying the true motion: the predictor seeds
             // the search at the answer and the skip vector equals it, so
             // this must skip.
-            let nb = MotionNeighbours { a: nb_inter(mv), b: nb_inter(mv), c: nb_inter(mv), d: nb_inter(mv) };
+            let st = state_all(mv, mv, mv, mv);
             let mut rec = fresh_rec();
-            let d = code_centre(&ctx, &mut rec, &refp, &srcy, [&srcb, &srcr], &nb);
+            let d = code_centre(&ctx, &mut rec, &refp, &srcy, [&srcb, &srcr], &st);
             assert_eq!(d.mv, mv, "({dx},{dy}) with agreeing neighbours");
             assert_eq!(d.cbp_luma, 0, "({dx},{dy}) residual should vanish");
             assert_eq!(d.cbp_chroma, 0, "({dx},{dy})");
@@ -1505,9 +1574,9 @@ mod tests {
             // of (zero, truth, truth) is still the truth, so the search
             // is still seeded at the answer.
             if mv != Mv::ZERO {
-                let nb = MotionNeighbours { a: nb_inter(Mv::ZERO), b: nb_inter(mv), c: nb_inter(mv), d: nb_inter(mv) };
+                let st = state_all(Mv::ZERO, mv, mv, mv);
                 let mut rec = fresh_rec();
-                let d = code_centre(&ctx, &mut rec, &refp, &srcy, [&srcb, &srcr], &nb);
+                let d = code_centre(&ctx, &mut rec, &refp, &srcy, [&srcb, &srcr], &st);
                 assert_eq!(d.mv, mv, "({dx},{dy})");
                 assert_eq!(d.kind, InterMbKind::P16x16, "({dx},{dy}) skip vector is zero, must not skip");
             }
@@ -1517,7 +1586,7 @@ mod tests {
             // zero, so only the untranslated case may skip.
             if dx.abs() <= 8 && dy.abs() <= 8 {
                 let mut rec = fresh_rec();
-                let d = code_centre(&ctx, &mut rec, &refp, &srcy, [&srcb, &srcr], &absent_nb());
+                let d = code_centre(&ctx, &mut rec, &refp, &srcy, [&srcb, &srcr], &absent_state());
                 assert_eq!(d.mv, mv, "({dx},{dy}) from a zero seed");
                 assert_eq!(d.cbp_luma, 0);
                 assert_eq!(d.cbp_chroma, 0);
@@ -1551,7 +1620,7 @@ mod tests {
             }
         }
         let mut rec = fresh_rec();
-        let d = code_centre(&ctx, &mut rec, &refp, &srcy, [&srcb, &srcr], &absent_nb());
+        let d = code_centre(&ctx, &mut rec, &refp, &srcy, [&srcb, &srcr], &absent_state());
         assert_ne!(d.kind, InterMbKind::PSkip, "residual survived, skip is illegal");
         assert_eq!(d.kind, InterMbKind::P16x16);
         assert_ne!(d.cbp_luma, 0, "±15 noise must leave levels at QP 26");
@@ -1571,7 +1640,7 @@ mod tests {
             let srcb = translated_chroma(&refp[1], mv);
             let srcr = translated_chroma(&refp[2], mv);
             let mut rec = fresh_rec();
-            let d = code_centre(&ctx, &mut rec, &refp, &srcy, [&srcb, &srcr], &absent_nb());
+            let d = code_centre(&ctx, &mut rec, &refp, &srcy, [&srcb, &srcr], &absent_state());
             assert_eq!(d.mv, mv, "quarter vector ({qx},{qy})");
             assert_eq!(d.cbp_luma, 0, "({qx},{qy}) the residual is zero by construction");
             assert_eq!(d.cbp_chroma, 0, "({qx},{qy})");
@@ -1586,6 +1655,14 @@ mod tests {
     /// with `colocated_motion` over a real colocated `Frame` — across
     /// present/absent/intra neighbour mixes in both lists and colocated
     /// records that are intra, still, and moving.
+    ///
+    /// The reference indices and the median vectors are now literal calls
+    /// into the decoder, so what this still earns is the *colZeroFlag*
+    /// half, which remains the encoder's own: it reads one motion out of
+    /// a per-macroblock `FilterMb` where the decoder reads the colocated
+    /// 8x8's corner block out of the colocated picture. Those agree only
+    /// while every partition is 16x16, and this is where that will fail
+    /// first when it stops being true.
     #[test]
     fn spatial_direct_agrees_with_the_decoders_derivation() {
         use crate::h264::mb::{
@@ -1601,7 +1678,6 @@ mod tests {
         for mask in 0..16u32 {
             for draw in 0..6 {
                 let mut info = PicInfo::new(3, 3);
-                let mut mine = [absent_nb(), absent_nb()];
                 for &(addr, slot) in &nbs {
                     if mask & (1 << slot) == 0 {
                         continue;
@@ -1609,14 +1685,12 @@ mod tests {
                     // Each present neighbour: per list, one of unused /
                     // used-with-a-vector; intra when both unused.
                     let mut used_any = false;
-                    let mut per_list = [nb_intra(); 2];
                     for l in 0..2 {
                         if lcg(&mut seed) % 3 != 0 {
                             let mv = Mv::new(
                                 (lcg(&mut seed) % 33) as i16 - 16,
                                 (lcg(&mut seed) % 33) as i16 - 16,
                             );
-                            per_list[l] = nb_inter(mv);
                             frame.motion[l][addr * 16..addr * 16 + 16].fill(BlockMotion {
                                 mv,
                                 ref_idx: 0,
@@ -1633,14 +1707,6 @@ mod tests {
                     info.mbs[addr].slice = 0;
                     info.mbs[addr].kind =
                         if used_any { DecKind::Inter16x16 } else { DecKind::I16x16 };
-                    for (l, n) in per_list.into_iter().enumerate() {
-                        match slot {
-                            0 => mine[l].a = n,
-                            1 => mine[l].b = n,
-                            2 => mine[l].c = n,
-                            _ => mine[l].d = n,
-                        }
-                    }
                 }
                 // The colocated record: rotate through intra, still (a
                 // vector inside the +-1 window), and moving; list 1 only
@@ -1703,66 +1769,12 @@ mod tests {
                     }
                 }
 
-                // Mine.
-                let (got_ref, got_mv) = spatial_direct_16x16(&mine, &col);
+                // Mine, over the same state the picture walk would hold.
+                let mut st = MbMotionState::new();
+                st.start(&frame, &info, cur_addr, &mut dnb);
+                let (got_ref, got_mv) = spatial_direct_16x16(&st, &col);
                 assert_eq!(got_ref, want_ref, "mask {mask:04b} draw {draw} ref");
                 assert_eq!(got_mv, want_mv, "mask {mask:04b} draw {draw} mv");
-            }
-        }
-    }
-
-    /// The mirrored predictor and skip derivations agree with the
-    /// decoder's own — `predict_mv` and `p_skip_mv` run over a real
-    /// `MotionCache` gathered from a real frame — across every
-    /// present/absent combination of A, B, C, D, with inter and intra
-    /// neighbours and varied vectors.
-    #[test]
-    fn the_predictor_and_skip_mv_agree_with_the_decoders_derivation() {
-        let mut frame = Frame::<u8>::new(3, 3, ChromaFormat::Yuv420, 8, false);
-        let mut seed = 7u64;
-        // Current macroblock: address 4 (centre). A=3, B=1, C=2, D=0.
-        let cur_addr = 4usize;
-        let nbs = [(3usize, 0usize), (1, 1), (2, 2), (0, 3)]; // (addr, slot a/b/c/d)
-        for mask in 0..16u32 {
-            for intra_mask in 0..16u32 {
-                for _ in 0..4 {
-                    let mut info = PicInfo::new(3, 3);
-                    let mut mine = absent_nb();
-                    for &(addr, slot) in &nbs {
-                        let present = mask & (1 << slot) != 0;
-                        if !present {
-                            continue;
-                        }
-                        let intra = intra_mask & (1 << slot) != 0;
-                        info.mbs[addr].decoded = true;
-                        info.mbs[addr].slice = 0;
-                        info.mbs[addr].kind = if intra { DecKind::I16x16 } else { DecKind::Inter16x16 };
-                        let mv = Mv::new((lcg(&mut seed) % 65) as i16 - 32, (lcg(&mut seed) % 65) as i16 - 32);
-                        if !intra {
-                            let bm = BlockMotion { mv, ref_idx: 0, ref_parity: PARITY_FRAME, ref_id: 1 };
-                            for blk in 0..16 {
-                                frame.motion[0][addr * 16 + blk] = bm;
-                            }
-                        }
-                        let n = if intra { nb_intra() } else { nb_inter(mv) };
-                        match slot {
-                            0 => mine.a = n,
-                            1 => mine.b = n,
-                            2 => mine.c = n,
-                            _ => mine.d = n,
-                        }
-                    }
-                    info.mbs[cur_addr].decoded = false;
-                    let mut dnb = MbNeighbours::default();
-                    dnb.derive_into(&info, cur_addr, 0);
-                    let mut cache = MotionCache::default();
-                    cache.gather(&dnb, &frame, &info);
-                    let cur = [[BlockMotion::default(); 16]; 2];
-                    let want_mvp = predict_mv(&cache, &cur, 0, 0, 0, 0, 0, 16, 16);
-                    let want_skip = p_skip_mv(&cache, &cur);
-                    assert_eq!(mv_predictor_16x16(&mine), want_mvp, "mask={mask:04b} intra={intra_mask:04b}");
-                    assert_eq!(skip_mv_16x16(&mine), want_skip, "mask={mask:04b} intra={intra_mask:04b}");
-                }
             }
         }
     }
@@ -1790,7 +1802,7 @@ mod tests {
                 *v = (*v as i32 + (lcg(&mut seed) % 17) as i32 - 8).clamp(0, 255) as u8;
             }
             let mut rec = fresh_rec();
-            let d = code_centre(&ctx, &mut rec, &refp, &srcy, [&srcb, &srcr], &absent_nb());
+            let d = code_centre(&ctx, &mut rec, &refp, &srcy, [&srcb, &srcr], &absent_state());
             assert_eq!(d.kind, InterMbKind::P16x16, "qp={qp} inter must win on matched content");
 
             // Luma: prediction through the same decoder kernel, residual
@@ -1868,7 +1880,7 @@ mod tests {
                 *v = (*v as i32 + (lcg(&mut seed) % 21) as i32 - 10).clamp(0, 255) as u8;
             }
             let mut rec = fresh_rec();
-            let d = code_centre(&ctx, &mut rec, &refp, &srcy, [&srcb, &srcr], &absent_nb());
+            let d = code_centre(&ctx, &mut rec, &refp, &srcy, [&srcb, &srcr], &absent_state());
             assert_eq!(d.kind, InterMbKind::P16x16, "qp={qp}");
 
             for blk in 0..16 {

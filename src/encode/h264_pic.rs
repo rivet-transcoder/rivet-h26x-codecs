@@ -24,15 +24,12 @@ use crate::dsp::h264_enc::{H264EncDsp, Quant};
 use crate::encode::h264_deblock::{FilterMb, deblock_recon, nz_mask_of};
 use crate::encode::h264_intra::{IntraCtx, MbAvail, MbDecision, MbKind, code_macroblock};
 use crate::encode::h264_me::{
-    BDecision, BMbKind, InterDecision, InterMbKind, MotionNeighbours, code_macroblock_b16,
-    code_macroblock_p16, mv_predictor_16x16, nb_inter, nb_intra, skip_mv_16x16,
-    spatial_direct_ref_idx_mirror,
+    BDecision, BMbKind, InterDecision, InterMbKind, MbMotionState, code_macroblock_b16,
+    code_macroblock_p16,
 };
 use crate::encode::h264_syntax::{Geometry, Plane, Recon};
 use crate::h264::frame::{BlockMotion, Frame, Mv};
-use crate::h264::mb::{
-    MbInfo, MbMotion, MbNeighbours, MotionCache, NbMotion, PicInfo, chroma_qp,
-};
+use crate::h264::mb::{MbInfo, MbMotion, MbNeighbours, PicInfo, chroma_qp};
 use crate::h264::sps::ScalingLists;
 use crate::h264::transform::Dequant;
 use crate::picture::ChromaFormat;
@@ -87,7 +84,7 @@ impl Default for IntraTools {
 /// rather than mirrored.
 ///
 /// The encoder has always mirrored 8.4.1.3 instead, through
-/// [`MotionNeighbours`]: four macroblock-level neighbours, one motion
+/// `MotionNeighbours`: four macroblock-level neighbours, one motion
 /// each. That is expressible only while every partition is the whole
 /// macroblock. The neighbours of a smaller partition are 4x4 *blocks*,
 /// and for every partition after the first they are blocks of this same
@@ -124,15 +121,6 @@ impl PicMotion {
         ];
         frame.mb_intra = vec![false; n];
         PicMotion { info: PicInfo::new(mbs_wide, mbs_high), frame }
-    }
-
-    /// The neighbours and gathered motion cache for macroblock `addr`,
-    /// derived exactly as the decoder's slice loop derives them. The
-    /// macroblock itself is still undecoded at this point, which is what
-    /// keeps it out of its own neighbour set.
-    pub fn cache_for(&self, addr: usize, nb: &mut MbNeighbours, cache: &mut MotionCache) {
-        nb.derive_into(&self.info, addr, 0);
-        cache.gather(nb, &self.frame, &self.info);
     }
 
     /// Commit one coded macroblock: the kind its neighbours will test for
@@ -172,61 +160,6 @@ pub(crate) fn mb_motion_16x16(l0: Option<Mv>, l1: Option<Mv>) -> MbMotion {
     }
     mot
 }
-
-/// Assert that the mirrored 16x16 derivations agree with the decoder's
-/// own, over the state actually being coded.
-///
-/// The unit test `the_predictor_and_skip_mv_agree_with_the_decoders_derivation`
-/// already holds the mirror against `predict_mv` and `p_skip_mv` over
-/// synthetic neighbour sets. This is the same comparison over every
-/// macroblock of every clip the gate encodes, and it is here for one
-/// reason: it is the evidence that `PicMotion` can *replace* the mirror
-/// rather than merely sit beside it. Once it has, this goes, along with
-/// [`MotionNeighbours`].
-///
-/// Debug-only, because it is scaffolding and because the state it reads
-/// is maintained whether or not anything checks it.
-#[cfg(debug_assertions)]
-fn cross_check_16x16(cache: &MotionCache, nbm: &MotionNeighbours, list: usize) {
-    let cur: MbMotion = [[BlockMotion::default(); 16]; 2];
-    let want = crate::h264::mb::predict_mv(cache, &cur, 0, list, 0, 0, 0, 16, 16);
-    assert_eq!(
-        mv_predictor_16x16(nbm),
-        want,
-        "list {list}: the mirrored 16x16 predictor disagrees with the decoder's"
-    );
-    if list == 0 {
-        assert_eq!(
-            skip_mv_16x16(nbm),
-            crate::h264::mb::p_skip_mv(cache, &cur),
-            "the mirrored P_Skip vector disagrees with the decoder's"
-        );
-    }
-}
-
-#[cfg(not(debug_assertions))]
-fn cross_check_16x16(_cache: &MotionCache, _nbm: &MotionNeighbours, _list: usize) {}
-
-/// The same for spatial direct's reference indices (8.4.1.2.2's
-/// `min_positive` over the three neighbours per list), against the
-/// decoder's [`crate::h264::mb::spatial_direct_ref_idx`].
-///
-/// The vectors are not compared here: the encoder's derivation reads
-/// colZeroFlag out of a per-macroblock `FilterMb`, and the decoder's
-/// reads it per 8x8 out of the colocated picture's own motion — the two
-/// agree only because of INVARIANT(16x16-only), which is the premise
-/// this work removes. That comparison arrives with the colocated
-/// storage.
-#[cfg(debug_assertions)]
-fn cross_check_direct_ref_idx(cache: &MotionCache, nbm: &[MotionNeighbours; 2]) {
-    let cur: MbMotion = [[BlockMotion::default(); 16]; 2];
-    let want = crate::h264::mb::spatial_direct_ref_idx(cache, &cur);
-    let mine = spatial_direct_ref_idx_mirror(nbm);
-    assert_eq!(mine, want, "the mirrored spatial-direct reference indices disagree");
-}
-
-#[cfg(not(debug_assertions))]
-fn cross_check_direct_ref_idx(_cache: &MotionCache, _nbm: &[MotionNeighbours; 2]) {}
 
 /// The decoder's name for an intra decision's kind — what the loop
 /// filter's boundary-strength derivation switches on.
@@ -444,12 +377,13 @@ pub(crate) fn code_intra_picture(
 /// Three per-macroblock states walk the picture together, each mirroring
 /// what the reader derives rather than what would be convenient:
 ///
-/// - **Motion** ([`MotionNeighbours`]): an inter macroblock contributes
-///   its vector with `ref_idx` 0 — a *skipped* one contributes the
-///   derived skip vector, because a decoder stores exactly that — and an
-///   intra macroblock contributes "available, not used for inter
-///   prediction". The above-left value is saved before the row entry is
-///   overwritten, or every D neighbour would be one picture-row too new.
+/// - **Motion** ([`PicMotion`]): the picture's per-4x4 motion in the
+///   decoder's own layout, committed per macroblock — a *skipped* one
+///   commits the derived skip vector, because a decoder stores exactly
+///   that, and an intra one commits the default throughout. Nothing here
+///   summarises: the derivations read it through the decoder's own
+///   `MotionCache`, so there is no neighbour bookkeeping left to get
+///   subtly wrong.
 /// - **Intra modes**: `Some(2)` for every available macroblock that is
 ///   not `I_NxN` — skip and P_16x16 included — because that is the DC the
 ///   reader's mode prediction derives for them (8.3.1.1).
@@ -472,32 +406,16 @@ pub(crate) fn code_p_picture(
 
     let mut fmbs: Vec<FilterMb> = Vec::with_capacity(mbs_wide * mbs_high);
     let mut top_modes: Vec<[Option<u8>; 4]> = vec![[None; 4]; mbs_wide];
-    let mut top_motion: Vec<NbMotion> = vec![NbMotion::NONE; mbs_wide];
-    // The decoder-shaped motion state, maintained beside the mirrored
-    // neighbours and cross-checked against them per macroblock: see
-    // `PicMotion`. Nothing reads it yet — this is the proof that it can
-    // replace the mirror before anything depends on that.
+    // The picture's motion in the decoder's own layout, and the
+    // per-macroblock working set its derivations read.
     let mut pm = PicMotion::new(mbs_wide, mbs_high);
     let mut dnb = MbNeighbours::default();
-    let mut dcache = MotionCache::default();
+    let mut st = MbMotionState::new();
     for mb_y in 0..mbs_high {
         let mut left_modes: [Option<u8>; 4] = [None; 4];
-        let mut left_motion = NbMotion::NONE;
-        let mut topleft_motion = NbMotion::NONE;
         for mb_x in 0..mbs_wide {
-            let nbm = MotionNeighbours {
-                a: left_motion,
-                b: if mb_y > 0 { top_motion[mb_x] } else { NbMotion::NONE },
-                c: if mb_y > 0 && mb_x + 1 < mbs_wide {
-                    top_motion[mb_x + 1]
-                } else {
-                    NbMotion::NONE
-                },
-                d: topleft_motion,
-            };
             let addr = mb_y * mbs_wide + mb_x;
-            pm.cache_for(addr, &mut dnb, &mut dcache);
-            cross_check_16x16(&dcache, &nbm, 0);
+            st.start(&pm.frame, &pm.info, addr, &mut dnb);
             let dec = code_macroblock_p16(
                 ctx,
                 rec,
@@ -508,11 +426,8 @@ pub(crate) fn code_p_picture(
                 pc.luma_stride,
                 [src_cb, src_cr],
                 pc.chroma_stride,
-                &nbm,
+                &st,
             );
-            // The above-left of the *next* column is what stands in this
-            // column's row entry now, before this macroblock replaces it.
-            topleft_motion = if mb_y > 0 { top_motion[mb_x] } else { NbMotion::NONE };
             pm.commit(
                 addr,
                 match dec.kind {
@@ -535,9 +450,6 @@ pub(crate) fn code_p_picture(
                         l0: Some(dec.mv),
                         l1: None,
                     });
-                    let m = nb_inter(dec.mv);
-                    left_motion = m;
-                    top_motion[mb_x] = m;
                     left_modes = [Some(2); 4];
                     top_modes[mb_x] = [Some(2); 4];
                 }
@@ -550,9 +462,6 @@ pub(crate) fn code_p_picture(
                         l0: Some(dec.mv),
                         l1: None,
                     });
-                    let m = nb_inter(dec.mv);
-                    left_motion = m;
-                    top_motion[mb_x] = m;
                     left_modes = [Some(2); 4];
                     top_modes[mb_x] = [Some(2); 4];
                 }
@@ -584,8 +493,6 @@ pub(crate) fn code_p_picture(
                         l0: None,
                         l1: None,
                     });
-                    left_motion = nb_intra();
-                    top_motion[mb_x] = nb_intra();
                     (left_modes, top_modes[mb_x]) = edge_modes(idec.kind, &modes);
                 }
             }
@@ -638,32 +545,14 @@ pub(crate) fn code_b_picture(
 
     let mut fmbs: Vec<FilterMb> = Vec::with_capacity(mbs_wide * mbs_high);
     let mut top_modes: Vec<[Option<u8>; 4]> = vec![[None; 4]; mbs_wide];
-    let mut top_motion: [Vec<NbMotion>; 2] =
-        [vec![NbMotion::NONE; mbs_wide], vec![NbMotion::NONE; mbs_wide]];
     let mut pm = PicMotion::new(mbs_wide, mbs_high);
     let mut dnb = MbNeighbours::default();
-    let mut dcache = MotionCache::default();
+    let mut st = MbMotionState::new();
     for mb_y in 0..mbs_high {
         let mut left_modes: [Option<u8>; 4] = [None; 4];
-        let mut left_motion = [NbMotion::NONE; 2];
-        let mut topleft_motion = [NbMotion::NONE; 2];
         for mb_x in 0..mbs_wide {
-            let nbm: [MotionNeighbours; 2] = std::array::from_fn(|l| MotionNeighbours {
-                a: left_motion[l],
-                b: if mb_y > 0 { top_motion[l][mb_x] } else { NbMotion::NONE },
-                c: if mb_y > 0 && mb_x + 1 < mbs_wide {
-                    top_motion[l][mb_x + 1]
-                } else {
-                    NbMotion::NONE
-                },
-                d: topleft_motion[l],
-            });
             let addr = mb_y * mbs_wide + mb_x;
-            pm.cache_for(addr, &mut dnb, &mut dcache);
-            for l in 0..2 {
-                cross_check_16x16(&dcache, &nbm[l], l);
-            }
-            cross_check_direct_ref_idx(&dcache, &nbm);
+            st.start(&pm.frame, &pm.info, addr, &mut dnb);
             let dec = code_macroblock_b16(
                 ctx,
                 rec,
@@ -674,8 +563,8 @@ pub(crate) fn code_b_picture(
                 pc.luma_stride,
                 [src_cb, src_cr],
                 pc.chroma_stride,
-                &nbm,
-                &col[mb_y * mbs_wide + mb_x],
+                &st,
+                &col[addr],
             );
             pm.commit(
                 addr,
@@ -693,9 +582,6 @@ pub(crate) fn code_b_picture(
                     ),
                 },
             );
-            for l in 0..2 {
-                topleft_motion[l] = if mb_y > 0 { top_motion[l][mb_x] } else { NbMotion::NONE };
-            }
             if dec.kind == BMbKind::UseIntra {
                 let mb = MbAvail {
                     left: mb_x > 0,
@@ -724,10 +610,6 @@ pub(crate) fn code_b_picture(
                     l0: None,
                     l1: None,
                 });
-                for l in 0..2 {
-                    left_motion[l] = nb_intra();
-                    top_motion[l][mb_x] = nb_intra();
-                }
                 (left_modes, top_modes[mb_x]) = edge_modes(idec.kind, &modes);
                 continue;
             }
@@ -752,16 +634,6 @@ pub(crate) fn code_b_picture(
                 l0: dec.used[0].then_some(dec.mv[0]),
                 l1: dec.used[1].then_some(dec.mv[1]),
             });
-            for l in 0..2 {
-                // A used list contributes its vector at reference 0; an
-                // unused one contributes "available, not used for inter
-                // prediction" — the same value the decoder's motion array
-                // holds for it, and the same value an intra macroblock
-                // leaves (`nb_intra`).
-                let m = if dec.used[l] { nb_inter(dec.mv[l]) } else { nb_intra() };
-                left_motion[l] = m;
-                top_motion[l][mb_x] = m;
-            }
             left_modes = [Some(2); 4];
             top_modes[mb_x] = [Some(2); 4];
         }
