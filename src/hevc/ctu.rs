@@ -1542,7 +1542,12 @@ pub fn chroma_qp(chroma_array_type: u32, qpi: i32) -> i32 {
 }
 
 /// The 4:2:2 chroma intra mode mapping (Table 8-3), by `modeIdc`.
-const MODE_422: [u32; 35] = [0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 12, 13, 15, 17, 18, 19, 20, 21, 22, 23, 23, 24, 24, 25, 25, 26, 27, 27, 28, 28, 29, 29, 30, 31];
+/// `pub(crate)` for the encoder's intra decision module, whose mirrored
+/// derivation must use THIS table rather than a retyped copy — a derived
+/// table can drift, a shared one cannot. The decision module still carries
+/// its copy from when this file was frozen; the allow goes away with it.
+#[allow(dead_code)]
+pub(crate) const MODE_422: [u32; 35] = [0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 12, 13, 15, 17, 18, 19, 20, 21, 22, 23, 23, 24, 24, 25, 25, 26, 27, 27, 28, 28, 29, 29, 30, 31];
 
 #[cfg(test)]
 mod write_round_trip {

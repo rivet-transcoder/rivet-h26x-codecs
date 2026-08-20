@@ -143,12 +143,6 @@ impl H265Encoder {
     /// live beside their readers. Everything else refuses by name.
     fn code_picture(&mut self, c: Coded, src: &[u8]) -> Result<Access> {
         let g = self.geom;
-        if self.cfg.chroma != crate::ChromaFormat::Yuv420 {
-            // The intra decision machinery models 4:2:0 only today.
-            return Err(Error::unsupported(
-                "H.265 encode: chroma formats other than 4:2:0 (encoder in progress)",
-            ));
-        }
         // Lossless is transquant bypass: the PPS enables it, every CU says
         // it, and the residuals travel raw. The QP still appears in the
         // headers because the syntax demands one, and it still matters to
@@ -173,8 +167,23 @@ impl H265Encoder {
         // conformance window hides the difference.
         let (dw, dh) = (self.cfg.width as usize, self.cfg.height as usize);
         let (cw, ch) = (g.coded_width as usize, g.coded_height as usize);
-        let (cdw, cdh) = (dw.div_ceil(2), dh.div_ceil(2));
-        let (ccw, cch) = (cw / 2, ch / 2);
+        // Per-format chroma geometry: SubWidthC/SubHeightC divide the luma
+        // dimensions, and monochrome has no chroma planes at all — the
+        // decision module's chroma slices are then empty and never indexed.
+        let chroma = self.cfg.chroma;
+        let cat = match chroma {
+            crate::ChromaFormat::Monochrome => 0u32,
+            crate::ChromaFormat::Yuv420 => 1,
+            crate::ChromaFormat::Yuv422 => 2,
+            crate::ChromaFormat::Yuv444 => 3,
+        };
+        let (sw, sh) = match chroma {
+            crate::ChromaFormat::Yuv420 => (2usize, 2usize),
+            crate::ChromaFormat::Yuv422 => (2, 1),
+            _ => (1, 1),
+        };
+        let (cdw, cdh) = (dw.div_ceil(sw), dh.div_ceil(sh));
+        let (ccw, cch) = (cw / sw, ch / sh);
         let pad = |src: &[u8], sw: usize, sh: usize, tw: usize, th: usize| -> Vec<u8> {
             let mut out = vec![0u8; tw * th];
             for y in 0..th {
@@ -186,8 +195,14 @@ impl H265Encoder {
             out
         };
         let py = pad(&src[..dw * dh], dw, dh, cw, ch);
-        let pcb = pad(&src[dw * dh..dw * dh + cdw * cdh], cdw, cdh, ccw, cch);
-        let pcr = pad(&src[dw * dh + cdw * cdh..], cdw, cdh, ccw, cch);
+        let (pcb, pcr) = if cat != 0 {
+            (
+                pad(&src[dw * dh..dw * dh + cdw * cdh], cdw, cdh, ccw, cch),
+                pad(&src[dw * dh + cdw * cdh..], cdw, cdh, ccw, cch),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         // The decision machinery, on the decoder's own kernels.
         let cpu = Cpu::detect_honouring_env();
@@ -204,7 +219,7 @@ impl H265Encoder {
             strong_smoothing: false,
             bypass,
         };
-        let mut pic = IntraPicture::<u8>::new(cw, ch, g.log2_ctb, 8);
+        let mut pic = IntraPicture::<u8>::new_with_chroma(cw, ch, g.log2_ctb, 8, chroma);
         // The transform-split search is on: a CU may carry four quarter-size
         // TUs where that wins the decision module's cost comparison, and the
         // writer below spells both shapes.
@@ -242,7 +257,7 @@ impl H265Encoder {
             for cy in 0..hc {
                 for cxu in 0..wc {
                     let d = pic.code_ctu(&ictx, cxu, cy, &py, cw, &pcb, &pcr, ccw);
-                    write_ctu_intra(&mut e, &mut cx, &d, cxu, cy, bypass);
+                    write_ctu_intra(&mut e, &mut cx, &d, cxu, cy, bypass, cat);
                     e.encode_terminate(u32::from(cy == hc - 1 && cxu == wc - 1));
                 }
             }
@@ -261,8 +276,10 @@ impl H265Encoder {
             }
         };
         crop(&pic.recon.y, dw, dh, &mut rec);
-        crop(&pic.recon.cb, cdw, cdh, &mut rec);
-        crop(&pic.recon.cr, cdw, cdh, &mut rec);
+        if cat != 0 {
+            crop(&pic.recon.cb, cdw, cdh, &mut rec);
+            crop(&pic.recon.cr, cdw, cdh, &mut rec);
+        }
         self.recon.push(rec);
 
         Ok(Access { data: out, keyframe: true, poc: c.poc, encode_index: c.encode })
@@ -292,7 +309,7 @@ impl H265Encoder {
 /// set, `coding_unit` reads a `cu_transquant_bypass_flag` as its very first
 /// bin, so this writer spells one — the CU's own choice, `d.bypass` — and
 /// when clear, nothing is written and the CU must not claim bypass.
-fn write_ctu_intra(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, ctu_x: usize, ctu_y: usize, pps_bypass: bool) {
+fn write_ctu_intra(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, ctu_x: usize, ctu_y: usize, pps_bypass: bool, cat: u32) {
     let log2 = d.log2_cu;
     debug_assert!((4..=5).contains(&log2), "one CU per CTU wants CTB 16 or 32");
     debug_assert!(!d.nxn, "PART_NxN exists only at the minimum CU size");
@@ -315,13 +332,18 @@ fn write_ctu_intra(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, ctu_
     } else {
         write_rem_intra_luma_pred_mode(e, u32::from(syn0.rem));
     }
-    write_intra_chroma_pred_mode(e, cx, u32::from(d.chroma_syntax));
+    // Monochrome has no chroma syntax at all: `coding_unit` reads the mode,
+    // `transform_tree` the cbfs and `transform_unit` the residuals only
+    // when `chroma_array_type != 0`, so the writer emits nothing chroma.
+    if cat != 0 {
+        write_intra_chroma_pred_mode(e, cx, u32::from(d.chroma_syntax));
+    }
 
     let n = 1usize << log2;
     let params = |log2_size: u32, c_idx: usize, mode: u8| ResidualParams {
         log2_size,
         c_idx,
-        scan_idx: residual_scan_idx(true, log2_size, c_idx, 1, u32::from(mode)),
+        scan_idx: residual_scan_idx(true, log2_size, c_idx, cat, u32::from(mode)),
         bypass: d.bypass,
         transform_skip_allowed: false,
         sign_hiding: false,
@@ -350,29 +372,58 @@ fn write_ctu_intra(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, ctu_
         // Prediction is per-PU (one mode for the whole 2Nx2N CU), so every
         // child TB scans by the same luma mode.
         write_split_transform_flag(e, cx, log2, true);
-        write_cbf_chroma(e, cx, 0, d.cbf_chroma[0]);
-        write_cbf_chroma(e, cx, 0, d.cbf_chroma[1]);
+        if cat != 0 {
+            // Depth-0 chroma cbfs, per component — the gate bins. A 4:2:2
+            // split parent codes only the first bin of each pair (the
+            // reader's `!split || log2 == 3` arm skips the second above the
+            // 8x8 node), so the single stored bin gates all of that
+            // component's child squares, top and bottom alike.
+            for comp in 0..2 {
+                write_cbf_chroma(e, cx, 0, d.cbf_chroma[comp]);
+            }
+        }
         let q = (n / 2) * (n / 2);
-        let qc = (n / 4) * (n / 4);
+        // The child chroma TB: the luma child's own size at 4:4:4, half of
+        // it elsewhere.
+        let log2c = if cat == 3 { log2 - 1 } else { log2 - 2 };
+        let qc = 1usize << (2 * log2c);
         for i in 0..4 {
             write_split_transform_flag(e, cx, log2 - 1, false);
-            for comp in 0..2 {
-                if d.cbf_chroma[comp] {
-                    write_cbf_chroma(e, cx, 1, d.cbf_chroma_tu[comp][i]);
+            if cat != 0 {
+                for comp in 0..2 {
+                    if d.cbf_chroma[comp] {
+                        write_cbf_chroma(e, cx, 1, d.cbf_chroma_tu[comp][i]);
+                        if cat == 2 {
+                            write_cbf_chroma(e, cx, 1, d.cbf_chroma_tu_bot[comp][i]);
+                        }
+                    }
                 }
             }
             write_cbf_luma(e, cx, 1, d.cbf_luma[i]);
             if d.cbf_luma[i] {
                 write_residual(e, cx, &params(log2 - 1, 0, d.luma_modes[0]), &d.luma[i * q..(i + 1) * q]);
             }
-            for comp in 0..2 {
-                if d.cbf_chroma[comp] && d.cbf_chroma_tu[comp][i] {
-                    write_residual(
-                        e,
-                        cx,
-                        &params(log2 - 2, comp + 1, d.chroma_mode),
-                        &d.chroma[comp][i * qc..(i + 1) * qc],
-                    );
+            if cat != 0 {
+                for comp in 0..2 {
+                    if !d.cbf_chroma[comp] {
+                        continue;
+                    }
+                    // 4:2:2: the child's stacked pair, top then bottom;
+                    // one square everywhere else. The reader walks
+                    // components outermost, squares within.
+                    let pair = if cat == 2 { 2 } else { 1 };
+                    for t in 0..pair {
+                        let cbf = if t == 0 { d.cbf_chroma_tu[comp][i] } else { d.cbf_chroma_tu_bot[comp][i] };
+                        if cbf {
+                            let slot = if cat == 2 { 2 * i + t } else { i };
+                            write_residual(
+                                e,
+                                cx,
+                                &params(log2c, comp + 1, d.chroma_mode),
+                                &d.chroma[comp][slot * qc..(slot + 1) * qc],
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -381,21 +432,39 @@ fn write_ctu_intra(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, ctu_
 
     // Transform tree: a single TU the size of the CU.
     write_split_transform_flag(e, cx, log2, false);
-    write_cbf_chroma(e, cx, 0, d.cbf_chroma[0]);
-    write_cbf_chroma(e, cx, 0, d.cbf_chroma[1]);
+    if cat != 0 {
+        // Per component: the cbf, and at 4:2:2 the stacked pair's second
+        // bin right after it (the reader's `!split || log2 == 3` arm — an
+        // unsplit node always codes both halves).
+        for comp in 0..2 {
+            write_cbf_chroma(e, cx, 0, d.cbf_chroma[comp]);
+            if cat == 2 {
+                write_cbf_chroma(e, cx, 0, d.cbf_chroma_bot[comp]);
+            }
+        }
+    }
     write_cbf_luma(e, cx, 0, d.cbf_luma[0]);
     if d.cbf_luma[0] {
         write_residual(e, cx, &params(log2, 0, d.luma_modes[0]), &d.luma[..n * n]);
     }
-    let nc = n / 2;
-    for comp in 0..2 {
-        if d.cbf_chroma[comp] {
-            write_residual(
-                e,
-                cx,
-                &params(log2 - 1, comp + 1, d.chroma_mode),
-                &d.chroma[comp][..nc * nc],
-            );
+    if cat != 0 {
+        // The chroma TB is the luma's own size at 4:4:4, half elsewhere;
+        // 4:2:2 stacks two squares per component, top then bottom.
+        let log2c = if cat == 3 { log2 } else { log2 - 1 };
+        let nc2 = 1usize << (2 * log2c);
+        for comp in 0..2 {
+            let pair = if cat == 2 { 2 } else { 1 };
+            for t in 0..pair {
+                let cbf = if t == 0 { d.cbf_chroma[comp] } else { d.cbf_chroma_bot[comp] };
+                if cbf {
+                    write_residual(
+                        e,
+                        cx,
+                        &params(log2c, comp + 1, d.chroma_mode),
+                        &d.chroma[comp][t * nc2..(t + 1) * nc2],
+                    );
+                }
+            }
         }
     }
 }
@@ -435,29 +504,33 @@ mod tests {
         assert!(!out[0].data.is_empty());
         assert_eq!(e.reconstructions().len(), 1);
 
-        // The named holes.
-        let holes: [(Config, &str); 2] = [
-            (Config { gop: 8, ..cfg(64, 64, ChromaFormat::Yuv420) }, "inter prediction"),
-            (Config { gop: 0, ..cfg(64, 64, ChromaFormat::Yuv422) }, "chroma formats"),
-        ];
-        for (config, want) in holes {
-            let per = match config.chroma {
-                ChromaFormat::Yuv422 => 64 * 64 * 2,
-                _ => 64 * 64 * 3 / 2,
-            };
-            let mut e = H265Encoder::new(config).unwrap();
-            let frame = vec![64u8; per];
-            let mut named = false;
-            for _ in 0..3 {
-                if let Err(err) = e.push(&frame) {
-                    let s = format!("{err}");
-                    assert!(s.contains(want), "expected {want:?} in: {s}");
-                    named = true;
-                    break;
-                }
-            }
-            assert!(named, "never reached the {want:?} hole");
+        // Every chroma format codes now — a picture per format, each
+        // producing a stream and a reconstruction of the right size.
+        for (chroma, per) in [
+            (ChromaFormat::Monochrome, 64 * 64),
+            (ChromaFormat::Yuv422, 64 * 64 * 2),
+            (ChromaFormat::Yuv444, 64 * 64 * 3),
+        ] {
+            let mut e = H265Encoder::new(Config { gop: 0, ..cfg(64, 64, chroma) }).unwrap();
+            let out = e.push(&vec![64u8; per]).unwrap();
+            assert_eq!(out.len(), 1, "{chroma:?} should code");
+            assert!(!out[0].data.is_empty());
+            assert_eq!(e.reconstructions()[0].len(), per, "{chroma:?} recon size");
         }
+
+        // The one remaining named hole.
+        let mut e = H265Encoder::new(Config { gop: 8, ..cfg(64, 64, ChromaFormat::Yuv420) }).unwrap();
+        let frame = vec![64u8; 64 * 64 * 3 / 2];
+        let mut named = false;
+        for _ in 0..3 {
+            if let Err(err) = e.push(&frame) {
+                let s = format!("{err}");
+                assert!(s.contains("inter prediction"), "expected the inter hole in: {s}");
+                named = true;
+                break;
+            }
+        }
+        assert!(named, "never reached the inter-prediction hole");
     }
 
     /// Lossless (transquant bypass) reconstructs the source exactly: the
