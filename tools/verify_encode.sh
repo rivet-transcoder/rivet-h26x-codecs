@@ -90,6 +90,7 @@ hevc-cqp-intra|--codec h265 --qp 26 --gop 0
 hevc-cqp-ip|--codec h265 --qp 26 --gop 8
 hevc-cqp40-intra|--codec h265 --qp 40 --gop 0
 hevc-cqp40-ip|--codec h265 --qp 40 --gop 8
+hevc-cqp-ipb|--codec h265 --qp 26 --gop 8 --bframes 2
 "}
 
 one() {

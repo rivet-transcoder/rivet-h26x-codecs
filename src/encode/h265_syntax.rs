@@ -33,6 +33,10 @@ pub const NAL_VPS: u8 = 32;
 pub const NAL_SPS: u8 = 33;
 /// Picture parameter set.
 pub const NAL_PPS: u8 = 34;
+/// Coded slice of a non-IRAP picture, trailing, not referenced — a
+/// sub-layer non-reference picture, which a decoder may discard without
+/// affecting anything it decodes afterwards.
+pub const NAL_TRAIL_N: u8 = 0;
 /// Coded slice of a non-IRAP picture, trailing, referenced.
 pub const NAL_TRAIL_R: u8 = 1;
 /// Coded slice of an IDR picture with no leading pictures.
@@ -132,6 +136,24 @@ fn chroma_idc(c: ChromaFormat) -> u32 {
     }
 }
 
+/// What the decoded picture buffer must hold: every picture this encoder
+/// may still reference, plus every picture held back waiting for output
+/// because something coded after it displays first.
+///
+/// Returned as the pair the parameter sets write —
+/// `max_dec_pic_buffering_minus1` and `max_num_reorder_pics` — because
+/// the standard requires the second to be no larger than the first, and
+/// deriving them apart is how they came to disagree: the sequence set
+/// declared a reorder depth of `bframes` against a buffer sized for
+/// references alone. Nothing noticed while H.265 refused B pictures, and
+/// libavcodec refused the first stream that had them
+/// ("sps_max_num_reorder_pics out of range"). Our own decoder was more
+/// forgiving, which is exactly why CROSS exists.
+fn dpb(cfg: &Config) -> (u32, u32) {
+    let reorder = cfg.bframes;
+    (cfg.max_refs.max(1) + reorder, reorder)
+}
+
 /// `profile_tier_level`, shared by the VPS and SPS.
 ///
 /// Twelve bytes, most of them reserved and required to be zero, plus a
@@ -165,7 +187,7 @@ fn write_ptl(w: &mut BitWriter, g: &Geometry) {
 }
 
 /// Video parameter set.
-pub fn write_vps(g: &Geometry) -> Vec<u8> {
+pub fn write_vps(cfg: &Config, g: &Geometry) -> Vec<u8> {
     let mut w = BitWriter::with_capacity(32);
     w.bits(4, 0); // vps_video_parameter_set_id
     w.flag(true); // vps_base_layer_internal_flag
@@ -176,8 +198,9 @@ pub fn write_vps(g: &Geometry) -> Vec<u8> {
     w.bits(16, 0xffff); // vps_reserved_0xffff_16bits
     write_ptl(&mut w, g);
     w.flag(true); // vps_sub_layer_ordering_info_present_flag
-    w.ue(1); // vps_max_dec_pic_buffering_minus1[0]
-    w.ue(0); // vps_max_num_reorder_pics[0]
+    let (buffering, reorder) = dpb(cfg);
+    w.ue(buffering); // vps_max_dec_pic_buffering_minus1[0]
+    w.ue(reorder); // vps_max_num_reorder_pics[0]
     w.ue(0); // vps_max_latency_increase_plus1[0]
     w.bits(6, 0); // vps_max_layer_id
     w.ue(0); // vps_num_layer_sets_minus1
@@ -222,8 +245,9 @@ pub fn write_sps(cfg: &Config, g: &Geometry, log2_max_poc_lsb: u32) -> Vec<u8> {
     w.ue(if g.chroma == ChromaFormat::Monochrome { 0 } else { g.bit_depth - 8 });
     w.ue(log2_max_poc_lsb - 4);
     w.flag(true); // sps_sub_layer_ordering_info_present_flag
-    w.ue(cfg.max_refs.max(1)); // sps_max_dec_pic_buffering_minus1[0]
-    w.ue(if cfg.bframes > 0 { cfg.bframes } else { 0 });
+    let (buffering, reorder) = dpb(cfg);
+    w.ue(buffering); // sps_max_dec_pic_buffering_minus1[0]
+    w.ue(reorder); // sps_max_num_reorder_pics[0]
     w.ue(0); // sps_max_latency_increase_plus1[0]
     w.ue(g.log2_min_cb - 3); // log2_min_luma_coding_block_size_minus3
     w.ue(g.log2_ctb - g.log2_min_cb); // log2_diff_max_min_luma_coding_block_size
@@ -458,7 +482,7 @@ mod tests {
             (64, 64, ChromaFormat::Monochrome),
         ] {
             let (cfg, g) = geom(w, h, c);
-            let vps = write_vps(&g);
+            let vps = write_vps(&cfg, &g);
             assert!(!vps.is_empty());
             let sps = write_sps(&cfg, &g, 8);
             let parsed = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&sps))

@@ -176,12 +176,7 @@ impl H265Encoder {
                     "H.265 encode: lossless inter pictures (encoder in progress)",
                 ));
             }
-            if c.kind == Kind::B {
-                return Err(Error::unsupported(
-                    "H.265 encode: B pictures (encoder in progress; P works)",
-                ));
-            }
-            return self.code_p_picture(c, src, qp);
+            return self.code_inter_picture(c, src, qp);
         }
 
         // Sources at coded size, edge-replicated: the coded picture is a
@@ -249,7 +244,7 @@ impl H265Encoder {
 
         // Parameter sets, then the one slice.
         let mut out = Vec::new();
-        out.extend_from_slice(&syn::annexb(syn::NAL_VPS, &syn::write_vps(&g)));
+        out.extend_from_slice(&syn::annexb(syn::NAL_VPS, &syn::write_vps(&self.cfg, &g)));
         out.extend_from_slice(&syn::annexb(
             syn::NAL_SPS,
             &syn::write_sps(&self.cfg, &g, LOG2_MAX_POC_LSB),
@@ -335,16 +330,43 @@ impl H265Encoder {
         // borders extended for motion compensation, POC set, motion grid
         // intact. An IDR empties the buffer first - everything before it
         // is discarded, which is what makes it a random access point.
-        let mut frame = pic.recon;
-        frame.poc = c.poc as i32;
-        frame.extend_rows(0, frame.height);
+        // An IDR empties the buffer: everything before it is discarded,
+        // which is what makes it a random access point.
         self.refs.clear();
-        self.refs.push(frame);
+        self.retain_reference(&c, pic.recon);
 
         Ok(Access { data: out, keyframe: true, poc: c.poc, encode_index: c.encode })
     }
 
-    /// Code one P picture: every CTU one inter CU, decided against the
+    /// Keep a coded picture as a reference the way a decoder keeps it —
+    /// borders extended for motion compensation, picture order count set,
+    /// motion grid intact — and drop what can no longer be referenced.
+    ///
+    /// A picture the scheduler marked non-reference is not kept at all: in
+    /// a non-pyramid group of pictures nothing refers to a B picture, and
+    /// keeping one would let a later search predict from a picture the
+    /// bitstream never told a decoder to hold.
+    ///
+    /// Of the rest, two are enough for the geometry this encoder codes:
+    /// list 0 takes the nearest past picture and list 1 the nearest
+    /// future one, and the anchors either side of a group of B pictures
+    /// are exactly those two. Keeping the two most recently coded is not
+    /// the same as keeping the two nearest in display order, which is why
+    /// the selection above searches by picture order count rather than
+    /// taking the last.
+    fn retain_reference(&mut self, c: &Coded, mut frame: crate::hevc::frame::Frame<u8>) {
+        if !c.reference {
+            return;
+        }
+        frame.poc = c.poc as i32;
+        frame.extend_rows(0, frame.height);
+        self.refs.push(frame);
+        while self.refs.len() > 2 {
+            self.refs.remove(0);
+        }
+    }
+
+    /// Code one inter picture — P or B: every CTU one inter CU, decided against the
     /// single stored reference and serialised through the coding-tree
     /// writers that live beside their readers.
     ///
@@ -356,7 +378,7 @@ impl H265Encoder {
     /// most sharply that a non-skip 2Nx2N merge CU never codes
     /// `rqt_root_cbf` (the reader infers it true), which is why a merge
     /// with nothing left to code must be spelled as a skip instead.
-    fn code_p_picture(&mut self, c: Coded, src: &[u8], qp: u8) -> Result<Access> {
+    fn code_inter_picture(&mut self, c: Coded, src: &[u8], qp: u8) -> Result<Access> {
         let g = self.geom;
         let (dw, dh) = (self.cfg.width as usize, self.cfg.height as usize);
         let (cw, ch) = (g.coded_width as usize, g.coded_height as usize);
@@ -411,11 +433,26 @@ impl H265Encoder {
         let mut pps = crate::hevc::pps::Pps::parse(&crate::nal::unescape_rbsp(&pps_rbsp))?;
         pps.resolve_tiles(&sps)?;
 
-        let refp = self
+        // List 0 is the nearest reference in the past; a B picture's list 1
+        // is the nearest in the future. The scheduler codes both anchors
+        // before releasing the B pictures between them, so both are here by
+        // the time one of those codes — and the retention below keeps them
+        // until the last picture that can reference them has been coded.
+        let cur = c.poc as i32;
+        let past = self
             .refs
-            .last()
-            .ok_or_else(|| Error::bitstream("H.265 encode: a P picture with no reference"))?;
-        let ref_poc = refp.poc;
+            .iter()
+            .filter(|f| f.poc < cur)
+            .max_by_key(|f| f.poc)
+            .ok_or_else(|| Error::bitstream("H.265 encode: an inter picture with no past reference"))?;
+        let future = self.refs.iter().filter(|f| f.poc > cur).min_by_key(|f| f.poc);
+        if c.kind == Kind::B && future.is_none() {
+            return Err(Error::bitstream(
+                "H.265 encode: a B picture with no future reference",
+            ));
+        }
+        let ref_poc = past.poc;
+        let future_poc = future.map(|f| f.poc);
 
         let cpu = Cpu::detect_honouring_env();
         let mut dsp = HevcDsp::<u8>::SCALAR;
@@ -440,9 +477,13 @@ impl H265Encoder {
                 poc_lsb: (c.poc as u32) & ((1 << LOG2_MAX_POC_LSB) - 1),
                 qp,
                 log2_max_poc_lsb: LOG2_MAX_POC_LSB,
-                // One reference, in the past: the inline short term set
-                // this becomes is what builds RefPicList0.
-                ref_deltas: vec![ref_poc - c.poc as i32],
+                // The inline short term reference picture set: one past
+                // entry, which becomes RefPicList0, and for a B picture one
+                // future entry, which becomes RefPicList1.
+                ref_deltas: match future_poc {
+                    Some(f) if c.kind == Kind::B => vec![ref_poc - cur, f - cur],
+                    _ => vec![ref_poc - cur],
+                },
             },
             qp,
             syn::NAL_TRAIL_R,
@@ -455,9 +496,9 @@ impl H265Encoder {
         w.align_zero();
 
         let (wc, hc) = (g.ctbs_wide as usize, g.ctbs_high as usize);
-        // Initialisation type 1 is what the decoder derives for a P slice
-        // when cabac_init_flag is absent, which the PPS guarantees.
-        let mut cx = Contexts::new(1, qp as i32);
+        // The initialisation type the decoder derives when cabac_init_flag
+        // is absent, which the PPS guarantees: 1 for a P slice, 2 for a B.
+        let mut cx = Contexts::new(if c.kind == Kind::B { 2 } else { 1 }, qp as i32);
         // cu_skip_flag's context counts *skipped* available neighbours, so
         // the walk carries what it decided, one entry per CTU.
         let mut skipped = vec![false; wc * hc];
@@ -469,7 +510,12 @@ impl H265Encoder {
             let mut e = CabacEncoder::new(&mut w);
             for cy in 0..hc {
                 for cxu in 0..wc {
-                    let d = pic.code_ctu(&mctx, refp, cxu, cy, &py, cw, &pcb, &pcr, ccw);
+                    let d = match future {
+                        Some(r1) if c.kind == Kind::B => {
+                            pic.code_ctu_b(&mctx, past, r1, cxu, cy, &py, cw, &pcb, &pcr, ccw)
+                        }
+                        _ => pic.code_ctu(&mctx, past, cxu, cy, &py, cw, &pcb, &pcr, ccw),
+                    };
                     let left = (cxu > 0).then(|| skipped[cy * wc + cxu - 1]);
                     let above = (cy > 0).then(|| skipped[(cy - 1) * wc + cxu]);
                     // The decision module answers `UseIntra` when its
@@ -503,7 +549,10 @@ impl H265Encoder {
         // reference filtered, which is what a decoder's DPB holds.
         deblock_inter_picture(&mctx, &mut pic, &decisions);
         let mut out = Vec::new();
-        out.extend_from_slice(&syn::annexb(syn::NAL_TRAIL_R, &w.into_nal()));
+        // A picture nothing will reference is a sub-layer non-reference
+        // picture, and saying so lets a decoder discard it.
+        let nal = if c.reference { syn::NAL_TRAIL_R } else { syn::NAL_TRAIL_N };
+        out.extend_from_slice(&syn::annexb(nal, &w.into_nal()));
 
         let mut rec = Vec::with_capacity(self.frame_bytes);
         let crop = |p: &crate::hevc::frame::Plane16<u8>, tw: usize, th: usize, out: &mut Vec<u8>| {
@@ -520,14 +569,7 @@ impl H265Encoder {
         }
         self.recon.push(rec);
 
-        // This picture becomes the reference for the next one. One slot:
-        // the decision searches exactly one reference, and the slice
-        // header it just wrote declares exactly one.
-        let mut frame = pic.recon;
-        frame.poc = c.poc as i32;
-        frame.extend_rows(0, frame.height);
-        self.refs.clear();
-        self.refs.push(frame);
+        self.retain_reference(&c, pic.recon);
 
         Ok(Access { data: out, keyframe: false, poc: c.poc, encode_index: c.encode })
     }
@@ -1021,14 +1063,30 @@ mod tests {
             assert!(e.reconstructions().iter().all(|r| r.len() == per), "{chroma:?}: recon size");
         }
 
+        // B pictures code too, in every chroma format: a group with two of
+        // them per anchor produces one access unit per picture, and only
+        // the first is a keyframe.
+        for (chroma, per) in [
+            (ChromaFormat::Yuv420, 64 * 64 * 3 / 2),
+            (ChromaFormat::Yuv444, 64 * 64 * 3),
+        ] {
+            let mut e =
+                H265Encoder::new(Config { gop: 8, bframes: 2, ..cfg(64, 64, chroma) }).unwrap();
+            let frame = vec![64u8; per];
+            let mut units = Vec::new();
+            for _ in 0..6 {
+                units.extend(e.push(&frame).expect("a B group should code"));
+            }
+            units.extend(e.flush().unwrap());
+            assert_eq!(units.len(), 6, "one access unit per picture for {chroma:?}");
+            assert!(units[0].keyframe, "the first is an IDR");
+            assert!(units[1..].iter().all(|u| !u.keyframe), "the rest are not");
+            assert!(units.iter().all(|u| !u.data.is_empty()));
+        }
+
         // The named holes that remain, each reached by the configuration
         // that asks for it.
-        let holes: [(Config, usize, &str); 2] = [
-            (
-                Config { gop: 8, bframes: 2, ..cfg(64, 64, ChromaFormat::Yuv420) },
-                64 * 64 * 3 / 2,
-                "B pictures",
-            ),
+        let holes: [(Config, usize, &str); 1] = [
             (
                 Config {
                     gop: 8,
