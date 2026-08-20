@@ -133,8 +133,9 @@ fn lcg(seed: &mut u64) -> u32 {
     (*seed >> 33) as u32
 }
 
-/// Compare every entry of the installed 8-bit HEVC kernel table against the
-/// scalar reference over randomized inputs — all the block shapes the
+/// Compare every entry of the installed HEVC kernel tables — 8-bit, and
+/// 16-bit at bit depths 10 and 12 — against the scalar reference over
+/// randomized inputs — all the block shapes the
 /// dispatch serves, every fractional position, the fused kernels at every
 /// (fx, fy), the deblocking filters, and the clipping corners — returning
 /// the number of comparisons that disagreed (0 = bit-exact).
@@ -374,6 +375,206 @@ pub extern "C" fn h26x_hevc_dsp_check() -> u32 {
             }
         }
         fails += (a != b) as u32;
+    }
+
+    // ------------------------------------------------------------------
+    // The 16-bit-sample table, at bit depths 10 and 12. The inverse
+    // transform entries are the same fn items the u8 table already swept,
+    // so they are not repeated here.
+    // ------------------------------------------------------------------
+    let s = HevcDsp::<u16>::SCALAR;
+    let d = HevcDsp::<u16>::new(h26x::dsp::Cpu::detect());
+    for &bd in &[10u32, 12] {
+        let max = (1i32 << bd) - 1;
+        let shift1 = bd.min(12) as i32 - 8;
+
+        // Interpolation.
+        let mut seed = 61u64 + bd as u64;
+        let stride = 96;
+        let src: Vec<u16> = (0..stride * 96).map(|_| (lcg(&mut seed) % (max as u32 + 1)) as u16).collect();
+        for &(w, h) in &SIZES {
+            let mut a = vec![0i16; w * h];
+            let mut b = vec![0i16; w * h];
+            for frac in 0..4 {
+                (s.qpel_h)(&mut a, &src, stride, w, h, frac, shift1);
+                (d.qpel_h)(&mut b, &src, stride, w, h, frac, shift1);
+                fails += (a != b) as u32;
+                (s.qpel_v)(&mut a, &src, stride, w, h, frac, shift1);
+                (d.qpel_v)(&mut b, &src, stride, w, h, frac, shift1);
+                fails += (a != b) as u32;
+                let mid: Vec<i16> = (0..stride * 96).map(|_| (lcg(&mut seed) % 30000) as i16 - 15000).collect();
+                (s.qpel_v2)(&mut a, &mid, stride, w, h, frac);
+                (d.qpel_v2)(&mut b, &mid, stride, w, h, frac);
+                fails += (a != b) as u32;
+            }
+            for frac in 0..8 {
+                (s.epel_h)(&mut a, &src, stride, w, h, frac, shift1);
+                (d.epel_h)(&mut b, &src, stride, w, h, frac, shift1);
+                fails += (a != b) as u32;
+                (s.epel_v)(&mut a, &src, stride, w, h, frac, shift1);
+                (d.epel_v)(&mut b, &src, stride, w, h, frac, shift1);
+                fails += (a != b) as u32;
+                let mid: Vec<i16> = (0..stride * 96).map(|_| (lcg(&mut seed) % 30000) as i16 - 15000).collect();
+                (s.epel_v2)(&mut a, &mid, stride, w, h, frac);
+                (d.epel_v2)(&mut b, &mid, stride, w, h, frac);
+                fails += (a != b) as u32;
+            }
+            (s.qpel_copy)(&mut a, &src, stride, w, h, 14 - bd as i32);
+            (d.qpel_copy)(&mut b, &src, stride, w, h, 14 - bd as i32);
+            fails += (a != b) as u32;
+        }
+
+        // Combination and weighting, with the corner palette again.
+        let mut seed = 67u64 + bd as u64;
+        for &(w, h) in &SIZES {
+            for corner in [false, true] {
+                let draw = |seed: &mut u64| -> i16 {
+                    if corner { CORNERS[(lcg(seed) as usize) % CORNERS.len()] } else { (lcg(seed) % 32768) as i16 - 16384 }
+                };
+                let pa: Vec<i16> = (0..w * h).map(|_| draw(&mut seed)).collect();
+                let pb: Vec<i16> = (0..w * h).map(|_| draw(&mut seed)).collect();
+                let stride = w + 5;
+                let mut a = vec![0u16; stride * h];
+                let mut b = vec![0u16; stride * h];
+                (s.uni)(&mut a, stride, &pa, w, h, 14 - bd as i32, max);
+                (d.uni)(&mut b, stride, &pa, w, h, 14 - bd as i32, max);
+                fails += (a != b) as u32;
+                (s.bi)(&mut a, stride, &pa, &pb, w, h, 15 - bd as i32, max);
+                (d.bi)(&mut b, stride, &pa, &pb, w, h, 15 - bd as i32, max);
+                fails += (a != b) as u32;
+                for &(lwd, wt, o) in &[(6i32, 64i32, 0i32), (0, 1, 3), (5, -20, -7), (7, 127, 100), (7, -128, -128)] {
+                    let lwd = lwd + 14 - bd as i32;
+                    (s.weighted_uni)(&mut a, stride, &pa, w, h, lwd, wt, o, max);
+                    (d.weighted_uni)(&mut b, stride, &pa, w, h, lwd, wt, o, max);
+                    fails += (a != b) as u32;
+                    (s.weighted_bi)(&mut a, stride, &pa, &pb, w, h, lwd, wt, 64 - wt, o, -o, max);
+                    (d.weighted_bi)(&mut b, stride, &pa, &pb, w, h, lwd, wt, 64 - wt, o, -o, max);
+                    fails += (a != b) as u32;
+                }
+            }
+        }
+
+        // Residual add.
+        let mut seed = 71u64 + bd as u64;
+        for &n in &[4usize, 8, 16, 32] {
+            for corner in [false, true] {
+                let stride = n + 7;
+                let base: Vec<u16> = (0..stride * n).map(|_| (lcg(&mut seed) % (max as u32 + 1)) as u16).collect();
+                let res: Vec<i16> = (0..n * n)
+                    .map(|_| if corner { CORNERS[(lcg(&mut seed) as usize) % CORNERS.len()] } else { (lcg(&mut seed) % 512) as i16 - 256 })
+                    .collect();
+                let mut a = base.clone();
+                let mut b = base;
+                (s.add_residual)(&mut a, stride, &res, n, max);
+                (d.add_residual)(&mut b, stride, &res, n, max);
+                fails += (a != b) as u32;
+            }
+        }
+
+        // Fused interpolation + prediction.
+        let mut seed = 73u64 + bd as u64;
+        {
+            let stride = 128;
+            let src: Vec<u16> = (0..stride * 128).map(|_| (lcg(&mut seed) % (max as u32 + 1)) as u16).collect();
+            let mut ta = vec![0i16; h26x::dsp::hevc::MC_TMP_LEN];
+            let mut tb = vec![0i16; h26x::dsp::hevc::MC_TMP_LEN];
+            for &(w, h) in &SIZES {
+                let other: Vec<i16> = (0..w * h).map(|_| (lcg(&mut seed) % 32768) as i16 - 16384).collect();
+                let ds = w + 9;
+                let mut a = vec![0u16; ds * h];
+                let mut b = vec![0u16; ds * h];
+                for fx in 0..4 {
+                    for fy in 0..4 {
+                        (s.qpel_uni)(&mut a, ds, &src, stride, w, h, fx, fy, &mut ta, bd);
+                        (d.qpel_uni)(&mut b, ds, &src, stride, w, h, fx, fy, &mut tb, bd);
+                        fails += (a != b) as u32;
+                        (s.qpel_bi)(&mut a, ds, &src, stride, w, h, fx, fy, &mut ta, &other, bd);
+                        (d.qpel_bi)(&mut b, ds, &src, stride, w, h, fx, fy, &mut tb, &other, bd);
+                        fails += (a != b) as u32;
+                    }
+                }
+                for fx in 0..8 {
+                    for fy in 0..8 {
+                        (s.epel_uni)(&mut a, ds, &src, stride, w, h, fx, fy, &mut ta, bd);
+                        (d.epel_uni)(&mut b, ds, &src, stride, w, h, fx, fy, &mut tb, bd);
+                        fails += (a != b) as u32;
+                        (s.epel_bi)(&mut a, ds, &src, stride, w, h, fx, fy, &mut ta, &other, bd);
+                        (d.epel_bi)(&mut b, ds, &src, stride, w, h, fx, fy, &mut tb, &other, bd);
+                        fails += (a != b) as u32;
+                    }
+                }
+            }
+        }
+
+        // SAO.
+        let mut seed = 79u64 + bd as u64;
+        let stride = 72;
+        let src: Vec<u16> = (0..stride * 80).map(|_| (lcg(&mut seed) % (max as u32 + 1)) as u16).collect();
+        for &(w, h) in &SIZES {
+            let mut table = [0i16; 32];
+            let start = (lcg(&mut seed) % 28) as usize;
+            for k in 0..4 {
+                table[start + k] = (lcg(&mut seed) % 15) as i16 - 7;
+            }
+            let mut a = vec![0u16; src.len()];
+            let mut b = vec![0u16; src.len()];
+            (s.sao_band)(&mut a, stride, &src, stride, w, h, &table, bd as i32 - 5, max);
+            (d.sao_band)(&mut b, stride, &src, stride, w, h, &table, bd as i32 - 5, max);
+            fails += (a != b) as u32;
+            let mut off = [0i16; 5];
+            for k in [0usize, 1, 3, 4] {
+                off[k] = (lcg(&mut seed) % 15) as i16 - 7;
+            }
+            for &(na, nb) in &[(-1isize, 1isize), (-(stride as isize), stride as isize), (-(stride as isize) - 1, stride as isize + 1)] {
+                let origin = 4 * stride + 4;
+                let mut a = src.clone();
+                let mut b = src.clone();
+                (s.sao_edge)(&mut a, &src, origin, stride, w, h, na, nb, &off, max);
+                (d.sao_edge)(&mut b, &src, origin, stride, w, h, na, nb, &off, max);
+                fails += (a != b) as u32;
+            }
+        }
+
+        // Deblocking, with bit-depth-scaled beta/tc as the spec derives them.
+        let mut seed = 83u64 + bd as u64;
+        let stride = 48;
+        let sh = bd - 8;
+        for trial in 0..300 {
+            let base = lcg(&mut seed) % (max as u32 + 1);
+            let spread = 1 + lcg(&mut seed) % (48 << sh);
+            let plane: Vec<u16> = (0..stride * 32).map(|_| ((base + lcg(&mut seed) % spread).min(max as u32)) as u16).collect();
+            let v = |seed: &mut u64, n: u32| ((lcg(seed) % n) as i32) << sh;
+            let beta = [v(&mut seed, 64), v(&mut seed, 64)];
+            let tc = [v(&mut seed, 25), v(&mut seed, 25)];
+            let bl = |x: u32| x % 2 == 0;
+            let no_p = [bl(lcg(&mut seed)), bl(lcg(&mut seed))];
+            let no_q = [bl(lcg(&mut seed)), bl(lcg(&mut seed))];
+            let tc4 = [tc[0], tc[1], v(&mut seed, 25), v(&mut seed, 25)];
+            let np4 = [no_p[0], no_p[1], bl(lcg(&mut seed)), bl(lcg(&mut seed))];
+            let nq4 = [no_q[0], no_q[1], bl(lcg(&mut seed)), bl(lcg(&mut seed))];
+            let off = 8 * stride + 8;
+            let mut a = plane.clone();
+            let mut b = plane;
+            match trial % 4 {
+                0 => {
+                    (s.deblock_luma_v)(&mut a, off, stride, beta, tc, no_p, no_q, max);
+                    (d.deblock_luma_v)(&mut b, off, stride, beta, tc, no_p, no_q, max);
+                }
+                1 => {
+                    (s.deblock_luma_h)(&mut a, off, stride, beta, tc, no_p, no_q, max);
+                    (d.deblock_luma_h)(&mut b, off, stride, beta, tc, no_p, no_q, max);
+                }
+                2 => {
+                    (s.deblock_chroma_v)(&mut a, off, stride, tc4, np4, nq4, max);
+                    (d.deblock_chroma_v)(&mut b, off, stride, tc4, np4, nq4, max);
+                }
+                _ => {
+                    (s.deblock_chroma_h)(&mut a, off, stride, tc4, np4, nq4, max);
+                    (d.deblock_chroma_h)(&mut b, off, stride, tc4, np4, nq4, max);
+                }
+            }
+            fails += (a != b) as u32;
+        }
     }
 
     fails

@@ -258,8 +258,10 @@ pub fn install_simd_u16(d: &mut HevcDsp<u16>, cpu: Cpu) {
     if cpu.neon {
         super::hevc_neon::install(d);
     }
-    // wasm32 has no 16-bit-sample kernels yet: wasm decode is 8-bit today,
-    // so the 10/12-bit table stays on the scalar reference there.
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    if cpu.simd128 {
+        super::hevc_wasm128::install_u16(d);
+    }
 }
 
 /// SIMD kernels for 8-bit sample planes.
