@@ -302,3 +302,218 @@ pub extern "C" fn h26x_hevc_dsp_check() -> u32 {
 
     fails
 }
+
+// ----------------------------------------------------------------------
+// Kernel self-test
+// ----------------------------------------------------------------------
+//
+// `h264_x86_128.rs` ends in a test module that drives every kernel over
+// randomised inputs and asserts bit-exactness against the scalar reference.
+// The wasm tier cannot have one: `cargo test` does not run on
+// wasm32-unknown-unknown, so a test module in `h264_wasm128.rs` would be
+// text that never executes — the failure shape this whole file exists to
+// avoid. So the same randomised sweep lives here instead, exported from the
+// probe and run *inside* the module by `tools/wasm.sh`, where it actually
+// executes on every host that runs the script. The trials mirror the x86
+// test module deliberately — same LCG, same smooth-plane construction, same
+// alpha/beta/tC0 and coefficient ranges — so the two tiers face the same
+// evidence.
+
+/// Compare every H.264 kernel of the installed table against the scalar
+/// reference over randomised inputs, returning a bitmask of the groups that
+/// disagreed: 1 = interpolation/combination, 2 = deblocking, 4 = transforms.
+///
+/// Zero means every comparison agreed. In a build without `+simd128` the
+/// installed table *is* the scalar reference and the sweep is vacuous —
+/// `tools/wasm.sh` checks the rung separately, which is what makes the
+/// simd128 run's zero meaningful.
+#[unsafe(no_mangle)]
+pub extern "C" fn h26x_selftest() -> u32 {
+    use h26x::dsp::Cpu;
+    use h26x::dsp::h264::{H264Dsp, NO_DC, PRED_STRIDE};
+
+    let s = H264Dsp::<u8>::SCALAR;
+    let d = H264Dsp::<u8>::new(Cpu::detect());
+    let mut fail = 0u32;
+
+    // Interpolation and combination, as in `qpel_matches_scalar`.
+    {
+        let mut seed = 5u64;
+        let stride = 64;
+        let src: Vec<u8> = (0..stride * 64).map(|_| lcg(&mut seed) as u8).collect();
+        for &(w, h) in &[(4usize, 4usize), (4, 8), (8, 4), (8, 8), (8, 16), (16, 8), (16, 16)] {
+            let block = |v: &[u8]| -> Vec<u8> { (0..h).flat_map(|y| v[y * PRED_STRIDE..y * PRED_STRIDE + w].to_vec()).collect() };
+            for pos in 0..16 {
+                let mut a = vec![0u8; 16 * PRED_STRIDE];
+                let mut b = vec![0u8; 16 * PRED_STRIDE];
+                (s.qpel[pos])(&mut a, &src[stride * 3 + 3..], stride, w, h, 255);
+                (d.qpel[pos])(&mut b, &src[stride * 3 + 3..], stride, w, h, 255);
+                if block(&a) != block(&b) {
+                    fail |= 1;
+                }
+            }
+            for xf in 0..8 {
+                for yf in 0..8 {
+                    let (cw, ch) = (w / 2, h / 2);
+                    let mut a = vec![0u8; 16 * PRED_STRIDE];
+                    let mut b = vec![0u8; 16 * PRED_STRIDE];
+                    (s.chroma)(&mut a, &src[stride * 5 + 5..], stride, cw, ch, xf, yf);
+                    (d.chroma)(&mut b, &src[stride * 5 + 5..], stride, cw, ch, xf, yf);
+                    let cb = |v: &[u8]| -> Vec<u8> { (0..ch).flat_map(|y| v[y * PRED_STRIDE..y * PRED_STRIDE + cw].to_vec()).collect() };
+                    if cb(&a) != cb(&b) {
+                        fail |= 1;
+                    }
+                }
+            }
+            let a: Vec<u8> = (0..16 * PRED_STRIDE).map(|_| lcg(&mut seed) as u8).collect();
+            let b: Vec<u8> = (0..16 * PRED_STRIDE).map(|_| lcg(&mut seed) as u8).collect();
+            let ds = w + 3;
+            let mut d1 = vec![0u8; ds * h];
+            let mut d2 = vec![0u8; ds * h];
+            (s.avg)(&mut d1, ds, &a, &b, w, h);
+            (d.avg)(&mut d2, ds, &a, &b, w, h);
+            if d1 != d2 {
+                fail |= 1;
+            }
+            (s.copy)(&mut d1, ds, &a, w, h);
+            (d.copy)(&mut d2, ds, &a, w, h);
+            if d1 != d2 {
+                fail |= 1;
+            }
+            for &(lwd, wt, o) in &[(6, 64, 0), (0, 1, 3), (5, -20, -7), (7, 127, 127), (2, 33, -128)] {
+                (s.weighted_uni)(&mut d1, ds, &a, w, h, lwd, wt, o, 255);
+                (d.weighted_uni)(&mut d2, ds, &a, w, h, lwd, wt, o, 255);
+                if d1 != d2 {
+                    fail |= 1;
+                }
+                (s.weighted_bi)(&mut d1, ds, &a, &b, w, h, lwd, wt, 64 - wt, o, -o, 255);
+                (d.weighted_bi)(&mut d2, ds, &a, &b, w, h, lwd, wt, 64 - wt, o, -o, 255);
+                if d1 != d2 {
+                    fail |= 1;
+                }
+            }
+        }
+    }
+
+    // Deblocking, as in `deblocking_matches_scalar`.
+    {
+        let mut seed = 11u64;
+        let stride = 48;
+        for trial in 0..400 {
+            // Smooth-ish content so the alpha/beta tests pass often.
+            let base = lcg(&mut seed) % 256;
+            let spread = 1 + lcg(&mut seed) % 64;
+            let plane: Vec<u8> = (0..stride * 40).map(|_| (base + lcg(&mut seed) % spread).min(255) as u8).collect();
+            let alpha = (lcg(&mut seed) % 256) as i32;
+            let beta = (lcg(&mut seed) % 20) as i32;
+            let mut tc0 = [0i16; 4];
+            for t in tc0.iter_mut() {
+                *t = (lcg(&mut seed) % 6) as i16 - 1;
+            }
+            let off = 8 * stride + 8;
+            let mut a = plane.clone();
+            let mut b = plane.clone();
+            match trial % 10 {
+                8 => {
+                    (s.deblock_luma8_v)(&mut a, off, stride, alpha, beta, &tc0, 255);
+                    (d.deblock_luma8_v)(&mut b, off, stride, alpha, beta, &tc0, 255);
+                }
+                9 => {
+                    (s.deblock_luma8_v_intra)(&mut a, off, stride, alpha, beta, 255);
+                    (d.deblock_luma8_v_intra)(&mut b, off, stride, alpha, beta, 255);
+                }
+                0 => {
+                    (s.deblock_luma_v)(&mut a, off, stride, alpha, beta, &tc0, 255);
+                    (d.deblock_luma_v)(&mut b, off, stride, alpha, beta, &tc0, 255);
+                }
+                1 => {
+                    (s.deblock_luma_h)(&mut a, off, stride, alpha, beta, &tc0, 255);
+                    (d.deblock_luma_h)(&mut b, off, stride, alpha, beta, &tc0, 255);
+                }
+                2 => {
+                    (s.deblock_luma_v_intra)(&mut a, off, stride, alpha, beta, 255);
+                    (d.deblock_luma_v_intra)(&mut b, off, stride, alpha, beta, 255);
+                }
+                3 => {
+                    (s.deblock_luma_h_intra)(&mut a, off, stride, alpha, beta, 255);
+                    (d.deblock_luma_h_intra)(&mut b, off, stride, alpha, beta, 255);
+                }
+                4 => {
+                    (s.deblock_chroma_v)(&mut a, off, stride, alpha, beta, &tc0, 255);
+                    (d.deblock_chroma_v)(&mut b, off, stride, alpha, beta, &tc0, 255);
+                }
+                5 => {
+                    (s.deblock_chroma_h)(&mut a, off, stride, alpha, beta, &tc0, 255);
+                    (d.deblock_chroma_h)(&mut b, off, stride, alpha, beta, &tc0, 255);
+                }
+                6 => {
+                    (s.deblock_chroma_v_intra)(&mut a, off, stride, alpha, beta, 255);
+                    (d.deblock_chroma_v_intra)(&mut b, off, stride, alpha, beta, 255);
+                }
+                _ => {
+                    (s.deblock_chroma_h_intra)(&mut a, off, stride, alpha, beta, 255);
+                    (d.deblock_chroma_h_intra)(&mut b, off, stride, alpha, beta, 255);
+                }
+            }
+            if a != b {
+                fail |= 2;
+            }
+        }
+    }
+
+    // Transforms and residuals, as in `transforms_match_scalar`.
+    {
+        let mut seed = 17u64;
+        let stride = 24;
+        for trial in 0..500 {
+            let base: Vec<u8> = (0..stride * 8).map(|_| lcg(&mut seed) as u8).collect();
+            // Coefficients small enough that the transform stays in range.
+            let mut c16 = [0i16; 64];
+            let mut c32 = [0i32; 64];
+            let nz = 1 + lcg(&mut seed) % 64;
+            for k in 0..64 {
+                let v = if k < nz as usize { (lcg(&mut seed) % 512) as i32 - 256 } else { 0 };
+                c16[k] = v as i16;
+                c32[k] = v;
+            }
+            let mut a = base.clone();
+            let mut b = base.clone();
+            match trial % 6 {
+                0 => {
+                    let c: [i16; 16] = c16[0..16].try_into().unwrap();
+                    (s.idct4_add)(&mut a, stride, &c, 255);
+                    (d.idct4_add)(&mut b, stride, &c, 255);
+                }
+                1 => {
+                    (s.idct8_add)(&mut a, stride, &c16, 255);
+                    (d.idct8_add)(&mut b, stride, &c16, 255);
+                }
+                2 => {
+                    let dc = c32[0];
+                    (s.idct4_dc_add)(&mut a, stride, dc, 255);
+                    (d.idct4_dc_add)(&mut b, stride, dc, 255);
+                }
+                3 => {
+                    let dc = c32[0];
+                    (s.idct8_dc_add)(&mut a, stride, dc, 255);
+                    (d.idct8_dc_add)(&mut b, stride, dc, 255);
+                }
+                4 => {
+                    let c: [i32; 16] = c32[0..16].try_into().unwrap();
+                    let dc = if trial % 12 == 4 { NO_DC } else { c32[17] };
+                    (s.residual4)(&mut a, stride, &c, dc, 255);
+                    (d.residual4)(&mut b, stride, &c, dc, 255);
+                }
+                _ => {
+                    (s.residual8)(&mut a, stride, &c32, 255);
+                    (d.residual8)(&mut b, stride, &c32, 255);
+                }
+            }
+            if a != b {
+                fail |= 4;
+            }
+        }
+    }
+
+    fail
+}

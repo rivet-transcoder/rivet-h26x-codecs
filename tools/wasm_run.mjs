@@ -13,7 +13,7 @@ if (!wasmPath || !streamPath) {
   process.exit(2);
 }
 
-const stream = streamPath === "--rung" ? Buffer.alloc(0) : readFileSync(streamPath);
+const stream = streamPath.startsWith("--") ? Buffer.alloc(0) : readFileSync(streamPath);
 // The codec is the extension's, matching how the decoder's own example picks.
 const hevc = /\.(265|hevc|h265)$/i.test(streamPath) ? 1 : 0;
 
@@ -25,7 +25,7 @@ try {
   process.exit(1);
 }
 
-const { memory, h26x_scratch, h26x_decode, h26x_rung } = instance.exports;
+const { memory, h26x_scratch, h26x_decode, h26x_rung, h26x_selftest } = instance.exports;
 
 // --rung: which kernels the module was built with. A tier that installed
 // nothing would pass every decode comparison without running one vector
@@ -35,6 +35,25 @@ if (streamPath === "--rung") {
   const n = h26x_rung(p);
   console.log(new TextDecoder().decode(new Uint8Array(memory.buffer, p, n)));
   process.exit(0);
+}
+
+// --selftest: the randomised kernel sweep against the scalar reference, run
+// inside the module. Zero is agreement; anything else is a bitmask of the
+// kernel groups that disagreed (see `h26x_selftest` in the probe).
+if (streamPath === "--selftest") {
+  let mask;
+  try {
+    mask = h26x_selftest();
+  } catch (e) {
+    console.error(`trapped during selftest: ${e.message}`);
+    process.exit(1);
+  }
+  if (mask === 0) {
+    console.log("OK");
+    process.exit(0);
+  }
+  console.log(`FAILED (group mask ${mask})`);
+  process.exit(1);
 }
 const inPtr = h26x_scratch(stream.length);
 new Uint8Array(memory.buffer, inPtr, stream.length).set(stream);

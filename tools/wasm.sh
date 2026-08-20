@@ -86,6 +86,20 @@ for w in scalar:scalar simd128:SIMD128; do
   [ "$got" = "$want" ] || { echo "    expected $want"; fail=1; }
 done
 
+# The randomised kernel sweep the x86 tiers get from `cargo test`, run inside
+# the module instead, because no test harness runs there (see the probe's
+# `h26x_selftest`). On the scalar build it compares the reference with itself
+# and is vacuous; the rung check above is what makes the simd128 pass mean
+# something.
+echo
+echo "== kernel self-test inside wasm (randomised, against scalar) =="
+for w in scalar simd128; do
+  got=$(node tools/wasm_run.mjs "$TMP/$w.wasm" --selftest 2>&1)
+  printf "  %-8s %s
+" "$w" "$got"
+  [ "$got" = "OK" ] || fail=1
+done
+
 for w in scalar simd128; do
   echo
   echo "== vendored streams, decoded inside wasm ($w) =="
