@@ -107,6 +107,16 @@ pub struct H265Encoder {
 /// Keeping the commit out of the coding functions is what makes that
 /// impossible rather than merely avoided. They hand back what they made;
 /// only [`H265Encoder::code_picture`] decides to keep it.
+///
+/// That the coding functions keep *nothing* is the claim the byte-identity
+/// of every non-buffer stream rests on, so it is checked rather than
+/// assumed: `code_attempt` and `code_inter_picture` contain **no writes to
+/// `self` at all** — no counter, no scratch buffer reused across pictures,
+/// no cached context. Every write lives in [`H265Encoder::commit`] and
+/// `retain_reference`, which run only for an attempt that is kept. A
+/// single stray write in either coding path would leave a trace, make the
+/// second attempt something other than a clean re-run, and surface as a
+/// byte moving in a cell that had no reason to move.
 struct Attempt {
     access: Access,
     /// The reconstruction, cropped to display size.
