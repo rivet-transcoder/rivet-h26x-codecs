@@ -147,6 +147,8 @@ hevc-cqp40-sao-intra|--codec h265 --qp 40 --gop 0 --sao
 hevc-cqp40-sao-ip|--codec h265 --qp 40 --gop 8 --sao
 hevc-abr-64k|--codec h265 --bitrate 64000 --gop 8
 hevc-abr-96k|--codec h265 --bitrate 96000 --gop 8
+abr-64k|--codec h264 --bitrate 64000 --gop 8
+abr-128k|--codec h264 --bitrate 128000 --gop 8
 "}
 
 one() {

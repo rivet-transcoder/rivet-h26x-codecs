@@ -69,7 +69,7 @@ pub mod h265;
 pub mod h265_deblock;
 pub mod h265_intra;
 pub mod h265_me;
-pub(crate) mod h265_rc;
+pub(crate) mod rc;
 pub(crate) mod h265_sao;
 pub mod h265_syntax;
 
@@ -90,7 +90,7 @@ pub enum RateControl {
     /// The first mode whose correctness is not a property of the bitstream.
     /// A controller that ignores this number entirely still produces a
     /// perfectly legal stream that decodes identically on every decoder —
-    /// see the module documentation of `encode::h265_rc` for what is checked
+    /// see the module documentation of `encode::rc` for what is checked
     /// instead, and how.
     Bitrate {
         /// Target, in bits per second.

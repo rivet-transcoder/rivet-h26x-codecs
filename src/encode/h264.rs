@@ -25,6 +25,7 @@
 //! proven and every hole has a name.
 
 use super::gop::{Coded, Kind, Scheduler};
+use super::rc::{PicKind, RateController};
 use super::h264_syntax as syn;
 use super::{Access, Config, Entropy, RateControl};
 use crate::bitwriter::BitWriter;
@@ -34,6 +35,12 @@ use crate::{Error, Result};
 pub struct H264Encoder {
     cfg: Config,
     sched: Scheduler,
+    /// The rate controller, when the configuration asked for a bitrate.
+    /// The *same* controller H.265 drives — see [`super::rc`] for why
+    /// essentially all of it turned out to be codec-agnostic.
+    rc: Option<RateController>,
+    /// Bytes emitted so far, to hold the controller's ledger to.
+    emitted: u64,
     /// Source pictures held in display order, indexed by display position, so
     /// that a B picture held back by the scheduler still has its samples when
     /// its anchor arrives.
@@ -92,15 +99,6 @@ impl H264Encoder {
                 "H.264 encode: bit depth above 8 (encoder in progress)",
             ));
         }
-        if let RateControl::Bitrate { .. } = cfg.rate {
-            // Not "never": H.264 could have a rate controller, and the one
-            // being built for H.265 is deliberately codec-agnostic in its
-            // arithmetic. What it is not is wired here, and a --bitrate
-            // silently coded at a fixed quantiser is the worst answer.
-            return Err(Error::unsupported(
-                "H.264 encode: bitrate rate control (encoder in progress; H.265 has it)",
-            ));
-        }
         if cfg.sao {
             // Not "in progress": H.264 has no sample adaptive offset at
             // all. Refusing names that rather than silently ignoring a
@@ -143,7 +141,13 @@ impl H264Encoder {
             plane_dims.push((cw, chh));
         }
         let tools = super::h264_pic::IntraTools::new(cfg.transform_8x8);
+        let rc = match cfg.rate {
+            RateControl::Bitrate { bps } => Some(RateController::new(bps, cfg.fps, cfg.width, cfg.height, cfg.gop, cfg.bframes)),
+            _ => None,
+        };
         Ok(Self {
+            rc,
+            emitted: 0,
             cfg,
             sched,
             held: std::collections::BTreeMap::new(),
@@ -204,7 +208,23 @@ impl H264Encoder {
                 .held
                 .remove(&c.display)
                 .ok_or_else(|| Error::bitstream("H.264 encode: scheduler released an absent picture"))?;
-            out.push(self.code_picture(c, &src)?);
+            let access = self.code_picture(c, &src)?;
+            // The ledger closes here, at the one place every picture of
+            // every kind passes through, counting the whole access unit —
+            // start codes, NAL headers, parameter sets and slice payload —
+            // because that is what the target is measured against. Same
+            // shape, and the same reasoning, as the H.265 side.
+            self.emitted += access.data.len() as u64 * 8;
+            let emitted = self.emitted;
+            if let Some(rc) = self.rc.as_mut() {
+                rc.account(access.data.len());
+                debug_assert_eq!(
+                    rc.bits_spent, emitted,
+                    "rate-control ledger drifted: the controller has {} bits, the encoder emitted {emitted}",
+                    rc.bits_spent
+                );
+            }
+            out.push(access);
         }
         Ok(out)
     }
@@ -272,15 +292,49 @@ impl H264Encoder {
         if idr {
             self.frame_num = 0;
         }
-        let qp = self.picture_qp(c.kind);
+        // H.264 repeats its parameter sets with *every* access unit — see
+        // the SPS/PPS emitted below — so each picture's own quantiser can
+        // go straight into `pic_init_qp` with a zero `slice_qp_delta`, and
+        // varying it per picture needs no stream-wide nominal at all.
+        //
+        // That is a real difference from the H.265 side rather than a
+        // stylistic one: there the parameter sets are written once, in the
+        // IDR access unit, so every later picture refers back to a fixed
+        // quantiser and must carry its own as a delta against it. Making
+        // this side match that shape was tried and reverted: it changed
+        // every existing H.264 stream's bytes for no gain, because the
+        // decoded quantiser was identical either way.
+        //
+        // The controller chooses per picture, in coding order; everything
+        // else is a function of the configuration alone.
+        let qp = match self.cfg.rate {
+            RateControl::Bitrate { .. } => {
+                let kind = match c.kind {
+                    Kind::Idr | Kind::I => PicKind::Intra,
+                    Kind::P => PicKind::Inter,
+                    Kind::B => PicKind::B,
+                };
+                self.rc.as_mut().expect("a bitrate configuration builds a controller").pick_qp(kind)
+            }
+            _ => self.picture_qp(c.kind),
+        };
         // Whether this picture takes the transform intra path rather than
         // I_PCM. Lossless stays PCM because PCM is the exactly-lossless mode
         // and the transform path quantises; 4:4:4 stays PCM because
         // `code_macroblock` has no ChromaArrayType 3 path (chroma coded like
         // luma, a fourth residual layout); CABAC intra stays PCM until its
         // macroblock writer exists.
-        let transform_intra = idr
-            && matches!(self.cfg.rate, RateControl::ConstantQp(_));
+        // The envelope is about *quantising*, not about which mode picked
+        // the quantiser: the transform path quantises, so lossless has to
+        // stay PCM, and everything else may use it. It was spelled as
+        // `ConstantQp` because for a long time that was the only lossy
+        // mode there was — and when a bitrate target arrived it silently
+        // fell outside, coding every picture as PCM. The symptom was a
+        // controller that appeared to work and a stream whose size did not
+        // move with the target at all, because nothing downstream was
+        // reading the quantiser it chose.
+        let lossy = !matches!(self.cfg.rate, RateControl::Lossless);
+        let transform_intra = idr && lossy;
         // Whether a P picture takes the motion-search path rather than
         // all-skip. The same envelope as the intra transform path, plus
         // `bframes == 0`: a stream with B pictures must keep its P motion
@@ -289,9 +343,7 @@ impl H264Encoder {
         // future reference's vectors, and a B_Skip over a P with real
         // motion reconstructs *from those vectors* in a decoder. Coding
         // real B pictures (or replicating direct derivation) lifts this.
-        let transform_p = !idr
-            && c.kind == Kind::P
-            && matches!(self.cfg.rate, RateControl::ConstantQp(_));
+        let transform_p = !idr && c.kind == Kind::P && lossy;
         // B pictures share the envelope: inside it every picture type is
         // transform-coded, so a colocated picture's motion is always the
         // real record the direct derivation needs; outside it everything
@@ -300,9 +352,7 @@ impl H264Encoder {
         // hold-back on P is gone for exactly this reason — its ceiling was
         // the all-skip B reconstruction assuming zero colocated motion,
         // and real B pictures model colocated motion instead.
-        let transform_b = !idr
-            && c.kind == Kind::B
-            && matches!(self.cfg.rate, RateControl::ConstantQp(_));
+        let transform_b = !idr && c.kind == Kind::B && lossy;
         let mut out = Vec::new();
         out.extend_from_slice(&syn::annexb(
             syn::NAL_SPS,
@@ -538,14 +588,31 @@ impl H264Encoder {
         (past, future)
     }
 
+    /// What the rate controller achieved against what it was asked for,
+    /// in bits per second — `None` at a constant quantiser. Reported by the
+    /// encoder rather than recomputed by whoever is watching, for the
+    /// reason given on the H.265 side: one division, in one place.
+    pub fn rate_report(&self) -> Option<(f64, f64)> {
+        let rc = self.rc.as_ref()?;
+        let target = match self.cfg.rate {
+            RateControl::Bitrate { bps } => bps as f64,
+            _ => return None,
+        };
+        Some((rc.achieved_bps(self.cfg.fps), target))
+    }
+
     /// The quantiser this picture is coded at, before any adaptive
     /// adjustment. Lossless is signalled separately, so it has no QP of its
     /// own and reports the lowest.
     pub fn picture_qp(&self, kind: Kind) -> u8 {
         match self.cfg.rate {
-            // Refused in `new`, so unreachable — but spelled rather than
-            // wildcarded, so adding a mode makes this a compile error
-            // instead of a silent fixed quantiser.
+            // Under a bitrate target the quantiser is not a function of
+            // the configuration at all — it is chosen per picture from what
+            // the pictures before it actually cost, and `code_picture` asks
+            // the controller rather than asking here. This arm reports the
+            // neutral quantiser because there is no configured answer to
+            // give; a caller wanting the real one has to look at the
+            // stream, picture by picture.
             RateControl::Bitrate { .. } => 26,
             RateControl::Lossless => 0,
             RateControl::ConstantQp(q) => match kind {

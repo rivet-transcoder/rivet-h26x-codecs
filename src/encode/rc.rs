@@ -1,5 +1,28 @@
 //! Picture-level rate control: choosing a quantiser per picture to meet a
-//! bitrate target.
+//! bitrate target. **Shared by both codecs.**
+//!
+//! It began as H.265's and moved here whole when H.264 wanted one, which is
+//! not what anybody expected — the guess going in was that the budget and
+//! the damping would be common and the quantiser-to-bits relationship would
+//! not. It is the other way round, and emphatically: H.264 and H.265 define
+//! the quantiser *identically*, as a step size that doubles every six, and
+//! both decoders in this crate index their dequantisation tables by
+//! `qp % 6` and shift by `qp / 6` (`h264::transform`, `hevc::residual`). The
+//! one law this module steers by is therefore the most shared thing in it,
+//! not the least.
+//!
+//! What is genuinely per-codec turned out to be only wiring, and little of
+//! it: mapping that encoder's picture kind to [`PicKind`], and calling
+//! [`RateController::pick_qp`] and [`RateController::account`] in its own
+//! loop. Both encoders already carried a per-picture quantiser against a
+//! fixed one in the parameter set — `slice_qp_delta` in both — so neither
+//! needed new syntax to vary it.
+//!
+//! The one thing sharing *did* surface: H.264's constant-quantiser path
+//! already believed B pictures could afford to be worse, coding them at
+//! `qp + 2`. This module had no such belief and lumped them in with P. That
+//! was a gap in the H.265 controller rather than a difference between the
+//! codecs — H.265 has B pictures too — so [`B_WEIGHT`] fixes it for both.
 //!
 //! # Three kinds of property, and why this one is different
 //!
@@ -61,7 +84,40 @@
 //! The operating rule behind all three: **a rate-control check is
 //! meaningful exactly when it fails for a controller that ignores its
 //! target.** That is an experiment, not a judgement — replace this module's
-//! output with a constant quantiser and see what goes red.
+//! output with a constant quantiser and see what goes red. Doing exactly
+//! that is what caught the gate's failure tally not listing `RATE-FAIL`:
+//! ten cells printed a failure and were counted as passes.
+//!
+//! ## What the corpus can and cannot ask for
+//!
+//! A target outside a clip's achievable range cannot be hit by *any*
+//! controller, so the gate's targets have to sit inside every clip's range
+//! at once. Measured, in bits per second, between quantiser 51 and 0:
+//!
+//! ```text
+//!     clip                        floor      ceiling    range
+//!     src_detail_64x64_420       21_900      933_930    42.6x
+//!     src_motion_64x64_420       13_440      361_020    26.9x
+//!     src_grad_64x64_420          5_910      107_970    18.3x
+//!     src_odd_50x34_420          21_280       98_840     4.6x
+//! ```
+//!
+//! The **common** range is only `[21_900, 98_840]` — about 4.5x — because
+//! `src_odd_50x34_420` has almost no headroom. That is what caps the gate's
+//! bracket at 64k/96k, and it is a property of the corpus rather than of
+//! any controller: a tighter band wants a clip with more range, not better
+//! code. At 32k the transient alone pushes two clips past 2.0x.
+//!
+//! ## The error has a shape, and it is not noise
+//!
+//! Across the gate's sixteen H.265 rate cells the achieved rate averages
+//! about 1.17x of target, eleven of sixteen land above it, and every cell
+//! is tighter at the higher target than the lower one. That is the seeded
+//! first picture of each kind: on a six-to-twelve-frame clip one overspent
+//! keyframe is a large share of the whole budget and there is no later to
+//! recover it in, and the same absolute overspend matters less as the
+//! target rises. A second pass or a lookahead is what fixes it; neither is
+//! here, so the bias is reported rather than averaged away.
 //!
 //! ## What is deliberately not here
 //!
@@ -114,6 +170,25 @@ const MAX_QP_STEP: i32 = 3;
 /// overshoots, over-corrects, and rings.
 const CORRECTION_PICTURES: f64 = 8.0;
 
+/// The largest quantiser change the *first measured* pick of a kind may
+/// make, correcting the seed it inherited.
+///
+/// Wider than [`MAX_QP_STEP`], because that first correction is the most
+/// valuable decision the controller makes and throttling it to three steps
+/// wastes a short clip — the measured seed error on this project's own
+/// corpus was eighteen steps. But not unbounded, which is what it used to
+/// be: a single observation of content the model does not describe can
+/// then recommend the extreme, and the controller takes it in one move.
+/// Sixteen closes the measured eighteen almost entirely in one move and
+/// leaves a step or two of ordinary correction. It was twelve first, which
+/// stopped the runaway just as well but cost real accuracy in the other
+/// direction — cheap content needing a large *downward* correction could
+/// not reach its target inside a short clip, and the gate's smooth-ramp
+/// clip fell from 0.75x to 0.59x of its target, uncomfortably close to the
+/// band's floor. The bound exists to stop one catastrophic move, not to
+/// slow every large one.
+const MAX_FIRST_STEP: i32 = 16;
+
 /// How much more of the budget an intra picture may take than an inter one.
 ///
 /// An IDR costs several times a P at the same quantiser, so splitting a
@@ -122,6 +197,58 @@ const CORRECTION_PICTURES: f64 = 8.0;
 /// one. Four is a round number in the right region rather than a measured
 /// constant, and it is the first thing to replace with a measurement.
 const INTRA_WEIGHT: f64 = 4.0;
+
+/// How much of an inter picture's share a **B** picture gets.
+///
+/// Nothing references a B picture here, so spending fewer bits on it costs
+/// only itself. Both constant-quantiser paths already encode that belief —
+/// H.264's codes B pictures at `qp + 2` — and this is the same statement in
+/// budget terms rather than quantiser terms: two quantiser steps is a
+/// factor of `2^(-2/6)`, which is 0.79.
+///
+/// The H.265 controller shipped without it and treated B pictures as P,
+/// which was a gap rather than a codec difference; sharing this module with
+/// H.264 is what exposed it.
+const B_WEIGHT: f64 = 0.79;
+
+/// The most one picture's observation may move the complexity estimate, as
+/// a factor either way.
+///
+/// A single picture cannot legitimately reveal that content is sixteen
+/// times cheaper than the last measurement said. When it appears to,
+/// something other than complexity has changed — and the loop's response
+/// is to lower the quantiser, observe the same bits again, lower it
+/// further, and run away.
+///
+/// That is not hypothetical: wiring this controller to H.264 produced
+/// exactly it. Its pictures were falling outside the transform envelope
+/// and coding as all-skip at a *fixed* size, so every observation implied
+/// a cheaper picture, and the quantiser walked 32, 24, 21, 18, 15, 12, 9
+/// while the bits never moved. The envelope was the real bug and is fixed,
+/// but a controller that diverges when its model does not apply is a
+/// controller with a sharp edge, and content whose cost genuinely ignores
+/// the quantiser — a held frame, a black frame — can present the same way.
+/// Bounding the step does not make the model right; it makes being wrong
+/// survivable.
+const MAX_K_RATIO: f64 = 4.0;
+
+/// How little the bits may change, across a quantiser move of at least
+/// [`MAX_QP_STEP`], before this module concludes that the content is not
+/// responding to the quantiser at all.
+///
+/// Bounding the complexity step (above) slows a runaway; it cannot stop
+/// one, because a picture whose cost never moves keeps implying a cheaper
+/// picture forever and the quantiser keeps walking. The only way out is to
+/// notice. This is the noticing: move the quantiser meaningfully, see the
+/// bits stay inside this band, and conclude that the model does not apply
+/// here — then stop lowering the quantiser, because lowering it is what
+/// the model recommends and the model is the thing that is wrong.
+///
+/// It is deliberately a tight band. Content that responds even weakly
+/// still gets steered; only content that does not respond at all is
+/// frozen, and the flag is recomputed on every observation, so content
+/// that starts responding again is steered again.
+const INSENSITIVE_BAND: f64 = 0.06;
 
 /// Quantiser bounds. The syntax allows 0..=51 and both ends are legal;
 /// these are the same bounds `ConstantQp` clamps to.
@@ -153,19 +280,46 @@ const SEED_QP_MIN: f64 = 26.0;
 /// See [`SEED_QP_MIN`].
 const SEED_QP_MAX: f64 = 45.0;
 
-/// Which complexity estimate a picture draws on.
+/// Which complexity estimate a picture draws on, and what share of the
+/// budget it is given.
+///
+/// Three kinds rather than two because they cost genuinely different
+/// amounts at the same quantiser — an intra picture predicts from nothing,
+/// and a B picture predicts from both directions — and because nothing
+/// references a B picture, so its share can be cut without harming
+/// anything else.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PicKind {
     /// An IDR or other intra-coded picture.
     Intra,
-    /// A P or B picture.
+    /// A P picture: predicted from the past, and referenced by others.
     Inter,
+    /// A B picture: predicted from both directions, and referenced by
+    /// nothing, so it is given the smallest share.
+    B,
+}
+
+impl PicKind {
+    /// The share of a plain inter picture's budget this kind is given.
+    fn weight(self) -> f64 {
+        match self {
+            PicKind::Intra => INTRA_WEIGHT,
+            PicKind::Inter => 1.0,
+            PicKind::B => B_WEIGHT,
+        }
+    }
 }
 
 /// Per-kind complexity: `k` in `bits ≈ k * 2^(-qp/6)`.
 #[derive(Clone, Copy)]
 struct Complexity {
     k: f64,
+    /// The last `(quantiser, bits)` actually observed for this kind, to
+    /// tell a picture that got cheaper from one that never cared.
+    last_obs: Option<(u8, u64)>,
+    /// Set when the last two observations showed a real quantiser move and
+    /// essentially no change in bits. See [`INSENSITIVE_BAND`].
+    insensitive: bool,
     /// Whether `k` has been pinned by a real observation yet, or is still
     /// the seed. The first real observation replaces the seed outright
     /// rather than being blended into it — a seed is a guess and deserves
@@ -187,7 +341,7 @@ pub struct RateController {
     /// The leaky bucket: bits underspent so far. Negative means overspent.
     budget: f64,
     /// Per-kind complexity, indexed by [`PicKind`].
-    complexity: [Complexity; 2],
+    complexity: [Complexity; 3],
     /// The last quantiser chosen **from a measured model**, per kind, for
     /// the step limit.
     ///
@@ -204,7 +358,11 @@ pub struct RateController {
     ///   makes — is throttled to three steps, and on a short clip it never
     ///   arrives: the run below took five of eight pictures crawling from
     ///   a bad guess to the right answer, overspending the whole way.
-    last_informed: [Option<u8>; 2],
+    last_informed: [Option<u8>; 3],
+    /// The last quantiser chosen for each kind whether measured or guessed,
+    /// so that even the first measured correction has something to be
+    /// bounded against. See [`MAX_FIRST_STEP`].
+    last_any: [Option<u8>; 3],
     /// **The ledger.** Total bits emitted, as measured from the access
     /// units themselves — start codes, NAL headers, parameter sets and
     /// all. The encoder asserts this against the bytes it has produced;
@@ -222,14 +380,22 @@ pub struct RateController {
 impl RateController {
     /// A controller for `bps` bits per second at `fps` pictures per second
     /// over a `width` by `height` picture, with `gop` pictures between IDRs
-    /// (0 meaning every picture is one).
-    pub fn new(bps: u32, fps: u32, width: u32, height: u32, gop: u32) -> Self {
+    /// (0 meaning every picture is one) and `bframes` consecutive B
+    /// pictures between references.
+    pub fn new(bps: u32, fps: u32, width: u32, height: u32, gop: u32, bframes: u32) -> Self {
         let fps = fps.max(1) as f64;
         let per_picture = (bps as f64 / fps).max(1.0);
-        // With `gop` pictures per keyframe, one of them carries
-        // INTRA_WEIGHT and the rest carry 1.
+        // With `gop` pictures per keyframe, one carries INTRA_WEIGHT and
+        // the rest split between P and B in the ratio the scheduler will
+        // produce: `bframes` B pictures for every anchor. The average is
+        // what keeps the weights a *redistribution* — they change which
+        // picture gets the bits, never how many there are.
         let n = if gop == 0 { 1.0 } else { gop as f64 };
-        let avg_weight = (INTRA_WEIGHT + (n - 1.0)) / n;
+        let others = (n - 1.0).max(0.0);
+        let b_share = bframes as f64 / (bframes as f64 + 1.0);
+        let n_b = others * b_share;
+        let n_p = others - n_b;
+        let avg_weight = (INTRA_WEIGHT + n_p + n_b * B_WEIGHT) / n;
 
         // Seed complexity from the target's bits per pixel, through the
         // same law the controller steers by: 0.1 bits per pixel is about
@@ -242,17 +408,18 @@ impl RateController {
             let qp = (32.0 - 6.0 * (bpp / 0.1).log2()).clamp(SEED_QP_MIN, SEED_QP_MAX);
             target * 2f64.powf(qp / 6.0)
         };
-        let intra_target = per_picture * INTRA_WEIGHT / avg_weight;
-        let inter_target = per_picture / avg_weight;
+        let seed_for = |k: PicKind| per_picture * k.weight() / avg_weight;
         RateController {
             per_picture,
             avg_weight,
             budget: 0.0,
             complexity: [
-                Complexity { k: seed_k(intra_target), observed: false },
-                Complexity { k: seed_k(inter_target), observed: false },
+                Complexity { k: seed_k(seed_for(PicKind::Intra)), observed: false, last_obs: None, insensitive: false },
+                Complexity { k: seed_k(seed_for(PicKind::Inter)), observed: false, last_obs: None, insensitive: false },
+                Complexity { k: seed_k(seed_for(PicKind::B)), observed: false, last_obs: None, insensitive: false },
             ],
-            last_informed: [None; 2],
+            last_informed: [None; 3],
+            last_any: [None; 3],
             bits_spent: 0,
             pictures: 0,
             pending: None,
@@ -262,11 +429,7 @@ impl RateController {
     /// The bits this picture is aiming for: its share by kind, plus a
     /// slice of whatever the bucket has over- or under-spent so far.
     fn target_for(&self, kind: PicKind) -> f64 {
-        let weight = match kind {
-            PicKind::Intra => INTRA_WEIGHT,
-            PicKind::Inter => 1.0,
-        };
-        let base = self.per_picture * weight / self.avg_weight;
+        let base = self.per_picture * kind.weight() / self.avg_weight;
         // Spread the correction, and never let it move the target by more
         // than half — a single expensive picture should bend the next few,
         // not flatten them.
@@ -287,15 +450,35 @@ impl RateController {
         // `last_informed`. The first informed pick of each kind is allowed
         // to be as large a correction as it needs to be, because the thing
         // it is correcting is a guess.
+        // Three regimes, narrowing as the controller learns: no bound at
+        // all for the very first picture of a kind, a wide one for its
+        // first measured correction, and the ordinary step limit forever
+        // after.
         let informed = c.observed;
-        if let (Some(last), true) = (self.last_informed[kind as usize], informed) {
-            let last = last as i32;
-            qp = qp.clamp(last - MAX_QP_STEP, last + MAX_QP_STEP);
+        match (informed, self.last_informed[kind as usize], self.last_any[kind as usize]) {
+            (true, Some(last), _) => {
+                let last = last as i32;
+                qp = qp.clamp(last - MAX_QP_STEP, last + MAX_QP_STEP);
+            }
+            (_, None, Some(any)) => {
+                let any = any as i32;
+                qp = qp.clamp(any - MAX_FIRST_STEP, any + MAX_FIRST_STEP);
+            }
+            _ => {}
+        }
+        // Content that does not answer the quantiser cannot be steered by
+        // it, and the model's advice — lower it further — is exactly wrong.
+        // Hold the line instead of walking to zero.
+        if c.insensitive {
+            if let Some(last) = self.last_informed[kind as usize] {
+                qp = qp.max(last as i32);
+            }
         }
         let qp = qp.clamp(QP_MIN, QP_MAX) as u8;
         if informed {
             self.last_informed[kind as usize] = Some(qp);
         }
+        self.last_any[kind as usize] = Some(qp);
         self.pending = Some((kind, qp));
         qp
     }
@@ -323,7 +506,38 @@ impl RateController {
         if bits > 0 {
             let k_obs = bits as f64 * 2f64.powf(qp as f64 / 6.0);
             let c = &mut self.complexity[kind as usize];
-            c.k = if c.observed { 0.5 * c.k + 0.5 * k_obs } else { k_obs };
+            if c.observed {
+                // Bound the excursion before blending: see MAX_K_RATIO.
+                let lo = c.k / MAX_K_RATIO;
+                let hi = c.k * MAX_K_RATIO;
+                c.k = 0.5 * c.k + 0.5 * k_obs.clamp(lo, hi);
+            } else {
+                // The first real observation replaces the seed outright. A
+                // seed is a guess and deserves no weight once a fact
+                // exists, and it is not a previous measurement to be
+                // bounded against.
+                c.k = k_obs;
+            }
+            // Did the quantiser move, and did the bits care? Recomputed
+            // every time, so the verdict follows the content.
+            // Only a picture coded at a *different* quantiser carries
+            // information about whether the quantiser matters. When one is
+            // held — which is exactly what the verdict below causes — the
+            // absence of a move is not evidence against it, so the verdict
+            // stands until a real move contradicts it. Recomputing it to
+            // false on every held picture made the controller alternate
+            // between holding and stepping down, walking to zero in pairs.
+            match c.last_obs {
+                Some((pqp, pbits)) if pbits > 0 && (qp as i32 - pqp as i32).abs() >= MAX_QP_STEP => {
+                    let change = (bits as f64 / pbits as f64 - 1.0).abs();
+                    c.insensitive = change < INSENSITIVE_BAND;
+                    c.last_obs = Some((qp, bits));
+                }
+                None => c.last_obs = Some((qp, bits)),
+                // A held quantiser: keep both the verdict and the reference
+                // point it was reached from.
+                _ => {}
+            }
             c.observed = true;
         }
     }
@@ -376,7 +590,7 @@ mod tests {
     /// the bytes actually emitted.
     #[test]
     fn the_ledger_counts_every_byte_exactly_once() {
-        let mut rc = RateController::new(500_000, 30, 64, 64, 8);
+        let mut rc = RateController::new(500_000, 30, 64, 64, 8, 0);
         let sizes = [900usize, 120, 140, 95, 210, 88, 400, 3];
         for (i, &b) in sizes.iter().enumerate() {
             let kind = if i == 0 { PicKind::Intra } else { PicKind::Inter };
@@ -403,7 +617,7 @@ mod tests {
         let (ki, kp) = (K_INTRA, K_INTER);
         let mut totals = Vec::new();
         for bps in [200_000u32, 600_000, 1_800_000, 5_400_000] {
-            let mut rc = RateController::new(bps, 30, W, H, 8);
+            let mut rc = RateController::new(bps, 30, W, H, 8, 0);
             let mut total = 0usize;
             for i in 0..12 {
                 let kind = if i % 8 == 0 { PicKind::Intra } else { PicKind::Inter };
@@ -435,7 +649,7 @@ mod tests {
     fn a_scene_that_matches_the_model_lands_near_the_target() {
         let (ki, kp) = (K_INTRA, K_INTER);
         for bps in [200_000u32, 600_000, 1_800_000] {
-            let mut rc = RateController::new(bps, 30, W, H, 8);
+            let mut rc = RateController::new(bps, 30, W, H, 8, 0);
             for i in 0..40 {
                 let kind = if i % 8 == 0 { PicKind::Intra } else { PicKind::Inter };
                 let qp = rc.pick_qp(kind);
@@ -451,12 +665,40 @@ mod tests {
         }
     }
 
+    /// Content whose cost ignores the quantiser must not send the
+    /// controller into a spiral.
+    ///
+    /// This is the H.264 failure reproduced in miniature: a picture that
+    /// costs the same however it is quantised. The model has no `k` that
+    /// explains it, so every observation implies a cheaper picture than the
+    /// last, and without a bound the quantiser walks to zero chasing bits
+    /// that were never going to arrive. What is asserted is not that the
+    /// controller hits the target — it cannot, and should not pretend to —
+    /// but that it fails *quietly*, staying inside a sane band instead of
+    /// pinning itself at the extreme.
+    #[test]
+    fn a_picture_that_ignores_the_quantiser_does_not_send_it_running() {
+        let mut rc = RateController::new(2_000_000, 30, W, H, 8, 0);
+        let mut qps = Vec::new();
+        for i in 0..40 {
+            let kind = if i % 8 == 0 { PicKind::Intra } else { PicKind::Inter };
+            qps.push(rc.pick_qp(kind));
+            // The same size every time, whatever was asked for.
+            rc.account(400);
+        }
+        let lowest = *qps.iter().min().expect("forty pictures");
+        assert!(
+            lowest > 4,
+            "the quantiser ran away to {lowest} chasing bits that do not respond to it: {qps:?}"
+        );
+    }
+
     /// The quantiser may not lurch. A controller that jumps from 20 to 45
     /// to meet a budget produces a visible pulse, which is worse to watch
     /// than a steady small miss.
     #[test]
     fn the_quantiser_never_moves_more_than_the_step_limit() {
-        let mut rc = RateController::new(600_000, 30, W, H, 8);
+        let mut rc = RateController::new(600_000, 30, W, H, 8, 0);
         // The limit applies between measured picks of the same kind, so
         // the comparison tracks the previous inter quantiser specifically
         // and starts once two informed inter picks exist.
@@ -481,6 +723,35 @@ mod tests {
         }
     }
 
+    /// A B picture is given less than a P picture, and the three weights
+    /// still only *redistribute* — a GOP's total is what it would have been
+    /// with no weighting at all.
+    ///
+    /// The second half is the one worth pinning: weights that quietly
+    /// changed the total would make every target wrong by a factor nobody
+    /// could see, since the band is wide and the error would look like the
+    /// transient.
+    #[test]
+    fn b_pictures_are_given_less_than_p_and_the_weights_only_redistribute() {
+        // Two B pictures between anchors, eight pictures to a keyframe.
+        let (gop, bframes) = (8u32, 2u32);
+        let rc = RateController::new(500_000, 30, W, H, gop, bframes);
+        let (i, p, b) = (rc.target_for(PicKind::Intra), rc.target_for(PicKind::Inter), rc.target_for(PicKind::B));
+        assert!(b < p, "a B picture ({b:.0}) should be given less than a P ({p:.0})");
+        assert!(p < i, "a P picture ({p:.0}) should be given less than an intra ({i:.0})");
+
+        // The GOP as the scheduler will actually shape it.
+        let others = (gop - 1) as f64;
+        let n_b = others * bframes as f64 / (bframes as f64 + 1.0);
+        let n_p = others - n_b;
+        let total = i + p * n_p + b * n_b;
+        let plain = rc.per_picture * gop as f64;
+        assert!(
+            (total - plain).abs() < plain * 0.01,
+            "the weights changed the GOP's total: {total:.0} against {plain:.0}"
+        );
+    }
+
     /// An intra picture gets a larger share than an inter one at the same
     /// complexity — which shows up as a *lower* quantiser being affordable
     /// for it. Without the split, the picture after every keyframe is
@@ -488,7 +759,7 @@ mod tests {
     /// `INTRA_WEIGHT` were quietly dropped to 1.
     #[test]
     fn an_intra_picture_is_given_more_bits_than_an_inter_one() {
-        let rc = RateController::new(500_000, 30, W, H, 8);
+        let rc = RateController::new(500_000, 30, W, H, 8, 0);
         let i = rc.target_for(PicKind::Intra);
         let p = rc.target_for(PicKind::Inter);
         assert!(i > p * 2.0, "intra target {i:.0} is not meaningfully above inter {p:.0}");

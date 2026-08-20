@@ -212,6 +212,10 @@ fn main() {
         write_recon_display_order(&path, enc.reconstructions(), &pocs);
     }
     eprintln!("{} pictures, {} bytes", pocs.len(), stream.len());
+    if let Some((achieved, target)) = enc.rate_report() {
+        // Parsed by the gate. Same line, same shape, as the H.265 path.
+        eprintln!("rate: achieved {achieved:.0} bps, target {target:.0} bps, ratio {:.3}", achieved / target);
+    }
 }
 
 /// Write the reconstructions in *display* order — sorted by each coded

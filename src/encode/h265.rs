@@ -21,7 +21,7 @@ use super::gop::{Coded, Kind, Scheduler};
 use super::h265_deblock::{deblock_inter_picture, deblock_picture};
 use super::h265_intra::{CuDecision, IntraCtx, IntraPicture};
 use super::h265_me::{InterCuDecision, InterCuKind, InterPicture, PCuDecision, MAX_MERGE_CAND};
-use super::h265_rc::{PicKind, RateController};
+use super::rc::{PicKind, RateController};
 use super::h265_sao::{SaoPlan, sao_picture};
 use super::h265_syntax as syn;
 use super::{Access, Config, RateControl};
@@ -131,7 +131,7 @@ impl H265Encoder {
             RateControl::Bitrate { .. } => 26,
         };
         let rc = match cfg.rate {
-            RateControl::Bitrate { bps } => Some(RateController::new(bps, cfg.fps, cfg.width, cfg.height, cfg.gop)),
+            RateControl::Bitrate { bps } => Some(RateController::new(bps, cfg.fps, cfg.width, cfg.height, cfg.gop, cfg.bframes)),
             _ => None,
         };
         Ok(Self {
@@ -257,7 +257,11 @@ impl H265Encoder {
             // The controller chooses, once per picture, in coding order.
             // `account` below closes the loop with what it actually cost.
             RateControl::Bitrate { .. } => {
-                let kind = if c.kind == Kind::Idr { PicKind::Intra } else { PicKind::Inter };
+                let kind = match c.kind {
+                    Kind::Idr | Kind::I => PicKind::Intra,
+                    Kind::P => PicKind::Inter,
+                    Kind::B => PicKind::B,
+                };
                 self.rc.as_mut().expect("a bitrate configuration builds a controller").pick_qp(kind)
             }
         };
