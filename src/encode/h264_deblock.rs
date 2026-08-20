@@ -11,11 +11,11 @@
 //! That state is the whole game. The filter's boundary strengths read the
 //! macroblock kind (intra edges are bS 3/4 unconditionally), the
 //! nonzero-coefficient mask (bS 2), and the motion field (bS 1/0), plus
-//! each macroblock's QPs for the thresholds. [`FilterMb`] carries exactly
-//! that, filled by the picture writers from their decisions; get any of it
-//! wrong — the classic being a stale or empty `nz_mask` — and the filter
-//! runs with different strengths than the decoder's, which SELF reports on
-//! the first picture that codes a residual next to an edge.
+//! each macroblock's QPs for the thresholds — and it reads all of it out
+//! of the decoder's own `PicInfo` and per-4x4 motion, which the picture
+//! walks now fill as they code ([`PicMotion`]). Nothing is synthesised
+//! here any more: there is no encoder-side summary of a macroblock left to
+//! be subtly different from what a decoder derived.
 //!
 //! Ordering mirrors the decoder's: it filters a row only after the row
 //! below is reconstructed (intra prediction reads unfiltered neighbours)
@@ -31,53 +31,54 @@
 //! profile says so.
 
 use crate::dsp::h264::H264Dsp;
+use crate::encode::h264_pic::PicMotion;
 use crate::encode::h264_syntax::{Geometry, Recon};
 use crate::h264::deblock::{DeblockParams, deblock_mb_rows};
-use crate::h264::frame::{BlockMotion, Frame, Mv, PARITY_FRAME};
-use crate::h264::mb::{MbKind, PicInfo, chroma_qp};
+use crate::h264::frame::Frame;
 
-/// What the deblocking filter — and, stored beside a reference picture,
-/// the B direct derivation — needs to know about one coded macroblock,
-/// recorded by the picture walks in raster order as they code.
+/// Run the decoder's deblocking filter over a coded picture's
+/// reconstruction, in place.
 ///
-/// INVARIANT(16x16-only): one `FilterMb` records one motion per list for
-/// the *whole* macroblock. That is a faithful record only while every
-/// inter partition this encoder codes is 16x16 — it is also what makes a
-/// per-macroblock colocated read exact for spatial direct (the four 8x8
-/// corner derivations of 8.4.1.2 agree by construction), and what makes
-/// `part_edges = [0, 0]` exact for the loop filter. The day sub-macroblock
-/// partitions land, this struct must grow per-block motion *before*
-/// direct mode or the filter may trust it; grep this tag.
-#[derive(Clone, Copy)]
-pub struct FilterMb {
-    /// The macroblock kind, in the decoder's own vocabulary — what bS
-    /// derivation switches on. This encoder produces `I4x4`, `I16x16`,
-    /// `Inter16x16`, `PSkip`, `BDirect16x16` and `BSkip`.
-    pub kind: MbKind,
-    /// The "has coefficients" mask of the 4x4 luma blocks (raster), the
-    /// same derivation `derive()` stores in `MbInfo::nz_mask`
-    /// (src/h264/recon.rs): one bit per block with a nonzero count. Zero
-    /// for a skipped macroblock. See [`nz_mask_of`].
-    pub nz_mask: u16,
-    /// `transform_size_8x8_flag`: which of a macroblock's internal edges
-    /// are transform edges at all. Under the 8x8 transform the odd
-    /// internal luma edges are not, and the filter skips them
-    /// (`internal_odd` in src/h264/deblock.rs, and `filter_luma_style`'s
-    /// `step`); 4:2:2 chroma still filters at those positions. Wrong here
-    /// and the encoder's reconstruction is smoothed where a decoder's is
-    /// not, which SELF reports on the first coded 8x8 next to an edge.
-    pub transform_8x8: bool,
-    /// The list-0 vector when the macroblock predicts from list 0 — for
-    /// `PSkip` the *derived* skip vector, for B kinds whatever the mode
-    /// decision (or the direct derivation) settled on — because that is
-    /// the motion a decoder stores and compares across edges. `None` for
-    /// intra macroblocks and for B macroblocks not using the list.
-    pub l0: Option<Mv>,
-    /// The same for list 1. Always `None` outside B pictures.
-    pub l1: Option<Mv>,
+/// Everything the filter reads is already in `pm`: the per-macroblock
+/// `MbInfo` the walks filled as they coded, and the per-4x4 motion in the
+/// decoder's own layout. The planes and the motion are *moved* into a
+/// decoder frame and back out (`Vec` swaps, no copies) — the geometry is
+/// identical by construction, since both sides build planes of the coded
+/// size with the decoder's borders.
+///
+/// The slice parameters are the ones the header writes when its `deblock`
+/// flag is true — filter on, both offsets zero — and the two must stay in
+/// step: the writers call this unconditionally for exactly that reason.
+pub fn deblock_recon(dsp: &H264Dsp<u8>, g: &Geometry, pm: &mut PicMotion, rec: &mut [Recon]) {
+    let (mbw, mbh) = (g.mbs_wide as usize, g.mbs_high as usize);
+    debug_assert_eq!(pm.info.mbs.len(), mbw * mbh, "one MbInfo per macroblock");
+
+    let PicMotion { info, frame: src } = pm;
+    let mut frame = Frame::<u8>::empty();
+    frame.mb_width = mbw;
+    frame.mb_height = mbh;
+    frame.chroma = g.chroma;
+    frame.bit_depth = 8;
+    std::mem::swap(&mut frame.motion, &mut src.motion);
+    std::mem::swap(&mut frame.mb_intra, &mut src.mb_intra);
+    std::mem::swap(&mut frame.y, &mut rec[0]);
+    if rec.len() > 1 {
+        std::mem::swap(&mut frame.cb, &mut rec[1]);
+        std::mem::swap(&mut frame.cr, &mut rec[2]);
+    }
+
+    deblock_mb_rows(dsp, &mut frame, info, &[DeblockParams::default()], 0, mbh);
+
+    std::mem::swap(&mut frame.motion, &mut src.motion);
+    std::mem::swap(&mut frame.mb_intra, &mut src.mb_intra);
+    std::mem::swap(&mut frame.y, &mut rec[0]);
+    if rec.len() > 1 {
+        std::mem::swap(&mut frame.cb, &mut rec[1]);
+        std::mem::swap(&mut frame.cr, &mut rec[2]);
+    }
 }
 
-/// The nonzero mask of [`FilterMb`] from a decision's per-block counts:
+/// The nonzero mask of a macroblock from a decision's per-block counts:
 /// `derive()`'s own formula (src/h264/recon.rs, where `MbInfo::nz_mask`
 /// is built), including its 8x8 case.
 ///
@@ -100,81 +101,38 @@ pub fn nz_mask_of(nz: &[u8; 16], transform_8x8: bool) -> u16 {
     q(mask & 0x0033) | (q(mask & 0x00cc) << 2) | (q(mask & 0x3300) << 8) | (q(mask & 0xcc00) << 10)
 }
 
-/// Run the decoder's deblocking filter over a coded picture's
-/// reconstruction, in place.
-///
-/// `qp` is the slice QP, which is every macroblock's QP while nothing
-/// writes a nonzero `mb_qp_delta`; the chroma QPs derive from it with the
-/// zero offsets the PPS declares. The slice parameters are the ones the
-/// header writes when its `deblock` flag is true — filter on, both
-/// offsets zero — and the two must stay in step: the writers call this
-/// unconditionally for exactly that reason.
-pub fn deblock_recon(dsp: &H264Dsp<u8>, g: &Geometry, qp: u8, mbs: &[FilterMb], rec: &mut [Recon]) {
-    let (mbw, mbh) = (g.mbs_wide as usize, g.mbs_high as usize);
-    debug_assert_eq!(mbs.len(), mbw * mbh, "one FilterMb per macroblock");
-
-    // A decoder-shaped frame around the encoder's planes. The geometry is
-    // identical by construction — both sides build planes of the coded
-    // size with the decoder's borders — so the planes move, not copy.
-    let mut frame = Frame::<u8>::empty();
-    frame.mb_width = mbw;
-    frame.mb_height = mbh;
-    frame.chroma = g.chroma;
-    frame.bit_depth = 8;
-    let n = mbw * mbh;
-    frame.motion = [
-        vec![BlockMotion::default(); n * 16],
-        vec![BlockMotion::default(); n * 16],
-    ];
-    std::mem::swap(&mut frame.y, &mut rec[0]);
-    if rec.len() > 1 {
-        std::mem::swap(&mut frame.cb, &mut rec[1]);
-        std::mem::swap(&mut frame.cr, &mut rec[2]);
-    }
-
-    let mut info = PicInfo::new(mbw, mbh);
-    let qpc = chroma_qp(qp as i32, 0, 0) as i8;
-    for (addr, m) in mbs.iter().enumerate() {
-        let mi = &mut info.mbs[addr];
-        mi.kind = m.kind;
-        mi.decoded = true;
-        mi.slice = 0;
-        mi.qp = qp as i8;
-        mi.qpc = [qpc, qpc];
-        mi.nz_mask = m.nz_mask;
-        mi.transform_8x8 = m.transform_8x8;
-        // `part_edges` stays [0, 0] — the derivation's statement that one
-        // partition covers the macroblock, which is true of everything
-        // this encoder codes (INVARIANT(16x16-only) above).
-        //
-        // One motion per list for all sixteen blocks, reference index 0 of
-        // that list's one reference. `ref_id` is an identity the filter
-        // only ever compares for equality: 0 for the list-0 picture and 1
-        // for the list-1 picture says "same picture" and "different
-        // picture" exactly as the decoder's real ids do with one reference
-        // per list (a P picture's single reference is list 0's).
-        for (list, mv) in [(0usize, m.l0), (1usize, m.l1)] {
-            let Some(mv) = mv else { continue };
-            debug_assert!(!m.kind.is_intra(), "an intra FilterMb carries no motion");
-            let bm = BlockMotion { mv, ref_idx: 0, ref_parity: PARITY_FRAME, ref_id: list as u16 };
-            for blk in 0..16 {
-                frame.motion[list][addr * 16 + blk] = bm;
-            }
-        }
-    }
-
-    deblock_mb_rows(dsp, &mut frame, &info, &[DeblockParams::default()], 0, mbh);
-
-    std::mem::swap(&mut frame.y, &mut rec[0]);
-    if rec.len() > 1 {
-        std::mem::swap(&mut frame.cb, &mut rec[1]);
-        std::mem::swap(&mut frame.cr, &mut rec[2]);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::h264::frame::{BlockMotion, Mv, PARITY_FRAME};
+    use crate::h264::mb::{MbInfo, MbKind};
+
+    /// A picture of `n` identical macroblocks, in the state the walks
+    /// would have committed for them.
+    fn uniform(n: usize, mbw: usize, kind: MbKind, nz_mask: u16, l0: Option<Mv>) -> PicMotion {
+        let mut pm = PicMotion::new(mbw, n / mbw);
+        let mut mot = [[BlockMotion::default(); 16]; 2];
+        if let Some(mv) = l0 {
+            mot[0] = [BlockMotion { mv, ref_idx: 0, ref_parity: PARITY_FRAME, ref_id: 1 }; 16];
+        }
+        let qpc = crate::h264::mb::chroma_qp(26, 0, 0) as i8;
+        for addr in 0..n {
+            pm.commit(
+                addr,
+                MbInfo {
+                    kind,
+                    decoded: true,
+                    slice: 0,
+                    qp: 26,
+                    qpc: [qpc; 2],
+                    nz_mask,
+                    ..MbInfo::default()
+                },
+                &mot,
+            );
+        }
+        pm
+    }
 
     /// The mask formula agrees with the decoder's own in `derive()`: bit
     /// `b` set exactly when block `b` has coefficients.
@@ -239,17 +197,8 @@ mod tests {
             }
         }
         let before: Vec<Vec<u8>> = rec.iter().map(|p| p.data.clone()).collect();
-        let mbs = vec![
-            FilterMb {
-                kind: MbKind::PSkip,
-                nz_mask: 0,
-                transform_8x8: false,
-                l0: Some(Mv::new(6, -2)),
-                l1: None,
-            };
-            9
-        ];
-        deblock_recon(&dsp, &g, 26, &mbs, &mut rec);
+        let mut pm = uniform(9, 3, MbKind::PSkip, 0, Some(Mv::new(6, -2)));
+        deblock_recon(&dsp, &g, &mut pm, &mut rec);
         for (p, b) in rec.iter().zip(&before) {
             assert_eq!(&p.data, b, "bS 0 everywhere must leave every sample alone");
         }
@@ -289,17 +238,8 @@ mod tests {
             }
         }
         let before = rec[0].data.clone();
-        let mbs = vec![
-            FilterMb {
-                kind: MbKind::I4x4,
-                nz_mask: 0xffff,
-                transform_8x8: false,
-                l0: None,
-                l1: None,
-            };
-            9
-        ];
-        deblock_recon(&dsp, &g, 26, &mbs, &mut rec);
+        let mut pm = uniform(9, 3, MbKind::I4x4, 0xffff, None);
+        deblock_recon(&dsp, &g, &mut pm, &mut rec);
         assert_ne!(rec[0].data, before, "intra edges at QP 26 must filter");
     }
 }

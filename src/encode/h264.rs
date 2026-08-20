@@ -63,12 +63,13 @@ pub struct H264Encoder {
     /// so this holds several and picks by POC rather than keeping only the
     /// most recent.
     ///
-    /// Beside each picture's planes, its per-macroblock motion record (the
-    /// walk's [`super::h264_deblock::FilterMb`]s): what a later B picture's
-    /// spatial direct derivation reads as colocated motion.
-    /// INVARIANT(16x16-only): one record per macroblock is a faithful
-    /// motion history only while every partition is 16x16 — see the type.
-    refs: Vec<(i32, Vec<syn::Recon>, Vec<super::h264_deblock::FilterMb>)>,
+    /// Beside each picture's planes, its motion in the decoder's own
+    /// layout ([`super::h264_pic::PicMotion`]): per-4x4 `BlockMotion` and
+    /// the per-macroblock `MbInfo`. That is what a later B picture's
+    /// spatial direct derivation reads as colocated motion, at whatever
+    /// granularity 8.4.1.2.1 asks for — which is why it is stored whole
+    /// rather than summarised.
+    refs: Vec<(i32, Vec<syn::Recon>, super::h264_pic::PicMotion)>,
     /// `frame_num`, which counts *reference* pictures and wraps.
     frame_num: u32,
     idr_pic_id: u32,
@@ -387,22 +388,45 @@ impl H264Encoder {
             qp,
             &mut w,
         );
-        // Every coded picture leaves a per-macroblock motion record: the
-        // transform walks return the real one; the PCM and all-skip paths
-        // synthesize what a decoder would store for them (intra; skip at
-        // reference 0 with zero vectors — both lists for a B skip).
-        let total_mbs = (g.mbs_wide * g.mbs_high) as usize;
+        // Every coded picture leaves its motion in the decoder's layout:
+        // the transform walks return the real thing; the PCM and all-skip
+        // paths synthesize what a decoder would store for them (intra; a
+        // skip at reference 0 with zero vectors — both lists for a B
+        // skip), because a later B picture reads it as colocated motion.
         let synth = |kind: crate::h264::mb::MbKind, l0: bool, l1: bool| {
-            vec![
-                super::h264_deblock::FilterMb {
-                    kind,
-                    nz_mask: if kind == crate::h264::mb::MbKind::IPcm { 0xffff } else { 0 },
-                    transform_8x8: false,
-                    l0: l0.then_some(crate::h264::frame::Mv::ZERO),
-                    l1: l1.then_some(crate::h264::frame::Mv::ZERO),
-                };
-                total_mbs
-            ]
+            use crate::h264::frame::{BlockMotion, Mv, PARITY_FRAME};
+            let mut pm = super::h264_pic::PicMotion::new(
+                g.mbs_wide as usize,
+                g.mbs_high as usize,
+            );
+            let mut mot = [[BlockMotion::default(); 16]; 2];
+            for (l, used) in [(0usize, l0), (1usize, l1)] {
+                if used {
+                    mot[l] = [BlockMotion {
+                        mv: Mv::ZERO,
+                        ref_idx: 0,
+                        ref_parity: PARITY_FRAME,
+                        ref_id: 1 + l as u16,
+                    }; 16];
+                }
+            }
+            let qpc = crate::h264::mb::chroma_qp(qp as i32, 0, 0) as i8;
+            for addr in 0..(g.mbs_wide * g.mbs_high) as usize {
+                pm.commit(
+                    addr,
+                    crate::h264::mb::MbInfo {
+                        kind,
+                        decoded: true,
+                        slice: 0,
+                        qp: qp as i8,
+                        qpc: [qpc; 2],
+                        nz_mask: if kind == crate::h264::mb::MbKind::IPcm { 0xffff } else { 0 },
+                        ..crate::h264::mb::MbInfo::default()
+                    },
+                    &mot,
+                );
+            }
+            pm
         };
         let motion;
         if idr {

@@ -29,9 +29,10 @@
 
 use crate::bitwriter::BitWriter;
 use crate::encode::h264_intra::{MbDecision, MbKind};
-use crate::encode::h264_deblock::FilterMb;
 use crate::encode::h264_me::{BDecision, InterDecision, InterMbKind};
-use crate::encode::h264_pic::{BMb, IntraTools, PMb, code_b_picture, code_intra_picture, code_p_picture};
+use crate::encode::h264_pic::{
+    BMb, IntraTools, PMb, PicMotion, code_b_picture, code_intra_picture, code_p_picture,
+};
 use crate::encode::h264_syntax::{Geometry, Plane, Recon};
 use crate::h264::cavlc::{SCAN8_SUB, SCAN_CHROMA_DC, write_residual_block_cavlc};
 use crate::h264::mb::raster_of_blk;
@@ -557,7 +558,7 @@ pub fn write_intra_picture(
     qp: u8,
     planes: &[Plane<'_>],
     rec: &mut [Recon],
-) -> Vec<FilterMb> {
+) -> PicMotion {
     let mbs_wide = g.mbs_wide as usize;
     let rows = if g.chroma == crate::picture::ChromaFormat::Yuv444 { 0 } else { g.chroma_mb().1 as usize / 4 };
     let mut st = NzState::new(mbs_wide, rows, g.chroma == crate::picture::ChromaFormat::Yuv444);
@@ -585,7 +586,7 @@ pub fn write_p_picture(
     planes: &[Plane<'_>],
     rec: &mut [Recon],
     refp: &[Recon],
-) -> Vec<FilterMb> {
+) -> PicMotion {
     let mbs_wide = g.mbs_wide as usize;
     let rows = if g.chroma == crate::picture::ChromaFormat::Yuv444 { 0 } else { g.chroma_mb().1 as usize / 4 };
     let mut st = NzState::new(mbs_wide, rows, g.chroma == crate::picture::ChromaFormat::Yuv444);
@@ -702,8 +703,8 @@ pub fn write_b_picture(
     planes: &[Plane<'_>],
     rec: &mut [Recon],
     refs: [&[Recon]; 2],
-    col: &[FilterMb],
-) -> Vec<FilterMb> {
+    col: &PicMotion,
+) -> PicMotion {
     let mbs_wide = g.mbs_wide as usize;
     let rows = if g.chroma == crate::picture::ChromaFormat::Yuv444 { 0 } else { g.chroma_mb().1 as usize / 4 };
     let mut st = NzState::new(mbs_wide, rows, g.chroma == crate::picture::ChromaFormat::Yuv444);

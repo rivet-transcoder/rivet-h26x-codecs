@@ -68,7 +68,7 @@
 use crate::dsp::distortion::DistortionDsp;
 use crate::dsp::h264::{NO_DC, PRED_STRIDE};
 use crate::dsp::h264_enc::{qbits4, quant_offset};
-use crate::encode::h264_deblock::FilterMb;
+use crate::encode::h264_pic::PicMotion;
 use crate::encode::h264_intra::{IntraCtx, code_block_8x8, lambda, quad_rasters, reconstruct_8x8};
 use crate::h264::cavlc::sub_block_counts_8x8;
 use crate::encode::h264_syntax::Recon;
@@ -1151,15 +1151,17 @@ impl Default for BDecision {
 /// preference of `colocated_motion` in `src/h264/mb.rs` — list 0, else
 /// list 1), in which case that list's vector is zero.
 ///
-/// `col` is the colocated macroblock's record in the list-1 reference —
-/// one motion for the whole macroblock. The standard derives colZeroFlag
-/// per 8x8 from that partition's corner 4x4; reading one record per
-/// macroblock is exact because of INVARIANT(16x16-only) (see
-/// [`FilterMb`]): every colocated picture this encoder produced stored
-/// one motion per macroblock, so the four corner reads agree by
-/// construction. Long-term references do not exist here, so the
-/// long-term guard on colZeroFlag is vacuously satisfied.
-pub fn spatial_direct_16x16(st: &MbMotionState, col: &FilterMb) -> ([i8; 2], [Mv; 2]) {
+/// `col` is the list-1 reference's own motion, and `addr` this
+/// macroblock's address in it. colZeroFlag is read through the decoder's
+/// `colocated_motion` at the partition's colocated corner block, which
+/// for a 16x16 partition is block 0 (8.4.1.2.1). Long-term references do
+/// not exist here, so the long-term guard on colZeroFlag is vacuously
+/// satisfied.
+pub fn spatial_direct_16x16(
+    st: &MbMotionState,
+    col: &PicMotion,
+    addr: usize,
+) -> ([i8; 2], [Mv; 2]) {
     let mut ref_idx = st.direct_ref_idx();
     let mut mvp = [Mv::ZERO; 2];
     if ref_idx[0] < 0 && ref_idx[1] < 0 {
@@ -1174,10 +1176,16 @@ pub fn spatial_direct_16x16(st: &MbMotionState, col: &FilterMb) -> ([i8; 2], [Mv
             }
         }
     }
-    // colZeroFlag off the colocated record, with `colocated_motion`'s
-    // list preference. A stored list is always reference 0 here.
-    let col_motion = if col.kind.is_intra() { None } else { col.l0.or(col.l1) };
-    let col_zero = matches!(col_motion, Some(mv) if (-1..=1).contains(&mv.x) && (-1..=1).contains(&mv.y));
+    // colZeroFlag off the colocated picture's own motion, through the
+    // decoder's `colocated_motion` — its list preference (list 0, else
+    // list 1) and its answer of reference -1 for an intra macroblock
+    // included. Block 0 is the 16x16 partition's colocated corner
+    // (8.4.1.2.1); a smaller partition reads its own corner per 8x8, and
+    // that is now expressible because the colocated picture carries its
+    // real per-4x4 motion rather than one record per macroblock.
+    let (col_mv, col_ref) = col.colocated(addr, 0);
+    let col_zero =
+        col_ref == 0 && (-1..=1).contains(&col_mv.x) && (-1..=1).contains(&col_mv.y);
     let mut mv = [Mv::ZERO; 2];
     for l in 0..2 {
         if ref_idx[l] >= 0 && !(ref_idx[l] == 0 && col_zero) {
@@ -1220,8 +1228,8 @@ fn b_luma_satd(
 ///
 /// `refs` are the list-0 (past) and list-1 (future) reference pictures'
 /// planes, borders replicated; `nb` the neighbouring motion per list;
-/// `col` the colocated macroblock's record in the list-1 reference (see
-/// [`spatial_direct_16x16`]). The candidates are direct, L0, L1 and
+/// `col` the list-1 reference's motion and `addr` this macroblock's
+/// address in it (see [`spatial_direct_16x16`]). The candidates are direct, L0, L1 and
 /// bi-predictive 16x16 — direct keeps ties, because its syntax is
 /// cheapest — with the intra fallback consulted last, exactly as in the
 /// P path. `B_Skip` is chosen when direct won and no residual survived;
@@ -1242,7 +1250,8 @@ pub fn code_macroblock_b16(
     src_chroma: [&[u8]; 2],
     chroma_stride: usize,
     st: &MbMotionState,
-    col: &FilterMb,
+    col: &PicMotion,
+    addr: usize,
 ) -> BDecision {
     let (px, py) = (mb_x * 16, mb_y * 16);
     let soff = py * luma_stride + px;
@@ -1250,7 +1259,7 @@ pub fn code_macroblock_b16(
     let mut out = BDecision::default();
 
     // Direct first: it wins ties, because it costs no motion syntax.
-    let (dref, dmv) = spatial_direct_16x16(st, col);
+    let (dref, dmv) = spatial_direct_16x16(st, col, addr);
     let dused = [dref[0] >= 0, dref[1] >= 0];
     let mut best_cost = b_luma_satd(ctx, refs, px as i32, py as i32, src, luma_stride, dused, dmv);
     out.kind = BMbKind::BDirect16;
@@ -1658,11 +1667,12 @@ mod tests {
     ///
     /// The reference indices and the median vectors are now literal calls
     /// into the decoder, so what this still earns is the *colZeroFlag*
-    /// half, which remains the encoder's own: it reads one motion out of
-    /// a per-macroblock `FilterMb` where the decoder reads the colocated
-    /// 8x8's corner block out of the colocated picture. Those agree only
-    /// while every partition is 16x16, and this is where that will fail
-    /// first when it stops being true.
+    /// half — and that half is now the decoder's `colocated_motion` over
+    /// the colocated picture's real per-4x4 motion, read at the
+    /// partition's own corner block. What this still earns is the
+    /// *composition*: that the reference indices, the median vectors and
+    /// colZeroFlag are combined into 8.4.1.2.2's answer the way the
+    /// decoder combines them.
     #[test]
     fn spatial_direct_agrees_with_the_decoders_derivation() {
         use crate::h264::mb::{
@@ -1729,13 +1739,32 @@ mod tests {
                         BlockMotion::default()
                     });
                 }
-                let col = FilterMb {
-                    kind: if col_intra { DecKind::I16x16 } else { DecKind::Inter16x16 },
-                    nz_mask: 0,
-                    transform_8x8: false,
-                    l0: (!col_intra && !col_list1_only).then_some(col_mv),
-                    l1: (!col_intra).then_some(col_mv),
-                };
+                // The colocated picture as the encoder now stores one:
+                // real per-4x4 motion, which is what `colocated_motion`
+                // reads.
+                let mut col = PicMotion::new(3, 3);
+                let mut col_mot = [[BlockMotion::default(); 16]; 2];
+                for l in 0..2 {
+                    let uses = !col_intra && (l == 1 || !col_list1_only);
+                    if uses {
+                        col_mot[l] = [BlockMotion {
+                            mv: col_mv,
+                            ref_idx: 0,
+                            ref_parity: PARITY_FRAME,
+                            ref_id: 9,
+                        }; 16];
+                    }
+                }
+                col.commit(
+                    cur_addr,
+                    crate::h264::mb::MbInfo {
+                        kind: if col_intra { DecKind::I16x16 } else { DecKind::Inter16x16 },
+                        decoded: true,
+                        slice: 0,
+                        ..crate::h264::mb::MbInfo::default()
+                    },
+                    &col_mot,
+                );
 
                 // Decoder side.
                 info.mbs[cur_addr].decoded = false;
@@ -1772,7 +1801,7 @@ mod tests {
                 // Mine, over the same state the picture walk would hold.
                 let mut st = MbMotionState::new();
                 st.start(&frame, &info, cur_addr, &mut dnb);
-                let (got_ref, got_mv) = spatial_direct_16x16(&st, &col);
+                let (got_ref, got_mv) = spatial_direct_16x16(&st, &col, cur_addr);
                 assert_eq!(got_ref, want_ref, "mask {mask:04b} draw {draw} ref");
                 assert_eq!(got_mv, want_mv, "mask {mask:04b} draw {draw} mv");
             }

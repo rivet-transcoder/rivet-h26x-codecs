@@ -35,10 +35,9 @@
 use crate::bitwriter::BitWriter;
 use crate::cabac_enc::CabacEncoder;
 use crate::encode::h264_intra::{MbDecision, MbKind};
-use crate::encode::h264_deblock::FilterMb;
 use crate::encode::h264_me::{InterDecision, InterMbKind};
 use crate::encode::h264_pic::{
-    BMb, IntraTools, PMb, code_b_picture, code_intra_picture, code_p_picture,
+    BMb, IntraTools, PMb, PicMotion, code_b_picture, code_intra_picture, code_p_picture,
 };
 use crate::encode::h264_syntax::{Geometry, Plane, Recon};
 use crate::h264::SliceType;
@@ -165,7 +164,7 @@ pub fn write_intra_picture_cabac(
     qp: u8,
     planes: &[Plane<'_>],
     rec: &mut [Recon],
-) -> Vec<FilterMb> {
+) -> PicMotion {
     let mbw = g.mbs_wide as usize;
     let total = mbw * g.mbs_high as usize;
     let cfi = cfi_of(g.chroma);
@@ -206,7 +205,7 @@ pub fn write_p_picture_cabac(
     planes: &[Plane<'_>],
     rec: &mut [Recon],
     refp: &[Recon],
-) -> Vec<FilterMb> {
+) -> PicMotion {
     let mbw = g.mbs_wide as usize;
     let total = mbw * g.mbs_high as usize;
     let cfi = cfi_of(g.chroma);
@@ -281,8 +280,8 @@ pub fn write_b_picture_cabac(
     planes: &[Plane<'_>],
     rec: &mut [Recon],
     refs: [&[Recon]; 2],
-    col: &[FilterMb],
-) -> Vec<FilterMb> {
+    col: &PicMotion,
+) -> PicMotion {
     let mbw = g.mbs_wide as usize;
     let total = mbw * g.mbs_high as usize;
     let cfi = cfi_of(g.chroma);
