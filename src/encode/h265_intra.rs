@@ -1021,7 +1021,11 @@ fn code_luma_tb<S: Sample>(
 
 /// The chroma subsampling factors for a `chroma_array_type`, exactly as
 /// `Sps::sub_wh` derives them. Monochrome never asks.
-fn sub_wh(cat: u32) -> (usize, usize) {
+///
+/// `pub(crate)` for the inter decision, which needs the same derivation
+/// and must not carry a second copy of it — the drift hazard this module
+/// exists to avoid applies across modules as much as within one.
+pub(crate) fn sub_wh(cat: u32) -> (usize, usize) {
     match cat {
         1 => (2, 2),
         2 => (2, 1),
@@ -1037,7 +1041,10 @@ fn sub_wh(cat: u32) -> (usize, usize) {
 /// vertically, the second one `nc` luma rows down (no vertical
 /// subsampling, so component rows are luma rows); 4:4:4 one square at
 /// the luma size itself (`here`'s `if cat == 3 { log2 }` arm).
-fn chroma_tbs(cat: u32, xl: usize, yl: usize, log2: u32) -> ([(usize, usize); 2], usize, u32) {
+///
+/// `pub(crate)` for the same reason as [`sub_wh`]: the inter decision and
+/// the coding-tree writers place chroma TBs by this one derivation.
+pub(crate) fn chroma_tbs(cat: u32, xl: usize, yl: usize, log2: u32) -> ([(usize, usize); 2], usize, u32) {
     let log2c = if cat == 3 { log2 } else { log2 - 1 };
     let nc = 1usize << log2c;
     match cat {

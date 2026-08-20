@@ -175,11 +175,6 @@ impl H265Encoder {
                     "H.265 encode: lossless inter pictures (encoder in progress)",
                 ));
             }
-            if self.cfg.chroma != crate::ChromaFormat::Yuv420 {
-                return Err(Error::unsupported(
-                    "H.265 encode: inter pictures outside 4:2:0 (encoder in progress)",
-                ));
-            }
             if c.kind == Kind::B {
                 return Err(Error::unsupported(
                     "H.265 encode: B pictures (encoder in progress; P works)",
@@ -366,8 +361,24 @@ impl H265Encoder {
         let g = self.geom;
         let (dw, dh) = (self.cfg.width as usize, self.cfg.height as usize);
         let (cw, ch) = (g.coded_width as usize, g.coded_height as usize);
-        let (cdw, cdh) = (dw.div_ceil(2), dh.div_ceil(2));
-        let (ccw, cch) = (cw / 2, ch / 2);
+        // Per-format chroma geometry, exactly as the intra path derives it:
+        // SubWidthC/SubHeightC divide the luma dimensions, and monochrome
+        // has no chroma planes at all - the source carries none and the
+        // decision module never indexes the empty slices.
+        let chroma = self.cfg.chroma;
+        let cat = match chroma {
+            crate::ChromaFormat::Monochrome => 0u32,
+            crate::ChromaFormat::Yuv420 => 1,
+            crate::ChromaFormat::Yuv422 => 2,
+            crate::ChromaFormat::Yuv444 => 3,
+        };
+        let (sw, sh) = match chroma {
+            crate::ChromaFormat::Yuv420 => (2usize, 2usize),
+            crate::ChromaFormat::Yuv422 => (2, 1),
+            _ => (1, 1),
+        };
+        let (cdw, cdh) = (dw.div_ceil(sw), dh.div_ceil(sh));
+        let (ccw, cch) = (cw / sw, ch / sh);
         let pad = |src: &[u8], sw: usize, sh: usize, tw: usize, th: usize| -> Vec<u8> {
             let mut out = vec![0u8; tw * th];
             for y in 0..th {
@@ -379,8 +390,14 @@ impl H265Encoder {
             out
         };
         let py = pad(&src[..dw * dh], dw, dh, cw, ch);
-        let pcb = pad(&src[dw * dh..dw * dh + cdw * cdh], cdw, cdh, ccw, cch);
-        let pcr = pad(&src[dw * dh + cdw * cdh..], cdw, cdh, ccw, cch);
+        let (pcb, pcr) = if cat != 0 {
+            (
+                pad(&src[dw * dh..dw * dh + cdw * cdh], cdw, cdh, ccw, cch),
+                pad(&src[dw * dh + cdw * cdh..], cdw, cdh, ccw, cch),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         // The parameter sets this picture is coded against, parsed back
         // through the decoder's own parsers: the candidate derivation the
@@ -464,7 +481,7 @@ impl H265Encoder {
                     }
                     let left = (cxu > 0).then(|| skipped[cy * wc + cxu - 1]);
                     let above = (cy > 0).then(|| skipped[(cy - 1) * wc + cxu]);
-                    write_cu_inter(&mut e, &mut cx, &d, left, above);
+                    write_cu_inter(&mut e, &mut cx, &d, left, above, cat);
                     skipped[cy * wc + cxu] = matches!(d.kind, InterCuKind::Skip { .. });
                     e.encode_terminate(u32::from(cy == hc - 1 && cxu == wc - 1));
                     decisions.push(d);
@@ -488,8 +505,10 @@ impl H265Encoder {
             }
         };
         crop(&pic.recon.y, dw, dh, &mut rec);
-        crop(&pic.recon.cb, cdw, cdh, &mut rec);
-        crop(&pic.recon.cr, cdw, cdh, &mut rec);
+        if cat != 0 {
+            crop(&pic.recon.cb, cdw, cdh, &mut rec);
+            crop(&pic.recon.cr, cdw, cdh, &mut rec);
+        }
         self.recon.push(rec);
 
         // This picture becomes the reference for the next one. One slot:
@@ -523,12 +542,18 @@ impl H265Encoder {
 /// `ref_idx_l0` is absent because the slice declares one active reference,
 /// and `inter_pred_idc` is absent because a P slice forces list 0 - both
 /// reader-side conditions rather than simplifications.
+///
+/// `cat` is `ChromaArrayType`, and the transform tree below is the only
+/// part of this walk that depends on it - see the comments there for the
+/// per-format cbf and residual shapes, which are the inter mirror of what
+/// `write_ctu_intra`'s unsplit branch spells.
 fn write_cu_inter(
     e: &mut CabacEncoder,
     cx: &mut Contexts,
     d: &InterCuDecision,
     left_skip: Option<bool>,
     above_skip: Option<bool>,
+    cat: u32,
 ) {
     let log2 = d.log2_cu;
     // One CU per CTU, so the coding quadtree never splits and the flag is
@@ -568,14 +593,32 @@ fn write_cu_inter(
         InterCuKind::Skip { .. } | InterCuKind::UseIntra => unreachable!("handled above"),
     }
 
-    // The transform tree: one CU-sized TU, no split. cbf_luma is coded
-    // only because a chroma cbf is set or the depth is nonzero - for an
-    // inter leaf at depth 0 with both chroma cbfs clear the reader infers
-    // cbf_luma 1 and reads no bin, so writing one would desync.
+    // The transform tree: one CU-sized TU, no split.
     write_split_transform_flag(e, cx, log2, false);
-    write_cbf_chroma(e, cx, 0, d.cbf_chroma[0]);
-    write_cbf_chroma(e, cx, 0, d.cbf_chroma[1]);
-    if d.cbf_chroma[0] || d.cbf_chroma[1] {
+    // Chroma cbfs, per component. Monochrome codes none at all - the
+    // reader's `cat != 0` gate in `transform_tree` - and 4:2:2 codes the
+    // stacked pair's second bin immediately after the first, on this
+    // unsplit node, per its `cat == 2 && (!split || log2 == 3)` arm. The
+    // node is above 4x4 in every geometry this encoder produces, so the
+    // `log2 == 2` chroma-at-the-parent case never arises.
+    if cat != 0 {
+        for comp in 0..2 {
+            write_cbf_chroma(e, cx, 0, d.cbf_chroma[comp]);
+            if cat == 2 {
+                write_cbf_chroma(e, cx, 0, d.cbf_chroma_bot[comp]);
+            }
+        }
+    }
+    // cbf_luma is coded only because a chroma cbf is set or the depth is
+    // nonzero - for an inter leaf at depth 0 with every chroma cbf clear
+    // the reader infers cbf_luma 1 and reads no bin, so writing one would
+    // desync. Monochrome has no chroma cbf to set, so its inter leaves
+    // never carry the bin at all and must genuinely have luma
+    // coefficients; the decision module guarantees that by spelling a
+    // residual-free CU as a skip or as rqt_root_cbf 0.
+    let any_chroma_cbf =
+        cat != 0 && (d.cbf_chroma[0] || d.cbf_chroma[1] || d.cbf_chroma_bot[0] || d.cbf_chroma_bot[1]);
+    if any_chroma_cbf {
         write_cbf_luma(e, cx, 0, d.cbf_luma);
     } else {
         debug_assert!(d.cbf_luma, "an inter leaf with no chroma cbf has cbf_luma inferred 1");
@@ -583,7 +626,8 @@ fn write_cu_inter(
 
     let n = 1usize << log2;
     // Inter blocks always scan diagonally: the mode-dependent scans are an
-    // intra rule (7.4.9.11).
+    // intra rule (7.4.9.11), and `residual_scan_idx` returns 0 for every
+    // non-intra block regardless of size or component.
     let params = |log2_size: u32, c_idx: usize| ResidualParams {
         log2_size,
         c_idx,
@@ -602,10 +646,23 @@ fn write_cu_inter(
     if d.cbf_luma {
         write_residual(e, cx, &params(log2, 0), &d.luma[..n * n]);
     }
-    let nc = n / 2;
-    for comp in 0..2 {
-        if d.cbf_chroma[comp] {
-            write_residual(e, cx, &params(log2 - 1, comp + 1), &d.chroma[comp][..nc * nc]);
+    if cat != 0 {
+        // The chroma TB is the luma's own size at 4:4:4 and half of it
+        // elsewhere; 4:2:2 carries two of them stacked, top then bottom.
+        // The reader walks components outermost and the stacked pair
+        // within (`transform_unit`'s `for c` around `for t`), and the
+        // decision module packs slot `t` at `t * nc2` - the same layout
+        // and the same order as the intra writer above.
+        let log2c = if cat == 3 { log2 } else { log2 - 1 };
+        let nc2 = 1usize << (2 * log2c);
+        for comp in 0..2 {
+            let pair = if cat == 2 { 2 } else { 1 };
+            for t in 0..pair {
+                let cbf = if t == 0 { d.cbf_chroma[comp] } else { d.cbf_chroma_bot[comp] };
+                if cbf {
+                    write_residual(e, cx, &params(log2c, comp + 1), &d.chroma[comp][t * nc2..(t + 1) * nc2]);
+                }
+            }
         }
     }
 }
@@ -847,29 +904,37 @@ mod tests {
             assert_eq!(e.reconstructions()[0].len(), per, "{chroma:?} recon size");
         }
 
-        // P pictures code: a GOP of 4:2:0 pictures produces one access
-        // unit each, the first a keyframe and the rest not.
-        let mut e = H265Encoder::new(Config { gop: 8, ..cfg(64, 64, ChromaFormat::Yuv420) }).unwrap();
-        let frame = vec![64u8; 64 * 64 * 3 / 2];
-        let mut units = Vec::new();
-        for _ in 0..3 {
-            units.extend(e.push(&frame).expect("a P picture should code"));
+        // P pictures code, in every chroma format: a GOP produces one
+        // access unit per picture, the first a keyframe and the rest not,
+        // and the reconstruction is the size that format implies.
+        for (chroma, per) in [
+            (ChromaFormat::Monochrome, 64 * 64),
+            (ChromaFormat::Yuv420, 64 * 64 * 3 / 2),
+            (ChromaFormat::Yuv422, 64 * 64 * 2),
+            (ChromaFormat::Yuv444, 64 * 64 * 3),
+        ] {
+            let mut e = H265Encoder::new(Config { gop: 8, ..cfg(64, 64, chroma) }).unwrap();
+            let frame = vec![64u8; per];
+            let mut units = Vec::new();
+            for _ in 0..3 {
+                units.extend(e.push(&frame).expect("a P picture should code"));
+            }
+            units.extend(e.flush().unwrap());
+            assert_eq!(units.len(), 3, "{chroma:?}: one access unit per picture");
+            assert!(units[0].keyframe, "{chroma:?}: the first is an IDR");
+            assert!(!units[1].keyframe && !units[2].keyframe, "{chroma:?}: the rest are P");
+            assert!(units.iter().all(|u| !u.data.is_empty()), "{chroma:?}");
+            assert!(e.reconstructions().iter().all(|r| r.len() == per), "{chroma:?}: recon size");
         }
-        units.extend(e.flush().unwrap());
-        assert_eq!(units.len(), 3, "one access unit per picture");
-        assert!(units[0].keyframe, "the first is an IDR");
-        assert!(!units[1].keyframe && !units[2].keyframe, "the rest are P");
-        assert!(units.iter().all(|u| !u.data.is_empty()));
 
         // The named holes that remain, each reached by the configuration
         // that asks for it.
-        let holes: [(Config, usize, &str); 3] = [
+        let holes: [(Config, usize, &str); 2] = [
             (
                 Config { gop: 8, bframes: 2, ..cfg(64, 64, ChromaFormat::Yuv420) },
                 64 * 64 * 3 / 2,
                 "B pictures",
             ),
-            (Config { gop: 8, ..cfg(64, 64, ChromaFormat::Yuv422) }, 64 * 64 * 2, "outside 4:2:0"),
             (
                 Config {
                     gop: 8,
@@ -924,6 +989,180 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(!out[0].data.is_empty());
         assert_eq!(e.reconstructions()[0], frame, "bypass reconstruction differs from the source");
+    }
+
+    /// Inter pictures round-trip in every chroma format, in process:
+    /// SELF without leaving the harness. This is the serialiser side of
+    /// the contract — the decision module has its own replay test for the
+    /// reconstruction it holds, and this proves the bits spell that
+    /// reconstruction, which is the half a wrong cbf shape or a misplaced
+    /// chroma residual breaks.
+    ///
+    /// The vacuity guard matters as much as the round trip. Content whose
+    /// every CU codes as a skip would round-trip through any cbf shape at
+    /// all, because no chroma bin would ever be written; so the pictures
+    /// move and carry detail, and the test then asserts that chroma
+    /// residual really was coded. A stream without it proves nothing about
+    /// the chroma path this test exists to hold.
+    #[test]
+    fn inter_pictures_round_trip_in_every_chroma_format() {
+        for chroma in [
+            ChromaFormat::Monochrome,
+            ChromaFormat::Yuv420,
+            ChromaFormat::Yuv422,
+            ChromaFormat::Yuv444,
+        ] {
+            let (w, h) = (64usize, 64usize);
+            let frames = moving_frames(w, h, chroma);
+            let per = frames[0].len();
+
+            let mut e = H265Encoder::new(Config {
+                rate: super::super::RateControl::ConstantQp(30),
+                gop: 8,
+                ..cfg(w as u32, h as u32, chroma)
+            })
+            .unwrap();
+            let mut units = Vec::new();
+            for f in &frames {
+                units.extend(e.push(f).expect("should code"));
+            }
+            units.extend(e.flush().unwrap());
+            assert_eq!(units.len(), frames.len(), "{chroma:?}");
+            assert!(!units[1].keyframe, "{chroma:?}: the second picture should be a P picture");
+            assert!(e.reconstructions().iter().all(|r| r.len() == per), "{chroma:?}: recon size");
+
+            // SELF: the production decoder rebuilds every picture exactly
+            // as the encoder holds it.
+            let mut dec = crate::hevc::HevcDecoder::new();
+            for u in &units {
+                dec.push_annexb(&u.data).unwrap();
+            }
+            dec.flush().unwrap();
+            for (i, want) in e.reconstructions().iter().enumerate() {
+                let got = dec.next_picture().unwrap_or_else(|| panic!("{chroma:?}: picture {i} missing"));
+                assert_eq!(
+                    &got.into_packed(),
+                    want,
+                    "{chroma:?}: picture {i} differs from the encoder-held reconstruction"
+                );
+            }
+
+            // Vacuity guard, at the decision level.
+            let (luma_coded, chroma_coded) = inter_traffic(&frames, chroma);
+            assert!(luma_coded, "{chroma:?}: no P CU carried luma residual");
+            if chroma != ChromaFormat::Monochrome {
+                assert!(
+                    chroma_coded,
+                    "{chroma:?}: no P CU carried a chroma residual; the round trip proves nothing about chroma"
+                );
+            } else {
+                assert!(!chroma_coded, "monochrome carried a chroma cbf");
+            }
+        }
+    }
+
+    /// Three pictures of detailed content, each translated a little
+    /// further, in the packed layout the encoder takes. Real motion plus
+    /// real detail is what makes a P picture carry residual rather than
+    /// coding as a field of skips.
+    fn moving_frames(w: usize, h: usize, chroma: ChromaFormat) -> Vec<Vec<u8>> {
+        let (sw, sh) = match chroma {
+            ChromaFormat::Yuv420 => (2usize, 2usize),
+            ChromaFormat::Yuv422 => (2, 1),
+            _ => (1, 1),
+        };
+        let mono = chroma == ChromaFormat::Monochrome;
+        let (cw, ch) = if mono { (0, 0) } else { (w / sw, h / sh) };
+        let per = w * h + 2 * cw * ch;
+        (0..3usize)
+            .map(|f| {
+                let mut frame = vec![0u8; per];
+                let (dx, dy) = (3 * f, f);
+                for y in 0..h {
+                    for x in 0..w {
+                        let tx = ((x + dx) as i32 % 25 - 12).abs();
+                        let ty = ((y + dy) as i32 % 27 - 13).abs();
+                        frame[y * w + x] = (40 + 4 * tx + 3 * ty) as u8;
+                    }
+                }
+                for y in 0..ch {
+                    for x in 0..cw {
+                        let (sx, sy) = (x + dx / sw, y + dy / sh);
+                        let r2 = (sx as i32 % 17 - 8).abs() * (sy as i32 % 19 - 9).abs();
+                        frame[w * h + y * cw + x] = (110 + r2.min(90)) as u8;
+                        frame[w * h + cw * ch + y * cw + x] = (150 - r2.min(90)) as u8;
+                    }
+                }
+                frame
+            })
+            .collect()
+    }
+
+    /// Re-run the inter decision over the same content, reporting whether
+    /// any CU carried luma and chroma residual. It reads the decision the
+    /// encoder made, because the inputs and the context are identical —
+    /// cheaper and more direct than threading a counter out of the
+    /// encoder, and it cannot report traffic the encoder did not have.
+    fn inter_traffic(frames: &[Vec<u8>], chroma: ChromaFormat) -> (bool, bool) {
+        let (w, h) = (64usize, 64usize);
+        let (sw, sh) = match chroma {
+            ChromaFormat::Yuv420 => (2usize, 2usize),
+            ChromaFormat::Yuv422 => (2, 1),
+            _ => (1, 1),
+        };
+        let mono = chroma == ChromaFormat::Monochrome;
+        let (cw, ch) = if mono { (0, 0) } else { (w / sw, h / sh) };
+        let config =
+            Config { rate: super::super::RateControl::ConstantQp(30), gop: 8, ..cfg(w as u32, h as u32, chroma) };
+        let g = syn::Geometry::new(&config);
+        let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&syn::write_sps(
+            &config,
+            &g,
+            LOG2_MAX_POC_LSB,
+        )))
+        .unwrap();
+        let mut pps =
+            crate::hevc::pps::Pps::parse(&crate::nal::unescape_rbsp(&syn::write_pps(30, false, false))).unwrap();
+        pps.resolve_tiles(&sps).unwrap();
+
+        let cpu = Cpu::detect_honouring_env();
+        let mut dsp = HevcDsp::<u8>::SCALAR;
+        install_simd_u8(&mut dsp, cpu);
+        let enc_dsp = HevcEncDsp::new(cpu);
+        let dist = DistortionDsp::<u8>::new(cpu);
+        let ctx =
+            IntraCtx { dsp: &dsp, enc: &enc_dsp, dist: &dist, qp: 30, bit_depth: 8, strong_smoothing: false, bypass: false };
+        let split = |f: &[u8]| -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+            let (y, c) = f.split_at(w * h);
+            let (cb, cr) = c.split_at(cw * ch);
+            (y.to_vec(), cb.to_vec(), cr.to_vec())
+        };
+        let (wc, hc) = (w >> g.log2_ctb, h >> g.log2_ctb);
+
+        // The reference is picture 0 coded as intra, as the encoder builds it.
+        let mut ip = IntraPicture::<u8>::new_with_chroma(w, h, g.log2_ctb, 8, chroma);
+        ip.split_depth = 1;
+        let (py, pcb, pcr) = split(&frames[0]);
+        for cy in 0..hc {
+            for cx in 0..wc {
+                ip.code_ctu(&ctx, cx, cy, &py, w, &pcb, &pcr, cw);
+            }
+        }
+        let mut refp = ip.recon;
+        refp.poc = 0;
+        refp.extend_rows(0, h);
+
+        let mut pic = InterPicture::<u8>::new(&sps, &pps, 1);
+        let (py, pcb, pcr) = split(&frames[1]);
+        let (mut luma, mut chr) = (false, false);
+        for cy in 0..hc {
+            for cx in 0..wc {
+                let d = pic.code_ctu(&ctx, &refp, cx, cy, &py, w, &pcb, &pcr, cw);
+                luma |= d.cbf_luma && d.rqt_root_cbf;
+                chr |= d.cbf_chroma[0] || d.cbf_chroma[1] || d.cbf_chroma_bot[0] || d.cbf_chroma_bot[1];
+            }
+        }
+        (luma, chr)
     }
 
     /// The transform split carries live traffic and round-trips. Content
