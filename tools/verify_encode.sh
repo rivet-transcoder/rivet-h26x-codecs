@@ -44,6 +44,25 @@
 #               The test that a rate row is worth having: replace the
 #               controller with a constant quantiser and it must go red.
 #
+#   5. BUFFER   Only for --cpb-ms rows. A stream that underflows the coded
+#               picture buffer it declares is non-conforming - determined
+#               integer arithmetic, not a judgement - so unlike RATE this
+#               has a right answer. But neither of our conformance
+#               instruments can see it: a decoder is NOT required to check
+#               the hypothetical reference decoder and ours does not, and
+#               libavcodec decodes a violating stream as happily as any
+#               other. So h26xhrd checks it, reading the declaration out of
+#               the stream itself rather than being told.
+#
+#               These rows need a clip with seconds in it. On a six-to-
+#               twelve-frame clip the minimum conforming buffer is 33% to
+#               62% of the whole stream, so the buffer never completes a
+#               fill-and-drain cycle and both branches are vacuous - which
+#               is why the row is restricted to src_cut below.
+#
+#               Its mutation: make the controller ignore the buffer it was
+#               given, and the row must go red.
+#
 # Usage: verify_encode.sh [encoder] [decoder]
 #   H26X_WORK=dir   scratch directory holding the source clips (default: here)
 #   JOBS=n          configurations in parallel (default 4)
@@ -57,6 +76,9 @@ ENC=${1:-../release/examples/h26xenc.exe}
 DEC=${2:-../release/examples/h26xdec.exe}
 [ -f "$ENC" ] || ENC=${ENC%.exe}
 [ -f "$DEC" ] || DEC=${DEC%.exe}
+# The buffer checker lives beside the encoder it was built with.
+HRD=${HRD:-$(dirname "$ENC")/h26xhrd.exe}
+[ -f "$HRD" ] || HRD=${HRD%.exe}
 FFMPEG=${FFMPEG:-ffmpeg}
 TAG=$$
 OUT=enc_out_$TAG
@@ -85,6 +107,14 @@ if [ -z "$SOURCES" ]; then
   exit 2
 fi
 
+# A configuration's name may carry an `@substring` suffix, which restricts
+# it to sources whose filename contains that substring. Rows are not all
+# meaningful on all clips and pretending otherwise costs either coverage or
+# a red cell: the buffer rows below need a clip with seconds in it, the SAO
+# rows are carried by two clips and merely pass on the rest, and the rate
+# rows had to be calibrated per chroma format. Saying so in the row is
+# cheaper than a table somewhere else that goes stale.
+#
 # Configurations. Each is a name and the encoder flags for it. The list starts
 # at the simplest thing that can be legal and adds one axis at a time, because
 # when several are red at once the simplest one names the bug.
@@ -165,6 +195,7 @@ hevc-abr-64k|--codec h265 --bitrate 64000 --gop 8
 hevc-abr-96k|--codec h265 --bitrate 96000 --gop 8
 abr-64k|--codec h264 --bitrate 64000 --gop 8
 abr-128k|--codec h264 --bitrate 128000 --gop 8
+hevc-vbv-175@src_cut|--codec h265 --bitrate 64000 --cpb-ms 175 --gop 8
 "}
 
 one() {
@@ -238,6 +269,20 @@ one() {
       ;;
   esac
 
+  # 5. BUFFER. Only where a buffer was declared. h26xhrd reads the
+  # declaration out of the stream - rate and size from the sequence
+  # parameter set's VUI, the removal interval from the frame rate beside
+  # it, the initial delay from the buffering period SEI - so nothing here
+  # tells it what to expect.
+  case "$flags" in
+    *--cpb-ms*)
+      if ! out=$("$HRD" "$bs" 2>&1); then
+        echo "HRD-FAIL    $tag: $(echo "$out" | tail -1 | head -c 100)"
+        return 1
+      fi
+      ;;
+  esac
+
   # 3. QUALITY. Gated only when the configuration claims to be lossless.
   psnr=$(psnr_of "$src" "$rec")
   size=$(stat -c %s "$bs")
@@ -285,7 +330,7 @@ print("inf" if mse == 0 else f"{10 * math.log10(255 * 255 / mse):.2f}")
 PY
 }
 export -f one ffpix psnr_of
-export ENC DEC FFMPEG OUT
+export ENC DEC HRD FFMPEG OUT
 
 echo "== encode verification =="
 results="$OUT/results.txt"
@@ -301,6 +346,16 @@ for src in $SOURCES; do
         echo "verify_encode.sh: not a configuration: $name" >&2
         exit 2 ;;
     esac
+    # An `@substring` suffix restricts the row to matching sources.
+    case "$name" in
+      *@*)
+        pat=${name##*@}
+        case "$src" in
+          *"$pat"*) name=${name%@*} ;;
+          *) continue ;;
+        esac
+        ;;
+    esac
     echo "$src|$name|$flags"
   done
 done | xargs -P "$JOBS" -I{} bash -c 'IFS="|" read -r s n f <<< "{}"; one "$s" "$n" "$f"' \
@@ -311,7 +366,7 @@ pass=$(grep -c '^PASS' "$results")
 # failure prefix is missing from this pattern reports its failure and is
 # then counted as green - which is how the RATE rows first shipped, caught
 # only by running the mutation they exist to catch.
-bad=$(grep -cE '^(ENCODE|SELF|CROSS|LOSSLESS|RATE)-FAIL' "$results")
+bad=$(grep -cE '^(ENCODE|SELF|CROSS|LOSSLESS|RATE|HRD)-FAIL' "$results")
 echo
 echo "encode: $pass passed, $bad failed"
 [ "$bad" = 0 ] || fail=1

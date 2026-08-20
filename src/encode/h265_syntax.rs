@@ -41,6 +41,9 @@ pub const NAL_TRAIL_N: u8 = 0;
 pub const NAL_TRAIL_R: u8 = 1;
 /// Coded slice of an IDR picture with no leading pictures.
 pub const NAL_IDR_N_LP: u8 = 20;
+/// Supplemental enhancement information that precedes the pictures it
+/// describes. The buffering period message rides here.
+pub const NAL_PREFIX_SEI: u8 = 39;
 
 /// Prefix a NAL payload with the two-byte H.265 header and a start code.
 ///
@@ -186,6 +189,182 @@ fn write_ptl(w: &mut BitWriter, g: &Geometry) {
     w.bits(8, 120); // general_level_idc: level 4.0, which admits 1080p
 }
 
+/// The coded picture buffer this stream declares, in the exact values the
+/// syntax can carry.
+///
+/// The rounding matters and is deliberate. `BitRate` is
+/// `(bit_rate_value_minus1 + 1) << (6 + bit_rate_scale)` and `CpbSize` is
+/// `(cpb_size_value_minus1 + 1) << (4 + cpb_size_scale)`, so neither is a
+/// free integer. Both are rounded **down** here: a stream that declares
+/// slightly less than it was asked for is held to a slightly stricter
+/// standard than requested, which is the safe direction. Declaring more
+/// than the caller asked for would let a stream conform to a buffer nobody
+/// wanted.
+///
+/// The controller is then given *these* numbers rather than the caller's,
+/// so what it aims at and what the stream promises are the same value. A
+/// controller targeting 64000 while the stream declares 63936 would be
+/// wrong by exactly the rounding, forever, in the direction of overflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cpb {
+    /// `BitRate[0]`, bits per second, as declared.
+    pub bit_rate: u64,
+    /// `CpbSize[0]`, bits, as declared.
+    pub size: u64,
+    /// `initial_cpb_removal_delay_length_minus1 + 1`.
+    pub initial_delay_length: u32,
+    /// `au_cpb_removal_delay_length_minus1 + 1`.
+    pub removal_delay_length: u32,
+}
+
+/// The bit-rate and buffer scales this encoder writes. Zero for both keeps
+/// the coded values close to the numbers a caller recognises, at the cost
+/// of a ceiling: `bit_rate_value_minus1` is `ue(v)`, so a rate above about
+/// four gigabits would need a scale. Refused by name rather than silently
+/// rescaled, because a stream that declares a different rate than it was
+/// asked for is the one bug this whole feature exists to catch.
+const BIT_RATE_SCALE: u32 = 0;
+/// See [`BIT_RATE_SCALE`].
+const CPB_SIZE_SCALE: u32 = 0;
+/// Width of the delay fields, in bits. 24 is the usual choice and holds a
+/// delay of 186 seconds at the 90 kHz clock they are counted in.
+const DELAY_LENGTH: u32 = 24;
+
+impl Cpb {
+    /// The buffer for `bps` bits per second held for `cpb_ms` milliseconds,
+    /// snapped down to what the syntax can carry. `None` when the request
+    /// cannot be represented at the fixed scales above.
+    pub fn new(bps: u32, cpb_ms: u32) -> Option<Cpb> {
+        let br_unit = 1u64 << (6 + BIT_RATE_SCALE);
+        let cs_unit = 1u64 << (4 + CPB_SIZE_SCALE);
+        let bit_rate = (bps as u64 / br_unit) * br_unit;
+        let want = (bps as u64) * (cpb_ms as u64) / 1000;
+        let size = (want / cs_unit) * cs_unit;
+        if bit_rate == 0 || size == 0 {
+            return None;
+        }
+        // ue(v) in this writer is 32-bit; anything needing a scale is
+        // refused by the caller rather than rescaled here.
+        if bit_rate / br_unit > u32::MAX as u64 || size / cs_unit > u32::MAX as u64 {
+            return None;
+        }
+        Some(Cpb {
+            bit_rate,
+            size,
+            initial_delay_length: DELAY_LENGTH,
+            removal_delay_length: DELAY_LENGTH,
+        })
+    }
+
+    /// `initial_cpb_removal_delay`, in the 90 kHz units the syntax counts
+    /// it in: the time between the first bit arriving and the first access
+    /// unit being removed. This encoder starts the buffer **full**, which
+    /// is the largest initial delay the declared buffer allows and the most
+    /// forgiving start; a smaller one is legal and only makes conformance
+    /// harder.
+    pub fn initial_removal_delay_90k(&self) -> u32 {
+        ((self.size * 90_000) / self.bit_rate).min(((1u64 << DELAY_LENGTH) - 1) as u64) as u32
+    }
+}
+
+/// `hrd_parameters(1, 0)` — one sub-layer, NAL HRD only, one CPB, no
+/// sub-picture parameters. The inverse of `hevc::sps::parse_hrd`, which
+/// retains exactly the fields written here.
+fn write_hrd(w: &mut BitWriter, cpb: &Cpb, fps: u32) {
+    let _ = fps;
+    w.flag(true); // nal_hrd_parameters_present_flag
+    w.flag(false); // vcl_hrd_parameters_present_flag
+    w.flag(false); // sub_pic_hrd_params_present_flag
+    w.bits(4, BIT_RATE_SCALE);
+    w.bits(4, CPB_SIZE_SCALE);
+    w.bits(5, cpb.initial_delay_length - 1);
+    w.bits(5, cpb.removal_delay_length - 1);
+    w.bits(5, DELAY_LENGTH - 1); // dpb_output_delay_length_minus1
+    // The single sub-layer.
+    w.flag(true); // fixed_pic_rate_general_flag
+    w.ue(0); // elemental_duration_in_tc_minus1 — one tick per picture
+    w.ue(0); // cpb_cnt_minus1 — one buffer
+    // sub_layer_hrd_parameters(0), one CPB.
+    w.ue((cpb.bit_rate >> (6 + BIT_RATE_SCALE)) as u32 - 1); // bit_rate_value_minus1
+    w.ue((cpb.size >> (4 + CPB_SIZE_SCALE)) as u32 - 1); // cpb_size_value_minus1
+    // cbr_flag 0: variable bit rate.
+    //
+    // Constant bit rate means the arrival never pauses, so a stream that
+    // spends less than its rate must stuff the difference with filler data
+    // or the buffer overflows — that is what the flag promises. This
+    // encoder's controller targets an *average* and does not stuff, and it
+    // undershoots more often than not, so declaring a constant rate would
+    // declare something it does not do. The same rule that kept the
+    // deblocking flag off until the filter was actually applied.
+    //
+    // Under a variable rate the arrival simply stops at a full buffer, a
+    // full buffer is not an error, and underflow — the failure that
+    // actually matters to a decoder — is checked exactly as before.
+    w.flag(false); // cbr_flag
+}
+
+/// `vui_parameters` carrying only what the buffer model needs: the frame
+/// rate the removal times are counted in, and the HRD.
+///
+/// Everything else is absent by its own flag. A VUI is optional and this
+/// encoder had none until the buffer model needed one, so the only reason
+/// any of it is here is that a removal schedule without a frame rate is not
+/// a schedule.
+fn write_vui(w: &mut BitWriter, cpb: &Cpb, fps: u32) {
+    w.flag(false); // aspect_ratio_info_present_flag
+    w.flag(false); // overscan_info_present_flag
+    w.flag(false); // video_signal_type_present_flag
+    w.flag(false); // chroma_loc_info_present_flag
+    w.flag(false); // neutral_chroma_indication_flag
+    w.flag(false); // field_seq_flag
+    w.flag(false); // frame_field_info_present_flag
+    w.flag(false); // default_display_window_flag
+    w.flag(true); // vui_timing_info_present_flag
+    w.bits(32, 1); // vui_num_units_in_tick
+    w.bits(32, fps.max(1)); // vui_time_scale — ticks per second
+    w.flag(false); // vui_poc_proportional_to_timing_flag
+    w.flag(true); // vui_hrd_parameters_present_flag
+    write_hrd(w, cpb, fps);
+    w.flag(false); // bitstream_restriction_flag
+}
+
+/// A `buffering_period` SEI message, wrapped as a prefix SEI NAL.
+///
+/// It carries the one number the buffer model cannot derive: how long the
+/// first access unit waits after the first bit arrives. Everything else in
+/// the schedule follows from the frame rate in the VUI.
+///
+/// Written for every IRAP access unit, which is where a buffering period
+/// may begin.
+pub fn write_buffering_period_sei(cpb: &Cpb) -> Vec<u8> {
+    let mut p = BitWriter::with_capacity(16);
+    p.ue(0); // bp_seq_parameter_set_id
+    // sub_pic_hrd_params_present_flag is 0, so this flag is present.
+    p.flag(false); // irap_cpb_params_present_flag
+    p.flag(false); // concatenation_flag
+    p.bits(cpb.removal_delay_length, 0); // au_cpb_removal_delay_delta_minus1
+    // nal_hrd_parameters_present_flag is 1, one CPB.
+    p.bits(cpb.initial_delay_length, cpb.initial_removal_delay_90k());
+    p.bits(cpb.initial_delay_length, 0); // initial_cpb_removal_offset
+    p.rbsp_trailing_bits();
+    let payload = p.into_nal();
+
+    let mut w = BitWriter::with_capacity(payload.len() + 8);
+    w.bits(8, 0); // payload_type: buffering_period
+    // payload_size, in the standard's 255-at-a-time form.
+    let mut n = payload.len();
+    while n >= 255 {
+        w.bits(8, 255);
+        n -= 255;
+    }
+    w.bits(8, n as u32);
+    for b in &payload {
+        w.bits(8, *b as u32);
+    }
+    w.rbsp_trailing_bits();
+    w.into_nal()
+}
+
 /// Video parameter set.
 pub fn write_vps(cfg: &Config, g: &Geometry) -> Vec<u8> {
     let mut w = BitWriter::with_capacity(32);
@@ -211,7 +390,7 @@ pub fn write_vps(cfg: &Config, g: &Geometry) -> Vec<u8> {
 }
 
 /// Sequence parameter set.
-pub fn write_sps(cfg: &Config, g: &Geometry, log2_max_poc_lsb: u32) -> Vec<u8> {
+pub fn write_sps(cfg: &Config, g: &Geometry, log2_max_poc_lsb: u32, cpb: Option<&Cpb>) -> Vec<u8> {
     let mut w = BitWriter::with_capacity(64);
     w.bits(4, 0); // sps_video_parameter_set_id
     w.bits(3, 0); // sps_max_sub_layers_minus1
@@ -279,7 +458,13 @@ pub fn write_sps(cfg: &Config, g: &Geometry, log2_max_poc_lsb: u32) -> Vec<u8> {
     w.flag(false); // long_term_ref_pics_present_flag
     w.flag(false); // sps_temporal_mvp_enabled_flag
     w.flag(false); // strong_intra_smoothing_enabled_flag
-    w.flag(false); // vui_parameters_present_flag
+    match cpb {
+        Some(cpb) => {
+            w.flag(true); // vui_parameters_present_flag
+            write_vui(&mut w, cpb, cfg.fps);
+        }
+        None => w.flag(false), // vui_parameters_present_flag
+    }
     w.flag(false); // sps_extension_present_flag
     w.rbsp_trailing_bits();
     w.into_nal()
@@ -524,6 +709,67 @@ mod tests {
         (cfg, g)
     }
 
+    /// The HRD the SPS declares must survive the parser that, until this
+    /// change, read those fields only to stay bit-aligned and threw them
+    /// away.
+    ///
+    /// That discard is why this round trip did not exist and could not:
+    /// there was nothing to compare against. It is also why the writer
+    /// needed one — a `bit_rate_scale` off by one, or the delay lengths
+    /// written in the wrong order, would shift every field after it inside
+    /// the VUI and nothing downstream would notice, because the VUI sits at
+    /// the end of the SPS and a decoder that ignores it decodes the stream
+    /// perfectly either way.
+    #[test]
+    fn the_declared_buffer_survives_the_parser() {
+        use crate::hevc::sps::Sps;
+        for (bps, ms) in [(64_000u32, 125u32), (64_000, 1000), (2_000_000, 500), (128, 1000), (7_000_000, 250)] {
+            let Some(cpb) = Cpb::new(bps, ms) else { continue };
+            let (cfg, g) = geom(64, 64, ChromaFormat::Yuv420);
+            let cfg = Config { fps: 30, ..cfg };
+            let sps = Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 8, Some(&cpb))))
+                .unwrap_or_else(|e| panic!("{bps}bps/{ms}ms: the encoder's SPS must parse: {e}"));
+            let vui = sps.vui.as_ref().unwrap_or_else(|| panic!("{bps}bps/{ms}ms: no VUI"));
+            assert_eq!(vui.timing, Some((1, 30)), "{bps}bps/{ms}ms: frame rate");
+            let hrd = vui.hrd.unwrap_or_else(|| panic!("{bps}bps/{ms}ms: no HRD"));
+            assert_eq!(hrd.bit_rate, cpb.bit_rate, "{bps}bps/{ms}ms: bit rate");
+            assert_eq!(hrd.cpb_size, cpb.size, "{bps}bps/{ms}ms: buffer size");
+            // Variable bit rate, and the round trip pins it: declaring a
+            // constant rate would promise stuffing this encoder does not
+            // do, and the flag survives the parser either way, so only an
+            // assertion keeps the promise honest.
+            assert!(!hrd.cbr, "{bps}bps/{ms}ms: cbr flag should be clear");
+            assert_eq!(hrd.initial_delay_length, cpb.initial_delay_length, "{bps}bps/{ms}ms: initial delay width");
+            assert_eq!(hrd.removal_delay_length, cpb.removal_delay_length, "{bps}bps/{ms}ms: removal delay width");
+        }
+    }
+
+    /// A stream that declares no buffer must carry no VUI at all — the
+    /// bytes before this feature existed, unchanged.
+    #[test]
+    fn declaring_no_buffer_writes_no_vui() {
+        use crate::hevc::sps::Sps;
+        let (cfg, g) = geom(64, 64, ChromaFormat::Yuv420);
+        let sps = Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 8, None))).expect("SPS");
+        assert!(sps.vui.is_none(), "an SPS with no buffer declared should carry no VUI");
+    }
+
+    /// The declared values are rounded **down** from what was asked for,
+    /// never up. A buffer larger than requested, or a rate above it, would
+    /// let a stream conform to something nobody asked for — and the error
+    /// would be invisible, because the checker reads the declaration.
+    #[test]
+    fn the_declaration_never_exceeds_the_request() {
+        for bps in [1u32, 63, 64, 65, 1000, 64_000, 999_999] {
+            for ms in [1u32, 125, 500, 1000, 3000] {
+                let Some(cpb) = Cpb::new(bps, ms) else { continue };
+                assert!(cpb.bit_rate <= bps as u64, "{bps}bps: declared {} above the request", cpb.bit_rate);
+                let want = (bps as u64) * (ms as u64) / 1000;
+                assert!(cpb.size <= want, "{bps}bps/{ms}ms: declared buffer {} above the request {want}", cpb.size);
+            }
+        }
+    }
+
     /// The crate's own HEVC parsers are proven against 178 conformance
     /// streams; anything they reject is not a legal parameter set.
     #[test]
@@ -538,7 +784,7 @@ mod tests {
             let (cfg, g) = geom(w, h, c);
             let vps = write_vps(&cfg, &g);
             assert!(!vps.is_empty());
-            let sps = write_sps(&cfg, &g, 8);
+            let sps = write_sps(&cfg, &g, 8, None);
             let parsed = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&sps))
                 .unwrap_or_else(|e| panic!("{w}x{h} {c:?}: SPS rejected: {e}"));
             assert_eq!(parsed.width, g.coded_width, "{w}x{h} {c:?}");
@@ -552,7 +798,7 @@ mod tests {
     fn the_conformance_window_recovers_the_requested_size() {
         let (cfg, g) = geom(50, 34, ChromaFormat::Yuv420);
         assert_eq!((g.coded_width, g.coded_height), (64, 48));
-        let sps = write_sps(&cfg, &g, 8);
+        let sps = write_sps(&cfg, &g, 8, None);
         let parsed = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&sps)).unwrap();
         let (l, r, t, b) = parsed.conf_win;
         assert_eq!(g.coded_width - l - r, 50);
@@ -595,7 +841,7 @@ mod tests {
         use crate::hevc::sps::Sps;
 
         let (cfg, g) = geom(64, 64, ChromaFormat::Yuv420);
-        let sps = Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 16))).expect("SPS");
+        let sps = Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 16, None))).expect("SPS");
         let mut pps = Pps::parse(&crate::nal::unescape_rbsp(&write_pps(26, false, true))).expect("PPS");
         pps.resolve_tiles(&sps).expect("tiles");
 

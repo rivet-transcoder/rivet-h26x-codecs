@@ -129,9 +129,17 @@
 //!   syntax, a new writer and the reader's QP-prediction machinery — and it
 //!   would stack a second control loop on top of this one before this one
 //!   is proven. It is a follow-up, not an omission.
-//! - **No VBV / HRD buffer model.** That one *does* have a decoder-side
-//!   counterpart and therefore a conformance property, which makes it a
-//!   task of its own rather than a corner of this one. Refused by name.
+//! - **No guarantee of buffer conformance, only aim.** The controller
+//!   knows the coded picture buffer when one is declared and caps each
+//!   picture's target at [`CPB_AIM`] of what the buffer can afford, which
+//!   keeps a well-behaved stream inside it. It cannot *promise* to: the
+//!   size of a picture is not known until it is coded, so the cap is a
+//!   target and not a limit. Promising would need the ability to re-code a
+//!   picture that came out too large — panic mode — which is structurally
+//!   possible now that both picture writers decide in one pass and
+//!   serialise in another, and is deliberately not built until a clip
+//!   exists that can demonstrate it working. `encode::hrd` is the
+//!   instrument that would demonstrate it.
 //! - **No bit allocation across a GOP beyond the intra/inter split below.**
 //!
 //! # The model, stated plainly
@@ -249,6 +257,19 @@ const MAX_K_RATIO: f64 = 4.0;
 /// frozen, and the flag is recomputed on every observation, so content
 /// that starts responding again is steered again.
 const INSENSITIVE_BAND: f64 = 0.06;
+
+/// How much of what the buffer can afford a picture is allowed to aim at.
+///
+/// Not 1.0, because the controller *aims*: it chooses a quantiser from a
+/// model and finds out what the picture cost afterwards. Aiming exactly at
+/// the limit means missing it half the time, and every miss is a
+/// non-conforming stream rather than a slightly-off rate. Three quarters
+/// leaves room for the model to be wrong in the direction that matters.
+///
+/// This buys *aim*, not a guarantee. A guarantee needs the ability to
+/// re-code a picture that came out too large — panic mode — which is
+/// deliberately not here: see the module header.
+const CPB_AIM: f64 = 0.75;
 
 /// Quantiser bounds. The syntax allows 0..=51 and both ends are legal;
 /// these are the same bounds `ConstantQp` clamps to.
@@ -371,6 +392,12 @@ pub struct RateController {
     pub bits_spent: u64,
     /// Pictures accounted for, for the same reason.
     pub pictures: u64,
+    /// The declared coded picture buffer and how full it is, when the
+    /// stream declares one. Bits, tracked in the same leaky-bucket terms
+    /// `encode::hrd` uses to check the result — deliberately the same
+    /// arithmetic, so that the controller aiming at a buffer and the
+    /// checker measuring one cannot disagree about what the buffer is.
+    cpb: Option<(f64, f64)>,
     /// What [`RateController::pick_qp`] chose for the picture currently
     /// being coded, so [`RateController::account`] can pin the model
     /// against the quantiser that actually produced the bits.
@@ -383,6 +410,13 @@ impl RateController {
     /// (0 meaning every picture is one) and `bframes` consecutive B
     /// pictures between references.
     pub fn new(bps: u32, fps: u32, width: u32, height: u32, gop: u32, bframes: u32) -> Self {
+        Self::with_cpb(bps, fps, width, height, gop, bframes, None)
+    }
+
+    /// [`RateController::new`] against a declared coded picture buffer of
+    /// `cpb_bits`, which each picture's target is capped to fit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_cpb(bps: u32, fps: u32, width: u32, height: u32, gop: u32, bframes: u32, cpb_bits: Option<u64>) -> Self {
         let fps = fps.max(1) as f64;
         let per_picture = (bps as f64 / fps).max(1.0);
         // With `gop` pictures per keyframe, one carries INTRA_WEIGHT and
@@ -420,6 +454,10 @@ impl RateController {
             ],
             last_informed: [None; 3],
             last_any: [None; 3],
+            // A buffering period begins with the buffer full: that is the
+            // initial removal delay the stream declares, so it is the
+            // fullness the controller must start from.
+            cpb: cpb_bits.map(|c| (c as f64, c as f64)),
             bits_spent: 0,
             pictures: 0,
             pending: None,
@@ -440,7 +478,24 @@ impl RateController {
     /// Choose the quantiser for the next picture. Call once per picture,
     /// in coding order, before coding it.
     pub fn pick_qp(&mut self, kind: PicKind) -> u8 {
-        let target = self.target_for(kind);
+        let mut target = self.target_for(kind);
+        // What the buffer can hand over at this picture's removal time.
+        // The rate target says what the picture is *worth*; this says what
+        // it can *have*, and the smaller of the two wins.
+        if let Some((size, fullness)) = self.cpb {
+            let available = (fullness + self.per_picture).min(size);
+            // Before this kind has been measured the quantiser comes from
+            // a seed, and a seed is routinely wrong by a factor of two —
+            // the corpus measured eighteen quantiser steps of error. Being
+            // wrong about a rate costs a soft picture; being wrong about a
+            // buffer is a stream that does not conform. So an unmeasured
+            // picture aims at half of what a measured one would, and the
+            // very first picture of a stream — an intra picture against a
+            // small buffer, which is the case that actually underflows —
+            // is the one that benefits.
+            let aim = if self.complexity[kind as usize].observed { CPB_AIM } else { CPB_AIM * 0.5 };
+            target = target.min(available * aim).max(16.0);
+        }
         let c = self.complexity[kind as usize];
         // Invert bits(qp) = k * 2^(-qp/6).
         let want = 6.0 * (c.k / target).log2();
@@ -499,6 +554,18 @@ impl RateController {
             return;
         };
         self.budget += self.per_picture - bits as f64;
+        // The leaky bucket, in the same terms `encode::hrd` will check:
+        // bits arrive at the declared rate between removals, the buffer
+        // cannot hold more than its size, and this picture is removed
+        // whole. A buffer driven below empty is recorded as empty — the
+        // stream has already failed at that point and the controller's job
+        // is to climb out, not to carry a negative.
+        if let Some((size, fullness)) = self.cpb.as_mut() {
+            *fullness = (*fullness + self.per_picture).min(*size) - bits as f64;
+            if *fullness < 0.0 {
+                *fullness = 0.0;
+            }
+        }
         // Pin the model: one observation determines k exactly, given the
         // quantiser that produced it. A picture that coded to nothing says
         // nothing about complexity, so it is not allowed to zero the

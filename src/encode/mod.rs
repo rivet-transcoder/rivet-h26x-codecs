@@ -71,6 +71,7 @@ pub mod h265_intra;
 pub mod h265_me;
 pub(crate) mod rc;
 pub(crate) mod h265_sao;
+pub mod hrd;
 pub mod h265_syntax;
 
 /// How lossy, and by what means.
@@ -151,6 +152,14 @@ pub struct Config {
     pub subparts: bool,
     /// Worker threads; 0 asks for one per core, matching the decoders.
     pub threads: usize,
+    /// Coded picture buffer to declare, in milliseconds of the target
+    /// bitrate. 0 declares no buffer at all, which is what every stream
+    /// this encoder wrote before the buffer model existed.
+    ///
+    /// Only meaningful with [`RateControl::Bitrate`]: a buffer is a
+    /// constraint on a rate, and there is no rate to constrain at a fixed
+    /// quantiser. Asking for one anyway refuses by name.
+    pub cpb_ms: u32,
     /// Frames per second. Nothing in either bitstream carries it — H.265
     /// puts frame rate in the optional VUI, which this encoder does not
     /// write — so it exists for exactly one reason: a target in bits per
@@ -185,6 +194,7 @@ impl Default for Config {
             threads: 0,
             sao: false,
             fps: 30,
+            cpb_ms: 0,
         }
     }
 }

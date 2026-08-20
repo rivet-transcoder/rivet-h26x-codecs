@@ -2036,7 +2036,7 @@ mod tests {
         for (w, h) in [(48u32, 24u32), (40, 80)] {
             let cfg = Config { width: w, height: h, ..Config::default() };
             let syn = SynGeometry::new(&cfg);
-            let sps = Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &syn, 8))).unwrap();
+            let sps = Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &syn, 8, None))).unwrap();
             let mut pps = Pps::parse(&crate::nal::unescape_rbsp(&write_pps(26, false, false))).unwrap();
             pps.resolve_tiles(&sps).unwrap();
             let geo_dec = std::sync::Arc::new(PicGeometry::new(&sps, &pps));

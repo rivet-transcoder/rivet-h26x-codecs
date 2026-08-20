@@ -23,7 +23,7 @@ use super::h265_intra::{CuDecision, IntraCtx, IntraPicture};
 use super::h265_me::{InterCuDecision, InterCuKind, InterPicture, PCuDecision, MAX_MERGE_CAND};
 use super::rc::{PicKind, RateController};
 use super::h265_sao::{SaoPlan, sao_picture};
-use super::h265_syntax as syn;
+use super::h265_syntax::{self as syn, Cpb};
 use super::{Access, Config, RateControl};
 use crate::bitwriter::BitWriter;
 use crate::cabac_enc::CabacEncoder;
@@ -80,6 +80,11 @@ pub struct H265Encoder {
     pps_qp: u8,
     /// Bytes emitted so far, to hold the controller's ledger to.
     emitted: u64,
+    /// The coded picture buffer this stream declares, when it declares one.
+    /// The *declared* values, snapped to what the syntax carries — the
+    /// controller is handed these rather than the caller's request, so what
+    /// it aims at and what the stream promises are one number.
+    cpb: Option<Cpb>,
 }
 
 /// The POC LSB width the SPS declares. Fixed and generous, as on the H.264
@@ -130,12 +135,34 @@ impl H265Encoder {
             RateControl::Lossless => 26,
             RateControl::Bitrate { .. } => 26,
         };
+        let cpb = match (cfg.cpb_ms, cfg.rate) {
+            (0, _) => None,
+            (ms, RateControl::Bitrate { bps }) => match Cpb::new(bps, ms) {
+                Some(c) => Some(c),
+                None => {
+                    return Err(Error::unsupported(
+                        "H.265 encode: a coded picture buffer this size needs a bit-rate or buffer scale (encoder writes both as 0)",
+                    ));
+                }
+            },
+            _ => {
+                return Err(Error::unsupported(
+                    "H.265 encode: a coded picture buffer without a bitrate target (a buffer constrains a rate; a fixed quantiser has none)",
+                ));
+            }
+        };
         let rc = match cfg.rate {
-            RateControl::Bitrate { bps } => Some(RateController::new(bps, cfg.fps, cfg.width, cfg.height, cfg.gop, cfg.bframes)),
+            // The controller aims at the *declared* rate where a buffer
+            // was declared, so the two cannot disagree by the rounding.
+            RateControl::Bitrate { bps } => {
+                let bps = cpb.map_or(bps, |c| c.bit_rate as u32);
+                Some(RateController::with_cpb(bps, cfg.fps, cfg.width, cfg.height, cfg.gop, cfg.bframes, cpb.map(|c| c.size)))
+            }
             _ => None,
         };
         Ok(Self {
             geom: g,
+            cpb,
             sched: Scheduler::new(cfg.gop, cfg.bframes),
             rc,
             pps_qp,
@@ -343,7 +370,7 @@ impl H265Encoder {
         out.extend_from_slice(&syn::annexb(syn::NAL_VPS, &syn::write_vps(&self.cfg, &g)));
         out.extend_from_slice(&syn::annexb(
             syn::NAL_SPS,
-            &syn::write_sps(&self.cfg, &g, LOG2_MAX_POC_LSB),
+            &syn::write_sps(&self.cfg, &g, LOG2_MAX_POC_LSB, self.cpb.as_ref()),
         ));
         // Every picture is filtered, so the picture-wide PPS flag can
         // declare it unconditionally: intra pictures through
@@ -356,6 +383,13 @@ impl H265Encoder {
         // green.
         let deblock = true;
         out.extend_from_slice(&syn::annexb(syn::NAL_PPS, &syn::write_pps(self.pps_qp, bypass, deblock)));
+        // A buffering period may begin at any IRAP, and this encoder makes
+        // every one of them one: the message carries the initial removal
+        // delay, which is the single number the schedule cannot derive
+        // from the frame rate.
+        if let Some(cpb) = self.cpb.as_ref() {
+            out.extend_from_slice(&syn::annexb(syn::NAL_PREFIX_SEI, &syn::write_buffering_period_sei(cpb)));
+        }
 
         let mut w = BitWriter::with_capacity(cw * ch / 2);
         syn::write_slice_header(
@@ -407,7 +441,7 @@ impl H265Encoder {
         // Then SAO, over the deblocked samples, which is the order 8.7
         // fixes and the order `decoder.rs` applies them in.
         let plan = self.cfg.sao.then(|| {
-            let (sps, pps) = parsed_sets(&self.cfg, &g, qp, bypass, deblock);
+            let (sps, pps) = parsed_sets(&self.cfg, &g, qp, bypass, deblock, self.cpb.as_ref());
             sao_picture(&ictx, &mut pic.recon, &mut info, &sps, &pps, &py, cw, &pcb, &pcr, ccw)
         });
         {
@@ -541,7 +575,7 @@ impl H265Encoder {
         // decision module calls reads decoder structures, and building
         // them from the very bytes the stream carries is what keeps the
         // encoder's idea of the geometry and the decoder's identical.
-        let sps_rbsp = syn::write_sps(&self.cfg, &g, LOG2_MAX_POC_LSB);
+        let sps_rbsp = syn::write_sps(&self.cfg, &g, LOG2_MAX_POC_LSB, self.cpb.as_ref());
         // The very bytes the IDR access unit carried: `code_picture`
         // writes one PPS for the stream, with the deblocking filter on.
         // The very bytes the IDR access unit carried — which means the
@@ -740,8 +774,8 @@ fn sao_flags(sao: bool, cat: u32) -> Option<syn::SaoFlags> {
 /// filters and the candidate derivations read decoder structures, and
 /// building them from the very bytes the stream carries is what keeps the
 /// encoder's idea of the geometry and the decoder's identical.
-fn parsed_sets(cfg: &Config, g: &syn::Geometry, qp: u8, bypass: bool, deblock: bool) -> (crate::hevc::sps::Sps, crate::hevc::pps::Pps) {
-    let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&syn::write_sps(cfg, g, LOG2_MAX_POC_LSB)))
+fn parsed_sets(cfg: &Config, g: &syn::Geometry, qp: u8, bypass: bool, deblock: bool, cpb: Option<&Cpb>) -> (crate::hevc::sps::Sps, crate::hevc::pps::Pps) {
+    let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&syn::write_sps(cfg, g, LOG2_MAX_POC_LSB, cpb)))
         .expect("the encoder's own SPS parses");
     let mut pps = crate::hevc::pps::Pps::parse(&crate::nal::unescape_rbsp(&syn::write_pps(qp, bypass, deblock)))
         .expect("the encoder's own PPS parses");
@@ -1551,7 +1585,7 @@ mod tests {
         let config =
             Config { rate: super::super::RateControl::Lossless, gop: 8, ..cfg(w as u32, h as u32, chroma) };
         let g = syn::Geometry::new(&config);
-        let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&syn::write_sps(&config, &g, LOG2_MAX_POC_LSB)))
+        let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&syn::write_sps(&config, &g, LOG2_MAX_POC_LSB, None)))
             .unwrap();
         let mut pps =
             crate::hevc::pps::Pps::parse(&crate::nal::unescape_rbsp(&syn::write_pps(26, true, true))).unwrap();
@@ -1758,10 +1792,7 @@ mod tests {
         let config =
             Config { rate: super::super::RateControl::ConstantQp(30), gop: 8, ..cfg(w as u32, h as u32, chroma) };
         let g = syn::Geometry::new(&config);
-        let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&syn::write_sps(
-            &config,
-            &g,
-            LOG2_MAX_POC_LSB,
+        let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&syn::write_sps(&config, &g, LOG2_MAX_POC_LSB, None,
         )))
         .unwrap();
         let mut pps =
@@ -1945,7 +1976,7 @@ mod tests {
         // P picture predicts from.
         let g = syn::Geometry::new(&config);
         assert_eq!(g.log2_ctb, 5, "the guard assumes the writer's 32x32 CTB choice");
-        let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&syn::write_sps(&config, &g, LOG2_MAX_POC_LSB))).unwrap();
+        let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&syn::write_sps(&config, &g, LOG2_MAX_POC_LSB, None))).unwrap();
         let mut pps = crate::hevc::pps::Pps::parse(&crate::nal::unescape_rbsp(&syn::write_pps(26, false, true))).unwrap();
         pps.resolve_tiles(&sps).unwrap();
         let mut refp = Frame::<u8>::new(w, h, ChromaFormat::Yuv420, 8);
@@ -2064,7 +2095,7 @@ mod tests {
         // Decision-level guards on the real modules, against the
         // encoder's own reconstruction of the IDR.
         let g = syn::Geometry::new(&config);
-        let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&syn::write_sps(&config, &g, LOG2_MAX_POC_LSB))).unwrap();
+        let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&syn::write_sps(&config, &g, LOG2_MAX_POC_LSB, None))).unwrap();
         let mut pps = crate::hevc::pps::Pps::parse(&crate::nal::unescape_rbsp(&syn::write_pps(30, false, true))).unwrap();
         pps.resolve_tiles(&sps).unwrap();
         let mut refp = Frame::<u8>::new(w, h, ChromaFormat::Yuv420, 8);

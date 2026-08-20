@@ -628,7 +628,7 @@ mod tests {
     fn sets(w: u32, h: u32) -> (Sps, Pps) {
         let cfg = Config { width: w, height: h, chroma: ChromaFormat::Yuv420, bit_depth: 8, sao: true, ..Config::default() };
         let g = EncGeometry::new(&cfg);
-        let sps = Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 16))).unwrap();
+        let sps = Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 16, None))).unwrap();
         let mut pps = Pps::parse(&crate::nal::unescape_rbsp(&write_pps(30, false, true))).unwrap();
         pps.resolve_tiles(&sps).unwrap();
         (sps, pps)

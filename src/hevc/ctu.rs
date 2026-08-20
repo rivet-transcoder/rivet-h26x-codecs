@@ -2536,7 +2536,7 @@ mod write_round_trip {
         // drive both sides from the result.
         let cfg = Config { width, height, chroma: ChromaFormat::Yuv420, bit_depth: 8, sao, ..Config::default() };
         let g = EncGeometry::new(&cfg);
-        let sps = Sps::parse(&unescape_rbsp(&write_sps(&cfg, &g, 8))).expect("the encoder's SPS must parse");
+        let sps = Sps::parse(&unescape_rbsp(&write_sps(&cfg, &g, 8, None))).expect("the encoder's SPS must parse");
         let mut pps = Pps::parse(&unescape_rbsp(&write_pps(26, bypass, false))).expect("the encoder's PPS must parse");
         pps.resolve_tiles(&sps).expect("one tile covering the picture");
         assert!(!pps.sign_data_hiding && !pps.transform_skip_enabled && !pps.cu_qp_delta_enabled);
@@ -2940,7 +2940,7 @@ mod write_round_trip {
     fn p_round_trip(width: u32, height: u32, qp: i32, seed: u64, nref: u32, max_merge: u32) {
         let cfg = Config { width, height, chroma: ChromaFormat::Yuv420, bit_depth: 8, max_refs: 4, ..Config::default() };
         let g = EncGeometry::new(&cfg);
-        let sps = Sps::parse(&unescape_rbsp(&write_sps(&cfg, &g, 8))).expect("the encoder's SPS must parse");
+        let sps = Sps::parse(&unescape_rbsp(&write_sps(&cfg, &g, 8, None))).expect("the encoder's SPS must parse");
         let mut pps = Pps::parse(&unescape_rbsp(&write_pps(26, false, false))).expect("the encoder's PPS must parse");
         pps.resolve_tiles(&sps).expect("one tile covering the picture");
         let wc = sps.pic_width_in_ctbs() as usize;
@@ -3009,7 +3009,7 @@ mod write_round_trip {
     fn scripted_amvp(mx: i16, my: i16, nref: u32, ri: u32) {
         let cfg = Config { width: 32, height: 32, chroma: ChromaFormat::Yuv420, bit_depth: 8, max_refs: 4, ..Config::default() };
         let g = EncGeometry::new(&cfg);
-        let sps = Sps::parse(&unescape_rbsp(&write_sps(&cfg, &g, 8))).expect("SPS");
+        let sps = Sps::parse(&unescape_rbsp(&write_sps(&cfg, &g, 8, None))).expect("SPS");
         let mut pps = Pps::parse(&unescape_rbsp(&write_pps(26, false, false))).expect("PPS");
         pps.resolve_tiles(&sps).expect("one tile");
         assert_eq!(sps.pic_width_in_ctbs() * sps.pic_height_in_ctbs(), 1, "one CTU by construction");
@@ -3291,7 +3291,7 @@ mod write_round_trip {
     fn scripted_b_amvp(idc: u32, mvd0: Mv, mvd1: Mv) {
         let cfg = Config { width: 32, height: 32, chroma: ChromaFormat::Yuv420, bit_depth: 8, max_refs: 4, ..Config::default() };
         let g = EncGeometry::new(&cfg);
-        let sps = Sps::parse(&unescape_rbsp(&write_sps(&cfg, &g, 8))).expect("SPS");
+        let sps = Sps::parse(&unescape_rbsp(&write_sps(&cfg, &g, 8, None))).expect("SPS");
         let mut pps = Pps::parse(&unescape_rbsp(&write_pps(26, false, false))).expect("PPS");
         pps.resolve_tiles(&sps).expect("one tile");
         assert_eq!(sps.pic_width_in_ctbs() * sps.pic_height_in_ctbs(), 1, "one CTU by construction");
@@ -3361,7 +3361,7 @@ mod write_round_trip {
         for skip in [false, true] {
             let cfg = Config { width: 64, height: 32, chroma: ChromaFormat::Yuv420, bit_depth: 8, max_refs: 4, ..Config::default() };
             let g = EncGeometry::new(&cfg);
-            let sps = Sps::parse(&unescape_rbsp(&write_sps(&cfg, &g, 8))).expect("SPS");
+            let sps = Sps::parse(&unescape_rbsp(&write_sps(&cfg, &g, 8, None))).expect("SPS");
             let mut pps = Pps::parse(&unescape_rbsp(&write_pps(26, false, false))).expect("PPS");
             pps.resolve_tiles(&sps).expect("one tile");
             assert_eq!(sps.pic_width_in_ctbs(), 2);

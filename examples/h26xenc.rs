@@ -20,7 +20,7 @@ fn die(msg: &str) -> ! {
     eprintln!(
         "usage: h26xenc --input F --size WxH [--format 400|420|422|444] --output F\n\
          \x20      [--recon F] [--codec h264|h265] [--qp N | --lossless | --bitrate BPS]\n\
-         \x20      [--fps N]\n\
+         \x20      [--fps N] [--cpb-ms N]\n\
          \x20      [--gop N] [--bframes N] [--cavlc] [--t8x8] [--subparts] [--sao]\n\
          \x20      [--depth N] [--threads N]"
     );
@@ -64,6 +64,7 @@ fn main() {
                 cfg.rate = RateControl::Bitrate { bps: b };
             }
             "--fps" => cfg.fps = val(&mut i, &args, "--fps").parse().unwrap_or_else(|_| die("--fps")),
+            "--cpb-ms" => cfg.cpb_ms = val(&mut i, &args, "--cpb-ms").parse().unwrap_or_else(|_| die("--cpb-ms")),
             "--gop" => cfg.gop = val(&mut i, &args, "--gop").parse().unwrap_or_else(|_| die("--gop")),
             "--bframes" => {
                 cfg.bframes = val(&mut i, &args, "--bframes").parse().unwrap_or_else(|_| die("--bframes"))

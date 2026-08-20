@@ -1481,7 +1481,7 @@ mod tests {
     fn parsed_sets_fmt(w: u32, h: u32, chroma: ChromaFormat) -> (Sps, Pps) {
         let cfg = Config { width: w, height: h, gop: 8, chroma, ..Config::default() };
         let syn = SynGeometry::new(&cfg);
-        let sps = Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &syn, 16))).unwrap();
+        let sps = Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &syn, 16, None))).unwrap();
         let mut pps = Pps::parse(&crate::nal::unescape_rbsp(&write_pps(26, false, false))).unwrap();
         pps.resolve_tiles(&sps).unwrap();
         (sps, pps)

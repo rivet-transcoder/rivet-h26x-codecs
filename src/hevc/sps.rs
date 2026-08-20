@@ -334,24 +334,70 @@ pub struct Vui {
     /// `default_display_window` offsets in luma samples (l, r, t, b) — kept
     /// separate from the conformance window; not applied by default.
     pub default_display_window: (u32, u32, u32, u32),
+    /// The NAL hypothetical reference decoder parameters, when the stream
+    /// declares them.
+    ///
+    /// These were read and thrown away until an encoder needed to *write*
+    /// them: the fields had to be consumed to keep the bit reader aligned,
+    /// and nothing downstream in a decoder wants them, because **a decoder
+    /// is not required to check the HRD at all**. It is a constraint on the
+    /// encoder, verified by a separate conformance checker — which is why
+    /// keeping them costs a decoder nothing and buys the only instrument
+    /// that can see whether a stream conforms.
+    pub hrd: Option<Hrd>,
 }
 
-fn parse_sub_layer_hrd(r: &mut BitReader, cpb_cnt: u32, sub_pic: bool) {
-    for _ in 0..cpb_cnt {
-        r.ue();
-        r.ue();
+/// What a buffer model needs out of `hrd_parameters`, for the first (and,
+/// in what this crate writes, only) coded picture buffer of the NAL HRD.
+///
+/// Deliberately not the whole of `hrd_parameters`: the sub-picture fields,
+/// the VCL HRD and CPBs beyond the first are parsed past exactly as before
+/// and not retained, because nothing here can produce or check them and a
+/// field kept but never validated is worse than one skipped honestly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hrd {
+    /// `BitRate[0]`: `(bit_rate_value_minus1 + 1) << (6 + bit_rate_scale)`.
+    pub bit_rate: u64,
+    /// `CpbSize[0]`: `(cpb_size_value_minus1 + 1) << (4 + cpb_size_scale)`.
+    pub cpb_size: u64,
+    /// `cbr_flag[0]`.
+    pub cbr: bool,
+    /// `initial_cpb_removal_delay_length_minus1 + 1`, the width of the
+    /// delays a buffering period SEI carries — without it those messages
+    /// cannot be parsed at all.
+    pub initial_delay_length: u32,
+    /// `au_cpb_removal_delay_length_minus1 + 1`.
+    pub removal_delay_length: u32,
+    /// `dpb_output_delay_length_minus1 + 1`.
+    pub output_delay_length: u32,
+}
+
+/// One sub-layer's CPB list. Returns the first CPB's raw
+/// `(bit_rate_value_minus1, cpb_size_value_minus1, cbr_flag)`, which the
+/// caller scales — the scales live in the common part above.
+fn parse_sub_layer_hrd(r: &mut BitReader, cpb_cnt: u32, sub_pic: bool) -> Option<(u32, u32, bool)> {
+    let mut first = None;
+    for i in 0..cpb_cnt {
+        let bit_rate = r.ue();
+        let cpb_size = r.ue();
         if sub_pic {
             r.ue();
             r.ue();
         }
-        r.flag();
+        let cbr = r.flag();
+        if i == 0 {
+            first = Some((bit_rate, cpb_size, cbr));
+        }
     }
+    first
 }
 
-fn parse_hrd(r: &mut BitReader, common_inf: bool, max_sub_layers_minus1: u32) {
+fn parse_hrd(r: &mut BitReader, common_inf: bool, max_sub_layers_minus1: u32) -> Option<Hrd> {
     let mut nal_hrd = false;
     let mut vcl_hrd = false;
     let mut sub_pic = false;
+    let (mut bit_rate_scale, mut cpb_size_scale) = (0u32, 0u32);
+    let (mut initial_len, mut removal_len, mut output_len) = (24u32, 24u32, 24u32);
     if common_inf {
         nal_hrd = r.flag();
         vcl_hrd = r.flag();
@@ -363,16 +409,17 @@ fn parse_hrd(r: &mut BitReader, common_inf: bool, max_sub_layers_minus1: u32) {
                 r.flag();
                 r.bits(5);
             }
-            r.bits(4);
-            r.bits(4);
+            bit_rate_scale = r.bits(4);
+            cpb_size_scale = r.bits(4);
             if sub_pic {
                 r.bits(4);
             }
-            r.bits(5);
-            r.bits(5);
-            r.bits(5);
+            initial_len = r.bits(5) + 1;
+            removal_len = r.bits(5) + 1;
+            output_len = r.bits(5) + 1;
         }
     }
+    let mut out = None;
     for _ in 0..=max_sub_layers_minus1 {
         let fixed_general = r.flag();
         let mut fixed_within_cvs = true;
@@ -390,12 +437,26 @@ fn parse_hrd(r: &mut BitReader, common_inf: bool, max_sub_layers_minus1: u32) {
             cpb_cnt = r.ue() + 1;
         }
         if nal_hrd {
-            parse_sub_layer_hrd(r, cpb_cnt.min(32), sub_pic);
+            let first = parse_sub_layer_hrd(r, cpb_cnt.min(32), sub_pic);
+            // The highest sub-layer's parameters describe the whole
+            // stream, and the loop reaches it last, so the last write
+            // wins.
+            if let Some((br, cs, cbr)) = first {
+                out = Some(Hrd {
+                    bit_rate: ((br as u64) + 1) << (6 + bit_rate_scale),
+                    cpb_size: ((cs as u64) + 1) << (4 + cpb_size_scale),
+                    cbr,
+                    initial_delay_length: initial_len,
+                    removal_delay_length: removal_len,
+                    output_delay_length: output_len,
+                });
+            }
         }
         if vcl_hrd {
             parse_sub_layer_hrd(r, cpb_cnt.min(32), sub_pic);
         }
     }
+    out
 }
 
 fn parse_vui(r: &mut BitReader, max_sub_layers_minus1: u32) -> Vui {
@@ -442,7 +503,7 @@ fn parse_vui(r: &mut BitReader, max_sub_layers_minus1: u32) -> Vui {
             r.ue(); // num_ticks_poc_diff_one_minus1
         }
         if r.flag() {
-            parse_hrd(r, true, max_sub_layers_minus1);
+            vui.hrd = parse_hrd(r, true, max_sub_layers_minus1);
         }
     }
     if r.flag() {
