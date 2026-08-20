@@ -55,7 +55,13 @@ pub struct H264Encoder {
     /// A B picture needs one reference on each side of it in display order,
     /// so this holds several and picks by POC rather than keeping only the
     /// most recent.
-    refs: Vec<(i32, Vec<syn::Recon>)>,
+    ///
+    /// Beside each picture's planes, its per-macroblock motion record (the
+    /// walk's [`super::h264_deblock::FilterMb`]s): what a later B picture's
+    /// spatial direct derivation reads as colocated motion.
+    /// INVARIANT(16x16-only): one record per macroblock is a faithful
+    /// motion history only while every partition is 16x16 — see the type.
+    refs: Vec<(i32, Vec<syn::Recon>, Vec<super::h264_deblock::FilterMb>)>,
     /// `frame_num`, which counts *reference* pictures and wraps.
     frame_num: u32,
     idr_pic_id: u32,
@@ -96,6 +102,15 @@ impl H264Encoder {
         };
         let bps = if cfg.bit_depth > 8 { 2 } else { 1 };
         let sched = Scheduler::new(cfg.gop, cfg.bframes);
+        let mut cfg = cfg;
+        // A stream with B pictures keeps two marked references — the two
+        // anchors a B predicts between. Declaring one in the SPS would let
+        // the sliding window unmark the past anchor the moment the future
+        // one arrives, and every list-0 reference in a B slice would point
+        // at a picture the decoder no longer holds.
+        if cfg.bframes > 0 {
+            cfg.max_refs = cfg.max_refs.max(2);
+        }
         let geom = syn::Geometry::new(&cfg);
         let mut plane_dims = vec![(cfg.width, cfg.height)];
         if cfg.chroma != crate::ChromaFormat::Monochrome {
@@ -246,7 +261,18 @@ impl H264Encoder {
         // real B pictures (or replicating direct derivation) lifts this.
         let transform_p = !idr
             && c.kind == Kind::P
-            && self.cfg.bframes == 0
+            && matches!(self.cfg.rate, RateControl::ConstantQp(_))
+            && self.cfg.chroma != crate::ChromaFormat::Yuv444;
+        // B pictures share the envelope: inside it every picture type is
+        // transform-coded, so a colocated picture's motion is always the
+        // real record the direct derivation needs; outside it everything
+        // is PCM or all-skip, where the zero-colocated assumption of the
+        // temporal-direct fallback below still holds. The old bframes==0
+        // hold-back on P is gone for exactly this reason — its ceiling was
+        // the all-skip B reconstruction assuming zero colocated motion,
+        // and real B pictures model colocated motion instead.
+        let transform_b = !idr
+            && c.kind == Kind::B
             && matches!(self.cfg.rate, RateControl::ConstantQp(_))
             && self.cfg.chroma != crate::ChromaFormat::Yuv444;
         let mut out = Vec::new();
@@ -278,26 +304,45 @@ impl H264Encoder {
                 // both untouched.
                 deblock: true,
                 cabac,
+                direct_spatial: transform_b,
             },
             qp,
             &mut w,
         );
+        // Every coded picture leaves a per-macroblock motion record: the
+        // transform walks return the real one; the PCM and all-skip paths
+        // synthesize what a decoder would store for them (intra; skip at
+        // reference 0 with zero vectors — both lists for a B skip).
+        let total_mbs = (g.mbs_wide * g.mbs_high) as usize;
+        let synth = |kind: crate::h264::mb::MbKind, l0: bool, l1: bool| {
+            vec![
+                super::h264_deblock::FilterMb {
+                    kind,
+                    nz_mask: if kind == crate::h264::mb::MbKind::IPcm { 0xffff } else { 0 },
+                    l0: l0.then_some(crate::h264::frame::Mv::ZERO),
+                    l1: l1.then_some(crate::h264::frame::Mv::ZERO),
+                };
+                total_mbs
+            ]
+        };
+        let motion;
         if idr {
             // A CABAC slice's final terminate flushes the codeword and its
             // last one *is* the rbsp_stop_one_bit, so the CABAC writers
             // close the slice themselves and no `rbsp_trailing_bits`
             // follows them (9.3.4.6) — on both the transform and PCM paths.
             if transform_intra && cabac {
-                super::h264_cabac_mb::write_intra_picture_cabac(
+                motion = super::h264_cabac_mb::write_intra_picture_cabac(
                     &mut w, &g, &self.tools, qp, &planes, &mut recon,
                 );
             } else if transform_intra {
-                super::h264_cavlc_mb::write_intra_picture(
+                motion = super::h264_cavlc_mb::write_intra_picture(
                     &mut w, &g, &self.tools, qp, &planes, &mut recon,
                 );
                 w.rbsp_trailing_bits();
             } else if cabac {
                 syn::write_pcm_slice_data_cabac(&mut w, &g, qp, &planes, &mut recon);
+                motion = synth(crate::h264::mb::MbKind::IPcm, false, false);
             } else {
                 for mb_y in 0..g.mbs_high {
                     for mb_x in 0..g.mbs_wide {
@@ -305,6 +350,7 @@ impl H264Encoder {
                     }
                 }
                 w.rbsp_trailing_bits();
+                motion = synth(crate::h264::mb::MbKind::IPcm, false, false);
             }
         } else if transform_p {
             // A real P picture: motion search, skip where it is legal and
@@ -312,7 +358,7 @@ impl H264Encoder {
             // walk, two spellings (`encode::h264_pic`).
             let p0 = past.expect("checked above");
             if cabac {
-                super::h264_cabac_mb::write_p_picture_cabac(
+                motion = super::h264_cabac_mb::write_p_picture_cabac(
                     &mut w,
                     &g,
                     &self.tools,
@@ -322,7 +368,7 @@ impl H264Encoder {
                     &self.refs[p0].1,
                 );
             } else {
-                super::h264_cavlc_mb::write_p_picture(
+                motion = super::h264_cavlc_mb::write_p_picture(
                     &mut w,
                     &g,
                     &self.tools,
@@ -330,6 +376,26 @@ impl H264Encoder {
                     &planes,
                     &mut recon,
                     &self.refs[p0].1,
+                );
+                w.rbsp_trailing_bits();
+            }
+        } else if transform_b {
+            // A real B picture: per-list search, bi-prediction, spatial
+            // direct off the stored colocated motion, B_Skip where nothing
+            // survives. The scheduler delivered both anchors before this
+            // picture — checked above — and the colocated record is the
+            // list-1 reference's.
+            let p0 = past.expect("checked above");
+            let p1 = future.expect("checked above");
+            let refs2 = [&self.refs[p0].1[..], &self.refs[p1].1[..]];
+            let col = &self.refs[p1].2;
+            if cabac {
+                motion = super::h264_cabac_mb::write_b_picture_cabac(
+                    &mut w, &g, &self.tools, qp, &planes, &mut recon, refs2, col,
+                );
+            } else {
+                motion = super::h264_cavlc_mb::write_b_picture(
+                    &mut w, &g, &self.tools, qp, &planes, &mut recon, refs2, col,
                 );
                 w.rbsp_trailing_bits();
             }
@@ -349,6 +415,11 @@ impl H264Encoder {
             } else {
                 w.ue(g.mbs_wide * g.mbs_high); // mb_skip_run
             }
+            motion = if c.kind == Kind::B {
+                synth(crate::h264::mb::MbKind::BSkip, true, true)
+            } else {
+                synth(crate::h264::mb::MbKind::PSkip, true, false)
+            };
             let p0 = past.expect("checked above");
             match c.kind {
                 Kind::B => {
@@ -399,7 +470,7 @@ impl H264Encoder {
             // so every stored reference is search-ready and the P path never
             // has to wonder whether a plane's border is stale.
             crate::encode::h264_me::prepare_reference(&mut recon);
-            self.refs.push((c.poc, recon));
+            self.refs.push((c.poc, recon, motion));
             // The DPB the SPS declares. Dropping the oldest keeps the encoder
             // inside what it told the decoder to allocate.
             let cap = (self.cfg.max_refs.max(1) as usize) + 1;
@@ -425,15 +496,15 @@ impl H264Encoder {
             .refs
             .iter()
             .enumerate()
-            .filter(|(_, (p, _))| *p < poc)
-            .max_by_key(|(_, (p, _))| *p)
+            .filter(|(_, (p, _, _))| *p < poc)
+            .max_by_key(|(_, (p, _, _))| *p)
             .map(|(i, _)| i);
         let future = self
             .refs
             .iter()
             .enumerate()
-            .filter(|(_, (p, _))| *p > poc)
-            .min_by_key(|(_, (p, _))| *p)
+            .filter(|(_, (p, _, _))| *p > poc)
+            .min_by_key(|(_, (p, _, _))| *p)
             .map(|(i, _)| i);
         (past, future)
     }

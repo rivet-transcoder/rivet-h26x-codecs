@@ -235,6 +235,11 @@ pub struct SliceHeader {
     /// Whether the slice is entropy-coded with CABAC — a P or B header
     /// then carries `cabac_init_idc`.
     pub cabac: bool,
+    /// `direct_spatial_mv_pred_flag` (B slices only): true for the
+    /// transform B path, whose encoder mirrors the spatial derivation;
+    /// false for the legacy all-skip path, whose reconstruction assumes
+    /// temporal direct over zero colocated motion.
+    pub direct_spatial: bool,
 }
 
 /// `slice_type` for an I, P or B slice, in the "all slices of this picture
@@ -259,7 +264,7 @@ pub fn write_slice_header(h: &SliceHeader, pps_qp: u8, w: &mut BitWriter) {
     }
     w.bits(h.log2_max_poc_lsb, h.poc_lsb);
     if h.kind == Kind::B {
-        w.flag(false); // direct_spatial_mv_pred_flag
+        w.flag(h.direct_spatial); // direct_spatial_mv_pred_flag
     }
     if h.kind == Kind::P || h.kind == Kind::B {
         w.flag(false); // num_ref_idx_active_override_flag

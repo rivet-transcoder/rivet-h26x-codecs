@@ -24,10 +24,10 @@ use crate::dsp::h264_enc::{H264EncDsp, Quant};
 use crate::encode::h264_deblock::{FilterMb, deblock_recon, nz_mask_of};
 use crate::encode::h264_intra::{IntraCtx, MbAvail, MbDecision, MbKind, code_macroblock};
 use crate::encode::h264_me::{
-    InterDecision, InterMbKind, MotionNeighbours, code_macroblock_p16, nb_inter, nb_intra,
+    BDecision, BMbKind, InterDecision, InterMbKind, MotionNeighbours, code_macroblock_b16,
+    code_macroblock_p16, nb_inter, nb_intra,
 };
 use crate::encode::h264_syntax::{Geometry, Plane, Recon};
-use crate::h264::frame::Mv;
 use crate::h264::mb::{NbMotion, chroma_qp};
 use crate::h264::sps::ScalingLists;
 use crate::h264::transform::Dequant;
@@ -183,7 +183,7 @@ pub(crate) fn code_intra_picture(
     planes: &[Plane<'_>],
     rec: &mut [Recon],
     mut emit: impl FnMut(usize, usize, &MbDecision),
-) {
+) -> Vec<FilterMb> {
     let pc = PicCoding::new(g, tools, qp, planes);
     let ctx = &pc.ctx;
     let (mbs_wide, mbs_high) = (pc.mbs_wide, pc.mbs_high);
@@ -220,7 +220,8 @@ pub(crate) fn code_intra_picture(
                     MbKind::I16x16 => crate::h264::mb::MbKind::I16x16,
                 },
                 nz_mask: nz_mask_of(&dec.nz_luma),
-                mv: Mv::ZERO,
+                l0: None,
+                l1: None,
             });
             (left_modes, top_modes[mb_x]) = match dec.kind {
                 MbKind::I4x4 => (
@@ -234,8 +235,12 @@ pub(crate) fn code_intra_picture(
     // The loop filter, last: the whole picture is reconstructed (intra
     // prediction read its unfiltered neighbours above, as a decoder's
     // does), and what leaves this function — toward the SELF check and
-    // the reference list — is the filtered picture a decoder emits.
+    // the reference list — is the filtered picture a decoder emits. The
+    // per-macroblock records go back to the caller: stored beside a
+    // reference picture they are what a later B picture's direct
+    // derivation reads as colocated motion.
     deblock_recon(&tools.dsp, g, qp, &fmbs, rec);
+    fmbs
 }
 
 /// Decide, reconstruct and filter a P picture — motion search, skip, and
@@ -268,7 +273,7 @@ pub(crate) fn code_p_picture(
     rec: &mut [Recon],
     refp: &[Recon],
     mut emit: impl FnMut(usize, usize, PMb<'_>),
-) {
+) -> Vec<FilterMb> {
     let pc = PicCoding::new(g, tools, qp, planes);
     let ctx = &pc.ctx;
     let (mbs_wide, mbs_high) = (pc.mbs_wide, pc.mbs_high);
@@ -313,7 +318,8 @@ pub(crate) fn code_p_picture(
                     fmbs.push(FilterMb {
                         kind: crate::h264::mb::MbKind::PSkip,
                         nz_mask: 0,
-                        mv: dec.mv,
+                        l0: Some(dec.mv),
+                        l1: None,
                     });
                     let m = nb_inter(dec.mv);
                     left_motion = m;
@@ -326,7 +332,8 @@ pub(crate) fn code_p_picture(
                     fmbs.push(FilterMb {
                         kind: crate::h264::mb::MbKind::Inter16x16,
                         nz_mask: nz_mask_of(&dec.nz_luma),
-                        mv: dec.mv,
+                        l0: Some(dec.mv),
+                        l1: None,
                     });
                     let m = nb_inter(dec.mv);
                     left_motion = m;
@@ -361,7 +368,8 @@ pub(crate) fn code_p_picture(
                             MbKind::I16x16 => crate::h264::mb::MbKind::I16x16,
                         },
                         nz_mask: nz_mask_of(&idec.nz_luma),
-                        mv: Mv::ZERO,
+                        l0: None,
+                        l1: None,
                     });
                     left_motion = nb_intra();
                     top_motion[mb_x] = nb_intra();
@@ -380,4 +388,159 @@ pub(crate) fn code_p_picture(
     // the reconstruction becomes the next picture's reference — the
     // decoder's own ordering.
     deblock_recon(&tools.dsp, g, qp, &fmbs, rec);
+    fmbs
+}
+
+/// One coded macroblock of a B picture, as the walk hands it to a
+/// serialiser — [`PMb`]'s two-list sibling.
+pub enum BMb<'a> {
+    /// `B_Skip`: the serialiser codes the skip signal and nothing else.
+    Skip(&'a BDecision),
+    /// `B_Direct_16x16` with a residual (`mb_type` 0, no motion syntax).
+    Direct(&'a BDecision),
+    /// An explicit 16x16 — L0, L1 or bi by [`BDecision::used`] — with its
+    /// mvds, cbp and coefficients.
+    Explicit(&'a BDecision),
+    /// The intra fallback, coded as intra-in-B (the `mb_type` offset of
+    /// 23 is the serialiser's).
+    Intra(&'a MbDecision),
+}
+
+/// Decide, reconstruct and filter a B picture, handing each macroblock to
+/// `emit` in raster order — the two-list sibling of [`code_p_picture`],
+/// with one addition: `col` is the *list-1 reference's* per-macroblock
+/// motion record (the vec a previous walk returned), which the spatial
+/// direct derivation reads as colocated motion. `refs` are the list-0
+/// (past) and list-1 (future) reference planes, borders replicated.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn code_b_picture(
+    g: &Geometry,
+    tools: &IntraTools,
+    qp: u8,
+    planes: &[Plane<'_>],
+    rec: &mut [Recon],
+    refs: [&[Recon]; 2],
+    col: &[FilterMb],
+    mut emit: impl FnMut(usize, usize, BMb<'_>),
+) -> Vec<FilterMb> {
+    let pc = PicCoding::new(g, tools, qp, planes);
+    let ctx = &pc.ctx;
+    let (mbs_wide, mbs_high) = (pc.mbs_wide, pc.mbs_high);
+    let (src_y, src_cb, src_cr) = (&pc.src_y[..], &pc.src_cb[..], &pc.src_cr[..]);
+    debug_assert_eq!(col.len(), mbs_wide * mbs_high, "one colocated record per macroblock");
+
+    let mut fmbs: Vec<FilterMb> = Vec::with_capacity(mbs_wide * mbs_high);
+    let mut top_modes: Vec<[Option<u8>; 4]> = vec![[None; 4]; mbs_wide];
+    let mut top_motion: [Vec<NbMotion>; 2] =
+        [vec![NbMotion::NONE; mbs_wide], vec![NbMotion::NONE; mbs_wide]];
+    for mb_y in 0..mbs_high {
+        let mut left_modes: [Option<u8>; 4] = [None; 4];
+        let mut left_motion = [NbMotion::NONE; 2];
+        let mut topleft_motion = [NbMotion::NONE; 2];
+        for mb_x in 0..mbs_wide {
+            let nbm: [MotionNeighbours; 2] = std::array::from_fn(|l| MotionNeighbours {
+                a: left_motion[l],
+                b: if mb_y > 0 { top_motion[l][mb_x] } else { NbMotion::NONE },
+                c: if mb_y > 0 && mb_x + 1 < mbs_wide {
+                    top_motion[l][mb_x + 1]
+                } else {
+                    NbMotion::NONE
+                },
+                d: topleft_motion[l],
+            });
+            let dec = code_macroblock_b16(
+                ctx,
+                rec,
+                refs,
+                mb_x,
+                mb_y,
+                src_y,
+                pc.luma_stride,
+                [src_cb, src_cr],
+                pc.chroma_stride,
+                &nbm,
+                &col[mb_y * mbs_wide + mb_x],
+            );
+            for l in 0..2 {
+                topleft_motion[l] = if mb_y > 0 { top_motion[l][mb_x] } else { NbMotion::NONE };
+            }
+            if dec.kind == BMbKind::UseIntra {
+                let mb = MbAvail {
+                    left: mb_x > 0,
+                    top: mb_y > 0,
+                    top_left: mb_x > 0 && mb_y > 0,
+                    top_right: mb_y > 0 && mb_x + 1 < mbs_wide,
+                };
+                let (idec, modes) = code_macroblock(
+                    ctx,
+                    rec,
+                    mb_x,
+                    mb_y,
+                    src_y,
+                    pc.luma_stride,
+                    [src_cb, src_cr],
+                    pc.chroma_stride,
+                    mb,
+                    &left_modes,
+                    &top_modes[mb_x],
+                );
+                emit(mb_x, mb_y, BMb::Intra(&idec));
+                fmbs.push(FilterMb {
+                    kind: match idec.kind {
+                        MbKind::I4x4 => crate::h264::mb::MbKind::I4x4,
+                        MbKind::I16x16 => crate::h264::mb::MbKind::I16x16,
+                    },
+                    nz_mask: nz_mask_of(&idec.nz_luma),
+                    l0: None,
+                    l1: None,
+                });
+                for l in 0..2 {
+                    left_motion[l] = nb_intra();
+                    top_motion[l][mb_x] = nb_intra();
+                }
+                (left_modes, top_modes[mb_x]) = match idec.kind {
+                    MbKind::I4x4 => (
+                        [Some(modes[3]), Some(modes[7]), Some(modes[11]), Some(modes[15])],
+                        [Some(modes[12]), Some(modes[13]), Some(modes[14]), Some(modes[15])],
+                    ),
+                    MbKind::I16x16 => ([Some(2); 4], [Some(2); 4]),
+                };
+                continue;
+            }
+            emit(
+                mb_x,
+                mb_y,
+                match dec.kind {
+                    BMbKind::BSkip => BMb::Skip(&dec),
+                    BMbKind::BDirect16 => BMb::Direct(&dec),
+                    BMbKind::B16 => BMb::Explicit(&dec),
+                    BMbKind::UseIntra => unreachable!(),
+                },
+            );
+            fmbs.push(FilterMb {
+                kind: match dec.kind {
+                    BMbKind::BSkip => crate::h264::mb::MbKind::BSkip,
+                    BMbKind::BDirect16 => crate::h264::mb::MbKind::BDirect16x16,
+                    _ => crate::h264::mb::MbKind::Inter16x16,
+                },
+                nz_mask: nz_mask_of(&dec.nz_luma),
+                l0: dec.used[0].then_some(dec.mv[0]),
+                l1: dec.used[1].then_some(dec.mv[1]),
+            });
+            for l in 0..2 {
+                // A used list contributes its vector at reference 0; an
+                // unused one contributes "available, not used for inter
+                // prediction" — the same value the decoder's motion array
+                // holds for it, and the same value an intra macroblock
+                // leaves (`nb_intra`).
+                let m = if dec.used[l] { nb_inter(dec.mv[l]) } else { nb_intra() };
+                left_motion[l] = m;
+                top_motion[l][mb_x] = m;
+            }
+            left_modes = [Some(2); 4];
+            top_modes[mb_x] = [Some(2); 4];
+        }
+    }
+    deblock_recon(&tools.dsp, g, qp, &fmbs, rec);
+    fmbs
 }

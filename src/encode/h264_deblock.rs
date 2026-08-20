@@ -36,23 +36,37 @@ use crate::h264::deblock::{DeblockParams, deblock_mb_rows};
 use crate::h264::frame::{BlockMotion, Frame, Mv, PARITY_FRAME};
 use crate::h264::mb::{MbKind, PicInfo, chroma_qp};
 
-/// What the deblocking filter needs to know about one coded macroblock,
-/// recorded by the picture writers in raster order as they code.
+/// What the deblocking filter — and, stored beside a reference picture,
+/// the B direct derivation — needs to know about one coded macroblock,
+/// recorded by the picture walks in raster order as they code.
+///
+/// INVARIANT(16x16-only): one `FilterMb` records one motion per list for
+/// the *whole* macroblock. That is a faithful record only while every
+/// inter partition this encoder codes is 16x16 — it is also what makes a
+/// per-macroblock colocated read exact for spatial direct (the four 8x8
+/// corner derivations of 8.4.1.2 agree by construction), and what makes
+/// `part_edges = [0, 0]` exact for the loop filter. The day sub-macroblock
+/// partitions land, this struct must grow per-block motion *before*
+/// direct mode or the filter may trust it; grep this tag.
 #[derive(Clone, Copy)]
 pub struct FilterMb {
     /// The macroblock kind, in the decoder's own vocabulary — what bS
     /// derivation switches on. This encoder produces `I4x4`, `I16x16`,
-    /// `Inter16x16` and `PSkip`.
+    /// `Inter16x16`, `PSkip`, `BDirect16x16` and `BSkip`.
     pub kind: MbKind,
     /// The "has coefficients" mask of the 4x4 luma blocks (raster), the
     /// same derivation `derive()` stores in `MbInfo::nz_mask`
     /// (src/h264/recon.rs): one bit per block with a nonzero count. Zero
     /// for a skipped macroblock. See [`nz_mask_of`].
     pub nz_mask: u16,
-    /// The list-0 vector of an inter macroblock — for `PSkip` the
-    /// *derived* skip vector, because that is the motion a decoder stores
-    /// and compares across edges. Ignored for intra kinds.
-    pub mv: Mv,
+    /// The list-0 vector when the macroblock predicts from list 0 — for
+    /// `PSkip` the *derived* skip vector, for B kinds whatever the mode
+    /// decision (or the direct derivation) settled on — because that is
+    /// the motion a decoder stores and compares across edges. `None` for
+    /// intra macroblocks and for B macroblocks not using the list.
+    pub l0: Option<Mv>,
+    /// The same for list 1. Always `None` outside B pictures.
+    pub l1: Option<Mv>,
 }
 
 /// The nonzero mask of [`FilterMb`] from a decision's per-block counts:
@@ -110,16 +124,21 @@ pub fn deblock_recon(dsp: &H264Dsp<u8>, g: &Geometry, qp: u8, mbs: &[FilterMb], 
         mi.nz_mask = m.nz_mask;
         // `part_edges` stays [0, 0] — the derivation's statement that one
         // partition covers the macroblock, which is true of everything
-        // this encoder codes — and `transform_8x8` stays false.
-        if !m.kind.is_intra() {
-            // One motion for all sixteen blocks, reference index 0 of the
-            // one reference every inter macroblock uses: `ref_id` is an
-            // identity the filter only ever compares for equality, so a
-            // constant says "the same picture" exactly as the decoder's
-            // real ids do when there is one reference.
-            let bm = BlockMotion { mv: m.mv, ref_idx: 0, ref_parity: PARITY_FRAME, ref_id: 0 };
+        // this encoder codes (INVARIANT(16x16-only) above) — and
+        // `transform_8x8` stays false.
+        //
+        // One motion per list for all sixteen blocks, reference index 0 of
+        // that list's one reference. `ref_id` is an identity the filter
+        // only ever compares for equality: 0 for the list-0 picture and 1
+        // for the list-1 picture says "same picture" and "different
+        // picture" exactly as the decoder's real ids do with one reference
+        // per list (a P picture's single reference is list 0's).
+        for (list, mv) in [(0usize, m.l0), (1usize, m.l1)] {
+            let Some(mv) = mv else { continue };
+            debug_assert!(!m.kind.is_intra(), "an intra FilterMb carries no motion");
+            let bm = BlockMotion { mv, ref_idx: 0, ref_parity: PARITY_FRAME, ref_id: list as u16 };
             for blk in 0..16 {
-                frame.motion[0][addr * 16 + blk] = bm;
+                frame.motion[list][addr * 16 + blk] = bm;
             }
         }
     }
@@ -181,7 +200,7 @@ mod tests {
         }
         let before: Vec<Vec<u8>> = rec.iter().map(|p| p.data.clone()).collect();
         let mbs = vec![
-            FilterMb { kind: MbKind::PSkip, nz_mask: 0, mv: Mv::new(6, -2) };
+            FilterMb { kind: MbKind::PSkip, nz_mask: 0, l0: Some(Mv::new(6, -2)), l1: None };
             9
         ];
         deblock_recon(&dsp, &g, 26, &mbs, &mut rec);
@@ -225,7 +244,7 @@ mod tests {
         }
         let before = rec[0].data.clone();
         let mbs = vec![
-            FilterMb { kind: MbKind::I4x4, nz_mask: 0xffff, mv: Mv::ZERO };
+            FilterMb { kind: MbKind::I4x4, nz_mask: 0xffff, l0: None, l1: None };
             9
         ];
         deblock_recon(&dsp, &g, 26, &mbs, &mut rec);

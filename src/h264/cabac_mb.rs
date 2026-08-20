@@ -10,7 +10,7 @@
 use crate::cabac::{Cabac, Ctx, init_ctx_h264};
 use crate::cabac_enc::CabacEncoder;
 use crate::encode::h264_intra::{MbDecision, MbKind as IntraKind};
-use crate::encode::h264_me::{InterDecision, InterMbKind};
+use crate::encode::h264_me::{BDecision, BMbKind, InterDecision, InterMbKind};
 use crate::{Error, Result};
 
 use super::cavlc::{
@@ -450,6 +450,46 @@ pub(crate) fn write_mb_type_p_cabac(e: &mut CabacEncoder, st: &mut CabacState, t
     }
 }
 
+/// Write a B-slice `mb_type`: the exact inverse of [`decode_mb_type`]'s B
+/// branch over the values this encoder spells — 0 `B_Direct_16x16`, 1
+/// `B_L0_16x16`, 2 `B_L1_16x16`, 3 `B_Bi_16x16`, and 23+ intra (the
+/// I-slice tree behind the B prefix, `23 + intra_mb_type_code(..)`).
+///
+/// `inc` is the first bin's ctxIdxInc: how many of the two available
+/// neighbours are *neither* `B_Skip` nor `B_Direct_16x16` — read off
+/// [`WrittenMb::direct`] (a skipped B macroblock sets it too).
+///
+/// 4..=22 — the 16x8 / 8x16 / 8x8 B partitions — are refused by name,
+/// exactly as `P_8x8` is on the P writer: spelling the type would promise
+/// partitions nothing can serialise.
+pub(crate) fn write_mb_type_b_cabac(e: &mut CabacEncoder, st: &mut CabacState, inc: usize, t: u32) {
+    debug_assert!(
+        t <= 3 || t >= 23,
+        "B mb_type {t}: two-partition and sub-8x8 B macroblocks have no writer yet"
+    );
+    if t == 0 {
+        e.encode_decision(&mut st.ctx[CTX_MB_TYPE_B_PREFIX + inc], 0);
+        return;
+    }
+    e.encode_decision(&mut st.ctx[CTX_MB_TYPE_B_PREFIX + inc], 1);
+    if t <= 2 {
+        e.encode_decision(&mut st.ctx[CTX_MB_TYPE_B_PREFIX + 3], 0);
+        e.encode_decision(&mut st.ctx[CTX_MB_TYPE_B_PREFIX + 5], t - 1);
+        return;
+    }
+    e.encode_decision(&mut st.ctx[CTX_MB_TYPE_B_PREFIX + 3], 1);
+    // Four fixed bins carry `bits`: 0 for B_Bi_16x16 (t = 3 + 0), 13 for
+    // the intra escape.
+    let bits: u32 = if t == 3 { 0 } else { 13 };
+    e.encode_decision(&mut st.ctx[CTX_MB_TYPE_B_PREFIX + 4], (bits >> 3) & 1);
+    e.encode_decision(&mut st.ctx[CTX_MB_TYPE_B_PREFIX + 5], (bits >> 2) & 1);
+    e.encode_decision(&mut st.ctx[CTX_MB_TYPE_B_PREFIX + 5], (bits >> 1) & 1);
+    e.encode_decision(&mut st.ctx[CTX_MB_TYPE_B_PREFIX + 5], bits & 1);
+    if t >= 23 {
+        write_intra_mb_type_cabac(e, st, CTX_MB_TYPE_B_SUFFIX, false, 0, t - 23);
+    }
+}
+
 fn decode_sub_mb_type_p(c: &mut Cabac, st: &mut CabacState) -> u32 {
     if bin(c, st, CTX_SUB_MB_TYPE_P) != 0 {
         return 0;
@@ -679,7 +719,7 @@ fn decode_mvd(
     Ok((x, y))
 }
 
-/// Write both `mvd_l0` components of a P macroblock's 16x16 partition:
+/// Write both `mvd_lX` components of a 16x16 partition for one list:
 /// the exact inverse of [`decode_mvd`] over the shapes the encoder
 /// produces. The context sums read the 4x4 blocks left of and above the
 /// partition — for 16x16 always in the neighbouring macroblocks (left
@@ -694,6 +734,7 @@ pub(crate) fn write_mvd_16x16_cabac(
     st: &mut CabacState,
     left: Option<&WrittenMb>,
     above: Option<&WrittenMb>,
+    list: usize,
     mvd: Mv,
 ) {
     let abs = |m: Option<&WrittenMb>, blk: usize| -> (i32, i32) {
@@ -703,7 +744,7 @@ pub(crate) fn write_mvd_16x16_cabac(
                 if m.skip || m.intra {
                     (0, 0)
                 } else {
-                    (m.mvd[blk].x.abs() as i32, m.mvd[blk].y.abs() as i32)
+                    (m.mvd[list][blk].x.abs() as i32, m.mvd[list][blk].y.abs() as i32)
                 }
             }
         }
@@ -1070,11 +1111,15 @@ pub(crate) struct WrittenMb {
     /// 0 for `P_Skip`, -1 for intra. The contexts only ever ask `> 0`
     /// (refIdxZeroFlag), and never of a skipped or intra macroblock.
     pub ref_idx: [i8; 16],
-    /// `mvd_l0` per 4x4 block (raster), as the decoder's per-picture mvd
-    /// array holds it: the partition's mvd replicated over its blocks,
-    /// zero for intra and skipped macroblocks (which carry none). List 0
-    /// only — B slices grow a second array when they grow a writer.
-    pub mvd: [Mv; 16],
+    /// `mvd_lX` per list and 4x4 block (raster), as the decoder's
+    /// per-picture mvd arrays hold them: the partition's mvd replicated
+    /// over its blocks, zero for intra, skipped and direct macroblocks
+    /// (which carry none) and for a list the macroblock does not use.
+    pub mvd: [[Mv; 16]; 2],
+    /// The macroblock is `B_Skip` or `B_Direct_16x16`: the B `mb_type`
+    /// first-bin context counts available neighbours that are *neither*
+    /// (9.3.3.1.1.3). False for everything in a P slice.
+    pub direct: bool,
 }
 
 /// The luma nonzero counts as the decoder will store them: a block of an
@@ -1127,7 +1172,8 @@ impl WrittenMb {
             skip: false,
             intra: true,
             ref_idx: [-1; 16],
-            mvd: [Mv::ZERO; 16],
+            mvd: [[Mv::ZERO; 16]; 2],
+            direct: false,
         }
     }
 
@@ -1156,7 +1202,8 @@ impl WrittenMb {
                     skip: true,
                     intra: false,
                     ref_idx: [0; 16],
-                    mvd: [Mv::ZERO; 16],
+                    mvd: [[Mv::ZERO; 16]; 2],
+                    direct: false,
                 }
             }
             InterMbKind::P16x16 => WrittenMb {
@@ -1169,7 +1216,8 @@ impl WrittenMb {
                 skip: false,
                 intra: false,
                 ref_idx: [d.ref_idx; 16],
-                mvd: [d.mvd; 16],
+                mvd: [[d.mvd; 16], [Mv::ZERO; 16]],
+                direct: false,
             },
         }
     }
@@ -1189,7 +1237,53 @@ impl WrittenMb {
             skip: false,
             intra: true,
             ref_idx: [-1; 16],
-            mvd: [Mv::ZERO; 16],
+            mvd: [[Mv::ZERO; 16]; 2],
+            direct: false,
+        }
+    }
+
+    /// The state of a B macroblock written from `d`: the same gating as
+    /// the P constructor, per list. The direct kinds store no mvd and no
+    /// residual-bearing state beyond what their cbp says; `direct` marks
+    /// both `B_Skip` and `B_Direct_16x16`, which is what the B `mb_type`
+    /// first-bin context counts.
+    pub(crate) fn from_b_decision(d: &BDecision) -> Self {
+        match d.kind {
+            BMbKind::UseIntra => {
+                unreachable!("UseIntra codes the intra decision; build from that")
+            }
+            BMbKind::BSkip => {
+                debug_assert!(
+                    d.cbp_luma == 0 && d.cbp_chroma == 0,
+                    "a skip with residual is not a skip"
+                );
+                WrittenMb {
+                    pcm: false,
+                    i16x16: false,
+                    cbp: 0,
+                    dc_cbf: 0,
+                    nz_luma: [0; 16],
+                    nz_chroma: [[0; 8]; 2],
+                    skip: true,
+                    intra: false,
+                    ref_idx: [d.ref_idx[0]; 16],
+                    mvd: [[Mv::ZERO; 16]; 2],
+                    direct: true,
+                }
+            }
+            BMbKind::BDirect16 | BMbKind::B16 => WrittenMb {
+                pcm: false,
+                i16x16: false,
+                cbp: (d.cbp_luma & 15) | (d.cbp_chroma << 4),
+                dc_cbf: chroma_dc_cbf(d.cbp_chroma, &d.chroma_dc),
+                nz_luma: gate_nz_luma(d.cbp_luma, &d.nz_luma),
+                nz_chroma: if d.cbp_chroma == 2 { d.nz_chroma } else { [[0; 8]; 2] },
+                skip: false,
+                intra: false,
+                ref_idx: [d.ref_idx[0]; 16],
+                mvd: [[d.mvd[0]; 16], [d.mvd[1]; 16]],
+                direct: d.kind == BMbKind::BDirect16,
+            },
         }
     }
 }
@@ -1997,17 +2091,43 @@ pub(crate) fn write_inter_residual_cabac(
 ) {
     debug_assert!(
         d.kind == InterMbKind::P16x16,
-        "only P_L0_16x16 carries residual syntax (a skip carries none)"
+        "only a coded inter macroblock carries residual syntax (a skip carries none)"
     );
+    write_inter_residual_fields_cabac(
+        e, st, field, chroma_format_idc, d.cbp_luma, &d.nz_luma, &d.luma, d.cbp_chroma,
+        &d.chroma_dc, &d.chroma_ac, &d.nz_chroma, left, above,
+    );
+}
+
+/// The inter residual walk over its raw fields — what
+/// [`write_inter_residual_cabac`] wraps for an [`InterDecision`], exposed
+/// so a B decision (same residual layout, different motion shape) writes
+/// through the identical path rather than a second spelling.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_inter_residual_fields_cabac(
+    e: &mut CabacEncoder,
+    st: &mut CabacState,
+    field: bool,
+    chroma_format_idc: u32,
+    cbp_luma: u8,
+    nz_luma: &[u8; 16],
+    luma: &[[i16; 16]; 16],
+    cbp_chroma: u8,
+    chroma_dc: &[[i16; 8]; 2],
+    chroma_ac: &[[[i16; 16]; 8]; 2],
+    nz_chroma: &[[u8; 8]; 2],
+    left: Option<&WrittenMb>,
+    above: Option<&WrittenMb>,
+) {
     let cur = CurMbResidual {
         intra: false,
-        cbp_luma: d.cbp_luma,
-        nz_luma: &d.nz_luma,
-        nz_chroma: &d.nz_chroma,
+        cbp_luma,
+        nz_luma,
+        nz_chroma,
     };
     write_residual_walk_cabac(
-        e, st, field, chroma_format_idc, &cur, None, &d.luma, d.cbp_chroma, &d.chroma_dc,
-        &d.chroma_ac, left, above,
+        e, st, field, chroma_format_idc, &cur, None, luma, cbp_chroma, chroma_dc, chroma_ac,
+        left, above,
     );
 }
 
@@ -2886,7 +3006,7 @@ mod mb_round_trip {
         if num_ref > 1 {
             write_ref_idx_16x16_cabac(e, st, lnb, anb, d.ref_idx);
         }
-        write_mvd_16x16_cabac(e, st, lnb, anb, d.mvd);
+        write_mvd_16x16_cabac(e, st, lnb, anb, 0, d.mvd);
         write_cbp_cabac(e, st, lnb, anb, d.cbp_luma | (d.cbp_chroma << 4), cfi == 1 || cfi == 2);
         if d.cbp_luma != 0 || d.cbp_chroma != 0 {
             write_mb_qp_delta_cabac(e, st, d.qp_delta as i32);
@@ -3171,7 +3291,7 @@ mod mb_round_trip {
         assert_eq!(wm.nz_chroma[0], layer.chroma_nz[0], "mb {addr} WrittenMb nz_chroma Cb");
         assert_eq!(wm.nz_chroma[1], layer.chroma_nz[1], "mb {addr} WrittenMb nz_chroma Cr");
         for blk in 0..16 {
-            assert_eq!(wm.mvd[blk], layer.mvd[blk].mvd[0], "mb {addr} WrittenMb mvd {blk}");
+            assert_eq!(wm.mvd[0][blk], layer.mvd[blk].mvd[0], "mb {addr} WrittenMb mvd {blk}");
             assert_eq!(wm.ref_idx[blk], want_ri, "mb {addr} WrittenMb ref_idx {blk}");
         }
     }
@@ -3371,6 +3491,104 @@ mod mb_round_trip {
             enc_st.prev_qp_delta_nonzero, dec_st.prev_qp_delta_nonzero,
             "the qp-delta carry diverged"
         );
+    }
+
+    /// Every B `mb_type` this encoder spells, against every first-bin
+    /// increment the neighbour rule can produce, decoded by
+    /// [`decode_mb_type`] over real neighbour configurations: 0 direct,
+    /// 1..=3 the explicit 16x16 directions, 23+ the intra tree behind the
+    /// B prefix. (I_PCM in a B slice has no producer — the intra fallback
+    /// never chooses PCM — and stays untested here like the other
+    /// unspelled types.)
+    #[test]
+    fn b_mb_type_round_trips() {
+        for (inc, kinds) in [
+            (0usize, Some((MbKind::BSkip, MbKind::BDirect16x16))),
+            (1, Some((MbKind::Inter16x16, MbKind::BSkip))),
+            (2, Some((MbKind::Inter16x16, MbKind::I16x16))),
+        ] {
+            for t in [0u32, 1, 2, 3, 23, 24, 30, 47] {
+                let mut w = BitWriter::new();
+                let mut enc_st = CabacState::new(SliceType::B, 0, 30);
+                {
+                    let mut e = CabacEncoder::new(&mut w);
+                    write_mb_type_b_cabac(&mut e, &mut enc_st, inc, t);
+                    e.encode_terminate(1);
+                }
+                w.align_zero();
+                let data = w.into_rbsp();
+
+                let mut info = PicInfo::new(2, 2);
+                let addr = 3;
+                if let Some((left, above)) = kinds {
+                    for (a, k) in [(2usize, left), (1usize, above)] {
+                        info.mbs[a].kind = k;
+                        info.mbs[a].decoded = true;
+                    }
+                }
+                let mut nb = MbNeighbours::default();
+                nb.derive_into(&info, addr, 0);
+                let ctx = slice_ctx(SliceType::B, 1, 1, false);
+                let mut dec_st = CabacState::new(SliceType::B, 0, 30);
+                let mut c = Cabac::new(&data);
+                let got = decode_mb_type(&mut c, &mut dec_st, &ctx, &info, &nb).unwrap();
+                assert_eq!(got, t, "inc {inc}");
+                assert_eq!(c.terminate(), 1, "inc {inc} t {t}");
+                assert!(!c.overrun());
+                assert_eq!(enc_st.ctx, dec_st.ctx, "inc {inc} t {t}: contexts diverged");
+            }
+        }
+    }
+
+    /// The mvd writer's context sums read the *list's own* neighbour
+    /// mvds: a large list-0 mvd next door must not push the list-1
+    /// component into a different context. Written per list against
+    /// neighbours whose two lists carry very different magnitudes, and
+    /// decoded by [`decode_mvd`] over the decoder's own per-list arrays.
+    #[test]
+    fn mvd_contexts_read_the_lists_own_neighbours() {
+        for list in 0..2usize {
+            for mvd in [Mv::new(3, -7), Mv::new(-40, 1), Mv::ZERO] {
+                // Left and above neighbours: big mvds in list 0, tiny in
+                // list 1 — so the two lists select different contexts.
+                let mut nbmb = WrittenMb::from_inter_decision(&InterDecision {
+                    kind: InterMbKind::P16x16,
+                    ..InterDecision::default()
+                });
+                nbmb.mvd = [[Mv::new(30, 30); 16], [Mv::new(1, 0); 16]];
+                let mut w = BitWriter::new();
+                let mut enc_st = CabacState::new(SliceType::B, 0, 28);
+                {
+                    let mut e = CabacEncoder::new(&mut w);
+                    write_mvd_16x16_cabac(&mut e, &mut enc_st, Some(&nbmb), Some(&nbmb), list, mvd);
+                    e.encode_terminate(1);
+                }
+                w.align_zero();
+                let data = w.into_rbsp();
+
+                let mut info = PicInfo::new(2, 2);
+                let addr = 3;
+                for a in [1usize, 2] {
+                    info.mbs[a].kind = MbKind::Inter16x16;
+                    info.mbs[a].decoded = true;
+                    for blk in 0..16 {
+                        info.mvd[0][a * 16 + blk] = Mv::new(30, 30);
+                        info.mvd[1][a * 16 + blk] = Mv::new(1, 0);
+                    }
+                }
+                let mut nb = MbNeighbours::default();
+                nb.derive_into(&info, addr, 0);
+                let mut layer = MbLayer::new(MbKind::Inter16x16);
+                layer.reset(MbKind::Inter16x16, true);
+                let mut dec_st = CabacState::new(SliceType::B, 0, 28);
+                let mut c = Cabac::new(&data);
+                let (x, y) = decode_mvd(&mut c, &mut dec_st, &info, &layer, &nb, list, 0, 0).unwrap();
+                assert_eq!((x, y), (mvd.x, mvd.y), "list {list}");
+                assert_eq!(c.terminate(), 1);
+                assert!(!c.overrun());
+                assert_eq!(enc_st.ctx, dec_st.ctx, "list {list} mvd {mvd:?}: contexts diverged");
+            }
+        }
     }
 
     /// Every intra `mb_type` value against every first-bin increment,

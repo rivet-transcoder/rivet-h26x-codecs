@@ -11,7 +11,6 @@
 //!           --recon out.rec.yuv [--codec h264|h265] [--qp N | --lossless]
 //!           [--gop N] [--bframes N] [--cavlc] [--threads N]
 
-use std::io::Write;
 
 use h26x::ChromaFormat;
 use h26x::encode::{Config, Entropy, RateControl};
@@ -105,7 +104,7 @@ fn main() {
             die(&format!("input is {} bytes, less than one {fb}-byte picture", raw.len()));
         }
         let mut stream: Vec<u8> = Vec::new();
-        let mut frames = 0usize;
+        let mut pocs: Vec<(bool, i32)> = Vec::new();
         let fail = |e: h26x::Error| -> ! {
             eprintln!("h26xenc: {e}");
             std::process::exit(1);
@@ -115,7 +114,7 @@ fn main() {
                 Ok(units) => {
                     for a in units {
                         stream.extend_from_slice(&a.data);
-                        frames += 1;
+                        pocs.push((a.keyframe, a.poc));
                     }
                 }
                 Err(e) => fail(e),
@@ -125,20 +124,16 @@ fn main() {
             Ok(units) => {
                 for a in units {
                     stream.extend_from_slice(&a.data);
-                    frames += 1;
+                    pocs.push((a.keyframe, a.poc));
                 }
             }
             Err(e) => fail(e),
         }
         std::fs::write(&output, &stream).unwrap_or_else(|e| die(&format!("write {output}: {e}")));
         if let Some(path) = recon {
-            let mut f = std::fs::File::create(&path)
-                .unwrap_or_else(|e| die(&format!("create {path}: {e}")));
-            for r in enc.reconstructions() {
-                f.write_all(r).unwrap_or_else(|e| die(&format!("write {path}: {e}")));
-            }
+            write_recon_display_order(&path, enc.reconstructions(), &pocs);
         }
-        eprintln!("{frames} pictures, {} bytes", stream.len());
+        eprintln!("{} pictures, {} bytes", pocs.len(), stream.len());
         return;
     }
 
@@ -166,13 +161,13 @@ fn main() {
     }
 
     let mut stream: Vec<u8> = Vec::new();
-    let mut frames = 0usize;
+    let mut pocs: Vec<(bool, i32)> = Vec::new();
     for chunk in raw.chunks_exact(fb) {
         match enc.push(chunk) {
             Ok(units) => {
                 for a in units {
                     stream.extend_from_slice(&a.data);
-                    frames += 1;
+                    pocs.push((a.keyframe, a.poc));
                 }
             }
             Err(e) => {
@@ -185,7 +180,7 @@ fn main() {
         Ok(units) => {
             for a in units {
                 stream.extend_from_slice(&a.data);
-                frames += 1;
+                pocs.push((a.keyframe, a.poc));
             }
         }
         Err(e) => {
@@ -196,11 +191,40 @@ fn main() {
 
     std::fs::write(&output, &stream).unwrap_or_else(|e| die(&format!("write {output}: {e}")));
     if let Some(path) = recon {
-        let mut f = std::fs::File::create(&path)
-            .unwrap_or_else(|e| die(&format!("create {path}: {e}")));
-        for r in enc.reconstructions() {
-            f.write_all(r).unwrap_or_else(|e| die(&format!("write {path}: {e}")));
-        }
+        write_recon_display_order(&path, enc.reconstructions(), &pocs);
     }
-    eprintln!("{frames} pictures, {} bytes", stream.len());
+    eprintln!("{} pictures, {} bytes", pocs.len(), stream.len());
+}
+
+/// Write the reconstructions in *display* order — sorted by each coded
+/// picture's POC — because that is the order a decoder emits pictures and
+/// therefore the order the SELF comparison reads. The encoder hands them
+/// back in coding order, which differs the moment B pictures exist; an
+/// all-skip GOP hid that (every picture in it decoded identical), and the
+/// first real B pictures surfaced it as a phantom SELF failure whose
+/// per-frame diffs were exactly the reorder distance.
+fn write_recon_display_order(path: &str, recons: &[Vec<u8>], pocs: &[(bool, i32)]) {
+    use std::io::Write;
+    assert_eq!(recons.len(), pocs.len(), "one reconstruction per coded picture");
+    // POC restarts at every IDR, so display order is per coded video
+    // sequence: sort by (sequence, poc), the sequence counted up at each
+    // keyframe. A global poc sort interleaves GOPs — the first two-GOP
+    // clip with real B pictures found that the hard way.
+    let mut seq = 0u32;
+    let keys: Vec<(u32, i32)> = pocs
+        .iter()
+        .map(|&(key, poc)| {
+            if key {
+                seq += 1;
+            }
+            (seq, poc)
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..recons.len()).collect();
+    order.sort_by_key(|&i| keys[i]);
+    let mut f = std::fs::File::create(path)
+        .unwrap_or_else(|e| die(&format!("create {path}: {e}")));
+    for &i in &order {
+        f.write_all(&recons[i]).unwrap_or_else(|e| die(&format!("write {path}: {e}")));
+    }
 }

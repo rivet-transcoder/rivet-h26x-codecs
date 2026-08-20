@@ -35,14 +35,18 @@
 use crate::bitwriter::BitWriter;
 use crate::cabac_enc::CabacEncoder;
 use crate::encode::h264_intra::{MbDecision, MbKind};
+use crate::encode::h264_deblock::FilterMb;
 use crate::encode::h264_me::{InterDecision, InterMbKind};
-use crate::encode::h264_pic::{IntraTools, PMb, code_intra_picture, code_p_picture};
+use crate::encode::h264_pic::{
+    BMb, IntraTools, PMb, code_b_picture, code_intra_picture, code_p_picture,
+};
 use crate::encode::h264_syntax::{Geometry, Plane, Recon};
 use crate::h264::SliceType;
 use crate::h264::cabac_mb::{
     CabacState, WrittenMb, intra_mb_type_code, write_cbp_cabac, write_intra_pred_modes_cabac,
-    write_intra_residual_cabac, write_inter_residual_cabac, write_mb_qp_delta_cabac,
-    write_mb_skip_cabac, write_mb_type_i_cabac, write_mb_type_p_cabac, write_mvd_16x16_cabac,
+    write_intra_residual_cabac, write_inter_residual_cabac, write_inter_residual_fields_cabac,
+    write_mb_qp_delta_cabac, write_mb_skip_cabac, write_mb_type_b_cabac, write_mb_type_i_cabac,
+    write_mb_type_p_cabac, write_mvd_16x16_cabac,
 };
 use crate::picture::ChromaFormat;
 
@@ -118,7 +122,7 @@ fn write_p16_body(
     write_mb_type_p_cabac(e, st, 0);
     let lnb = left.map(|m| &m.nb);
     let anb = above.map(|m| &m.nb);
-    write_mvd_16x16_cabac(e, st, lnb, anb, d.mvd);
+    write_mvd_16x16_cabac(e, st, lnb, anb, 0, d.mvd);
     write_cbp_cabac(e, st, lnb, anb, d.cbp_luma | (d.cbp_chroma << 4), cfi == 1 || cfi == 2);
     if d.cbp_luma != 0 || d.cbp_chroma != 0 {
         write_mb_qp_delta_cabac(e, st, d.qp_delta as i32);
@@ -141,7 +145,7 @@ pub fn write_intra_picture_cabac(
     qp: u8,
     planes: &[Plane<'_>],
     rec: &mut [Recon],
-) {
+) -> Vec<FilterMb> {
     let mbw = g.mbs_wide as usize;
     let total = mbw * g.mbs_high as usize;
     let cfi = cfi_of(g.chroma);
@@ -149,7 +153,7 @@ pub fn write_intra_picture_cabac(
     let mut st = CabacState::new(SliceType::I, 0, qp as i32);
     let mut e = CabacEncoder::new(w);
     let mut coded: Vec<Coded> = Vec::with_capacity(total);
-    code_intra_picture(g, tools, qp, planes, rec, |mb_x, mb_y, dec| {
+    let fmbs = code_intra_picture(g, tools, qp, planes, rec, |mb_x, mb_y, dec| {
         let idx = coded.len();
         let left = (mb_x > 0).then(|| &coded[idx - 1]);
         let above = (mb_y > 0).then(|| &coded[idx - mbw]);
@@ -165,6 +169,7 @@ pub fn write_intra_picture_cabac(
     });
     drop(e);
     w.align_zero();
+    fmbs
 }
 
 /// Write every macroblock of a P CABAC picture: the shared walk owns the
@@ -180,7 +185,7 @@ pub fn write_p_picture_cabac(
     planes: &[Plane<'_>],
     rec: &mut [Recon],
     refp: &[Recon],
-) {
+) -> Vec<FilterMb> {
     let mbw = g.mbs_wide as usize;
     let total = mbw * g.mbs_high as usize;
     let cfi = cfi_of(g.chroma);
@@ -188,7 +193,7 @@ pub fn write_p_picture_cabac(
     let mut st = CabacState::new(SliceType::P, 0, qp as i32);
     let mut e = CabacEncoder::new(w);
     let mut coded: Vec<Coded> = Vec::with_capacity(total);
-    code_p_picture(g, tools, qp, planes, rec, refp, |mb_x, mb_y, mb| {
+    let fmbs = code_p_picture(g, tools, qp, planes, rec, refp, |mb_x, mb_y, mb| {
         let idx = coded.len();
         let left = (mb_x > 0).then(|| &coded[idx - 1]);
         let above = (mb_y > 0).then(|| &coded[idx - mbw]);
@@ -234,6 +239,122 @@ pub fn write_p_picture_cabac(
     });
     drop(e);
     w.align_zero();
+    fmbs
+}
+
+/// Write every macroblock of a B CABAC picture: the shared walk
+/// (`h264_pic::code_b_picture`) owns the searches, the direct derivation and the
+/// intra fallback; this side codes `mb_skip_flag` per macroblock against
+/// the B contexts, the macroblock layers (`B_Direct_16x16` is `mb_type` 0
+/// and no motion syntax; explicit 16x16 carries one mvd per used list;
+/// intra rides behind the B prefix at +23), and the `end_of_slice_flag`s.
+/// Returns the picture's motion record for the caller's reference
+/// bookkeeping.
+#[allow(clippy::too_many_arguments)]
+pub fn write_b_picture_cabac(
+    w: &mut BitWriter,
+    g: &Geometry,
+    tools: &IntraTools,
+    qp: u8,
+    planes: &[Plane<'_>],
+    rec: &mut [Recon],
+    refs: [&[Recon]; 2],
+    col: &[FilterMb],
+) -> Vec<FilterMb> {
+    let mbw = g.mbs_wide as usize;
+    let total = mbw * g.mbs_high as usize;
+    let cfi = cfi_of(g.chroma);
+    w.align_one();
+    let mut st = CabacState::new(SliceType::B, 0, qp as i32);
+    let mut e = CabacEncoder::new(w);
+    let mut coded: Vec<Coded> = Vec::with_capacity(total);
+    let fmbs = code_b_picture(g, tools, qp, planes, rec, refs, col, |mb_x, mb_y, mb| {
+        let idx = coded.len();
+        let left = (mb_x > 0).then(|| &coded[idx - 1]);
+        let above = (mb_y > 0).then(|| &coded[idx - mbw]);
+        let lnb = left.map(|m| &m.nb);
+        let anb = above.map(|m| &m.nb);
+        write_mb_skip_cabac(&mut e, &mut st, lnb, anb, true, matches!(mb, BMb::Skip(_)));
+        // The B `mb_type` first-bin context counts available neighbours
+        // that are neither B_Skip nor B_Direct_16x16.
+        let cond = |m: Option<&Coded>| -> usize {
+            m.map_or(0, |m| !(m.nb.skip || m.nb.direct) as usize)
+        };
+        let inc = cond(left) + cond(above);
+        let entry = match mb {
+            BMb::Skip(dec) => {
+                st.prev_qp_delta_nonzero = false;
+                Coded {
+                    nb: WrittenMb::from_b_decision(dec),
+                    not_nxn: true,
+                    chroma_nonzero: false,
+                }
+            }
+            BMb::Direct(dec) | BMb::Explicit(dec) => {
+                let direct = matches!(mb, BMb::Direct(_));
+                let t = if direct {
+                    0
+                } else {
+                    match dec.used {
+                        [true, false] => 1,
+                        [false, true] => 2,
+                        [true, true] => 3,
+                        [false, false] => unreachable!("an explicit B macroblock uses a list"),
+                    }
+                };
+                write_mb_type_b_cabac(&mut e, &mut st, inc, t);
+                if !direct {
+                    // One reference per list, so no ref_idx; the mvds in
+                    // list order for the lists the direction uses.
+                    debug_assert!(dec.ref_idx.iter().all(|&r| r <= 0));
+                    for l in 0..2 {
+                        if dec.used[l] {
+                            write_mvd_16x16_cabac(&mut e, &mut st, lnb, anb, l, dec.mvd[l]);
+                        }
+                    }
+                }
+                write_cbp_cabac(
+                    &mut e,
+                    &mut st,
+                    lnb,
+                    anb,
+                    dec.cbp_luma | (dec.cbp_chroma << 4),
+                    cfi == 1 || cfi == 2,
+                );
+                if dec.cbp_luma != 0 || dec.cbp_chroma != 0 {
+                    write_mb_qp_delta_cabac(&mut e, &mut st, dec.qp_delta as i32);
+                    st.prev_qp_delta_nonzero = dec.qp_delta != 0;
+                    write_inter_residual_fields_cabac(
+                        &mut e, &mut st, false, cfi, dec.cbp_luma, &dec.nz_luma, &dec.luma,
+                        dec.cbp_chroma, &dec.chroma_dc, &dec.chroma_ac, &dec.nz_chroma, lnb, anb,
+                    );
+                } else {
+                    st.prev_qp_delta_nonzero = false;
+                }
+                Coded {
+                    nb: WrittenMb::from_b_decision(dec),
+                    not_nxn: true,
+                    chroma_nonzero: false,
+                }
+            }
+            BMb::Intra(idec) => {
+                // Intra in a B slice: the same macroblock behind the B
+                // prefix, `mb_type` shifted by 23.
+                write_mb_type_b_cabac(&mut e, &mut st, inc, 23 + intra_mb_type_code(idec));
+                write_intra_body(&mut e, &mut st, idec, left, above, cfi);
+                Coded {
+                    nb: WrittenMb::from_decision(idec),
+                    not_nxn: idec.kind != MbKind::I4x4,
+                    chroma_nonzero: idec.chroma_mode != 0,
+                }
+            }
+        };
+        coded.push(entry);
+        e.encode_terminate((coded.len() == total) as u32); // end_of_slice_flag
+    });
+    drop(e);
+    w.align_zero();
+    fmbs
 }
 
 /// The slice data of an all-skip CABAC inter picture, P or B: one

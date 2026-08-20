@@ -29,8 +29,9 @@
 
 use crate::bitwriter::BitWriter;
 use crate::encode::h264_intra::{MbDecision, MbKind};
-use crate::encode::h264_me::{InterDecision, InterMbKind};
-use crate::encode::h264_pic::{IntraTools, PMb, code_intra_picture, code_p_picture};
+use crate::encode::h264_deblock::FilterMb;
+use crate::encode::h264_me::{BDecision, InterDecision, InterMbKind};
+use crate::encode::h264_pic::{BMb, IntraTools, PMb, code_b_picture, code_intra_picture, code_p_picture};
 use crate::encode::h264_syntax::{Geometry, Plane, Recon};
 use crate::h264::cavlc::{SCAN_CHROMA_DC, write_residual_block_cavlc};
 use crate::h264::mb::raster_of_blk;
@@ -444,13 +445,13 @@ pub fn write_intra_picture(
     qp: u8,
     planes: &[Plane<'_>],
     rec: &mut [Recon],
-) {
+) -> Vec<FilterMb> {
     let mbs_wide = g.mbs_wide as usize;
     let rows = g.chroma_mb().1 as usize / 4;
     let mut st = NzState::new(mbs_wide, rows);
     code_intra_picture(g, tools, qp, planes, rec, |mb_x, mb_y, dec| {
         write_macroblock(w, dec, &mut st, mb_x, mb_x > 0, mb_y > 0, 0);
-    });
+    })
 }
 
 /// Write every macroblock of a P CAVLC picture: the shared walk
@@ -471,7 +472,7 @@ pub fn write_p_picture(
     planes: &[Plane<'_>],
     rec: &mut [Recon],
     refp: &[Recon],
-) {
+) -> Vec<FilterMb> {
     let mbs_wide = g.mbs_wide as usize;
     let rows = g.chroma_mb().1 as usize / 4;
     let mut st = NzState::new(mbs_wide, rows);
@@ -480,7 +481,7 @@ pub fn write_p_picture(
     // *every* coded macroblock (zero included) and a bare trailing run
     // when the slice ends in skips (7.3.4).
     let mut skip_run: u32 = 0;
-    code_p_picture(g, tools, qp, planes, rec, refp, |mb_x, mb_y, mb| match mb {
+    let fmbs = code_p_picture(g, tools, qp, planes, rec, refp, |mb_x, mb_y, mb| match mb {
         PMb::Skip(_) => {
             skip_run += 1;
             skip_nz(&mut st, mb_x);
@@ -501,6 +502,116 @@ pub fn write_p_picture(
     if skip_run > 0 {
         w.ue(skip_run);
     }
+    fmbs
+}
+
+/// Write one coded B macroblock — `mb_type` (Table 7-14's 16x16 rows)
+/// through the residual. The skip run belongs to the caller; no `ref_idx`
+/// is written because exactly one reference is active per list, and the
+/// mvds come in list order for the lists the direction uses (7.3.5.1's
+/// prediction loops). `B_Direct_16x16` carries no motion syntax at all —
+/// `mb_type` 0, then straight to the coded block pattern.
+fn write_b16_macroblock(
+    w: &mut BitWriter,
+    dec: &BDecision,
+    st: &mut NzState,
+    mb_x: usize,
+    left: bool,
+    top: bool,
+    direct: bool,
+) {
+    debug_assert!(dec.ref_idx.iter().all(|&r| r <= 0), "multi-reference lists need te(v) ref_idx");
+    if direct {
+        w.ue(0); // B_Direct_16x16
+    } else {
+        // B_L0_16x16 (1), B_L1_16x16 (2), B_Bi_16x16 (3).
+        let t = match dec.used {
+            [true, false] => 1,
+            [false, true] => 2,
+            [true, true] => 3,
+            [false, false] => unreachable!("an explicit B macroblock uses a list"),
+        };
+        w.ue(t);
+        for l in 0..2 {
+            if dec.used[l] {
+                w.se(dec.mvd[l].x as i32);
+                w.se(dec.mvd[l].y as i32);
+            }
+        }
+    }
+    let cbp = (dec.cbp_luma | (dec.cbp_chroma << 4)) as usize;
+    let code = if st.rows != 0 {
+        INTER_CBP_TO_GOLOMB[cbp]
+    } else {
+        INTER_CBP_TO_GOLOMB_GRAY[cbp]
+    };
+    w.ue(code as u32);
+    if cbp != 0 {
+        w.se(dec.qp_delta as i32);
+    }
+    write_mb_residual(
+        w,
+        st,
+        mb_x,
+        left,
+        top,
+        None,
+        cbp,
+        &dec.luma,
+        &dec.chroma_dc,
+        &dec.chroma_ac,
+        &dec.nz_luma,
+        &dec.nz_chroma,
+    );
+}
+
+/// Write every macroblock of a B CAVLC picture: the shared walk
+/// (`h264_pic::code_b_picture`) owns the searches, the direct derivation and the
+/// intra fallback; this side spells the bits — the same `mb_skip_run`
+/// bookkeeping as P — and keeps the `nC` state. Returns the picture's
+/// motion record for the caller's reference bookkeeping.
+#[allow(clippy::too_many_arguments)]
+pub fn write_b_picture(
+    w: &mut BitWriter,
+    g: &Geometry,
+    tools: &IntraTools,
+    qp: u8,
+    planes: &[Plane<'_>],
+    rec: &mut [Recon],
+    refs: [&[Recon]; 2],
+    col: &[FilterMb],
+) -> Vec<FilterMb> {
+    let mbs_wide = g.mbs_wide as usize;
+    let rows = g.chroma_mb().1 as usize / 4;
+    let mut st = NzState::new(mbs_wide, rows);
+    let mut skip_run: u32 = 0;
+    let fmbs = code_b_picture(g, tools, qp, planes, rec, refs, col, |mb_x, mb_y, mb| match mb {
+        BMb::Skip(_) => {
+            skip_run += 1;
+            skip_nz(&mut st, mb_x);
+        }
+        BMb::Direct(dec) => {
+            w.ue(skip_run);
+            skip_run = 0;
+            write_b16_macroblock(w, dec, &mut st, mb_x, mb_x > 0, mb_y > 0, true);
+        }
+        BMb::Explicit(dec) => {
+            w.ue(skip_run);
+            skip_run = 0;
+            write_b16_macroblock(w, dec, &mut st, mb_x, mb_x > 0, mb_y > 0, false);
+        }
+        BMb::Intra(idec) => {
+            w.ue(skip_run);
+            skip_run = 0;
+            // Intra in a B slice: the same macroblock, `mb_type` shifted
+            // by 23 (Table 7-14's note).
+            write_macroblock(w, idec, &mut st, mb_x, mb_x > 0, mb_y > 0, 23);
+        }
+    });
+    if skip_run > 0 {
+        w.ue(skip_run);
+    }
+    fmbs
 }
 
 #[cfg(test)]
@@ -636,6 +747,76 @@ mod tests {
                         "chroma nz {comp}/{blk}"
                     );
                 }
+            }
+        }
+    }
+
+    /// Write one B macroblock of each 16x16 shape and hand the bits to
+    /// the production reader: the direction, the per-list mvds in list
+    /// order, the absent ref_idx, the INTER coded-block-pattern column
+    /// and the nonzero counts must all come back as written — and
+    /// `B_Direct_16x16` must come back as exactly `mb_type` 0 with no
+    /// motion syntax consumed.
+    #[test]
+    fn a_b16_macroblock_round_trips_through_the_reader() {
+        use crate::h264::mb::PRED_L0;
+        let cases: [(bool, [bool; 2], [crate::h264::frame::Mv; 2]); 5] = [
+            (true, [true, true], [crate::h264::frame::Mv::ZERO; 2]),
+            (false, [true, false], [crate::h264::frame::Mv::new(7, -3), crate::h264::frame::Mv::ZERO]),
+            (false, [false, true], [crate::h264::frame::Mv::ZERO, crate::h264::frame::Mv::new(-13, 21)]),
+            (false, [true, true], [crate::h264::frame::Mv::new(2, 2), crate::h264::frame::Mv::new(-1, 5)]),
+            (false, [true, true], [crate::h264::frame::Mv::ZERO, crate::h264::frame::Mv::ZERO]),
+        ];
+        for (direct, used, mvd) in cases {
+            let mut dec = BDecision { used, mvd, ..BDecision::default() };
+            dec.ref_idx = [if used[0] { 0 } else { -1 }, if used[1] { 0 } else { -1 }];
+            dec.luma[0][0] = 4;
+            dec.luma[0][5] = -1;
+            dec.nz_luma[0] = 2;
+            dec.cbp_luma = 0b0001;
+            dec.chroma_dc[0][1] = 2;
+            dec.cbp_chroma = 1;
+
+            let mut st = NzState::new(1, 2);
+            let mut w = BitWriter::new();
+            write_b16_macroblock(&mut w, &dec, &mut st, 0, false, false, direct);
+            w.rbsp_trailing_bits();
+            let rbsp = w.into_rbsp();
+
+            let ctx = SliceCtx {
+                slice_type: SliceType::B,
+                num_ref_idx: [1, 1],
+                direct_spatial: true,
+                ..p_ctx()
+            };
+            let info = PicInfo::new(1, 1);
+            let nb = MbNeighbours { mb_width: 1, ..MbNeighbours::default() };
+            let dq = Dequant::new(&flat());
+            let mut qps = QpState { prev_qp: 28, chroma_offset: [0, 0] };
+            let mut r = BitReader::new(&rbsp);
+            let t = r.ue();
+            let mut layer = MbLayer::new(DecKind::I4x4);
+            parse_mb_cavlc(&mut r, &ctx, &info, &nb, t, &mut layer, &dq, &mut qps)
+                .expect("the reader rejected what the writer produced");
+            assert!(!r.overrun());
+
+            if direct {
+                assert_eq!(t, 0);
+                assert_eq!(layer.kind, DecKind::BDirect16x16);
+            } else {
+                assert_eq!(layer.kind, DecKind::Inter16x16, "used {used:?}");
+                let want_dir = (used[0] as u8) * PRED_L0 + (used[1] as u8) * 2;
+                assert_eq!(layer.pred_dir[0], want_dir, "used {used:?}");
+                for l in 0..2 {
+                    if used[l] {
+                        assert_eq!(layer.mvd[0].mvd[l], mvd[l], "list {l}");
+                        assert_eq!(layer.ref_idx[l][0], 0, "list {l}");
+                    }
+                }
+            }
+            assert_eq!(layer.cbp, dec.cbp_luma | (dec.cbp_chroma << 4));
+            for blk in 0..16 {
+                assert_eq!(layer.nz[0][blk], dec.nz_luma[blk], "luma nz {blk}");
             }
         }
     }

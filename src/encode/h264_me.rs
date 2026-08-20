@@ -68,6 +68,7 @@
 use crate::dsp::distortion::DistortionDsp;
 use crate::dsp::h264::{NO_DC, PRED_STRIDE};
 use crate::dsp::h264_enc::{qbits4, quant_offset};
+use crate::encode::h264_deblock::FilterMb;
 use crate::encode::h264_intra::IntraCtx;
 use crate::encode::h264_syntax::Recon;
 use crate::h264::frame::Mv;
@@ -475,27 +476,142 @@ fn add_residual_4x4(ctx: &MeCtx, rec: &mut Recon, off: usize, levels: &[i16; 16]
     (ctx.dsp.residual4)(&mut rec.data[off..], rec.stride, &coefs, dc.unwrap_or(NO_DC), 255);
 }
 
-/// Code the chroma of the macroblock for the chosen vector: prediction
-/// through the decoder's bilinear kernel, per-4x4 forward transform with
-/// the DC pulled into the 2x2 (4:2:0) or 2x4 (4:2:2) Hadamard, and the
-/// reconstruction back through the decoder's DC transform and residual
-/// add. The shape of `code_chroma` in `src/encode/h264_intra.rs`, with the
-/// inter scaling lists (Cb 4, Cr 5) and the inter dead zone.
-fn code_inter_chroma(ctx: &MeCtx, rec: &mut [Recon], refp: &[Recon], cx: usize, cy: usize, mv: Mv, src: [&[u8]; 2], src_stride: usize, out: &mut InterDecision) {
+/// Write the 16x16 inter prediction for one or two references into the
+/// reconstruction planes, through the decoder's kernels and — when both
+/// lists predict — the decoder's default bi-predictive combine
+/// (`(a + b + 1) >> 1`, the `dsp.avg` kernel `predict_partition` runs for
+/// `Weighting::Default`). What stands in `rec` afterwards is bit-identical
+/// to what a decoder derives for the same vectors.
+fn predict_inter_16x16(
+    ctx: &MeCtx,
+    rec: &mut [Recon],
+    refs: [&[Recon]; 2],
+    px: usize,
+    py: usize,
+    used: [bool; 2],
+    mv: [Mv; 2],
+) {
+    debug_assert!(used[0] || used[1]);
+    let mut a = [0u8; 16 * PRED_STRIDE];
+    let mut b = [0u8; 16 * PRED_STRIDE];
+    // Luma.
+    let off = rec[0].offset(px as isize, py as isize);
+    let stride = rec[0].stride;
+    if used[0] && used[1] {
+        luma_pred_into(ctx, &refs[0][0], px as i32, py as i32, mv[0], &mut a);
+        luma_pred_into(ctx, &refs[1][0], px as i32, py as i32, mv[1], &mut b);
+        (ctx.dsp.avg)(&mut rec[0].data[off..], stride, &a, &b, 16, 16);
+    } else {
+        let l = if used[0] { 0 } else { 1 };
+        luma_pred_into(ctx, &refs[l][0], px as i32, py as i32, mv[l], &mut a);
+        (ctx.dsp.copy)(&mut rec[0].data[off..], stride, &a, 16, 16);
+    }
+    // Chroma.
     let h = ctx.chroma_h;
     if h == 0 {
         return;
     }
+    let (cx, cy) = ((px / 16) * 8, (py / 16) * h);
+    for comp in 0..2 {
+        let plane = &mut rec[comp + 1];
+        let off = plane.offset(cx as isize, cy as isize);
+        let stride = plane.stride;
+        if used[0] && used[1] {
+            chroma_pred_into(ctx, &refs[0][comp + 1], cx as i32, cy as i32, mv[0], h, &mut a);
+            chroma_pred_into(ctx, &refs[1][comp + 1], cx as i32, cy as i32, mv[1], h, &mut b);
+            (ctx.dsp.avg)(&mut plane.data[off..], stride, &a, &b, 8, h);
+        } else {
+            let l = if used[0] { 0 } else { 1 };
+            chroma_pred_into(ctx, &refs[l][comp + 1], cx as i32, cy as i32, mv[l], h, &mut a);
+            (ctx.dsp.copy)(&mut plane.data[off..], stride, &a, 8, h);
+        }
+    }
+}
+
+/// The coded residual of one inter macroblock, in the layout
+/// [`InterDecision`] (and the B decision) carry — produced by
+/// `code_inter_mb_residual` once the prediction stands in `rec`.
+struct InterResidual {
+    /// `CodedBlockPatternLuma`.
+    cbp_luma: u8,
+    /// `CodedBlockPatternChroma`.
+    cbp_chroma: u8,
+    /// Luma levels per 4x4 (raster), DC in place.
+    luma: [[i16; 16]; 16],
+    /// Nonzero count per luma block.
+    nz_luma: [u8; 16],
+    /// Chroma DC levels per component.
+    chroma_dc: [[i16; 8]; 2],
+    /// Chroma AC levels per component and block, position 0 zeroed.
+    chroma_ac: [[[i16; 16]; 8]; 2],
+    /// Nonzero count per chroma block.
+    nz_chroma: [[u8; 8]; 2],
+}
+
+/// Code the residual of a 16x16 inter macroblock whose *prediction*
+/// already stands in every plane of `rec`: forward transform and
+/// quantisation with the inter tables, reconstruction back through the
+/// decoder's inverse path in place, coefficients and counts out. Shared
+/// by the P and B paths — the prediction differs between them, the
+/// residual machinery must not.
+fn code_inter_mb_residual(
+    ctx: &MeCtx,
+    rec: &mut [Recon],
+    mb_x: usize,
+    mb_y: usize,
+    src_luma: &[u8],
+    luma_stride: usize,
+    src_chroma: [&[u8]; 2],
+    chroma_stride: usize,
+) -> InterResidual {
+    let (px, py) = (mb_x * 16, mb_y * 16);
+    let soff = py * luma_stride + px;
+    let mut out = InterResidual {
+        cbp_luma: 0,
+        cbp_chroma: 0,
+        luma: [[0; 16]; 16],
+        nz_luma: [0; 16],
+        chroma_dc: [[0; 8]; 2],
+        chroma_ac: [[[0; 16]; 8]; 2],
+        nz_chroma: [[0; 8]; 2],
+    };
+
+    // Luma: each 4x4 coded and reconstructed in place. Raster order —
+    // inter blocks predict from the reference, not from each other, so
+    // unlike Intra_4x4 nothing here needs the decode scan.
+    let off = rec[0].offset(px as isize, py as isize);
+    for blk in 0..16 {
+        let (bx, by) = (blk % 4, blk / 4);
+        let boff = off + by * 4 * rec[0].stride + bx * 4;
+        let bsoff = soff + by * 4 * luma_stride + bx * 4;
+        let (lv, n, _) = code_inter_4x4(ctx, &rec[0], boff, &src_luma[bsoff..], luma_stride, 3, ctx.qp, true);
+        out.luma[blk] = lv;
+        out.nz_luma[blk] = n as u8;
+        add_residual_4x4(ctx, &mut rec[0], boff, &lv, 3, ctx.qp, None);
+    }
+    for blk8 in 0..4 {
+        let (ox, oy) = ((blk8 % 2) * 2, (blk8 / 2) * 2);
+        if (0..4).any(|k| out.nz_luma[(oy + k / 2) * 4 + ox + k % 2] != 0) {
+            out.cbp_luma |= 1 << blk8;
+        }
+    }
+
+    // Chroma, per component: per-4x4 AC with the DC pulled into the 2x2
+    // (4:2:0) or 2x4 (4:2:2) Hadamard, reconstruction back through the
+    // decoder's DC transform and residual add.
+    let h = ctx.chroma_h;
+    if h == 0 {
+        return out;
+    }
+    let (cx, cy) = (mb_x * 8, mb_y * h);
+    let coff = cy * chroma_stride + cx;
     let blocks = h / 4 * 2;
     let mut any_ac = false;
     let mut any_dc = false;
-    let mut scratch = [0u8; 16 * PRED_STRIDE];
     for comp in 0..2 {
-        chroma_pred_into(ctx, &refp[comp + 1], cx as i32, cy as i32, mv, h, &mut scratch);
+        let src = &src_chroma[comp][coff..];
         let plane = &mut rec[comp + 1];
         let off = plane.offset(cx as isize, cy as isize);
-        (ctx.dsp.copy)(&mut plane.data[off..], plane.stride, &scratch, 8, h);
-
         let qp = ctx.qpc[comp];
         let list = 4 + comp; // Cb inter, Cr inter
         let mut dcs = [0i32; 8];
@@ -504,8 +620,8 @@ fn code_inter_chroma(ctx: &MeCtx, rec: &mut [Recon], refp: &[Recon], cx: usize, 
         for blk in 0..blocks {
             let (bx, by) = (blk % 2, blk / 2);
             let boff = off + by * 4 * plane.stride + bx * 4;
-            let soff = by * 4 * src_stride + bx * 4;
-            let (lv, n, dc) = code_inter_4x4(ctx, plane, boff, &src[comp][soff..], src_stride, list, qp, false);
+            let bsoff = by * 4 * chroma_stride + bx * 4;
+            let (lv, n, dc) = code_inter_4x4(ctx, plane, boff, &src[bsoff..], chroma_stride, list, qp, false);
             levels[blk] = lv;
             nz[blk] = n as u8;
             dcs[blk] = dc;
@@ -566,6 +682,7 @@ fn code_inter_chroma(ctx: &MeCtx, rec: &mut [Recon], refp: &[Recon], cx: usize, 
     } else {
         0
     };
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -634,50 +751,20 @@ pub fn code_macroblock_p16(
         return out;
     }
 
-    // Luma: the chosen vector's prediction into the reconstruction plane
-    // (through the decoder's kernel), then each 4x4 coded and reconstructed
-    // in place. Raster order — inter blocks predict from the reference,
-    // not from each other, so unlike Intra_4x4 nothing here needs the
-    // decode scan.
-    let off = rec[0].offset(px as isize, py as isize);
-    let mut scratch = [0u8; 16 * PRED_STRIDE];
-    luma_pred_into(ctx, &refp[0], px as i32, py as i32, mv, &mut scratch);
-    (ctx.dsp.copy)(&mut rec[0].data[off..], rec[0].stride, &scratch, 16, 16);
-    let mut nz = [0u8; 16];
-    for blk in 0..16 {
-        let (bx, by) = (blk % 4, blk / 4);
-        let boff = off + by * 4 * rec[0].stride + bx * 4;
-        let bsoff = soff + by * 4 * luma_stride + bx * 4;
-        let (lv, n, _) = code_inter_4x4(ctx, &rec[0], boff, &src_luma[bsoff..], luma_stride, 3, ctx.qp, true);
-        out.luma[blk] = lv;
-        nz[blk] = n as u8;
-        add_residual_4x4(ctx, &mut rec[0], boff, &lv, 3, ctx.qp, None);
-    }
-    out.nz_luma = nz;
-    let mut cbp = 0u8;
-    for blk8 in 0..4 {
-        let (ox, oy) = ((blk8 % 2) * 2, (blk8 / 2) * 2);
-        if (0..4).any(|k| nz[(oy + k / 2) * 4 + ox + k % 2] != 0) {
-            cbp |= 1 << blk8;
-        }
-    }
-    out.cbp_luma = cbp;
-
-    if ctx.chroma_h != 0 {
-        let (cx, cy) = (mb_x * 8, mb_y * ctx.chroma_h);
-        let coff = cy * chroma_stride + cx;
-        code_inter_chroma(
-            ctx,
-            rec,
-            refp,
-            cx,
-            cy,
-            mv,
-            [&src_chroma[0][coff..], &src_chroma[1][coff..]],
-            chroma_stride,
-            &mut out,
-        );
-    }
+    // The chosen vector's prediction into the reconstruction planes
+    // (through the decoder's kernels), then the residual coded and
+    // reconstructed in place.
+    predict_inter_16x16(ctx, rec, [refp, refp], px, py, [true, false], [mv, Mv::ZERO]);
+    let r = code_inter_mb_residual(
+        ctx, rec, mb_x, mb_y, src_luma, luma_stride, src_chroma, chroma_stride,
+    );
+    out.cbp_luma = r.cbp_luma;
+    out.cbp_chroma = r.cbp_chroma;
+    out.luma = r.luma;
+    out.nz_luma = r.nz_luma;
+    out.chroma_dc = r.chroma_dc;
+    out.chroma_ac = r.chroma_ac;
+    out.nz_chroma = r.nz_chroma;
 
     // P_Skip needs both legs: the vector the decoder would derive, and no
     // surviving residual. Either alone is a different macroblock — a zero
@@ -685,6 +772,269 @@ pub fn code_macroblock_p16(
     // vector with residual is P_16x16 with mvd 0.
     if out.cbp_luma == 0 && out.cbp_chroma == 0 && mv == skip_mv_16x16(nb) {
         out.kind = InterMbKind::PSkip;
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// B macroblocks
+// ---------------------------------------------------------------------------
+
+/// The macroblock types the B decision chooses between.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BMbKind {
+    /// `B_Skip`: direct motion, no residual, no syntax at all.
+    BSkip,
+    /// `B_Direct_16x16`: direct motion with a residual (`mb_type` 0).
+    BDirect16,
+    /// One explicit 16x16 partition — `B_L0_16x16`, `B_L1_16x16` or
+    /// `B_Bi_16x16` by [`BDecision::used`].
+    B16,
+    /// Inter lost: code this macroblock with the intra decision instead.
+    UseIntra,
+}
+
+/// How a B macroblock was coded, in the form an entropy coder needs — the
+/// two-list sibling of [`InterDecision`], with the same residual layout.
+#[derive(Clone)]
+pub struct BDecision {
+    /// The macroblock-level choice. For [`BMbKind::UseIntra`] every other
+    /// field except the motion is meaningless, exactly as with
+    /// [`InterMbKind::UseIntra`].
+    pub kind: BMbKind,
+    /// Which lists predict. `B16`: the searched direction (`[true,false]`
+    /// L0, `[false,true]` L1, `[true,true]` bi). `BSkip` / `BDirect16`:
+    /// the derived direct references — which is `[true,true]` whenever any
+    /// neighbour predicts from a list, and *always* both when no
+    /// neighbour does (8.4.1.2.2's both-negative rule).
+    pub used: [bool; 2],
+    /// The vector per list, quarter luma samples, meaningful where `used`.
+    /// Filled for every kind including the skips (the derived motion),
+    /// because later macroblocks' prediction and the loop filter need it.
+    pub mv: [Mv; 2],
+    /// `mv` minus that list's median predictor: what `mvd_lX` carries for
+    /// `B16`. Zero for the direct kinds (their syntax carries none).
+    pub mvd: [Mv; 2],
+    /// Reference index per list: 0 where `used`, -1 where not — the
+    /// values a decoder stores.
+    pub ref_idx: [i8; 2],
+    /// `CodedBlockPatternLuma`, as in [`InterDecision::cbp_luma`].
+    pub cbp_luma: u8,
+    /// `CodedBlockPatternChroma`.
+    pub cbp_chroma: u8,
+    /// `mb_qp_delta`. Zero — constant-QP coding.
+    pub qp_delta: i8,
+    /// Luma levels per 4x4 (raster), DC in place; the scan is the
+    /// entropy writer's. Identical layout to [`InterDecision::luma`].
+    pub luma: [[i16; 16]; 16],
+    /// Chroma DC levels per component.
+    pub chroma_dc: [[i16; 8]; 2],
+    /// Chroma AC levels per component and block, position 0 zeroed.
+    pub chroma_ac: [[[i16; 16]; 8]; 2],
+    /// Nonzero count per luma block.
+    pub nz_luma: [u8; 16],
+    /// The same per chroma block.
+    pub nz_chroma: [[u8; 8]; 2],
+}
+
+impl Default for BDecision {
+    fn default() -> Self {
+        BDecision {
+            kind: BMbKind::B16,
+            used: [true, false],
+            mv: [Mv::ZERO; 2],
+            mvd: [Mv::ZERO; 2],
+            ref_idx: [0, -1],
+            cbp_luma: 0,
+            cbp_chroma: 0,
+            qp_delta: 0,
+            luma: [[0; 16]; 16],
+            chroma_dc: [[0; 8]; 2],
+            chroma_ac: [[[0; 16]; 8]; 2],
+            nz_luma: [0; 16],
+            nz_chroma: [[0; 8]; 2],
+        }
+    }
+}
+
+/// `MinPositive` of two reference indices — the mirror of `min_positive`
+/// in `src/h264/mb.rs` (private there), which `spatial_direct_ref_idx`
+/// folds over the neighbours.
+fn min_positive(a: i8, b: i8) -> i8 {
+    if a >= 0 && b >= 0 { a.min(b) } else { a.max(b) }
+}
+
+/// The spatial direct motion of a 16x16 B macroblock (8.4.1.2.2),
+/// returning the reference index and vector per list.
+///
+/// Mirrors the decoder's derivation in `src/h264/recon.rs`
+/// (`derive_motion`'s `direct_spatial` branch): the reference indices are
+/// the `MinPositive` over the A / B / C neighbours per list
+/// (`spatial_direct_ref_idx`, with `prediction_neighbours`' C-to-D
+/// fallback); both negative means both lists at reference 0 with zero
+/// vectors; otherwise each used list takes the 16x16 median prediction —
+/// through the decoder's own `median_mvp` — unless the colocated block is
+/// effectively still (`colZeroFlag`: not intra, reference index 0, both
+/// vector components within plus-or-minus one quarter sample; the list
+/// preference of `colocated_motion` in `src/h264/mb.rs` — list 0, else
+/// list 1), in which case that list's vector is zero.
+///
+/// `col` is the colocated macroblock's record in the list-1 reference —
+/// one motion for the whole macroblock. The standard derives colZeroFlag
+/// per 8x8 from that partition's corner 4x4; reading one record per
+/// macroblock is exact because of INVARIANT(16x16-only) (see
+/// [`FilterMb`]): every colocated picture this encoder produced stored
+/// one motion per macroblock, so the four corner reads agree by
+/// construction. Long-term references do not exist here, so the
+/// long-term guard on colZeroFlag is vacuously satisfied.
+pub fn spatial_direct_16x16(nb: &[MotionNeighbours; 2], col: &FilterMb) -> ([i8; 2], [Mv; 2]) {
+    let mut ref_idx = [0i8; 2];
+    for (l, n) in nb.iter().enumerate() {
+        let c = if n.c.avail { n.c } else { n.d };
+        ref_idx[l] = min_positive(n.a.ref_idx, min_positive(n.b.ref_idx, c.ref_idx));
+    }
+    let mut mvp = [Mv::ZERO; 2];
+    if ref_idx[0] < 0 && ref_idx[1] < 0 {
+        ref_idx = [0, 0];
+    } else {
+        for (l, n) in nb.iter().enumerate() {
+            if ref_idx[l] >= 0 {
+                let c = if n.c.avail { n.c } else { n.d };
+                mvp[l] = median_mvp(n.a, n.b, c, ref_idx[l]);
+            }
+        }
+    }
+    // colZeroFlag off the colocated record, with `colocated_motion`'s
+    // list preference. A stored list is always reference 0 here.
+    let col_motion = if col.kind.is_intra() { None } else { col.l0.or(col.l1) };
+    let col_zero = matches!(col_motion, Some(mv) if (-1..=1).contains(&mv.x) && (-1..=1).contains(&mv.y));
+    let mut mv = [Mv::ZERO; 2];
+    for l in 0..2 {
+        if ref_idx[l] >= 0 && !(ref_idx[l] == 0 && col_zero) {
+            mv[l] = mvp[l];
+        }
+    }
+    (ref_idx, mv)
+}
+
+/// SATD of the source block against the 16x16 luma prediction for the
+/// given lists and vectors, without touching `rec` — how the B candidates
+/// are priced before one of them is committed.
+#[allow(clippy::too_many_arguments)]
+fn b_luma_satd(
+    ctx: &MeCtx,
+    refs: [&[Recon]; 2],
+    px: i32,
+    py: i32,
+    src: &[u8],
+    src_stride: usize,
+    used: [bool; 2],
+    mv: [Mv; 2],
+) -> u32 {
+    let mut a = [0u8; 16 * PRED_STRIDE];
+    if used[0] && used[1] {
+        let mut b = [0u8; 16 * PRED_STRIDE];
+        let mut c = [0u8; 16 * PRED_STRIDE];
+        luma_pred_into(ctx, &refs[0][0], px, py, mv[0], &mut a);
+        luma_pred_into(ctx, &refs[1][0], px, py, mv[1], &mut b);
+        (ctx.dsp.avg)(&mut c, PRED_STRIDE, &a, &b, 16, 16);
+        (ctx.dist.satd)(src, src_stride, &c, PRED_STRIDE, 16, 16)
+    } else {
+        let l = if used[0] { 0 } else { 1 };
+        luma_pred_into(ctx, &refs[l][0], px, py, mv[l], &mut a);
+        (ctx.dist.satd)(src, src_stride, &a, PRED_STRIDE, 16, 16)
+    }
+}
+
+/// Decide and code one B macroblock, leaving its reconstruction in `rec`.
+///
+/// `refs` are the list-0 (past) and list-1 (future) reference pictures'
+/// planes, borders replicated; `nb` the neighbouring motion per list;
+/// `col` the colocated macroblock's record in the list-1 reference (see
+/// [`spatial_direct_16x16`]). The candidates are direct, L0, L1 and
+/// bi-predictive 16x16 — direct keeps ties, because its syntax is
+/// cheapest — with the intra fallback consulted last, exactly as in the
+/// P path. `B_Skip` is chosen when direct won and no residual survived;
+/// unlike `P_Skip` there is no vector-equality leg, because direct motion
+/// *is* the derived motion.
+///
+/// On [`BMbKind::UseIntra`] the reconstruction planes are untouched: the
+/// caller runs the intra decision, which writes them itself.
+#[allow(clippy::too_many_arguments)]
+pub fn code_macroblock_b16(
+    ctx: &MeCtx,
+    rec: &mut [Recon],
+    refs: [&[Recon]; 2],
+    mb_x: usize,
+    mb_y: usize,
+    src_luma: &[u8],
+    luma_stride: usize,
+    src_chroma: [&[u8]; 2],
+    chroma_stride: usize,
+    nb: &[MotionNeighbours; 2],
+    col: &FilterMb,
+) -> BDecision {
+    let (px, py) = (mb_x * 16, mb_y * 16);
+    let soff = py * luma_stride + px;
+    let src = &src_luma[soff..];
+    let mut out = BDecision::default();
+
+    // Direct first: it wins ties, because it costs no motion syntax.
+    let (dref, dmv) = spatial_direct_16x16(nb, col);
+    let dused = [dref[0] >= 0, dref[1] >= 0];
+    let mut best_cost = b_luma_satd(ctx, refs, px as i32, py as i32, src, luma_stride, dused, dmv);
+    out.kind = BMbKind::BDirect16;
+    out.used = dused;
+    out.mv = dmv;
+    out.ref_idx = dref;
+
+    // Explicit candidates: one search per list around that list's median
+    // predictor, then the bi combination of the two winners.
+    let pred = [mv_predictor_16x16(&nb[0]), mv_predictor_16x16(&nb[1])];
+    let (mv0, _) = search_16x16(ctx, &refs[0][0], px as i32, py as i32, src, luma_stride, pred[0]);
+    let (mv1, _) = search_16x16(ctx, &refs[1][0], px as i32, py as i32, src, luma_stride, pred[1]);
+    for (used, label_mv) in [
+        ([true, false], [mv0, Mv::ZERO]),
+        ([false, true], [Mv::ZERO, mv1]),
+        ([true, true], [mv0, mv1]),
+    ] {
+        let cost = b_luma_satd(ctx, refs, px as i32, py as i32, src, luma_stride, used, label_mv);
+        if cost < best_cost {
+            best_cost = cost;
+            out.kind = BMbKind::B16;
+            out.used = used;
+            out.mv = label_mv;
+            out.ref_idx = [if used[0] { 0 } else { -1 }, if used[1] { 0 } else { -1 }];
+        }
+    }
+    if out.kind == BMbKind::B16 {
+        for l in 0..2 {
+            if out.used[l] {
+                out.mvd[l] = Mv::new(out.mv[l].x - pred[l].x, out.mv[l].y - pred[l].y);
+            }
+        }
+    }
+
+    if placeholder_inter_or_intra(ctx.dist, best_cost, src, luma_stride) {
+        out.kind = BMbKind::UseIntra;
+        return out;
+    }
+
+    // Commit: the winner's prediction into the reconstruction planes,
+    // then the shared residual machinery.
+    predict_inter_16x16(ctx, rec, refs, px, py, out.used, out.mv);
+    let r = code_inter_mb_residual(ctx, rec, mb_x, mb_y, src_luma, luma_stride, src_chroma, chroma_stride);
+    out.cbp_luma = r.cbp_luma;
+    out.cbp_chroma = r.cbp_chroma;
+    out.luma = r.luma;
+    out.nz_luma = r.nz_luma;
+    out.chroma_dc = r.chroma_dc;
+    out.chroma_ac = r.chroma_ac;
+    out.nz_chroma = r.nz_chroma;
+
+    // B_Skip is direct with nothing left to say.
+    if out.kind == BMbKind::BDirect16 && out.cbp_luma == 0 && out.cbp_chroma == 0 {
+        out.kind = BMbKind::BSkip;
     }
     out
 }
@@ -970,6 +1320,137 @@ mod tests {
             assert_eq!(d.cbp_luma, 0, "({qx},{qy}) the residual is zero by construction");
             assert_eq!(d.cbp_chroma, 0, "({qx},{qy})");
             assert!(d.nz_luma.iter().all(|&n| n == 0));
+        }
+    }
+
+    /// The spatial direct mirror agrees with the decoder's own pieces:
+    /// the per-list reference indices with `spatial_direct_ref_idx` over
+    /// a real `MotionCache`, the median vectors with
+    /// `prediction_neighbours` + `median_mvp`, and the colocated read
+    /// with `colocated_motion` over a real colocated `Frame` — across
+    /// present/absent/intra neighbour mixes in both lists and colocated
+    /// records that are intra, still, and moving.
+    #[test]
+    fn spatial_direct_agrees_with_the_decoders_derivation() {
+        use crate::h264::mb::{
+            colocated_motion, median_mvp as dec_median, prediction_neighbours,
+            spatial_direct_ref_idx,
+        };
+        let mut seed = 91u64;
+        let mut frame = Frame::<u8>::new(3, 3, ChromaFormat::Yuv420, 8, false);
+        // A colocated frame whose single macroblock record we vary.
+        let mut colf = Frame::<u8>::new(3, 3, ChromaFormat::Yuv420, 8, false);
+        let cur_addr = 4usize;
+        let nbs = [(3usize, 0usize), (1, 1), (2, 2), (0, 3)];
+        for mask in 0..16u32 {
+            for draw in 0..6 {
+                let mut info = PicInfo::new(3, 3);
+                let mut mine = [absent_nb(), absent_nb()];
+                for &(addr, slot) in &nbs {
+                    if mask & (1 << slot) == 0 {
+                        continue;
+                    }
+                    // Each present neighbour: per list, one of unused /
+                    // used-with-a-vector; intra when both unused.
+                    let mut used_any = false;
+                    let mut per_list = [nb_intra(); 2];
+                    for l in 0..2 {
+                        if lcg(&mut seed) % 3 != 0 {
+                            let mv = Mv::new(
+                                (lcg(&mut seed) % 33) as i16 - 16,
+                                (lcg(&mut seed) % 33) as i16 - 16,
+                            );
+                            per_list[l] = nb_inter(mv);
+                            frame.motion[l][addr * 16..addr * 16 + 16].fill(BlockMotion {
+                                mv,
+                                ref_idx: 0,
+                                ref_parity: PARITY_FRAME,
+                                ref_id: 1 + l as u16,
+                            });
+                            used_any = true;
+                        } else {
+                            frame.motion[l][addr * 16..addr * 16 + 16]
+                                .fill(BlockMotion::default());
+                        }
+                    }
+                    info.mbs[addr].decoded = true;
+                    info.mbs[addr].slice = 0;
+                    info.mbs[addr].kind =
+                        if used_any { DecKind::Inter16x16 } else { DecKind::I16x16 };
+                    for (l, n) in per_list.into_iter().enumerate() {
+                        match slot {
+                            0 => mine[l].a = n,
+                            1 => mine[l].b = n,
+                            2 => mine[l].c = n,
+                            _ => mine[l].d = n,
+                        }
+                    }
+                }
+                // The colocated record: rotate through intra, still (a
+                // vector inside the +-1 window), and moving; list 1 only
+                // on some draws, exercising `colocated_motion`'s list
+                // preference.
+                let col_case = draw % 3;
+                let col_mv = match col_case {
+                    0 => Mv::ZERO,
+                    1 => Mv::new(1, -1),
+                    _ => Mv::new((lcg(&mut seed) % 21) as i16 + 2, 0),
+                };
+                let col_list1_only = draw % 2 == 1;
+                let col_intra = draw == 5;
+                colf.mb_intra[cur_addr] = col_intra;
+                for l in 0..2 {
+                    let uses = !col_intra && (l == 1 || !col_list1_only);
+                    colf.motion[l][cur_addr * 16..cur_addr * 16 + 16].fill(if uses {
+                        BlockMotion { mv: col_mv, ref_idx: 0, ref_parity: PARITY_FRAME, ref_id: 9 }
+                    } else {
+                        BlockMotion::default()
+                    });
+                }
+                let col = FilterMb {
+                    kind: if col_intra { DecKind::I16x16 } else { DecKind::Inter16x16 },
+                    nz_mask: 0,
+                    l0: (!col_intra && !col_list1_only).then_some(col_mv),
+                    l1: (!col_intra).then_some(col_mv),
+                };
+
+                // Decoder side.
+                info.mbs[cur_addr].decoded = false;
+                let mut dnb = MbNeighbours::default();
+                dnb.derive_into(&info, cur_addr, 0);
+                let mut cache = MotionCache::default();
+                cache.gather(&dnb, &frame, &info);
+                let cur = [[BlockMotion::default(); 16]; 2];
+                let mut want_ref = spatial_direct_ref_idx(&cache, &cur);
+                let mut want_mv = [Mv::ZERO; 2];
+                if want_ref[0] < 0 && want_ref[1] < 0 {
+                    want_ref = [0, 0];
+                } else {
+                    for list in 0..2 {
+                        if want_ref[list] >= 0 {
+                            let (a, b, c) = prediction_neighbours(&cache, &cur, 0, list, 0, 0, 4);
+                            want_mv[list] = dec_median(a, b, c, want_ref[list]);
+                        }
+                    }
+                }
+                let (mv_col, ref_col, _, _) = colocated_motion(&colf, cur_addr, 0);
+                let col_zero = ref_col == 0
+                    && (-1..=1).contains(&mv_col.x)
+                    && (-1..=1).contains(&mv_col.y);
+                for list in 0..2 {
+                    if want_ref[list] >= 0 && want_ref[list] == 0 && col_zero {
+                        want_mv[list] = Mv::ZERO;
+                    }
+                    if want_ref[list] < 0 {
+                        want_mv[list] = Mv::ZERO;
+                    }
+                }
+
+                // Mine.
+                let (got_ref, got_mv) = spatial_direct_16x16(&mine, &col);
+                assert_eq!(got_ref, want_ref, "mask {mask:04b} draw {draw} ref");
+                assert_eq!(got_mv, want_mv, "mask {mask:04b} draw {draw} mv");
+            }
         }
     }
 
