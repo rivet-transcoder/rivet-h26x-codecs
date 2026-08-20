@@ -23,14 +23,18 @@
 //! filtered neighbour.
 //!
 //! What the state derivation is worth testing is spelled by the boundary
-//! strengths (8.7.2.4, `boundary_strengths` in the decoder): in an
+//! strengths (8.7.2.4, `boundary_strengths` in the decoder). In an
 //! all-intra picture every flagged edge has bS 2 — the intra case
-//! short-circuits *before* `cbf_luma` or motion is consulted. So the
-//! live inputs here are the edge flags, the intra pred_mode, the QP and
-//! the bypass exemption, and the tests break when any of them is
-//! mis-derived; the cbf mirror is faithfully kept but is inert until the
-//! encoder produces inter CUs, and no all-intra test can catch dropping
-//! it. Said here so nobody writes that vacuous test believing it bites.
+//! short-circuits *before* `cbf_luma` or motion is consulted — so the
+//! live inputs of [`deblock_picture`] are the edge flags, the intra
+//! pred_mode, the QP and the bypass exemption, and no all-intra test can
+//! catch dropping the cbf mirror. P pictures changed that:
+//! [`deblock_inter_picture`]'s edges live on the full ladder — bS 2
+//! against an intra neighbour, bS 1 where a flagged edge has coded
+//! residual on either side *or* the motion differs by a quarter-sample
+//! vector of four or more (or by reference), bS 0 where none of it does
+//! — so the cbf fill and the walk-maintained motion grid both carry
+//! weight there, and each has a test that its removal fails.
 //!
 //! **SAO stays off**, and stays named: it is the other in-loop filter, a
 //! separate lever with its own SPS flag (`write_sps` keeps it 0), its own
@@ -40,7 +44,9 @@
 use std::sync::Arc;
 
 use crate::encode::h265_intra::{luma_tbs, z_within_ctb, CuDecision, IntraCtx, IntraPicture};
+use crate::encode::h265_me::{InterCuDecision, InterCuKind, InterPicture};
 use crate::hevc::deblock::{deblock_rows, DeblockScratch};
+use crate::hevc::frame::Frame;
 use crate::hevc::pic::{Geometry, PicInfo};
 use crate::hevc::pps::Pps;
 use crate::sample::Sample;
@@ -59,16 +65,84 @@ use crate::sample::Sample;
 /// ones our headers declare: zero beta/tc offsets, zero chroma QP
 /// offsets, one slice, one tile.
 pub fn deblock_picture<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &mut IntraPicture<S>, decisions: &[CuDecision]) {
-    let h4 = pic.recon.height / 4;
     let info = build_info(ctx, pic, decisions);
-    // The one thing `deblock_rows` reads from the PPS is
-    // `loop_filter_across_tiles`, but it wants the real struct: parse the
-    // PPS our own writer emits, which is also the header a decoder of
-    // this stream will hold.
+    run_filter(ctx, &mut pic.recon, &info);
+}
+
+/// Deblock a P picture's reconstruction in place, exactly as a decoder
+/// will deblock its own.
+///
+/// The same once-per-picture, after-the-last-CTU contract as
+/// [`deblock_picture`] — and a thinner state derivation, because
+/// [`InterPicture`] already *is* decoder-grade state: the walk maintains
+/// the motion grid, the intra/inter pred_mode and the slice marks
+/// exactly as `prediction_unit` and the CTB loop do, so this entry point
+/// only completes what the walk had no reason to keep — the QP fill, the
+/// prediction- and coding-block edge flags, and the per-4x4 cbf — by the
+/// same `coding_unit` bookkeeping the intra builder mirrors. Filling them
+/// into `pic.info` is not pollution: it is state the decoder's own
+/// PicInfo would hold, added after the last read the candidate
+/// derivation makes.
+///
+/// Intra CUs inside a P slice are refused by name, mirroring the picture
+/// writer's own refusal — when intra-in-P lands, this entry point grows
+/// the paired intra decisions alongside.
+pub fn deblock_inter_picture<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &mut InterPicture<S>, decisions: &[InterCuDecision]) {
+    assert!(
+        !decisions.iter().any(|d| matches!(d.kind, InterCuKind::UseIntra)),
+        "H.265 encode: deblocking a P slice with intra CUs (encoder in progress, as is coding one)"
+    );
+    let n = 1usize << pic.log2_cu;
+    let (wc, hc) = (pic.recon.width >> pic.log2_cu, pic.recon.height >> pic.log2_cu);
+    let w4 = pic.recon.width / 4;
+    let mut di = 0;
+    for cy in 0..hc {
+        for cx in 0..wc {
+            let d = &decisions[di];
+            di += 1;
+            let (x0, y0) = (cx * n, cy * n);
+            // The mirror of coding_unit's bookkeeping block for one
+            // 2Nx2N inter CU: the QP over the CU; the prediction-block
+            // edge bits (2 down the PU's left column, 8 along its top
+            // row — one PU, so the CU boundary); and the coding-block
+            // edges marked as transform-block bits (1 and 4) on the same
+            // lines — "a skipped CU has no transform tree, so mark
+            // here", and a non-skip CU's single CU-sized TU marks
+            // exactly the same lines in transform_unit. No interior TB
+            // edges exist at this geometry, and no bypass does either.
+            PicInfo::fill4(&mut pic.info.qp_y, w4, x0, y0, n, n, ctx.qp as i8);
+            for yy in (y0..y0 + n).step_by(4) {
+                let i = (yy >> 2) * w4 + (x0 >> 2);
+                pic.info.edges[i] |= 1 | 2;
+            }
+            for xx in (x0..x0 + n).step_by(4) {
+                let i = (y0 >> 2) * w4 + (xx >> 2);
+                pic.info.edges[i] |= 4 | 8;
+            }
+            // The cbf fill — live at last: a flagged edge with coded
+            // residual on either side is bS 1 even when the motion
+            // matches, which is what separates a filtered edge from an
+            // untouched one between two same-motion CUs.
+            if d.cbf_luma {
+                PicInfo::fill4(&mut pic.info.cbf_luma, w4, x0, y0, n, n, 1u8);
+            }
+        }
+    }
+    let InterPicture { info, recon, .. } = pic;
+    run_filter(ctx, recon, info);
+}
+
+/// The shared tail of both entry points: the decoder's filter over the
+/// derived state. The one thing `deblock_rows` reads from the PPS is
+/// `loop_filter_across_tiles`, but it wants the real struct: parse the
+/// PPS our own writer emits, which is also the header a decoder of this
+/// stream will hold.
+fn run_filter<S: Sample>(ctx: &IntraCtx<'_, S>, recon: &mut Frame<S>, info: &PicInfo) {
+    let h4 = recon.height / 4;
     let pps = Pps::parse(&crate::nal::unescape_rbsp(&crate::encode::h265_syntax::write_pps(ctx.qp.clamp(0, 51) as u8, ctx.bypass, true)))
         .expect("the encoder's own PPS parses");
     let mut scratch = DeblockScratch::default();
-    deblock_rows(ctx.dsp, &mut scratch, &mut pic.recon, &info, &pps, ctx.bit_depth, ctx.bit_depth, 0, h4);
+    deblock_rows(ctx.dsp, &mut scratch, recon, info, &pps, ctx.bit_depth, ctx.bit_depth, 0, h4);
 }
 
 /// Build the per-picture side data the decoder's filter reads, from the
@@ -353,6 +427,211 @@ mod tests {
         let before = luma_snapshot(&pic);
         deblock_picture(&ctx, &mut pic, &decisions);
         assert_eq!(before, luma_snapshot(&pic), "a lossless picture was filtered");
+    }
+
+    fn parsed_sets(w: u32, h: u32) -> (crate::hevc::sps::Sps, Pps) {
+        use crate::encode::h265_syntax::{write_pps, write_sps, Geometry as SynGeometry};
+        let cfg = crate::encode::Config { width: w, height: h, gop: 8, ..crate::encode::Config::default() };
+        let syn = SynGeometry::new(&cfg);
+        let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &syn, 16))).unwrap();
+        let mut pps = Pps::parse(&crate::nal::unescape_rbsp(&write_pps(26, false))).unwrap();
+        pps.resolve_tiles(&sps).unwrap();
+        (sps, pps)
+    }
+
+    /// A synthetic P-picture state: reconstruction planes written by
+    /// hand, and the walk-maintained side data — slice marks, inter
+    /// pred_mode, one uniform motion grid with `ref_delta` 1 — filled
+    /// exactly as `InterPicture::code_ctu` fills it, so a test can dial
+    /// each CU's motion and cbf and read the boundary strength off the
+    /// filter's behaviour. Decisions default to `Skip` (no residual).
+    fn synthetic_p(w: usize, h: usize, luma: &dyn Fn(usize, usize) -> u8, chroma: &dyn Fn(usize, usize) -> u8) -> (InterPicture<u8>, Vec<InterCuDecision>) {
+        use crate::hevc::frame::{fill_motion, MotionInfo, Mv};
+        let (sps, pps) = parsed_sets(w as u32, h as u32);
+        let mut pic = InterPicture::new(&sps, &pps, 1);
+        let off = pic.recon.y.origin();
+        let stride = pic.recon.y.stride;
+        for y in 0..h {
+            for x in 0..w {
+                pic.recon.y.data[off + y * stride + x] = luma(x, y);
+            }
+        }
+        for plane in [&mut pic.recon.cb, &mut pic.recon.cr] {
+            let o = plane.origin();
+            let s = plane.stride;
+            for y in 0..plane.height {
+                for x in 0..plane.width {
+                    plane.data[o + y * s + x] = chroma(x, y);
+                }
+            }
+        }
+        pic.info.ctb_slice.fill(0);
+        pic.info.ctb_slice_addr.fill(0);
+        let w4 = pic.recon.w4;
+        PicInfo::fill4(&mut pic.info.pred_mode, w4, 0, 0, w, h, 0u8);
+        let mi = MotionInfo { mv: [Mv::ZERO, Mv::ZERO], ref_delta: [1, 0], ref_idx: [0, -1], flags: 0, pad: 0 };
+        fill_motion(&mut pic.recon.motion, w4, 0, 0, w, h, mi);
+        let n = 1usize << pic.log2_cu;
+        let count = (w >> pic.log2_cu) * (h >> pic.log2_cu);
+        let _ = n;
+        let decisions = vec![InterCuDecision { log2_cu: pic.log2_cu, ..InterCuDecision::default() }; count];
+        (pic, decisions)
+    }
+
+    fn luma_snapshot_p(pic: &InterPicture<u8>) -> Vec<u8> {
+        let off = pic.recon.y.origin();
+        let stride = pic.recon.y.stride;
+        let (w, h) = (pic.recon.width, pic.recon.height);
+        let mut out = Vec::with_capacity(w * h);
+        for y in 0..h {
+            out.extend_from_slice(&pic.recon.y.data[off + y * stride..off + y * stride + w]);
+        }
+        out
+    }
+
+    /// bS 0, live at last: two skipped CUs with identical motion and no
+    /// residual carry flagged edges — coding_unit marks a skipped CU's
+    /// boundary — but nothing on the strength ladder fires, so the step
+    /// between them must survive. In an all-intra picture this case
+    /// cannot exist (everything is bS 2); a P picture is where "an edge
+    /// exists" and "the edge is filtered" come apart.
+    #[test]
+    fn same_motion_without_residual_leaves_the_step() {
+        let kit = Kit::new();
+        let ctx = kit.ctx(32, false);
+        for (w, h) in [(32usize, 16usize), (64, 32)] {
+            let n = h; // one CTB row: CTB size == h by the writer's choice
+            let (mut pic, decisions) = synthetic_p(w, h, &|x, _| if x < n { 120 } else { 126 }, &|_, _| 128);
+            let before = luma_snapshot_p(&pic);
+            deblock_inter_picture(&ctx, &mut pic, &decisions);
+            assert_eq!(before, luma_snapshot_p(&pic), "{w}x{h}: a bS-0 edge was filtered");
+        }
+    }
+
+    /// The cbf mirror's first real test: same two same-motion CUs, but
+    /// the right one carries a coded residual, so the shared edge is
+    /// bS 1 and the step must be smoothed — while the chroma step on the
+    /// same boundary must survive untouched, because chroma filters at
+    /// bS 2 only and nothing in a P picture without intra CUs reaches 2.
+    /// Dropping the cbf fill from the state derivation turns the luma
+    /// filtering off and fails this test; that mutation was inert in the
+    /// all-intra world and is inert no longer.
+    #[test]
+    fn a_coded_residual_raises_the_edge_to_bs_one() {
+        let kit = Kit::new();
+        let ctx = kit.ctx(32, false);
+        for (w, h) in [(32usize, 16usize), (64, 32)] {
+            let n = h;
+            let (mut pic, mut decisions) = synthetic_p(
+                w,
+                h,
+                &|x, _| if x < n { 120 } else { 126 },
+                &|x, _| if x < n / 2 { 120 } else { 126 },
+            );
+            decisions[1].kind = InterCuKind::Merge { merge_idx: 0 };
+            decisions[1].rqt_root_cbf = true;
+            decisions[1].cbf_luma = true;
+            let before = luma_snapshot_p(&pic);
+            deblock_inter_picture(&ctx, &mut pic, &decisions);
+            let after = luma_snapshot_p(&pic);
+            assert_ne!(before, after, "{w}x{h}: a bS-1 edge was not filtered");
+            for y in 0..h {
+                assert!(after[y * w + n - 1] > 120, "left of the edge did not rise at row {y}");
+                assert!(after[y * w + n] < 126, "right of the edge did not fall at row {y}");
+            }
+            for plane in [&pic.recon.cb, &pic.recon.cr] {
+                let o = plane.origin();
+                for y in 0..plane.height {
+                    for x in 0..plane.width {
+                        let want = if x < n / 2 { 120 } else { 126 };
+                        assert_eq!(plane.data[o + y * plane.stride + x], want, "chroma moved at a bS-1 edge");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The motion half of bS 1: no residual anywhere, but the right CU's
+    /// vector differs from the left's by four quarter-samples — the
+    /// 8.7.2.4 threshold — so the edge filters; at three quarter-samples
+    /// it must not. The walk-maintained motion grid is the input under
+    /// test here, read through `motion_bs` exactly as a decoder reads it.
+    #[test]
+    fn a_motion_difference_raises_the_edge_to_bs_one() {
+        use crate::hevc::frame::{fill_motion, MotionInfo, Mv};
+        let kit = Kit::new();
+        let ctx = kit.ctx(32, false);
+        for (delta, expect_filtered) in [(4i16, true), (3, false)] {
+            let (w, h) = (32usize, 16usize);
+            let n = h;
+            let (mut pic, decisions) = synthetic_p(w, h, &|x, _| if x < n { 120 } else { 126 }, &|_, _| 128);
+            let mi = MotionInfo { mv: [Mv::new(delta, 0), Mv::ZERO], ref_delta: [1, 0], ref_idx: [0, -1], flags: 0, pad: 0 };
+            let w4 = pic.recon.w4;
+            fill_motion(&mut pic.recon.motion, w4, n, 0, n, h, mi);
+            let before = luma_snapshot_p(&pic);
+            deblock_inter_picture(&ctx, &mut pic, &decisions);
+            let changed = before != luma_snapshot_p(&pic);
+            assert_eq!(changed, expect_filtered, "delta {delta}: filtered={changed}");
+        }
+    }
+
+    /// End to end on the real walk: a source identical to the reference
+    /// codes as skip everywhere (the decision module's own guarantee),
+    /// and a picture of same-motion skips is never filtered — every CU
+    /// edge is flagged and every one is bS 0. The walk-maintained state
+    /// and this module's fills compose on genuine decisions here.
+    #[test]
+    fn a_pure_skip_picture_is_never_filtered() {
+        let kit = Kit::new();
+        let ctx = kit.ctx(30, false);
+        let (w, h) = (64usize, 32usize);
+        let (sps, pps) = parsed_sets(w as u32, h as u32);
+        let mut refp = Frame::<u8>::new(w, h, ChromaFormat::Yuv420, 8);
+        refp.poc = 0;
+        let off = refp.y.origin();
+        let stride = refp.y.stride;
+        for y in 0..h {
+            for x in 0..w {
+                refp.y.data[off + y * stride + x] = (60 + ((x * 5 + y * 3) % 130)) as u8;
+            }
+        }
+        for plane in [&mut refp.cb, &mut refp.cr] {
+            let o = plane.origin();
+            let s = plane.stride;
+            for y in 0..h / 2 {
+                for x in 0..w / 2 {
+                    plane.data[o + y * s + x] = (90 + ((x * 7 + y) % 60)) as u8;
+                }
+            }
+        }
+        refp.extend_rows(0, h);
+        let mut src_y = vec![0u8; w * h];
+        for y in 0..h {
+            src_y[y * w..y * w + w].copy_from_slice(&refp.y.data[off + y * stride..off + y * stride + w]);
+        }
+        let mut src_cb = vec![0u8; w * h / 4];
+        let mut src_cr = vec![0u8; w * h / 4];
+        for y in 0..h / 2 {
+            let ob = refp.cb.origin() + y * refp.cb.stride;
+            let orr = refp.cr.origin() + y * refp.cr.stride;
+            src_cb[y * w / 2..y * w / 2 + w / 2].copy_from_slice(&refp.cb.data[ob..ob + w / 2]);
+            src_cr[y * w / 2..y * w / 2 + w / 2].copy_from_slice(&refp.cr.data[orr..orr + w / 2]);
+        }
+        let n = 1usize << sps.log2_ctb_size;
+        let mut pic = InterPicture::<u8>::new(&sps, &pps, 1);
+        let mut decisions = Vec::new();
+        for cy in 0..h / n {
+            for cx in 0..w / n {
+                decisions.push(pic.code_ctu(&ctx, &refp, cx, cy, &src_y, w, &src_cb, &src_cr, w / 2));
+            }
+        }
+        assert!(
+            decisions.iter().all(|d| matches!(d.kind, InterCuKind::Skip { .. })),
+            "a source equal to its reference should skip everywhere"
+        );
+        let before = luma_snapshot_p(&pic);
+        deblock_inter_picture(&ctx, &mut pic, &decisions);
+        assert_eq!(before, luma_snapshot_p(&pic), "a pure-skip picture was filtered");
     }
 
     /// A really coded picture, end to end: code a gentle ramp at a high
