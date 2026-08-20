@@ -18,9 +18,9 @@
 //! proven against the crate's own conformance-tested parsers.
 
 use super::gop::{Coded, Kind, Scheduler};
-use super::h265_deblock::deblock_picture;
+use super::h265_deblock::{deblock_inter_picture, deblock_picture};
 use super::h265_intra::{CuDecision, IntraCtx, IntraPicture};
-use super::h265_me::{InterCuDecision, InterCuKind, InterPicture, MAX_MERGE_CAND};
+use super::h265_me::{InterCuDecision, InterCuKind, InterPicture, PCuDecision, MAX_MERGE_CAND};
 use super::h265_syntax as syn;
 use super::{Access, Config, RateControl};
 use crate::bitwriter::BitWriter;
@@ -253,18 +253,16 @@ impl H265Encoder {
             syn::NAL_SPS,
             &syn::write_sps(&self.cfg, &g, LOG2_MAX_POC_LSB),
         ));
-        // Intra pictures are filtered; inter pictures are not, and the
-        // PPS flag is picture-wide, so a stream containing any of them
-        // keeps the filter off rather than declaring one the encoder does
-        // not apply to every picture.
-        //
-        // The inter deblocker exists and is tested — see
-        // `h265_deblock::deblock_inter_picture` — but wiring it changes
-        // the reconstruction P pictures predict from, which changes their
-        // decisions, and on one clip the decision then asks for an intra
-        // coding unit inside a P slice, which this encoder cannot yet
-        // spell. Both halves land together when that hole closes.
-        let deblock = self.cfg.gop == 0;
+        // Every picture is filtered, so the picture-wide PPS flag can
+        // declare it unconditionally: intra pictures through
+        // `deblock_picture`, P pictures through `deblock_inter_picture`.
+        // The flag was `self.cfg.gop == 0` — all-intra streams only —
+        // for as long as a P picture had no filter to apply, because
+        // declaring one the encoder does not run is exactly the failure
+        // that first turned it off: two decoders filter, the encoder
+        // does not, SELF fails on every coded edge while CROSS stays
+        // green.
+        let deblock = true;
         out.extend_from_slice(&syn::annexb(syn::NAL_PPS, &syn::write_pps(qp, bypass, deblock)));
 
         let mut w = BitWriter::with_capacity(cw * ch / 2);
@@ -405,7 +403,9 @@ impl H265Encoder {
         // them from the very bytes the stream carries is what keeps the
         // encoder's idea of the geometry and the decoder's identical.
         let sps_rbsp = syn::write_sps(&self.cfg, &g, LOG2_MAX_POC_LSB);
-        let pps_rbsp = syn::write_pps(qp, false, false);
+        // The very bytes the IDR access unit carried: `code_picture`
+        // writes one PPS for the stream, with the deblocking filter on.
+        let pps_rbsp = syn::write_pps(qp, false, true);
         let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&sps_rbsp))?;
         let mut pps = crate::hevc::pps::Pps::parse(&crate::nal::unescape_rbsp(&pps_rbsp))?;
         pps.resolve_tiles(&sps)?;
@@ -445,9 +445,9 @@ impl H265Encoder {
             },
             qp,
             syn::NAL_TRAIL_R,
-            // Inter pictures are unfiltered for now, and the header must
+            // Filtered, like every other picture, and the header must
             // agree with the PPS this stream carries.
-            false,
+            true,
             &mut w,
         );
         w.flag(true); // byte_alignment()
@@ -469,30 +469,38 @@ impl H265Encoder {
             for cy in 0..hc {
                 for cxu in 0..wc {
                     let d = pic.code_ctu(&mctx, refp, cxu, cy, &py, cw, &pcb, &pcr, ccw);
-                    if matches!(d.kind, InterCuKind::UseIntra) {
-                        // Legal, and the decision module offers it, but
-                        // coding an intra CU inside a P slice needs the
-                        // intra decision working on this picture's own
-                        // reconstruction - one picture, two decision
-                        // modules - which is its own piece of wiring.
-                        return Err(Error::unsupported(
-                            "H.265 encode: intra coding units inside a P slice (encoder in progress)",
-                        ));
-                    }
                     let left = (cxu > 0).then(|| skipped[cy * wc + cxu - 1]);
                     let above = (cy > 0).then(|| skipped[(cy - 1) * wc + cxu]);
-                    write_cu_inter(&mut e, &mut cx, &d, left, above, cat);
-                    skipped[cy * wc + cxu] = matches!(d.kind, InterCuKind::Skip { .. });
+                    // The decision module answers `UseIntra` when its
+                    // flatness proxy says inter has lost. The CU is then
+                    // coded by the intra decision over *this* picture's
+                    // reconstruction - the same `code_cu_2nx2n_intra` an
+                    // I slice runs, reading the inter neighbours already
+                    // reconstructed beside it, which the PPS's
+                    // `constrained_intra_pred_flag` 0 makes references.
+                    let coded = if matches!(d.kind, InterCuKind::UseIntra) {
+                        PCuDecision::Intra(Box::new(pic.code_ctu_intra(&mctx, cxu, cy, &py, cw, &pcb, &pcr, ccw)))
+                    } else {
+                        PCuDecision::Inter(d)
+                    };
+                    match &coded {
+                        PCuDecision::Inter(d) => write_cu_inter(&mut e, &mut cx, d, left, above, cat),
+                        PCuDecision::Intra(d) => write_cu_intra_in_p(&mut e, &mut cx, d, left, above, 1),
+                    }
+                    skipped[cy * wc + cxu] = matches!(&coded, PCuDecision::Inter(d) if matches!(d.kind, InterCuKind::Skip { .. }));
                     e.encode_terminate(u32::from(cy == hc - 1 && cxu == wc - 1));
-                    decisions.push(d);
+                    decisions.push(coded);
                 }
             }
         }
         w.align_zero();
-        // deblock_inter_picture(&mctx, &mut pic, &decisions) belongs here,
-        // once an intra coding unit inside a P slice can be spelled: see
-        // the note beside `deblock` in code_picture.
-        let _ = &decisions;
+        // After the whole picture reconstructs and before the crop, for
+        // the same reasons the intra path gives: intra prediction — which
+        // a P slice now also performs — reads unfiltered neighbours, and
+        // the filtered planes are what a decoder emits and therefore what
+        // SELF compares against. This picture becomes the next one's
+        // reference filtered, which is what a decoder's DPB holds.
+        deblock_inter_picture(&mctx, &mut pic, &decisions);
         let mut out = Vec::new();
         out.extend_from_slice(&syn::annexb(syn::NAL_TRAIL_R, &w.into_nal()));
 
@@ -667,33 +675,24 @@ fn write_cu_inter(
     }
 }
 
-/// Serialise one all-intra CTU holding exactly one `PART_2Nx2N` CU whose
-/// transform tree is either a single CU-sized TU or one level of splitting
-/// into four quarter TUs — the two shapes the decision machinery produces
-/// at CTB 16 or 32, and the geometry guarantees no partial CTUs.
+/// Serialise one CTU of an **I** slice, holding exactly one `PART_2Nx2N`
+/// CU whose transform tree is either a single CU-sized TU or one level of
+/// splitting into four quarter TUs — the two shapes the decision machinery
+/// produces at CTB 16 or 32, and the geometry guarantees no partial CTUs.
 ///
-/// The walk is the reader's, specialised to those shapes: `coding_quadtree`
-/// reads one `split_cu_flag` (the CTB is above the minimum CU size, so the
-/// flag is coded, false); `coding_unit` reads the luma mode syntax for one
-/// prediction block and the chroma mode (no `part_mode` — that is read only
-/// at the minimum CU size, which a 16/32 CTB never is); `transform_tree`
-/// reads one coded `split_transform_flag` (the SPS makes the maximum
-/// transform equal the CTB precisely so the unsplit shape is expressible,
-/// and declares hierarchy depth 2 so the split one is too), the chroma cbfs
-/// at depth 0, and then per leaf `cbf_luma` (always coded for intra) and
-/// the residual blocks — see the split branch below for the per-child
-/// ordering. Anything that stops matching the reader here desyncs the
-/// arithmetic coder and fails SELF wholesale, which is exactly the property
-/// the encode gate checks.
+/// This is the I-slice envelope; the CU itself is
+/// [`write_cu_intra_body`], shared with the P-slice envelope
+/// [`write_cu_intra_in_p`]. Here `coding_quadtree` reads one
+/// `split_cu_flag` (the CTB is above the minimum CU size, so the flag is
+/// coded, false), and then `coding_unit` starts straight at the intra
+/// syntax: an I slice reads neither `cu_skip_flag` nor `pred_mode_flag`,
+/// both being gated on `slice_type != I`.
 ///
 /// `pps_bypass` mirrors the PPS's `transquant_bypass_enabled_flag`: when
 /// set, `coding_unit` reads a `cu_transquant_bypass_flag` as its very first
 /// bin, so this writer spells one — the CU's own choice, `d.bypass` — and
 /// when clear, nothing is written and the CU must not claim bypass.
 fn write_ctu_intra(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, ctu_x: usize, ctu_y: usize, pps_bypass: bool, cat: u32) {
-    let log2 = d.log2_cu;
-    debug_assert!((4..=5).contains(&log2), "one CU per CTU wants CTB 16 or 32");
-    debug_assert!(!d.nxn, "PART_NxN exists only at the minimum CU size");
     debug_assert!(pps_bypass || !d.bypass, "a bypass CU is unspellable unless the PPS enables the flag");
     // Every coded neighbour has depth 0 (one CU per CTU), and in a single
     // slice availability is picture geometry.
@@ -702,9 +701,76 @@ fn write_ctu_intra(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, ctu_
         above_depth: (ctu_y > 0).then_some(0),
     };
     write_split_cu_flag(e, cx, &nb, 0, false);
+    // An I slice reads no `cu_skip_flag` and no `pred_mode_flag` — both
+    // are gated on `slice_type != I` (ctu.rs:405, ctu.rs:434) — so the
+    // CU starts at the bypass flag.
     if pps_bypass {
         write_cu_transquant_bypass_flag(e, cx, d.bypass);
     }
+    write_cu_intra_body(e, cx, d, cat);
+}
+
+/// Serialise one intra coding unit inside a **P** slice.
+///
+/// Same CU, different envelope. Ahead of the intra syntax a P slice reads
+/// three more things, and the reader's own gates say which
+/// (`coding_unit`, `src/hevc/ctu.rs:395`):
+///
+/// - `cu_skip_flag` — coded whenever `slice_type != I` (ctu.rs:405), 0
+///   here, with the same left/above skipped-neighbour context increment
+///   the inter writer uses.
+/// - `pred_mode_flag` — likewise coded when `slice_type != I`
+///   (ctu.rs:434), and **1**: this is the element that makes the CU
+///   intra, and the one whose absence made intra-in-P unspellable.
+/// - `part_mode` — *not* coded. The reader's gate is
+///   `!intra || log2_cb == log2_min_cb_size` (ctu.rs:437), and these CUs
+///   are intra at the whole CTB, 16 or 32, while `write_sps` fixes the
+///   minimum coding block at 8 (`log2_min_cb = 3`, `h265_syntax.rs`).
+///   Writing one would desync; `PART_2Nx2N` is inferred.
+///
+/// No `cu_transquant_bypass_flag` either: `code_p_picture` writes its PPS
+/// with `transquant_bypass_enabled_flag` clear (lossless inter refuses by
+/// name upstream), so the reader takes no such bin.
+fn write_cu_intra_in_p(
+    e: &mut CabacEncoder,
+    cx: &mut Contexts,
+    d: &CuDecision,
+    left_skip: Option<bool>,
+    above_skip: Option<bool>,
+    cat: u32,
+) {
+    debug_assert!(!d.bypass, "P pictures carry no transquant bypass, so no CU may claim it");
+    let nb = SplitCuNb {
+        left_depth: left_skip.map(|_| 0),
+        above_depth: above_skip.map(|_| 0),
+    };
+    write_split_cu_flag(e, cx, &nb, 0, false);
+    write_cu_skip_flag(e, cx, left_skip, above_skip, false);
+    write_pred_mode_flag(e, cx, true);
+    write_cu_intra_body(e, cx, d, cat);
+}
+
+/// The intra coding unit proper: everything from `prev_intra_luma_pred_flag`
+/// to the last residual block, which is byte for byte the same syntax in an
+/// I slice and a P slice — the reader reaches it from both through the same
+/// `coding_unit` tail (`src/hevc/ctu.rs:448` onward), and nothing in it
+/// consults the slice type. One spelling, so the two cannot drift.
+///
+/// The walk is the reader's, specialised to the two shapes the decision
+/// machinery produces: `coding_unit` reads the luma mode syntax for one
+/// prediction block and the chroma mode; `transform_tree` reads one coded
+/// `split_transform_flag` (the SPS makes the maximum transform equal the
+/// CTB precisely so the unsplit shape is expressible, and declares
+/// hierarchy depth 2 so the split one is too), the chroma cbfs at depth 0,
+/// and then per leaf `cbf_luma` (always coded for intra) and the residual
+/// blocks — see the split branch below for the per-child ordering.
+/// Anything that stops matching the reader here desyncs the arithmetic
+/// coder and fails SELF wholesale, which is exactly the property the
+/// encode gate checks.
+fn write_cu_intra_body(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, cat: u32) {
+    let log2 = d.log2_cu;
+    debug_assert!((4..=5).contains(&log2), "one CU per CTU wants CTB 16 or 32");
+    debug_assert!(!d.nxn, "PART_NxN exists only at the minimum CU size");
 
     let syn0 = d.luma_syntax[0];
     write_prev_intra_luma_pred_flag(e, cx, syn0.prev_flag);

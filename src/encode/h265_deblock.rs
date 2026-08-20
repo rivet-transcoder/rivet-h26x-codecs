@@ -44,7 +44,7 @@
 use std::sync::Arc;
 
 use crate::encode::h265_intra::{luma_tbs, z_within_ctb, CuDecision, IntraCtx, IntraPicture};
-use crate::encode::h265_me::{InterCuDecision, InterCuKind, InterPicture};
+use crate::encode::h265_me::{InterPicture, PCuDecision};
 use crate::hevc::deblock::{deblock_rows, DeblockScratch};
 use crate::hevc::frame::Frame;
 use crate::hevc::pic::{Geometry, PicInfo};
@@ -84,14 +84,16 @@ pub fn deblock_picture<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &mut IntraPicture<
 /// PicInfo would hold, added after the last read the candidate
 /// derivation makes.
 ///
-/// Intra CUs inside a P slice are refused by name, mirroring the picture
-/// writer's own refusal — when intra-in-P lands, this entry point grows
-/// the paired intra decisions alongside.
-pub fn deblock_inter_picture<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &mut InterPicture<S>, decisions: &[InterCuDecision]) {
-    assert!(
-        !decisions.iter().any(|d| matches!(d.kind, InterCuKind::UseIntra)),
-        "H.265 encode: deblocking a P slice with intra CUs (encoder in progress, as is coding one)"
-    );
+/// A P slice may hold intra CUs, so the decisions arrive as
+/// [`PCuDecision`]s. An intra one contributes the same three things an
+/// inter one does — QP, edges, cbf — but reads its edges and its cbf off
+/// its *transform tree*, through [`luma_tbs`], exactly as the all-intra
+/// builder does; the prediction-block bits are the CU boundary either
+/// way, one PU covering the CU. Its `pred_mode` 1 is already in
+/// `pic.info`, stored by the walk when it chose intra, and that is what
+/// gives every one of its edges boundary strength 2 (8.7.2.4
+/// short-circuits on intra before it looks at cbf or motion).
+pub fn deblock_inter_picture<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &mut InterPicture<S>, decisions: &[PCuDecision]) {
     let n = 1usize << pic.log2_cu;
     let (wc, hc) = (pic.recon.width >> pic.log2_cu, pic.recon.height >> pic.log2_cu);
     let w4 = pic.recon.width / 4;
@@ -102,29 +104,61 @@ pub fn deblock_inter_picture<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &mut InterPi
             di += 1;
             let (x0, y0) = (cx * n, cy * n);
             // The mirror of coding_unit's bookkeeping block for one
-            // 2Nx2N inter CU: the QP over the CU; the prediction-block
-            // edge bits (2 down the PU's left column, 8 along its top
-            // row — one PU, so the CU boundary); and the coding-block
-            // edges marked as transform-block bits (1 and 4) on the same
-            // lines — "a skipped CU has no transform tree, so mark
-            // here", and a non-skip CU's single CU-sized TU marks
-            // exactly the same lines in transform_unit. No interior TB
-            // edges exist at this geometry, and no bypass does either.
+            // 2Nx2N CU: the QP over the CU, then the edge flags and the
+            // cbf, which is where the two kinds part company.
             PicInfo::fill4(&mut pic.info.qp_y, w4, x0, y0, n, n, ctx.qp as i8);
+            // The prediction-block edge bits — 2 down the PU's left
+            // column, 8 along its top row. One PU per CU of either kind,
+            // so its boundary is the CU's.
             for yy in (y0..y0 + n).step_by(4) {
                 let i = (yy >> 2) * w4 + (x0 >> 2);
-                pic.info.edges[i] |= 1 | 2;
+                pic.info.edges[i] |= 2;
             }
             for xx in (x0..x0 + n).step_by(4) {
                 let i = (y0 >> 2) * w4 + (xx >> 2);
-                pic.info.edges[i] |= 4 | 8;
+                pic.info.edges[i] |= 8;
             }
-            // The cbf fill — live at last: a flagged edge with coded
-            // residual on either side is bS 1 even when the motion
-            // matches, which is what separates a filtered edge from an
-            // untouched one between two same-motion CUs.
-            if d.cbf_luma {
-                PicInfo::fill4(&mut pic.info.cbf_luma, w4, x0, y0, n, n, 1u8);
+            match d {
+                PCuDecision::Inter(d) => {
+                    // The coding-block edges marked as transform-block
+                    // bits (1 and 4) on the same lines — "a skipped CU
+                    // has no transform tree, so mark here", and a
+                    // non-skip CU's single CU-sized TU marks exactly the
+                    // same lines in transform_unit. No interior TB edges
+                    // exist at this geometry, and no bypass does either.
+                    for yy in (y0..y0 + n).step_by(4) {
+                        pic.info.edges[(yy >> 2) * w4 + (x0 >> 2)] |= 1;
+                    }
+                    for xx in (x0..x0 + n).step_by(4) {
+                        pic.info.edges[(y0 >> 2) * w4 + (xx >> 2)] |= 4;
+                    }
+                    // The cbf fill — live at last: a flagged edge with
+                    // coded residual on either side is bS 1 even when the
+                    // motion matches, which is what separates a filtered
+                    // edge from an untouched one between two same-motion
+                    // CUs.
+                    if d.cbf_luma {
+                        PicInfo::fill4(&mut pic.info.cbf_luma, w4, x0, y0, n, n, 1u8);
+                    }
+                }
+                PCuDecision::Intra(d) => {
+                    // An intra CU's transform tree may split, so its TB
+                    // edges and its cbf come off the tree rather than off
+                    // the CU — `luma_tbs` is the one enumeration of it,
+                    // and this is `build_info`'s per-TB block verbatim.
+                    for (tx, ty, tlog2, cbf) in luma_tbs(d, x0, y0) {
+                        let tn = 1usize << tlog2;
+                        for yy in (ty..ty + tn).step_by(4) {
+                            pic.info.edges[(yy >> 2) * w4 + (tx >> 2)] |= 1;
+                        }
+                        for xx in (tx..tx + tn).step_by(4) {
+                            pic.info.edges[(ty >> 2) * w4 + (xx >> 2)] |= 4;
+                        }
+                        if cbf {
+                            PicInfo::fill4(&mut pic.info.cbf_luma, w4, tx, ty, tn, tn, 1u8);
+                        }
+                    }
+                }
             }
         }
     }
@@ -240,6 +274,7 @@ fn build_info<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &IntraPicture<S>, decisions
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encode::h265_me::{InterCuDecision, InterCuKind};
     use crate::dsp::hevc::HevcDsp;
     use crate::dsp::hevc_enc::HevcEncDsp;
     use crate::dsp::distortion::DistortionDsp;
@@ -445,7 +480,7 @@ mod tests {
     /// exactly as `InterPicture::code_ctu` fills it, so a test can dial
     /// each CU's motion and cbf and read the boundary strength off the
     /// filter's behaviour. Decisions default to `Skip` (no residual).
-    fn synthetic_p(w: usize, h: usize, luma: &dyn Fn(usize, usize) -> u8, chroma: &dyn Fn(usize, usize) -> u8) -> (InterPicture<u8>, Vec<InterCuDecision>) {
+    fn synthetic_p(w: usize, h: usize, luma: &dyn Fn(usize, usize) -> u8, chroma: &dyn Fn(usize, usize) -> u8) -> (InterPicture<u8>, Vec<PCuDecision>) {
         use crate::hevc::frame::{fill_motion, MotionInfo, Mv};
         let (sps, pps) = parsed_sets(w as u32, h as u32);
         let mut pic = InterPicture::new(&sps, &pps, 1);
@@ -474,7 +509,7 @@ mod tests {
         let n = 1usize << pic.log2_cu;
         let count = (w >> pic.log2_cu) * (h >> pic.log2_cu);
         let _ = n;
-        let decisions = vec![InterCuDecision { log2_cu: pic.log2_cu, ..InterCuDecision::default() }; count];
+        let decisions = vec![PCuDecision::Inter(InterCuDecision { log2_cu: pic.log2_cu, ..InterCuDecision::default() }); count];
         (pic, decisions)
     }
 
@@ -528,9 +563,10 @@ mod tests {
                 &|x, _| if x < n { 120 } else { 126 },
                 &|x, _| if x < n / 2 { 120 } else { 126 },
             );
-            decisions[1].kind = InterCuKind::Merge { merge_idx: 0 };
-            decisions[1].rqt_root_cbf = true;
-            decisions[1].cbf_luma = true;
+            let PCuDecision::Inter(d1) = &mut decisions[1] else { unreachable!("synthetic_p builds inter CUs") };
+            d1.kind = InterCuKind::Merge { merge_idx: 0 };
+            d1.rqt_root_cbf = true;
+            d1.cbf_luma = true;
             let before = luma_snapshot_p(&pic);
             deblock_inter_picture(&ctx, &mut pic, &decisions);
             let after = luma_snapshot_p(&pic);
@@ -622,11 +658,11 @@ mod tests {
         let mut decisions = Vec::new();
         for cy in 0..h / n {
             for cx in 0..w / n {
-                decisions.push(pic.code_ctu(&ctx, &refp, cx, cy, &src_y, w, &src_cb, &src_cr, w / 2));
+                decisions.push(PCuDecision::Inter(pic.code_ctu(&ctx, &refp, cx, cy, &src_y, w, &src_cb, &src_cr, w / 2)));
             }
         }
         assert!(
-            decisions.iter().all(|d| matches!(d.kind, InterCuKind::Skip { .. })),
+            decisions.iter().all(|d| matches!(d, PCuDecision::Inter(d) if matches!(d.kind, InterCuKind::Skip { .. }))),
             "a source equal to its reference should skip everywhere"
         );
         let before = luma_snapshot_p(&pic);

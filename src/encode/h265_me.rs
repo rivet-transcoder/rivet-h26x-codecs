@@ -161,10 +161,11 @@
 //! Lagrangian constant for the same reason.
 
 use crate::dsp::hevc_enc::{qbits, quant_offset, quant_scale};
-use crate::encode::h265_intra::{IntraCtx, chroma_tbs, sub_wh};
+use crate::encode::h265_intra::{CuDecision, Geo, IntraCtx, chroma_tbs, code_cu_2nx2n_intra, sub_wh};
 use crate::hevc::ctu::chroma_qp;
 use crate::hevc::frame::{Frame, MotionInfo, Mv, Plane16, fill_motion};
 use crate::hevc::inter::{McScratch, Weighting, predict_block};
+use crate::hevc::intra::IntraScratch;
 use crate::hevc::mvpred::{Cand, PuPos, RefCtx, amvp, merge_candidate};
 use crate::hevc::pic::{Geometry, PicInfo};
 use crate::hevc::pps::Pps;
@@ -297,6 +298,30 @@ impl Default for InterCuDecision {
     }
 }
 
+/// How one CU of a P slice was coded — the seam the picture writer and
+/// the deblocker consume, because a P slice holds CUs of both kinds.
+///
+/// [`InterPicture::code_ctu`] answers [`InterCuKind::UseIntra`] when the
+/// flatness proxy says inter has lost; the caller then calls
+/// [`InterPicture::code_ctu_intra`] and keeps *that* decision instead.
+/// The inter one it displaces described nothing that was coded: its
+/// coefficients were never quantised and its reconstruction never
+/// written.
+///
+/// The intra half is boxed because it is the larger of the two by a
+/// factor of two (a [`CuDecision`] carries the split shape's sixteen
+/// coefficient slots) and it is the rarer by far; an unboxed enum would
+/// double the memory of every P picture for the variant that seldom
+/// fires.
+#[derive(Clone)]
+pub enum PCuDecision {
+    /// An inter CU: skip, merge or AMVP.
+    Inter(InterCuDecision),
+    /// An intra CU inside the P slice, decided by the intra module over
+    /// this same picture's reconstruction.
+    Intra(Box<CuDecision>),
+}
+
 /// Per-picture state of the P-picture walk: the reconstruction the next
 /// CUs and the next picture predict from, and the decoder-grade side state
 /// the candidate derivation reads. The caller walks CTUs in raster order
@@ -326,6 +351,20 @@ pub struct InterPicture<S: Sample> {
     pub cat: u32,
     /// The current picture's POC (the motion grid stores POC differences).
     pub cur_poc: i32,
+    /// How deep [`InterPicture::code_ctu_intra`] may let an intra CU's
+    /// transform tree split — the same knob as
+    /// [`super::h265_intra::IntraPicture::split_depth`] and the same
+    /// caveat: the coding-tree writer must be able to spell whichever
+    /// shapes it permits, and a decision the writer cannot serialise
+    /// desyncs the arithmetic coder. **1**, matching what the picture
+    /// writer sets for I slices and what `write_cu_intra_body` spells.
+    pub split_depth: u32,
+    /// The picture descriptor the intra decision's availability and MPM
+    /// mirrors read, built once from the SPS.
+    geo: Geo,
+    /// Reference-sample scratch for the intra decision, held per picture
+    /// exactly as [`super::h265_intra::IntraPicture`] holds its own.
+    intra_scratch: IntraScratch,
     /// MC scratch, as the decoder allocates per slice.
     scratch: McScratch<S>,
     /// Luma-only prediction scratch for candidate scoring: the clamp
@@ -366,6 +405,9 @@ impl<S: Sample> InterPicture<S> {
             log2_cu: sps.log2_ctb_size,
             cat: sps.chroma_array_type(),
             cur_poc,
+            split_depth: 1,
+            geo: Geo::new(sps.log2_ctb_size, w, h, sps.chroma_array_type()),
+            intra_scratch: IntraScratch::default(),
             scratch: McScratch::new(),
             swin: vec![S::default(); (64 + 7) * (64 + 7)],
             stmp: vec![0; crate::dsp::hevc::MC_TMP_LEN],
@@ -504,6 +546,11 @@ impl<S: Sample> InterPicture<S> {
             fill_motion(&mut self.recon.motion, self.recon.w4, x0, y0, n, n, MotionInfo::INTRA);
             let w4 = self.info.w4;
             PicInfo::fill4(&mut self.info.pred_mode, w4, x0, y0, n, n, 1);
+            // `coding_unit` records `cu_skip_flag` for every CU before it
+            // knows the pred mode (ctu.rs:419), and the *next* CU's
+            // `cu_skip_flag` context counts skipped neighbours out of
+            // exactly this array. An intra CU is never skipped.
+            PicInfo::fill4(&mut self.info.skip, w4, x0, y0, n, n, 0);
             return out;
         }
 
@@ -569,6 +616,75 @@ impl<S: Sample> InterPicture<S> {
         PicInfo::fill4(&mut self.info.pred_mode, w4, x0, y0, n, n, 0);
         PicInfo::fill4(&mut self.info.skip, w4, x0, y0, n, n, matches!(out.kind, InterCuKind::Skip { .. }) as u8);
         out
+    }
+
+    /// Code the CTU at `(cu_x, cu_y)` as an **intra** CU inside this P
+    /// slice, after [`InterPicture::code_ctu`] answered
+    /// [`InterCuKind::UseIntra`] for it. Call it only then, and only
+    /// immediately: the walk's ordering invariants are the intra
+    /// decision's too.
+    ///
+    /// This is not a second intra encoder. It is
+    /// [`code_cu_2nx2n_intra`] — the very function
+    /// [`super::h265_intra::IntraPicture::code_ctu`] calls for an I
+    /// slice — pointed at *this* picture's state:
+    ///
+    /// - **`self.recon`**, so intra prediction reads reconstructed
+    ///   neighbours *including the inter-coded ones*. That is legal and
+    ///   deliberate rather than an oversight of constrained intra
+    ///   prediction: `write_pps` writes `constrained_intra_pred_flag` 0
+    ///   (`h265_syntax.rs:272`), which switches off the second half of
+    ///   the reader's own reference check —
+    ///   `available_at(..) && (!cip || pred_mode == 1)`, `ctu.rs:1157`.
+    ///   With `cip` false the reader takes any decoded neighbour, so the
+    ///   encoder must too, or the two predict from different samples.
+    /// - **`self.info.intra_mode`**, the decoder's own per-4x4 luma-mode
+    ///   grid, as the grid the MPM derivation reads and fills — rather
+    ///   than a private copy that would have to be kept in step with it.
+    /// - **`self.info.pred_mode`**, so the MPM derivation applies the
+    ///   reader's not-intra gate (`ctu.rs:627`): a neighbouring *inter*
+    ///   CU contributes `INTRA_DC`, not whatever mode last stood in the
+    ///   mode grid at that position.
+    ///
+    /// `code_ctu` has already stored the motion (`MotionInfo::INTRA`),
+    /// `pred_mode` 1 and `skip` 0 over the CU — the marks
+    /// `coding_unit` writes before it parses any intra syntax — so the
+    /// deblocker and every later candidate derivation see what a decoder
+    /// of this stream will see.
+    #[allow(clippy::too_many_arguments)]
+    pub fn code_ctu_intra(
+        &mut self,
+        ctx: &MeCtx<'_, S>,
+        cu_x: usize,
+        cu_y: usize,
+        src_y: &[S],
+        y_stride: usize,
+        src_cb: &[S],
+        src_cr: &[S],
+        c_stride: usize,
+    ) -> CuDecision {
+        let n = 1usize << self.log2_cu;
+        let (x0, y0) = (cu_x * n, cu_y * n);
+        // Split the borrows: the mode grid is written, the pred-mode grid
+        // is read, and both live in `info` beside each other.
+        let PicInfo { intra_mode, pred_mode, .. } = &mut self.info;
+        let (intra_mode, pred_mode) = (&mut intra_mode[..], &pred_mode[..]);
+        code_cu_2nx2n_intra(
+            ctx,
+            self.geo,
+            &mut self.recon,
+            intra_mode,
+            Some(pred_mode),
+            &mut self.intra_scratch,
+            self.split_depth,
+            x0,
+            y0,
+            src_y,
+            y_stride,
+            src_cb,
+            src_cr,
+            c_stride,
+        )
     }
 
     /// Greedy small-diamond SAD descent at full-sample positions, seeded

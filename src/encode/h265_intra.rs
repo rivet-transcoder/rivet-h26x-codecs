@@ -334,21 +334,39 @@ pub struct IntraCtx<'a, S: Sample> {
 /// The fixed picture geometry the availability rules need, copied out of
 /// [`IntraPicture`] so the free functions below can borrow the planes and
 /// the mode grid independently.
+///
+/// `pub(crate)` because an intra CU is not the exclusive property of an
+/// intra picture: a P slice may hold one, and
+/// [`super::h265_me::InterPicture`] then builds this same descriptor over
+/// its own reconstruction and calls [`code_cu_2nx2n_intra`] with it, so
+/// that both slice types run one spelling of the intra decision.
 #[derive(Clone, Copy)]
-struct Geo {
+pub(crate) struct Geo {
     /// log2 of the CU == CTB size.
-    log2_cu: u32,
+    pub(crate) log2_cu: u32,
     /// CTUs per row.
-    wc: usize,
+    pub(crate) wc: usize,
     /// 4x4 blocks per row.
-    w4: usize,
+    pub(crate) w4: usize,
     /// Luma picture width and height in samples.
-    width: usize,
-    height: usize,
+    pub(crate) width: usize,
+    /// See `width`.
+    pub(crate) height: usize,
     /// `chroma_array_type`: 0 monochrome, 1 = 4:2:0 — the discriminator
     /// the reader's chroma gates test, carried in its numeric form so the
     /// mirrors read like the code they mirror.
-    cat: u32,
+    pub(crate) cat: u32,
+}
+
+impl Geo {
+    /// The descriptor for a picture of `width` by `height` luma samples
+    /// coded as whole CTUs of `1 << log2_cu`. The two derived fields are
+    /// computed here rather than at each call site, because a `wc` or a
+    /// `w4` that disagrees with the picture silently corrupts every
+    /// availability answer instead of failing.
+    pub(crate) fn new(log2_cu: u32, width: usize, height: usize, cat: u32) -> Self {
+        Geo { log2_cu, wc: width >> log2_cu, w4: width / 4, width, height, cat }
+    }
 }
 
 /// Per-picture state of the all-intra walk: the reconstruction the
@@ -432,7 +450,7 @@ impl<S: Sample> IntraPicture<S> {
             // availability test keeps uncoded entries from ever being read.
             modes: vec![1; w4 * h4],
             scratch: IntraScratch::default(),
-            geo: Geo { log2_cu, wc: width >> log2_cu, w4, width, height, cat },
+            geo: Geo::new(log2_cu, width, height, cat),
         }
     }
 
@@ -482,7 +500,7 @@ impl<S: Sample> IntraPicture<S> {
                 // z-order within the CU, which is decode order: each block
                 // predicts from the reconstruction of those before it.
                 let (px, py) = (x0 + (pb & 1) * 4, y0 + (pb >> 1) * 4);
-                let cands = mpm_candidates(geo, modes, px, py);
+                let cands = mpm_candidates(geo, modes, None, px, py);
                 let soff = py * y_stride + px;
                 let mode = search_luma_mode(ctx, geo, &mut recon.y, scratch, px, py, 2, &src_y[soff..], y_stride, cands);
                 let nz = code_luma_tb(
@@ -546,93 +564,7 @@ impl<S: Sample> IntraPicture<S> {
                 }
             }
         } else {
-            // PART_2Nx2N. The luma mode is chosen once, by SATD on the
-            // unsplit CU-sized prediction, and both transform structures
-            // reuse it — a per-structure mode search would be fairer and
-            // costs double, a simplification to lift with real RD. The
-            // chroma mode likewise, on the parent-size prediction.
-            let cands = mpm_candidates(geo, modes, x0, y0);
-            let soff = y0 * y_stride + x0;
-            let mode = search_luma_mode(ctx, geo, &mut recon.y, scratch, x0, y0, geo.log2_cu, &src_y[soff..], y_stride, cands);
-            out.luma_modes = [mode; 4];
-            out.luma_syntax[0] = as_syntax(mode, cands);
-            PicInfo::fill4(modes, geo.w4, x0, y0, n, n, mode);
-            if geo.cat != 0 {
-                let (csyn, cmode) = search_chroma_mode(
-                    ctx,
-                    geo,
-                    &mut recon.cb,
-                    &mut recon.cr,
-                    scratch,
-                    x0,
-                    y0,
-                    geo.log2_cu,
-                    mode,
-                    scb,
-                    scr,
-                    c_stride,
-                );
-                out.chroma_syntax = csyn;
-                out.chroma_mode = cmode;
-            }
-            let cmode = out.chroma_mode;
-
-            // The transform structure: one CU-sized TU, or — when the
-            // writer-side knob allows — a split, judged by reconstruction
-            // SSD plus the placeholder rate terms. The trials overwrite
-            // each other in the plane and the decision; a trial reads
-            // only samples outside the CU or samples it wrote itself, so
-            // no state needs saving — whichever loses is simply
-            // recomputed, the way the H.264 side puts back the I_4x4
-            // coding its I_16x16 trials overwrote.
-            let (ssd_u, nz_u) = code_cu_2nx2n(
-                ctx, geo, recon, scratch, x0, y0, mode, cmode, false, [false; 4], &src_y[soff..], y_stride, scb, scr, c_stride, &mut out,
-            );
-            if split_depth >= 1 {
-                assert!(split_depth <= 2, "split_depth {split_depth} above the SPS transform depth of 2");
-                let cost_u = ssd_u as f32 + tu_structure_cost(geo.cat, ctx.qp, &out, nz_u);
-                // The split trial, children in decode order. With the
-                // deeper search on, each child is coded unsplit, re-coded
-                // subdivided, and settled — losing structure recomputed —
-                // BEFORE the next child codes, because the next child
-                // predicts from this one's final reconstruction; a joint
-                // search over the sixteen child-shape combinations is a
-                // refinement real RD might want, greedy is the
-                // simplification taken here. At split_depth 1 this loop
-                // is code_cu_2nx2n's own split path verbatim, so the
-                // decisions are bit-identical to the one-level search.
-                clear_for_trial(&mut out, true);
-                let (mut ssd_s, mut nz_s) = (0u64, 0u32);
-                for i in 0..4 {
-                    let (mut ssd_i, mut nz_i) = code_child(ctx, geo, recon, scratch, x0, y0, i, false, mode, cmode, &src_y[soff..], y_stride, scb, scr, c_stride, &mut out);
-                    if split_depth >= 2 {
-                        let cost_a = ssd_i as f32 + lambda_bits(ctx.qp, child_structure_bins(geo.cat, geo.log2_cu, false), nz_i);
-                        let (ssd_b, nz_b) = code_child(ctx, geo, recon, scratch, x0, y0, i, true, mode, cmode, &src_y[soff..], y_stride, scb, scr, c_stride, &mut out);
-                        let cost_b = ssd_b as f32 + lambda_bits(ctx.qp, child_structure_bins(geo.cat, geo.log2_cu, true), nz_b);
-                        if cost_a <= cost_b {
-                            let (sa, na) = code_child(ctx, geo, recon, scratch, x0, y0, i, false, mode, cmode, &src_y[soff..], y_stride, scb, scr, c_stride, &mut out);
-                            ssd_i = sa;
-                            nz_i = na;
-                        } else {
-                            ssd_i = ssd_b;
-                            nz_i = nz_b;
-                        }
-                    }
-                    ssd_s += ssd_i;
-                    nz_s += nz_i;
-                }
-                if geo.cat != 0 {
-                    for comp in 0..2 {
-                        out.cbf_chroma[comp] = out.cbf_chroma_tu[comp].iter().any(|&f| f) || out.cbf_chroma_tu_bot[comp].iter().any(|&f| f);
-                    }
-                }
-                let cost_s = ssd_s as f32 + tu_structure_cost(geo.cat, ctx.qp, &out, nz_s);
-                if cost_u <= cost_s {
-                    let _ = code_cu_2nx2n(
-                        ctx, geo, recon, scratch, x0, y0, mode, cmode, false, [false; 4], &src_y[soff..], y_stride, scb, scr, c_stride, &mut out,
-                    );
-                }
-            }
+            return code_cu_2nx2n_intra(ctx, geo, recon, modes, None, scratch, split_depth, x0, y0, src_y, y_stride, src_cb, src_cr, c_stride);
         }
         out
     }
@@ -641,8 +573,156 @@ impl<S: Sample> IntraPicture<S> {
     /// `(xp, yp)` — exposed for a replaying test or writer that needs to
     /// re-derive what [`LumaModeSyntax`] indexes into.
     pub fn mpm_list(&self, xp: usize, yp: usize) -> [u32; 3] {
-        mpm_candidates(self.geo, &self.modes, xp, yp)
+        mpm_candidates(self.geo, &self.modes, None, xp, yp)
     }
+}
+
+/// Decide and code one `PART_2Nx2N` intra CU at luma `(x0, y0)`, leaving
+/// its reconstruction in `recon` and its chosen luma mode in `modes`.
+///
+/// The body of [`IntraPicture::code_ctu`]'s 2Nx2N arm, lifted out whole
+/// so a **P slice can code an intra CU through exactly this code**. An
+/// intra CU is an intra CU: the syntax the reader parses inside a P slice
+/// is the same `coding_unit` tail (`src/hevc/ctu.rs:448` onward) it parses
+/// inside an I slice, so having two spellings of the decision would be two
+/// things to keep in step, and one of them would eventually drift.
+///
+/// Everything the decision touches arrives as an argument rather than
+/// through `self`, which is what makes that sharing possible — the caller
+/// supplies whichever reconstruction and mode grid its picture owns:
+///
+/// - `recon` is *the picture's* reconstruction, and for a P picture that
+///   means one already holding inter-coded neighbours. Reading them is
+///   correct and deliberate: `write_pps` writes
+///   `constrained_intra_pred_flag` 0 (`h265_syntax.rs:272`), so the
+///   reader's own reference-availability check —
+///   `available_at(..) && (!cip || pred_mode == 1)`, `ctu.rs:1157` — has
+///   its second clause disabled and inter neighbours *are* references.
+/// - `modes` is the per-4x4 luma-mode grid the MPM derivation reads and
+///   this function fills, `PicInfo::intra_mode`'s twin.
+/// - `pred_mode` is the per-4x4 intra/inter grid, `None` in an all-intra
+///   picture; see [`mpm_candidates`].
+///
+/// The luma source is the whole plane; the chroma sources are whole
+/// planes too, offset here by the CU's position.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn code_cu_2nx2n_intra<S: Sample>(
+    ctx: &IntraCtx<'_, S>,
+    geo: Geo,
+    recon: &mut Frame<S>,
+    modes: &mut [u8],
+    pred_mode: Option<&[u8]>,
+    scratch: &mut IntraScratch,
+    split_depth: u32,
+    x0: usize,
+    y0: usize,
+    src_y: &[S],
+    y_stride: usize,
+    src_cb: &[S],
+    src_cr: &[S],
+    c_stride: usize,
+) -> CuDecision {
+    let n = 1usize << geo.log2_cu;
+    // The chroma sources at this CU, or empty slices in monochrome —
+    // where every chroma step below is skipped and they are never
+    // indexed, mirroring the reader's uniform `chroma_array_type != 0`
+    // gates.
+    let (scb, scr) = if geo.cat != 0 {
+        let (sw, sh) = sub_wh(geo.cat);
+        let coff = (y0 / sh) * c_stride + x0 / sw;
+        (&src_cb[coff..], &src_cr[coff..])
+    } else {
+        (&src_cb[..0], &src_cr[..0])
+    };
+    let mut out = CuDecision { log2_cu: geo.log2_cu, bypass: ctx.bypass, ..CuDecision::default() };
+    // PART_2Nx2N. The luma mode is chosen once, by SATD on the
+    // unsplit CU-sized prediction, and both transform structures
+    // reuse it — a per-structure mode search would be fairer and
+    // costs double, a simplification to lift with real RD. The
+    // chroma mode likewise, on the parent-size prediction.
+    let cands = mpm_candidates(geo, modes, pred_mode, x0, y0);
+    let soff = y0 * y_stride + x0;
+    let mode = search_luma_mode(ctx, geo, &mut recon.y, scratch, x0, y0, geo.log2_cu, &src_y[soff..], y_stride, cands);
+    out.luma_modes = [mode; 4];
+    out.luma_syntax[0] = as_syntax(mode, cands);
+    PicInfo::fill4(modes, geo.w4, x0, y0, n, n, mode);
+    if geo.cat != 0 {
+        let (csyn, cmode) = search_chroma_mode(
+            ctx,
+            geo,
+            &mut recon.cb,
+            &mut recon.cr,
+            scratch,
+            x0,
+            y0,
+            geo.log2_cu,
+            mode,
+            scb,
+            scr,
+            c_stride,
+        );
+        out.chroma_syntax = csyn;
+        out.chroma_mode = cmode;
+    }
+    let cmode = out.chroma_mode;
+
+    // The transform structure: one CU-sized TU, or — when the
+    // writer-side knob allows — a split, judged by reconstruction
+    // SSD plus the placeholder rate terms. The trials overwrite
+    // each other in the plane and the decision; a trial reads
+    // only samples outside the CU or samples it wrote itself, so
+    // no state needs saving — whichever loses is simply
+    // recomputed, the way the H.264 side puts back the I_4x4
+    // coding its I_16x16 trials overwrote.
+    let (ssd_u, nz_u) = code_cu_2nx2n(
+        ctx, geo, recon, scratch, x0, y0, mode, cmode, false, [false; 4], &src_y[soff..], y_stride, scb, scr, c_stride, &mut out,
+    );
+    if split_depth >= 1 {
+        assert!(split_depth <= 2, "split_depth {split_depth} above the SPS transform depth of 2");
+        let cost_u = ssd_u as f32 + tu_structure_cost(geo.cat, ctx.qp, &out, nz_u);
+        // The split trial, children in decode order. With the
+        // deeper search on, each child is coded unsplit, re-coded
+        // subdivided, and settled — losing structure recomputed —
+        // BEFORE the next child codes, because the next child
+        // predicts from this one's final reconstruction; a joint
+        // search over the sixteen child-shape combinations is a
+        // refinement real RD might want, greedy is the
+        // simplification taken here. At split_depth 1 this loop
+        // is code_cu_2nx2n's own split path verbatim, so the
+        // decisions are bit-identical to the one-level search.
+        clear_for_trial(&mut out, true);
+        let (mut ssd_s, mut nz_s) = (0u64, 0u32);
+        for i in 0..4 {
+            let (mut ssd_i, mut nz_i) = code_child(ctx, geo, recon, scratch, x0, y0, i, false, mode, cmode, &src_y[soff..], y_stride, scb, scr, c_stride, &mut out);
+            if split_depth >= 2 {
+                let cost_a = ssd_i as f32 + lambda_bits(ctx.qp, child_structure_bins(geo.cat, geo.log2_cu, false), nz_i);
+                let (ssd_b, nz_b) = code_child(ctx, geo, recon, scratch, x0, y0, i, true, mode, cmode, &src_y[soff..], y_stride, scb, scr, c_stride, &mut out);
+                let cost_b = ssd_b as f32 + lambda_bits(ctx.qp, child_structure_bins(geo.cat, geo.log2_cu, true), nz_b);
+                if cost_a <= cost_b {
+                    let (sa, na) = code_child(ctx, geo, recon, scratch, x0, y0, i, false, mode, cmode, &src_y[soff..], y_stride, scb, scr, c_stride, &mut out);
+                    ssd_i = sa;
+                    nz_i = na;
+                } else {
+                    ssd_i = ssd_b;
+                    nz_i = nz_b;
+                }
+            }
+            ssd_s += ssd_i;
+            nz_s += nz_i;
+        }
+        if geo.cat != 0 {
+            for comp in 0..2 {
+                out.cbf_chroma[comp] = out.cbf_chroma_tu[comp].iter().any(|&f| f) || out.cbf_chroma_tu_bot[comp].iter().any(|&f| f);
+            }
+        }
+        let cost_s = ssd_s as f32 + tu_structure_cost(geo.cat, ctx.qp, &out, nz_s);
+        if cost_u <= cost_s {
+            let _ = code_cu_2nx2n(
+                ctx, geo, recon, scratch, x0, y0, mode, cmode, false, [false; 4], &src_y[soff..], y_stride, scb, scr, c_stride, &mut out,
+            );
+        }
+    }
+    out
 }
 
 /// Every luma transform block a decision describes, as `(x, y, log2,
@@ -750,19 +830,30 @@ fn fill_ref_avail(geo: Geo, avail: &mut RefAvail, xl: usize, yl: usize, n: usize
 
 /// The three MPM candidates (8.4.2) for the prediction block at `(xp,
 /// yp)`: the left and above neighbours' modes (DC where a neighbour is
-/// unavailable, and for an above neighbour outside the current CTB row),
-/// expanded to three by the standard's formula. The mirror of
-/// `mpm_candidates` in `hevc::ctu`; its not-intra check has no counterpart
-/// here because everything this encoder codes is intra.
-fn mpm_candidates(geo: Geo, modes: &[u8], xp: usize, yp: usize) -> [u32; 3] {
+/// unavailable, is not intra-coded, or — for an above neighbour — lies
+/// outside the current CTB row), expanded to three by the standard's
+/// formula. The mirror of `mpm_candidates` in `hevc::ctu` (ctu.rs:620),
+/// element for element.
+///
+/// `pred_mode` is that reader's `pred_mode[i] != 1 => INTRA_DC` gate
+/// (ctu.rs:627), per 4x4 as `PicInfo::pred_mode` holds it. `None` says
+/// every coded block in this picture is intra — an I slice — where the
+/// gate provably cannot fire; a P slice passes the decoder's own array,
+/// because there the neighbour to the left may well be an inter CU and
+/// its stored mode must not be believed.
+fn mpm_candidates(geo: Geo, modes: &[u8], pred_mode: Option<&[u8]>, xp: usize, yp: usize) -> [u32; 3] {
     let cand = |xn: i32, yn: i32, is_above: bool| -> u32 {
         if !decoded_before(geo, xp, yp, xn, yn) {
+            return 1;
+        }
+        let i = (yn as usize >> 2) * geo.w4 + (xn as usize >> 2);
+        if pred_mode.is_some_and(|p| p[i] != 1) {
             return 1;
         }
         if is_above && (yn as usize) < (yp >> geo.log2_cu) << geo.log2_cu {
             return 1;
         }
-        modes[(yn as usize >> 2) * geo.w4 + (xn as usize >> 2)] as u32
+        modes[i] as u32
     };
     let a = cand(xp as i32 - 1, yp as i32, false);
     let b = cand(xp as i32, yp as i32 - 1, true);
@@ -2366,7 +2457,7 @@ mod tests {
             let mut pic = IntraPicture::<u8>::new(w, h, log2_cu, 8);
             let geo = pic.geo;
             let IntraPicture { recon, modes, scratch, .. } = &mut pic;
-            let cands = mpm_candidates(geo, modes, 0, 0);
+            let cands = mpm_candidates(geo, &modes, None, 0, 0);
             // An angular mode, so the prediction really propagates
             // neighbour samples rather than averaging them away.
             let mode = 26u8;
@@ -2515,7 +2606,7 @@ mod tests {
             let mut pic = IntraPicture::<u8>::new_with_chroma(w, h, log2_cu, 8, chroma);
             let geo = pic.geo;
             let IntraPicture { recon, modes, scratch, .. } = &mut pic;
-            let cands = mpm_candidates(geo, modes, 0, 0);
+            let cands = mpm_candidates(geo, &modes, None, 0, 0);
             let mode = 26u8;
             let mut d = CuDecision { log2_cu, ..CuDecision::default() };
             d.luma_modes = [mode; 4];
@@ -2593,7 +2684,7 @@ mod tests {
             let mut pic = IntraPicture::<u8>::new_with_chroma(w, h, log2_cu, 8, chroma);
             let geo = pic.geo;
             let IntraPicture { recon, modes, scratch, .. } = &mut pic;
-            let cands = mpm_candidates(geo, modes, 0, 0);
+            let cands = mpm_candidates(geo, &modes, None, 0, 0);
             let mode = 10u8;
             let mut d = CuDecision { log2_cu, bypass: true, ..CuDecision::default() };
             d.luma_modes = [mode; 4];
@@ -2632,7 +2723,7 @@ mod tests {
             let mut pic = IntraPicture::<u8>::new(w, h, log2_cu, 8);
             let geo = pic.geo;
             let IntraPicture { recon, modes, scratch, .. } = &mut pic;
-            let cands = mpm_candidates(geo, modes, 0, 0);
+            let cands = mpm_candidates(geo, &modes, None, 0, 0);
             let mode = 1u8; // DC; any legal mode serves
             let mut d = CuDecision { log2_cu, bypass: true, ..CuDecision::default() };
             d.luma_modes = [mode; 4];
@@ -2675,7 +2766,7 @@ mod tests {
                     // hold it against what the encoder said it chose.
                     for pb in 0..4 {
                         let (px, py) = (x0 + (pb & 1) * 4, y0 + (pb >> 1) * 4);
-                        let cands = mpm_candidates(geo, modes, px, py);
+                        let cands = mpm_candidates(geo, modes, None, px, py);
                         let mode = mode_from_syntax(d.luma_syntax[pb], cands);
                         assert_eq!(mode, d.luma_modes[pb] as u32, "syntax and mode disagree at ({px},{py})");
                         fill_ref_avail(geo, &mut scratch.avail, px, py, 4, 1, 1);
@@ -2688,7 +2779,7 @@ mod tests {
                     // With a split, each TB is predicted afresh from the
                     // reconstruction as it stands — the decoder's per-TB
                     // behaviour, and the thing this replay anchors.
-                    let cands = mpm_candidates(geo, modes, x0, y0);
+                    let cands = mpm_candidates(geo, &modes, None, x0, y0);
                     let mode = mode_from_syntax(d.luma_syntax[0], cands);
                     assert_eq!(mode, d.luma_modes[0] as u32, "syntax and mode disagree at ({x0},{y0})");
                     PicInfo::fill4(modes, geo.w4, x0, y0, n, n, mode as u8);
