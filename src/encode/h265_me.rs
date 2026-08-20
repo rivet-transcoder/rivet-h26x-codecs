@@ -579,6 +579,23 @@ impl<S: Sample> InterPicture<S> {
         let soff = y0 * y_stride + x0;
         let src = &src_y[soff..];
 
+        // One reference, and that is a measured choice rather than a
+        // simplification. Multi-reference is a choice BETWEEN pictures:
+        // a block uncovered by motion, or one whose match is periodic,
+        // can be predicted better from an older frame than the newest.
+        // On this encoder's geometry it never is. Whole-CTU 32x32 coding
+        // units average over enough content that one reference always
+        // serves them — measured at 0 of 140 blocks across the corpus,
+        // where the same probe at 16x16 said 6.9% and was answering
+        // about a block size this encoder does not code. Two references
+        // were built and measured anyway: 0.80% worse, every clip, none
+        // better, which is `ref_idx` signalled per prediction unit for a
+        // choice that never has a better answer.
+        //
+        // The opportunity is gated on partition size, so re-run
+        // `tools/multiref_opportunity.py` at the new size the day
+        // sub-CU partitioning lands; its docstring says where the
+        // implementation is kept.
         // Full-sample descent from every distinct seed's best, then the
         // two sub-sample rings.
         let mut seeds: Vec<Mv> = vec![Mv::ZERO, mvp[0], mvp[1]];

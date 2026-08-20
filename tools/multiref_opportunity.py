@@ -19,6 +19,18 @@ that basis two-reference prediction was built. It LOST 0.80% BD-rate on every
 clip. Re-run at BLK=32 — the size the H.265 encoder actually codes, since its
 CUs are whole CTUs — the answer is ZERO blocks out of 140.
 
+A zero row is usually the honest answer rather than a broken measurement,
+and it is worth knowing which clips give one and why before you see it:
+
+  - A clip that HOLDS ONE FRAME (src_static) has t-1 and t-2 identical, so
+    there is nothing to choose between them and the count must be zero.
+  - A clip with a HARD CUT (src_cut) scores low for the opposite reason:
+    across the cut everything older is unrelated content, so the older
+    reference is strictly worse rather than sometimes better.
+
+Neither is a defect in the probe or in a feature built on it. Say so before
+the rows appear, or somebody reads flat cells as something broken.
+
 So the probe was right and the reading was wrong: it was run at a block size
 the encoder does not use. Multi-reference's value is gated on partition size,
 because a large block averages over enough content that one reference always
