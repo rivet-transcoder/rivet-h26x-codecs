@@ -49,16 +49,19 @@
 //!   will make it reachable from production geometry — and brings the
 //!   chroma-at-the-parent rule (`transform_unit`'s `blk_idx == 3` case)
 //!   that one level never triggers.
-//! - **Chroma formats: 4:0:0, 4:2:0 and 4:2:2**
-//!   ([`IntraPicture::new_with_chroma`]; plain `new` stays 4:2:0).
-//!   Monochrome simply omits every chroma element, mirroring the reader's
-//!   `chroma_array_type == 0` gates. 4:2:0 carries one chroma TU per
-//!   component at half the luma TU size; 4:2:2 carries the stacked pair
-//!   of half-size squares `transform_unit` walks (`yct = yc + t * nc`),
-//!   each square with its own cbf, the derived mode passing through the
-//!   Table 8-3 remap and the chroma QP through the plain clamp rather
-//!   than Table 8-10. 4:4:4 is refused by name — next in line, not
-//!   designed around.
+//! - **All four chroma formats** ([`IntraPicture::new_with_chroma`];
+//!   plain `new` stays 4:2:0). Monochrome simply omits every chroma
+//!   element, mirroring the reader's `chroma_array_type == 0` gates.
+//!   4:2:0 carries one chroma TU per component at half the luma TU size;
+//!   4:2:2 the stacked pair of half-size squares `transform_unit` walks
+//!   (`yct = yc + t * nc`), each square with its own cbf, the derived
+//!   mode passing through the Table 8-3 remap and the chroma QP through
+//!   the plain clamp rather than Table 8-10; 4:4:4 one chroma TU at the
+//!   luma TU's own size and position, with the reference-smoothing
+//!   filter on for chroma too (`intra_predict_block`'s
+//!   `c_idx == 0 || cat == 3`). One 4:4:4 corner is refused by name:
+//!   `PART_NxN` (8x8 CTUs, test-only geometry) would need four chroma
+//!   modes and per-4x4 chroma TBs.
 //! - **One slice, one tile, raster CTU order.** Availability reduces to
 //!   picture geometry plus z-scan order, mirrored from the decoder.
 //! - **Flat scaling lists, no transform skip, no RDPCM, no rotation** —
@@ -210,10 +213,17 @@ pub struct CuDecision {
     /// - 4:2:2 unsplit (and `PART_NxN`): the stacked square pair, top
     ///   then bottom, `nc*nc` entries each at `[t*nc*nc..]`;
     /// - 4:2:2 `split_tu`: per child in z-order, that child's pair top
-    ///   then bottom, `qc*qc` entries each at `[(2*i + t)*qc*qc..]`.
+    ///   then bottom, `qc*qc` entries each at `[(2*i + t)*qc*qc..]`;
+    /// - 4:4:4 unsplit: one TU of `n*n` entries at `[0..n*n]`,
+    ///   `n = 1 << log2_cu` (a 32 CTB fills the array);
+    /// - 4:4:4 `split_tu`: four child TUs of `(n/2)*(n/2)` entries at
+    ///   `[i*(n/2)*(n/2)..]` in z-order — 8x8 chroma TBs at a 16 CTB,
+    ///   which scan mode-dependently at 4:4:4 (7.4.9.11's
+    ///   `log2 == 3 && (c_idx == 0 || cat == 3)` arm), unlike the
+    ///   diagonal-only 8x8 chroma of the other formats.
     ///
-    /// Sized for the largest supported or planned shape (4:4:4 chroma at
-    /// a 32 CTB is a 32x32 TU).
+    /// Sized for the largest of these (4:4:4 chroma at a 32 CTB is a
+    /// 32x32 TU).
     pub chroma: [[i16; 1024]; 2],
 }
 
@@ -348,10 +358,16 @@ impl<S: Sample> IntraPicture<S> {
             ChromaFormat::Monochrome => 0,
             ChromaFormat::Yuv420 => 1,
             ChromaFormat::Yuv422 => 2,
-            ChromaFormat::Yuv444 => {
-                unimplemented!("H.265 intra decision: Yuv444 (4:4:4 in progress)")
-            }
+            ChromaFormat::Yuv444 => 3,
         };
+        // 4:4:4 PART_NxN carries four chroma modes (one per PB) and a
+        // chroma TB inside every 4x4 luma TB — a shape CuDecision's single
+        // chroma mode cannot describe. The 8x8-CTB geometry is test-only,
+        // so refuse the combination by name rather than mis-code it.
+        assert!(
+            !(cat == 3 && log2_cu == 3),
+            "H.265 intra decision: 4:4:4 with 8x8 CTUs (PART_NxN needs per-PB chroma modes; unimplemented)"
+        );
         let w4 = width / 4;
         let h4 = height / 4;
         IntraPicture {
@@ -863,9 +879,10 @@ fn sub_wh(cat: u32) -> (usize, usize) {
 /// positions in coding order with the chroma TB size. Monochrome carries
 /// none; 4:2:0 one half-size square; 4:2:2 two half-size squares stacked
 /// vertically, the second one `nc` luma rows down (no vertical
-/// subsampling, so component rows are luma rows).
+/// subsampling, so component rows are luma rows); 4:4:4 one square at
+/// the luma size itself (`here`'s `if cat == 3 { log2 }` arm).
 fn chroma_tbs(cat: u32, xl: usize, yl: usize, log2: u32) -> ([(usize, usize); 2], usize, u32) {
-    let log2c = log2 - 1;
+    let log2c = if cat == 3 { log2 } else { log2 - 1 };
     let nc = 1usize << log2c;
     match cat {
         0 => ([(0, 0); 2], 0, log2c),
@@ -1224,10 +1241,11 @@ mod tests {
         let mut pic = IntraPicture::new_with_chroma(w, h, log2_cu, 8, chroma);
         pic.try_split = try_split;
         let n = 1usize << log2_cu;
+        let cs = if chroma == ChromaFormat::Yuv444 { w } else { w / 2 };
         let mut decisions = Vec::new();
         for cy in 0..h / n {
             for cx in 0..w / n {
-                decisions.push(pic.code_ctu(ctx, cx, cy, src_y, w, src_cb, src_cr, w / 2));
+                decisions.push(pic.code_ctu(ctx, cx, cy, src_y, w, src_cb, src_cr, cs));
             }
         }
         (pic, decisions)
@@ -1536,11 +1554,15 @@ mod tests {
             let y = noise(w, h, 99 + log2_cu as u64);
             let cbs = noise(w / 2, h / 2, 7);
             let crs = noise(w / 2, h / 2, 8);
-            // The split trial runs (and under bypass reliably loses: the
-            // residual is spatial, so partitioning it moves no energy and
-            // the extra signalling decides) — exactness must survive the
-            // trial machinery either way. The split *shape* under bypass
-            // is exercised by lossless_bypass_composes_with_the_split_shape.
+            // The split trial runs. On uniform noise it loses — a spatial
+            // residual that is nonzero everywhere gives a split nothing to
+            // isolate, so the signalling decides — but that is a property
+            // of this content, not of bypass: where prediction zeroes
+            // whole quadrants their cbfs vanish under a split, and the
+            // encode gate measured lossless splits winning big on the
+            // gradient clip. Exactness must survive either choice; the
+            // split shape under bypass is pinned content-independently by
+            // lossless_bypass_composes_with_the_split_shape.
             let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, true, ChromaFormat::Yuv420, &y, &cbs, &crs);
             for (name, plane, src, pw, ph) in [
                 ("y", &pic.recon.y, &y, w, h),
@@ -1874,6 +1896,74 @@ mod tests {
         }
     }
 
+    /// 4:4:4 end to end: chroma TBs at the luma size and position, the
+    /// reference-smoothing filter on for chroma, the clamped chroma QP —
+    /// all inside the coding loop, so the fresh decoder-side replay plus
+    /// the per-plane distortion bound state the same thing they do for
+    /// the subsampled formats. Both transform structures occur, which
+    /// exercises the 8x8-chroma split children at a 16 CTB.
+    #[test]
+    fn yuv444_replays_and_stays_in_bound() {
+        let kit = Kit::new();
+        for &(log2_cu, qp) in &[(4u32, 30i32), (4, 43), (5, 34)] {
+            let ctx = kit.ctx(qp, false);
+            let n = 1usize << log2_cu;
+            let (w, h) = (4 * n, 2 * n);
+            let y = mixed_source(w, h, n, 0x444 ^ ((log2_cu as u64) << 8) ^ qp as u64);
+            let cbs = noise(w, h, 0x444cb);
+            let crs = noise(w, h, 0x444c7);
+            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, true, ChromaFormat::Yuv444, &y, &cbs, &crs);
+            assert!(
+                decisions.iter().any(|d| d.split_tu) && decisions.iter().any(|d| !d.split_tu),
+                "log2_cu={log2_cu} qp={qp}: only one structure occurred"
+            );
+            let replayed = replay(&ctx, w, h, log2_cu, ChromaFormat::Yuv444, &decisions);
+            assert_planes_equal(&pic.recon, &replayed, log2_cu, qp);
+
+            let bd_off = 6 * (ctx.bit_depth as i32 - 8);
+            let qp_c = chroma_qp(3, ctx.qp.clamp(-bd_off, 57)) + bd_off;
+            for (name, plane, src, pqp) in [
+                ("y", &pic.recon.y, &y, qp),
+                ("cb", &pic.recon.cb, &cbs, qp_c),
+                ("cr", &pic.recon.cr, &crs, qp_c),
+            ] {
+                let step = 1i32 << (pqp / 6);
+                let off = plane.origin();
+                let mut worst = 0i32;
+                for yy in 0..h {
+                    for xx in 0..w {
+                        let d = plane.data[off + yy * plane.stride + xx] as i32 - src[yy * w + xx] as i32;
+                        worst = worst.max(d.abs());
+                    }
+                }
+                assert!(worst <= 8 * step + 16, "{name} log2_cu={log2_cu} qp={pqp} worst={worst} step={step}");
+            }
+        }
+    }
+
+    /// 4:4:4 transquant bypass is exactly lossless.
+    #[test]
+    fn yuv444_bypass_reconstructs_the_source_exactly() {
+        let kit = Kit::new();
+        let ctx = kit.ctx(26, true);
+        for log2_cu in 4..=5u32 {
+            let n = 1usize << log2_cu;
+            let (w, h) = (2 * n, 2 * n);
+            let y = noise(w, h, 0x444b + log2_cu as u64);
+            let cbs = noise(w, h, 0xc1);
+            let crs = noise(w, h, 0xc2);
+            let (pic, _) = code_picture(&ctx, w, h, log2_cu, true, ChromaFormat::Yuv444, &y, &cbs, &crs);
+            for (name, plane, src) in [("y", &pic.recon.y, &y), ("cb", &pic.recon.cb, &cbs), ("cr", &pic.recon.cr, &crs)] {
+                let off = plane.origin();
+                for yy in 0..h {
+                    for xx in 0..w {
+                        assert_eq!(plane.data[off + yy * plane.stride + xx], src[yy * w + xx], "{name} ({xx},{yy}) log2_cu={log2_cu}");
+                    }
+                }
+            }
+        }
+    }
+
     /// The construction the split exists for: three flat quadrants and a
     /// busy one. Unsplit, the big transform smears the busy quadrant's
     /// energy across the whole block's spectrum; split, three TUs code
@@ -1971,11 +2061,15 @@ mod tests {
 
     /// Transquant bypass composed with the split shape: the residual is
     /// carried raw per TB and prediction runs per TB over the exact
-    /// reconstruction, so a split CU is exactly lossless too. The public
-    /// decision never picks a split under bypass (partitioning a spatial
-    /// residual moves no energy, so the extra signalling always loses),
-    /// so this codes the split shape directly through the same function
-    /// the trial uses, then replays it fresh.
+    /// reconstruction, so a split CU is exactly lossless too. On the
+    /// noise this test uses the decision would not pick the split (a
+    /// residual that is nonzero everywhere gives it nothing to isolate) —
+    /// though on real content bypass splits genuinely win, because
+    /// prediction zeroes whole quadrants and their cbfs vanish; the
+    /// encode gate measured a 39% smaller lossless gradient stream. So
+    /// this codes the split shape directly through the same function the
+    /// trial uses, making the shape's coverage independent of what the
+    /// decision happens to choose, then replays it fresh.
     #[test]
     fn lossless_bypass_composes_with_the_split_shape() {
         let kit = Kit::new();
