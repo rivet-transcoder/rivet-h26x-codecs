@@ -164,6 +164,24 @@ pub fn deblock_inter_picture<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &mut InterPi
                     }
                 }
                 PCuDecision::Intra(d) => {
+                    // Transquant-bypass CUs are exempt from the filter
+                    // sample for sample. The inter arm above marks them
+                    // and the all-intra walk in `build_info` marks them;
+                    // THIS arm did not, and an intra CU inside a lossless
+                    // P slice is exactly the case that reaches it.
+                    //
+                    // It stayed invisible because no clip in the corpus
+                    // produced one: `prefer_intra` fires inside a P
+                    // picture when inter prediction has nothing to offer,
+                    // which in practice means a scene cut, and the corpus
+                    // had no cut in it. `src_cut` found it on the first
+                    // run — the encoder filtered samples the decoder left
+                    // alone, so SELF failed on the P pictures after the
+                    // cut and stayed failed until the next IDR reset the
+                    // reference.
+                    if d.bypass {
+                        PicInfo::fill4(&mut pic.info.filter_exempt, w4, x0, y0, n, n, 3u8);
+                    }
                     // An intra CU's transform tree may split, so its TB
                     // edges and its cbf come off the tree rather than off
                     // the CU — `luma_tbs` is the one enumeration of it,
