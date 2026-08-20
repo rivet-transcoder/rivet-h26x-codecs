@@ -250,6 +250,19 @@ pub enum InterCuKind {
 pub struct InterCuDecision {
     /// log2 of the CU (== CTB) size, 4 or 5.
     pub log2_cu: u32,
+    /// `cu_transquant_bypass_flag`. When set, `luma` and `chroma` carry
+    /// the **raw residual** rather than quantised levels: the decoder
+    /// skips dequantisation and the inverse transform for such a CU and
+    /// adds what it reads straight to the prediction, so prediction plus
+    /// residual is the source exactly.
+    ///
+    /// Two consequences the writer and the deblocker must respect.
+    /// `coding_unit` reads this flag as the CU's **very first** bin —
+    /// before `cu_skip_flag`, so even a skipped CU spells it — and only
+    /// when the PPS sets `transquant_bypass_enabled_flag`. And a bypass
+    /// CU is exempt from the in-loop filters sample for sample, which is
+    /// what keeps a lossless stream lossless once deblocking is on.
+    pub bypass: bool,
     /// The choice, with its signalling payload.
     pub kind: InterCuKind,
     /// The chosen motion vector, quarter luma samples, list 0. Filled for
@@ -318,6 +331,7 @@ impl Default for InterCuDecision {
     fn default() -> Self {
         InterCuDecision {
             log2_cu: 0,
+            bypass: false,
             kind: InterCuKind::Skip { merge_idx: 0 },
             mv: Mv::ZERO,
             ref_idx: 0,
@@ -531,7 +545,7 @@ impl<S: Sample> InterPicture<S> {
     ) -> InterCuDecision {
         let n = 1usize << self.log2_cu;
         let (x0, y0) = (cu_x * n, cu_y * n);
-        let mut out = InterCuDecision { log2_cu: self.log2_cu, ..InterCuDecision::default() };
+        let mut out = InterCuDecision { log2_cu: self.log2_cu, bypass: ctx.bypass, ..InterCuDecision::default() };
 
         // Mark the CTB as this (single) slice's, as the decoder does at CTB
         // start: `avail_ctx` reads the current CTB's slice address, and
@@ -688,7 +702,7 @@ impl<S: Sample> InterPicture<S> {
     ) -> InterCuDecision {
         let n = 1usize << self.log2_cu;
         let (x0, y0) = (cu_x * n, cu_y * n);
-        let mut out = InterCuDecision { log2_cu: self.log2_cu, ..InterCuDecision::default() };
+        let mut out = InterCuDecision { log2_cu: self.log2_cu, bypass: ctx.bypass, ..InterCuDecision::default() };
 
         let ctb = self.info.ctb_of(x0, y0);
         self.info.ctb_slice_addr[ctb] = 0;
@@ -1238,6 +1252,21 @@ fn code_residual_inter<S: Sample>(
             work[yy * n + xx] = (src[yy * src_stride + xx].to_i32() - plane.data[off + yy * stride + xx].to_i32()) as i16;
         }
     }
+
+    if ctx.bypass {
+        // Lossless: the residual IS the coefficients. `residual_block`
+        // skips `scale_coefficients` and the inverse transform for a
+        // bypassed CU (`hevc::ctu`'s `if !cu.bypass` gate) and adds what
+        // it parsed as it stands, so carrying the raw difference makes
+        // prediction plus residual equal the source — and the clip inside
+        // `add_residual` never bites, because that sum is a real sample
+        // value by construction. The same branch `h265_intra`'s
+        // `code_residual` takes, and for the same reason.
+        levels[..n * n].copy_from_slice(&work[..n * n]);
+        (ctx.dsp.add_residual)(&mut plane.data[off..], stride, &work, n, max);
+        return levels[..n * n].iter().filter(|&&v| v != 0).count() as u32;
+    }
+
     (ctx.enc.fdct[(log2 - 2) as usize])(&mut work, log2, ctx.bit_depth);
     let qb = qbits(qp, log2, ctx.bit_depth);
     let nz = (ctx.enc.quant)(&work, levels, n, quant_scale((qp % 6) as usize), qb, quant_offset(qb, false));

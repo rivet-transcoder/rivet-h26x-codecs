@@ -131,12 +131,23 @@ pub fn deblock_inter_picture<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &mut InterPi
             }
             match d {
                 PCuDecision::Inter(d) => {
+                    // Transquant-bypass CUs are exempt from the filter
+                    // sample for sample, exactly as the all-intra walk
+                    // marks them: `coding_unit` records the flag and the
+                    // filter leaves such samples untouched, which is what
+                    // keeps a lossless inter picture lossless once
+                    // deblocking is on. This became reachable the moment
+                    // lossless inter stopped refusing; before that no
+                    // inter CU could carry the flag.
+                    if d.bypass {
+                        PicInfo::fill4(&mut pic.info.filter_exempt, w4, x0, y0, n, n, 3u8);
+                    }
                     // The coding-block edges marked as transform-block
                     // bits (1 and 4) on the same lines — "a skipped CU
                     // has no transform tree, so mark here", and a
                     // non-skip CU's single CU-sized TU marks exactly the
                     // same lines in transform_unit. No interior TB edges
-                    // exist at this geometry, and no bypass does either.
+                    // exist at this geometry.
                     for yy in (y0..y0 + n).step_by(4) {
                         pic.info.edges[(yy >> 2) * w4 + (x0 >> 2)] |= 1;
                     }

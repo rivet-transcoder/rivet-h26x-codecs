@@ -179,15 +179,7 @@ impl H265Encoder {
             RateControl::ConstantQp(q) => q.min(51),
         };
         if c.kind != Kind::Idr {
-            if bypass {
-                // Transquant bypass on an inter CU is legal, but the inter
-                // decision does not model it and a lossy stream sold as
-                // lossless is the worst possible answer.
-                return Err(Error::unsupported(
-                    "H.265 encode: lossless inter pictures (encoder in progress)",
-                ));
-            }
-            return self.code_inter_picture(c, src, qp);
+            return self.code_inter_picture(c, src, qp, bypass);
         }
 
         // Sources at coded size, edge-replicated: the coded picture is a
@@ -408,7 +400,7 @@ impl H265Encoder {
     /// most sharply that a non-skip 2Nx2N merge CU never codes
     /// `rqt_root_cbf` (the reader infers it true), which is why a merge
     /// with nothing left to code must be spelled as a skip instead.
-    fn code_inter_picture(&mut self, c: Coded, src: &[u8], qp: u8) -> Result<Access> {
+    fn code_inter_picture(&mut self, c: Coded, src: &[u8], qp: u8, bypass: bool) -> Result<Access> {
         let g = self.geom;
         let (dw, dh) = (self.cfg.width as usize, self.cfg.height as usize);
         let (cw, ch) = (g.coded_width as usize, g.coded_height as usize);
@@ -458,7 +450,7 @@ impl H265Encoder {
         let sps_rbsp = syn::write_sps(&self.cfg, &g, LOG2_MAX_POC_LSB);
         // The very bytes the IDR access unit carried: `code_picture`
         // writes one PPS for the stream, with the deblocking filter on.
-        let pps_rbsp = syn::write_pps(qp, false, true);
+        let pps_rbsp = syn::write_pps(qp, bypass, true);
         let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&sps_rbsp))?;
         let mut pps = crate::hevc::pps::Pps::parse(&crate::nal::unescape_rbsp(&pps_rbsp))?;
         pps.resolve_tiles(&sps)?;
@@ -496,7 +488,7 @@ impl H265Encoder {
             qp: qp as i32,
             bit_depth: 8,
             strong_smoothing: false,
-            bypass: false,
+            bypass,
         };
         let mut pic = InterPicture::<u8>::new(&sps, &pps, c.poc as i32);
 
@@ -587,8 +579,8 @@ impl H265Encoder {
                     let above = (cy > 0).then(|| skipped[addr - wc]);
                     write_sao_for(&mut e, &mut cx, plan.as_ref(), addr, cxu, cy, qp, cat);
                     match &decisions[addr] {
-                        PCuDecision::Inter(d) => write_cu_inter(&mut e, &mut cx, d, left, above, cat),
-                        PCuDecision::Intra(d) => write_cu_intra_in_p(&mut e, &mut cx, d, left, above, cat),
+                        PCuDecision::Inter(d) => write_cu_inter(&mut e, &mut cx, d, left, above, cat, bypass),
+                        PCuDecision::Intra(d) => write_cu_intra_in_p(&mut e, &mut cx, d, left, above, cat, bypass),
                     }
                     e.encode_terminate(u32::from(cy == hc - 1 && cxu == wc - 1));
                 }
@@ -705,8 +697,10 @@ fn write_cu_inter(
     left_skip: Option<bool>,
     above_skip: Option<bool>,
     cat: u32,
+    pps_bypass: bool,
 ) {
     let log2 = d.log2_cu;
+    debug_assert!(pps_bypass || !d.bypass, "a bypass CU is unspellable unless the PPS enables the flag");
     // One CU per CTU, so the coding quadtree never splits and the flag is
     // coded exactly once, false - the same shape the intra writer spells.
     let nb = SplitCuNb {
@@ -714,6 +708,14 @@ fn write_cu_inter(
         above_depth: above_skip.map(|_| 0),
     };
     write_split_cu_flag(e, cx, &nb, 0, false);
+    // cu_transquant_bypass_flag is the CU's VERY FIRST bin - `coding_unit`
+    // reads it before cu_skip_flag, so even a skipped CU spells one, and
+    // it is present exactly when the PPS sets
+    // transquant_bypass_enabled_flag. Writing it after the skip flag, or
+    // omitting it on a skip, desyncs from the first lossless CU onward.
+    if pps_bypass {
+        write_cu_transquant_bypass_flag(e, cx, d.bypass);
+    }
 
     let skip = matches!(d.kind, InterCuKind::Skip { .. });
     write_cu_skip_flag(e, cx, left_skip, above_skip, skip);
@@ -810,7 +812,7 @@ fn write_cu_inter(
         log2_size,
         c_idx,
         scan_idx: 0,
-        bypass: false,
+        bypass: d.bypass,
         transform_skip_allowed: false,
         sign_hiding: false,
         intra: false,
@@ -908,13 +910,19 @@ fn write_cu_intra_in_p(
     left_skip: Option<bool>,
     above_skip: Option<bool>,
     cat: u32,
+    pps_bypass: bool,
 ) {
-    debug_assert!(!d.bypass, "P pictures carry no transquant bypass, so no CU may claim it");
+    debug_assert!(pps_bypass || !d.bypass, "a bypass CU is unspellable unless the PPS enables the flag");
     let nb = SplitCuNb {
         left_depth: left_skip.map(|_| 0),
         above_depth: above_skip.map(|_| 0),
     };
     write_split_cu_flag(e, cx, &nb, 0, false);
+    // `coding_unit` reads cu_transquant_bypass_flag BEFORE cu_skip_flag,
+    // so it comes first here too.
+    if pps_bypass {
+        write_cu_transquant_bypass_flag(e, cx, d.bypass);
+    }
     write_cu_skip_flag(e, cx, left_skip, above_skip, false);
     write_pred_mode_flag(e, cx, true);
     write_cu_intra_body(e, cx, d, cat);
@@ -1184,19 +1192,13 @@ mod tests {
             assert!(units.iter().all(|u| !u.data.is_empty()));
         }
 
-        // The named holes that remain, each reached by the configuration
-        // that asks for it.
-        let holes: [(Config, usize, &str); 1] = [
-            (
-                Config {
-                    gop: 8,
-                    rate: super::super::RateControl::Lossless,
-                    ..cfg(64, 64, ChromaFormat::Yuv420)
-                },
-                64 * 64 * 3 / 2,
-                "lossless inter",
-            ),
-        ];
+        // No named holes remain in the H.265 envelope: intra, P and B all
+        // code, in every chroma format, lossy and lossless. This array is
+        // deliberately kept — empty — rather than deleted, because the
+        // loop below is the shape that proves a refusal is reached BY the
+        // configuration that asks for it rather than merely present in the
+        // source, and the next exclusion should be added here.
+        let holes: [(Config, usize, &str); 0] = [];
         for (config, per, want) in holes {
             let mut e = H265Encoder::new(config).unwrap();
             let frame = vec![64u8; per];
@@ -1216,6 +1218,63 @@ mod tests {
                 }
             }
             assert!(named, "never reached the {want:?} hole");
+        }
+
+        // Lossless inter, the last hole to close, codes in every chroma
+        // format and reconstructs the source EXACTLY — for P and for B.
+        // Exactness is the whole point of the mode, so it is asserted
+        // here and not merely that a stream came out.
+        for chroma in [
+            ChromaFormat::Monochrome,
+            ChromaFormat::Yuv420,
+            ChromaFormat::Yuv422,
+            ChromaFormat::Yuv444,
+        ] {
+            for bframes in [0u32, 2] {
+                let frames = moving_frames_n(64, 64, chroma, 6);
+                let mut e = H265Encoder::new(Config {
+                    rate: super::super::RateControl::Lossless,
+                    gop: 8,
+                    bframes,
+                    ..cfg(64, 64, chroma)
+                })
+                .unwrap();
+                let mut units = Vec::new();
+                for f in &frames {
+                    units.extend(e.push(f).expect("lossless inter should code"));
+                }
+                units.extend(e.flush().unwrap());
+                assert_eq!(units.len(), frames.len(), "{chroma:?} bframes={bframes}");
+                assert!(
+                    units[1..].iter().any(|u| !u.keyframe),
+                    "{chroma:?} bframes={bframes}: no inter picture was coded, so lossless INTER is untested"
+                );
+                // The reconstructions come back in coding order; every one
+                // must equal its source picture exactly.
+                assert_eq!(e.reconstructions().len(), frames.len());
+                // POC advances by TWO per picture (`gop.rs`: poc = display
+                // * 2), so the display index of an access unit is poc / 2 —
+                // not poc. Getting that wrong reads a neighbouring source
+                // and reports a lossless stream as lossy, which is exactly
+                // what it did while this test was being written.
+                // With B pictures the scheduler must actually have held
+                // one back, or the bframes arm proves nothing beyond the
+                // bframes=0 one.
+                if bframes > 0 {
+                    assert!(
+                        units.iter().any(|u| u.encode_index as usize != (u.poc / 2) as usize),
+                        "{chroma:?}: coding order never differed from display order, so no B picture was coded"
+                    );
+                }
+                for u in &units {
+                    let rec = &e.reconstructions()[u.encode_index as usize];
+                    assert_eq!(
+                        rec, &frames[(u.poc / 2) as usize],
+                        "{chroma:?} bframes={bframes}: picture poc {} is not lossless",
+                        u.poc
+                    );
+                }
+            }
         }
     }
 
@@ -1318,6 +1377,12 @@ mod tests {
     /// real detail is what makes a P picture carry residual rather than
     /// coding as a field of skips.
     fn moving_frames(w: usize, h: usize, chroma: ChromaFormat) -> Vec<Vec<u8>> {
+        moving_frames_n(w, h, chroma, 3)
+    }
+
+    /// The same, with a chosen picture count — a B group needs more than
+    /// three before the scheduler actually holds one back.
+    fn moving_frames_n(w: usize, h: usize, chroma: ChromaFormat, count: usize) -> Vec<Vec<u8>> {
         let (sw, sh) = match chroma {
             ChromaFormat::Yuv420 => (2usize, 2usize),
             ChromaFormat::Yuv422 => (2, 1),
@@ -1326,7 +1391,7 @@ mod tests {
         let mono = chroma == ChromaFormat::Monochrome;
         let (cw, ch) = if mono { (0, 0) } else { (w / sw, h / sh) };
         let per = w * h + 2 * cw * ch;
-        (0..3usize)
+        (0..count)
             .map(|f| {
                 let mut frame = vec![0u8; per];
                 let (dx, dy) = (3 * f, f);
