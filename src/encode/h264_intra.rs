@@ -290,10 +290,15 @@ fn avail_8x8(bx: usize, by: usize, mb: MbAvail) -> IntraAvail {
 /// sub-block nonzero counts CAVLC's `nC` reads.
 ///
 /// The 8x8 has no DC split — no Intra_16x16-style Hadamard exists for it,
-/// whatever the macroblock type — so unlike [`code_block_4x4`] there is
-/// no `keep_dc`, and position 0 always carries its own coefficient.
+/// whatever the macroblock type — so unlike `code_block_4x4` there is no
+/// `keep_dc`, and position 0 always carries its own coefficient. That is
+/// also why the inter path shares this function rather than keeping its
+/// own the way it does for the 4x4 (`code_inter_4x4` in
+/// src/encode/h264_me.rs exists to drop the DC split): with nothing to
+/// differ about, a second copy would only be a second thing to keep in
+/// step. `intra` still picks the dead zone, which does differ.
 #[allow(clippy::too_many_arguments)]
-fn code_block_8x8(
+pub(crate) fn code_block_8x8(
     ctx: &IntraCtx,
     rec: &mut Recon,
     off: usize,
@@ -334,7 +339,14 @@ fn code_block_8x8(
 /// read off `MbDequant::for_mb` in src/h264/mb.rs. The lists this encoder
 /// sends are flat, so the two orders agree numerically today and would
 /// stop agreeing the moment a scaling matrix arrived.
-fn reconstruct_8x8(ctx: &IntraCtx, rec: &mut Recon, off: usize, levels: &[i16; 64], list8: usize, qp: i32) {
+pub(crate) fn reconstruct_8x8(
+    ctx: &IntraCtx,
+    rec: &mut Recon,
+    off: usize,
+    levels: &[i16; 64],
+    list8: usize,
+    qp: i32,
+) {
     let scale = &ctx.dequant.scale8[list8][(qp % 6) as usize];
     let shift = (qp / 6) as u32;
     let mut coefs = [0i32; 64];
@@ -970,34 +982,65 @@ fn chosen_nxn_modes(_out: &MbDecision, chosen: &[u8; 16]) -> [u8; 16] {
 /// them a macroblock is coded as, the transform size included.
 ///
 /// Every candidate is fully coded and reconstructed first, and this
-/// scores it as the SATD of that *reconstruction* against the source
-/// plus `lambda` times a fixed estimate of the mode signalling: two bits
-/// for `I_16x16` (the type carries the mode), four bits a block for
-/// `I_4x4`'s sixteen modes, and for `I_8x8` four bits for each of its
-/// four modes plus the `transform_size_8x8_flag` itself.
+/// scores it as `distortion` — how far that *reconstruction* landed from
+/// the source — plus `lambda` times a fixed estimate of the mode
+/// signalling: two bits for `I_16x16` (the type carries the mode), four
+/// bits a block for `I_4x4`'s sixteen modes, and for `I_8x8` four bits
+/// for each of its four modes plus the `transform_size_8x8_flag` itself.
 ///
-/// What it has no term for is the residual, and that is where the choice
-/// between the two `I_NxN` transforms actually lives: at a fixed
-/// quantiser the 8x8 usually codes comparable pictures in *fewer bits*
-/// rather than reconstructing them more closely, so a distortion-led
-/// comparison understates it and this will take 8x8 less often than a
-/// rate-distortion decision would. It is deliberately not dressed up as
-/// more than that — the estimate is one expression per candidate and the
-/// comparison is a `min`, so a real decision replaces this function and
-/// nothing else.
-fn placeholder_intra_cost(kind: MbKind, satd: u32, qp: i32) -> f32 {
+/// It has no term for the residual, which is where the choice between
+/// the two `I_NxN` transforms mostly lives: at a fixed quantiser the 8x8
+/// usually codes comparable pictures in *fewer bits* rather than
+/// reconstructing them more closely, so this takes 8x8 less often than a
+/// real rate-distortion decision would.
+///
+/// Which measure `distortion` is depends on whether the 8x8 transform is
+/// on offer ([`intra_distortion`]), and that is worth stating plainly
+/// because it looks like an inconsistency and is one.
+fn placeholder_intra_cost(kind: MbKind, distortion: u64, qp: i32) -> f32 {
     let bits = match kind {
         MbKind::I16x16 => 2.0,
         MbKind::I4x4 => 4.0 * 16.0,
         MbKind::I8x8 => 4.0 * 4.0 + 1.0,
     };
-    satd as f32 + lambda(qp) * bits
+    distortion as f32 + lambda(qp) * bits
+}
+
+/// How far a coded candidate's reconstruction landed from the source —
+/// squared error when the 8x8 transform is on offer, SATD when it is not.
+///
+/// Squared error is the right measure for this comparison. Every
+/// candidate is fully *coded* before it is scored, so what separates them
+/// is how close the reconstruction landed; SATD is a stand-in for what a
+/// **prediction** will cost to code, which is a different question and
+/// the one an intra mode search inside a block is asking. Scored by SATD
+/// the ladder took `I_8x8` on macroblocks whose squared error was worse,
+/// and at QP 26 the motion clip lost half a decibel while spending 19%
+/// more bits — the wrong trade in both directions at once. Moving to
+/// squared error turned that into +0.07 dB at 13% more, and gained
+/// between 0.05 and 3.6 dB on every other clip and quantiser measured,
+/// at fewer bits in each case.
+///
+/// So why is SATD still here? Because the SATD ladder's output is pinned.
+/// Every stream this encoder has ever written is a 4x4-versus-16x16
+/// decision made that way, and switching the measure moves bytes in
+/// configurations that have nothing to do with the 8x8 transform.
+/// Keeping the old measure where the old mode set applies is what lets
+/// "everything not using the 8x8 transform is byte-identical" be checked
+/// rather than argued about. Unifying the two is a change of its own,
+/// with its own before-and-after numbers, and it should happen.
+fn intra_distortion(ctx: &IntraCtx, src: &[u8], src_stride: usize, recon: &[u8]) -> u64 {
+    if ctx.t8x8 {
+        (ctx.dist.ssd)(src, src_stride, recon, 16, 16, 16)
+    } else {
+        (ctx.dist.satd)(src, src_stride, recon, 16, 16, 16) as u64
+    }
 }
 
 /// The Lagrangian multiplier H.264 mode decision conventionally uses,
 /// `0.85 * 2^((QP - 12) / 3)`, in the same units as a SATD so a mode's
 /// cost can be its distortion plus `lambda` times its bits.
-fn lambda(qp: i32) -> f32 {
+pub(crate) fn lambda(qp: i32) -> f32 {
     0.85f32 * ((qp - 12) as f32 / 3.0).exp2()
 }
 
@@ -1042,10 +1085,10 @@ pub fn code_macroblock(
     let off = rec[0].offset(px as isize, py as isize);
     let mut pred = [0u8; 256];
     // The reconstruction of a coded candidate, scored against the source.
-    macro_rules! recon_satd {
+    macro_rules! recon_cost {
         () => {{
             gather(&rec[0], off, 16, 16, &mut pred);
-            (ctx.dist.satd)(&src_luma[soff..], luma_stride, &pred, 16, 16, 16)
+            intra_distortion(ctx, &src_luma[soff..], luma_stride, &pred)
         }};
     }
 
@@ -1063,7 +1106,7 @@ pub fn code_macroblock(
         top_modes,
         &mut out,
     );
-    let cost_4x4 = placeholder_intra_cost(MbKind::I4x4, recon_satd!(), ctx.qp);
+    let cost_4x4 = placeholder_intra_cost(MbKind::I4x4, recon_cost!(), ctx.qp);
 
     // I_8x8, when the PPS offers the transform: the same interleaved
     // shape over four quads, and it overwrites the I_4x4 reconstruction
@@ -1084,7 +1127,7 @@ pub fn code_macroblock(
             top_modes,
             &mut out8,
         );
-        cost_8x8 = placeholder_intra_cost(MbKind::I8x8, recon_satd!(), ctx.qp);
+        cost_8x8 = placeholder_intra_cost(MbKind::I8x8, recon_cost!(), ctx.qp);
     }
 
     // I_16x16: its prediction reads only neighbours outside the
@@ -1098,7 +1141,11 @@ pub fn code_macroblock(
             continue;
         }
         gather(&rec[0], off, 16, 16, &mut pred);
-        let c = placeholder_intra_cost(MbKind::I16x16, (ctx.dist.satd)(&src_luma[soff..], luma_stride, &pred, 16, 16, 16), ctx.qp);
+        let c = placeholder_intra_cost(
+            MbKind::I16x16,
+            intra_distortion(ctx, &src_luma[soff..], luma_stride, &pred),
+            ctx.qp,
+        );
         if c < best.0 {
             best = (c, mode);
         }

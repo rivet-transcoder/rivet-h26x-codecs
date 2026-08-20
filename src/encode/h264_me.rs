@@ -69,7 +69,8 @@ use crate::dsp::distortion::DistortionDsp;
 use crate::dsp::h264::{NO_DC, PRED_STRIDE};
 use crate::dsp::h264_enc::{qbits4, quant_offset};
 use crate::encode::h264_deblock::FilterMb;
-use crate::encode::h264_intra::IntraCtx;
+use crate::encode::h264_intra::{IntraCtx, code_block_8x8, lambda, quad_rasters, reconstruct_8x8};
+use crate::h264::cavlc::sub_block_counts_8x8;
 use crate::encode::h264_syntax::Recon;
 use crate::h264::frame::Mv;
 use crate::h264::mb::{NbMotion, median_mvp};
@@ -564,6 +565,12 @@ fn predict_inter_16x16(
 /// [`InterDecision`] (and the B decision) carry — produced by
 /// `code_inter_mb_residual` once the prediction stands in `rec`.
 struct InterResidual {
+    /// `transform_size_8x8_flag`. Forced false when `cbp_luma` is zero:
+    /// the syntax then carries no flag and a decoder infers zero, so
+    /// recording anything else would leave the encoder's loop filter and
+    /// the next macroblock's contexts disagreeing with a decoder's over a
+    /// bit nobody wrote.
+    transform_8x8: bool,
     /// `CodedBlockPatternLuma`.
     cbp_luma: u8,
     /// `CodedBlockPatternChroma`.
@@ -578,6 +585,107 @@ struct InterResidual {
     chroma_ac: [[[i16; 16]; 16]; 2],
     /// Nonzero count per chroma block.
     nz_chroma: [[u8; 16]; 2],
+}
+
+/// A macroblock's worth of luma out of a plane, packed 16 by 16.
+fn gather16(p: &Recon, off: usize, out: &mut [u8; 256]) {
+    for y in 0..16 {
+        out[y * 16..y * 16 + 16].copy_from_slice(&p.data[off + y * p.stride..off + y * p.stride + 16]);
+    }
+}
+
+/// The inverse of [`gather16`]: put a saved macroblock back.
+fn scatter16(p: &mut Recon, off: usize, src: &[u8; 256]) {
+    for y in 0..16 {
+        p.data[off + y * p.stride..off + y * p.stride + 16]
+            .copy_from_slice(&src[y * 16..y * 16 + 16]);
+    }
+}
+
+/// Code an inter macroblock's luma as sixteen 4x4 blocks, reconstructing
+/// in place, and fill the levels, counts and coded block pattern.
+fn code_luma_4x4(
+    ctx: &MeCtx,
+    rec: &mut Recon,
+    off: usize,
+    src: &[u8],
+    src_stride: usize,
+    out: &mut InterResidual,
+) {
+    for blk in 0..16 {
+        let (bx, by) = (blk % 4, blk / 4);
+        let boff = off + by * 4 * rec.stride + bx * 4;
+        let bsoff = by * 4 * src_stride + bx * 4;
+        let (lv, n, _) = code_inter_4x4(ctx, rec, boff, &src[bsoff..], src_stride, 3, ctx.qp, true);
+        out.luma[blk] = lv;
+        out.nz_luma[blk] = n as u8;
+        add_residual_4x4(ctx, rec, boff, &lv, 3, ctx.qp, None);
+    }
+    for blk8 in 0..4 {
+        if quad_rasters(blk8).iter().any(|&r| out.nz_luma[r] != 0) {
+            out.cbp_luma |= 1 << blk8;
+        }
+    }
+}
+
+/// The same as four 8x8 blocks: the shared block coder at the *inter*
+/// dead zone and 8x8 scaling list 1 (`2 * plane + inter`, so luma inter
+/// is 1 — not the 4x4 order's 3), and the counts kept per CAVLC sub-scan
+/// as [`InterDecision::nz_luma`] promises.
+fn code_luma_8x8(
+    ctx: &MeCtx,
+    rec: &mut Recon,
+    off: usize,
+    src: &[u8],
+    src_stride: usize,
+    out: &mut InterResidual,
+) {
+    for blk8 in 0..4 {
+        let (bx, by) = ((blk8 & 1) * 2, (blk8 >> 1) * 2);
+        let boff = off + by * 4 * rec.stride + bx * 4;
+        let bsoff = by * 4 * src_stride + bx * 4;
+        let (lv, counts) =
+            code_block_8x8(ctx, rec, boff, &src[bsoff..], src_stride, 1, ctx.qp, false);
+        reconstruct_8x8(ctx, rec, boff, &lv, 1, ctx.qp);
+        out.luma.as_flattened_mut()[blk8 * 64..blk8 * 64 + 64].copy_from_slice(&lv);
+        for (sub, &raster) in quad_rasters(blk8).iter().enumerate() {
+            out.nz_luma[raster] = counts[sub];
+        }
+        if counts.iter().any(|&n| n != 0) {
+            out.cbp_luma |= 1 << blk8;
+        }
+    }
+    debug_assert_eq!(
+        out.luma.as_flattened().iter().filter(|&&v| v != 0).count(),
+        (0..4)
+            .map(|b| sub_block_counts_8x8(&out.luma.as_flattened()[b * 64..b * 64 + 64])
+                .iter()
+                .map(|&n| n as usize)
+                .sum::<usize>())
+            .sum::<usize>(),
+        "the four sub-scans have to partition an 8x8's sixty-four positions"
+    );
+}
+
+/// PLACEHOLDER — which transform size an inter macroblock's luma residual
+/// uses.
+///
+/// Both are coded and reconstructed from the same prediction, and this
+/// compares the sum of squared errors of each reconstruction against the
+/// source plus `lambda` times the one bit the flag costs.
+///
+/// Squared error, for the reason `intra_distortion` in
+/// src/encode/h264_intra.rs sets out at length: both candidates here are
+/// fully coded, so what separates them is how close the reconstruction
+/// landed, and SATD measures what a *prediction* would cost to code
+/// instead. This decision is new, so unlike the intra ladder it has
+/// nothing pinning it to the older measure and simply uses the right one.
+///
+/// It still has no rate term for the residual, which is where the 8x8
+/// transform mostly earns its keep, so it takes 8x8 less often than a
+/// real rate-distortion decision would. One function, one comparison.
+fn placeholder_inter_transform_size(ssd_4x4: u64, ssd_8x8: u64, qp: i32) -> bool {
+    ssd_8x8 as f32 + lambda(qp) < ssd_4x4 as f32
 }
 
 /// Code the residual of a 16x16 inter macroblock whose *prediction*
@@ -599,6 +707,7 @@ fn code_inter_mb_residual(
     let (px, py) = (mb_x * 16, mb_y * 16);
     let soff = py * luma_stride + px;
     let mut out = InterResidual {
+        transform_8x8: false,
         cbp_luma: 0,
         cbp_chroma: 0,
         luma: [[0; 16]; 16],
@@ -608,29 +717,50 @@ fn code_inter_mb_residual(
         nz_chroma: [[0; 16]; 2],
     };
 
-    // Luma: each 4x4 coded and reconstructed in place. Raster order —
-    // inter blocks predict from the reference, not from each other, so
-    // unlike Intra_4x4 nothing here needs the decode scan.
+    // Luma. The 4x4 candidate first — each block coded and reconstructed
+    // in place, in raster order, because inter blocks predict from the
+    // reference rather than from each other and so, unlike Intra_4x4,
+    // nothing here needs the decode scan.
     let off = rec[0].offset(px as isize, py as isize);
-    for blk in 0..16 {
-        let (bx, by) = (blk % 4, blk / 4);
-        let boff = off + by * 4 * rec[0].stride + bx * 4;
-        let bsoff = soff + by * 4 * luma_stride + bx * 4;
-        let (lv, n, _) = code_inter_4x4(ctx, &rec[0], boff, &src_luma[bsoff..], luma_stride, 3, ctx.qp, true);
-        out.luma[blk] = lv;
-        out.nz_luma[blk] = n as u8;
-        add_residual_4x4(ctx, &mut rec[0], boff, &lv, 3, ctx.qp, None);
-    }
-    for blk8 in 0..4 {
-        let (ox, oy) = ((blk8 % 2) * 2, (blk8 / 2) * 2);
-        if (0..4).any(|k| out.nz_luma[(oy + k / 2) * 4 + ox + k % 2] != 0) {
-            out.cbp_luma |= 1 << blk8;
+    // The prediction, before any residual is added to it: the 8x8
+    // candidate has to start from the same samples, and whichever loses
+    // has to be undone.
+    let mut pred = [0u8; 256];
+    gather16(&rec[0], off, &mut pred);
+    code_luma_4x4(ctx, &mut rec[0], off, &src_luma[soff..], luma_stride, &mut out);
+
+    if ctx.t8x8 {
+        // Score what the 4x4 reconstructed, keep it, and try the 8x8 from
+        // the same prediction.
+        let mut recon4 = [0u8; 256];
+        gather16(&rec[0], off, &mut recon4);
+        let cost4 = (ctx.dist.ssd)(&src_luma[soff..], luma_stride, &recon4, 16, 16, 16);
+        let r4 = (out.cbp_luma, out.luma, out.nz_luma);
+
+        scatter16(&mut rec[0], off, &pred);
+        out.cbp_luma = 0;
+        out.luma = [[0; 16]; 16];
+        out.nz_luma = [0; 16];
+        code_luma_8x8(ctx, &mut rec[0], off, &src_luma[soff..], luma_stride, &mut out);
+        let mut recon8 = [0u8; 256];
+        gather16(&rec[0], off, &mut recon8);
+        let cost8 = (ctx.dist.ssd)(&src_luma[soff..], luma_stride, &recon8, 16, 16, 16);
+
+        // A macroblock with no coded luma block carries no flag at all,
+        // so the 8x8 candidate cannot be *recorded* even when it wins:
+        // both spell the same empty residual, and 4x4 is what a decoder
+        // will infer.
+        if placeholder_inter_transform_size(cost4, cost8, ctx.qp) {
+            out.transform_8x8 = true;
+        } else {
+            scatter16(&mut rec[0], off, &recon4);
+            (out.cbp_luma, out.luma, out.nz_luma) = r4;
         }
     }
 
     let h = ctx.chroma_h;
     if h == 0 {
-        return out;
+        return out.gate_transform_size();
     }
     if ctx.c444 {
         // 4:4:4: the chroma planes code luma-style — each 4x4 keeps its
@@ -643,24 +773,47 @@ fn code_inter_mb_residual(
             let plane = &mut rec[comp + 1];
             let off = plane.offset(px as isize, py as isize);
             let qp = ctx.qpc[comp];
-            for blk in 0..16 {
-                let (bx, by) = (blk % 4, blk / 4);
-                let boff = off + by * 4 * plane.stride + bx * 4;
-                let bsoff = by * 4 * luma_stride + bx * 4;
-                let (lv, n, _) =
-                    code_inter_4x4(ctx, plane, boff, &src[bsoff..], luma_stride, 4 + comp, qp, true);
-                out.chroma_ac[comp][blk] = lv;
-                out.nz_chroma[comp][blk] = n as u8;
-                add_residual_4x4(ctx, plane, boff, &lv, 4 + comp, qp, None);
+            if out.transform_8x8 {
+                // The transform size is the macroblock's, not the plane's:
+                // one `transform_size_8x8_flag` governs all three
+                // luma-style planes, exactly as one coded block pattern
+                // does. The 8x8 scaling lists run `2 * plane + inter`, so
+                // Cb inter is 3 and Cr inter 5 — not the 4x4 order's 4
+                // and 5.
+                for blk8 in 0..4 {
+                    let (bx, by) = ((blk8 & 1) * 2, (blk8 >> 1) * 2);
+                    let boff = off + by * 4 * plane.stride + bx * 4;
+                    let bsoff = by * 4 * luma_stride + bx * 4;
+                    let (lv, counts) = code_block_8x8(
+                        ctx, plane, boff, &src[bsoff..], luma_stride, 3 + 2 * comp, qp, false,
+                    );
+                    reconstruct_8x8(ctx, plane, boff, &lv, 3 + 2 * comp, qp);
+                    out.chroma_ac[comp].as_flattened_mut()[blk8 * 64..blk8 * 64 + 64]
+                        .copy_from_slice(&lv);
+                    for (sub, &raster) in quad_rasters(blk8).iter().enumerate() {
+                        out.nz_chroma[comp][raster] = counts[sub];
+                    }
+                }
+            } else {
+                for blk in 0..16 {
+                    let (bx, by) = (blk % 4, blk / 4);
+                    let boff = off + by * 4 * plane.stride + bx * 4;
+                    let bsoff = by * 4 * luma_stride + bx * 4;
+                    let (lv, n, _) = code_inter_4x4(
+                        ctx, plane, boff, &src[bsoff..], luma_stride, 4 + comp, qp, true,
+                    );
+                    out.chroma_ac[comp][blk] = lv;
+                    out.nz_chroma[comp][blk] = n as u8;
+                    add_residual_4x4(ctx, plane, boff, &lv, 4 + comp, qp, None);
+                }
             }
             for blk8 in 0..4 {
-                let (ox, oy) = ((blk8 % 2) * 2, (blk8 / 2) * 2);
-                if (0..4).any(|k| out.nz_chroma[comp][(oy + k / 2) * 4 + ox + k % 2] != 0) {
+                if quad_rasters(blk8).iter().any(|&r| out.nz_chroma[comp][r] != 0) {
                     out.cbp_luma |= 1 << blk8;
                 }
             }
         }
-        return out;
+        return out.gate_transform_size();
     }
     // Chroma, per component: per-4x4 AC with the DC pulled into the 2x2
     // (4:2:0) or 2x4 (4:2:2) Hadamard, reconstruction back through the
@@ -744,7 +897,27 @@ fn code_inter_mb_residual(
     } else {
         0
     };
-    out
+    out.gate_transform_size()
+}
+
+impl InterResidual {
+    /// Drop a recorded 8x8 transform when nothing is left to carry it.
+    ///
+    /// The reader takes `transform_size_8x8_flag` only when
+    /// `layer.cbp & 15 != 0` (`parse_mb_cavlc` / `parse_mb_cabac`), and
+    /// that cbp is the *final* one — which in 4:4:4 the chroma planes
+    /// contribute to, so the test cannot be made before they are coded.
+    /// With no coded luma-style block there is no flag on the wire, a
+    /// decoder infers zero, and both transform sizes reconstruct the bare
+    /// prediction anyway; recording anything else would leave the loop
+    /// filter and the next macroblock's contexts disagreeing with a
+    /// decoder over a bit nobody wrote.
+    fn gate_transform_size(mut self) -> Self {
+        if self.cbp_luma == 0 {
+            self.transform_8x8 = false;
+        }
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -820,6 +993,7 @@ pub fn code_macroblock_p16(
     let r = code_inter_mb_residual(
         ctx, rec, mb_x, mb_y, src_luma, luma_stride, src_chroma, chroma_stride,
     );
+    out.transform_8x8 = r.transform_8x8;
     out.cbp_luma = r.cbp_luma;
     out.cbp_chroma = r.cbp_chroma;
     out.luma = r.luma;
@@ -1093,6 +1267,7 @@ pub fn code_macroblock_b16(
     // then the shared residual machinery.
     predict_inter_16x16(ctx, rec, refs, px, py, out.used, out.mv);
     let r = code_inter_mb_residual(ctx, rec, mb_x, mb_y, src_luma, luma_stride, src_chroma, chroma_stride);
+    out.transform_8x8 = r.transform_8x8;
     out.cbp_luma = r.cbp_luma;
     out.cbp_chroma = r.cbp_chroma;
     out.luma = r.luma;
