@@ -15,8 +15,15 @@ use super::tables::{DIAG_SCAN4X4_X, DIAG_SCAN4X4_Y, DIAG_SCAN8X8_X, DIAG_SCAN8X8
 /// The scan of positions inside a 4x4 sub-block, and of sub-blocks inside
 /// the transform block, for `scan_idx` (0 diagonal, 1 horizontal, 2 vertical).
 /// Returns `(x, y)` for scan position `i` in a `size x size` grid.
+///
+/// `pub(crate)` for the encoder's rate-distortion quantisation, which has
+/// to know which coefficient is *last in scan order* before it can ask
+/// what dropping it would save. That is the one thing RDOQ cannot get
+/// from the writer by calling it, and the alternative — a second copy of
+/// these tables on the encode side — is the drift this crate keeps
+/// deleting. Visibility only; the derivation is untouched.
 #[inline]
-fn scan_pos(scan_idx: u32, log2_size: u32, i: usize) -> (usize, usize) {
+pub(crate) fn scan_pos(scan_idx: u32, log2_size: u32, i: usize) -> (usize, usize) {
     match (scan_idx, log2_size) {
         (0, 0) => (0, 0),
         (0, 1) => {

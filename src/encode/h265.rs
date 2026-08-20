@@ -325,6 +325,12 @@ impl H265Encoder {
             bit_depth: 8,
             strong_smoothing: false,
             bypass,
+            // An all-intra stream has no inter pictures at all, so no
+            // picture here is ever predicted from and each may be
+            // quantised for its own optimum. With a GOP, this IDR is the
+            // anchor every P picture reads, and trimming it costs them
+            // more than it saves — see `rdoq_trim`.
+            free_to_trim: self.cfg.gop == 0,
         };
         let mut pic = IntraPicture::<u8>::new_with_chroma(cw, ch, g.log2_ctb, 8, chroma);
         // The transform-split search is on: a CU may carry four quarter-size
@@ -588,6 +594,9 @@ impl H265Encoder {
             bit_depth: 8,
             strong_smoothing: false,
             bypass,
+            // Every inter picture this encoder codes is kept as the next
+            // one's reference, so none of them is free to trim.
+            free_to_trim: false,
         };
         let mut pic = InterPicture::<u8>::new(&sps, &pps, c.poc as i32);
 
@@ -1562,7 +1571,7 @@ mod tests {
             qp: 26,
             bit_depth: 8,
             strong_smoothing: false,
-            bypass: true,
+            bypass: true, free_to_trim: false,
         };
         let split = |f: &[u8]| -> (Vec<u8>, Vec<u8>, Vec<u8>) {
             let (y, c) = f.split_at(w * h);
@@ -1765,7 +1774,7 @@ mod tests {
         let enc_dsp = HevcEncDsp::new(cpu);
         let dist = DistortionDsp::<u8>::new(cpu);
         let ctx =
-            IntraCtx { dsp: &dsp, enc: &enc_dsp, dist: &dist, qp: 30, bit_depth: 8, strong_smoothing: false, bypass: false };
+            IntraCtx { dsp: &dsp, enc: &enc_dsp, dist: &dist, qp: 30, bit_depth: 8, strong_smoothing: false, bypass: false, free_to_trim: false };
         let split = |f: &[u8]| -> (Vec<u8>, Vec<u8>, Vec<u8>) {
             let (y, c) = f.split_at(w * h);
             let (cb, cr) = c.split_at(cw * ch);
@@ -1842,7 +1851,7 @@ mod tests {
             qp: 30,
             bit_depth: 8,
             strong_smoothing: false,
-            bypass: false,
+            bypass: false, free_to_trim: false,
         };
         let mut pic = IntraPicture::<u8>::new(64, 64, 5, 8);
         pic.split_depth = 1;
@@ -1959,7 +1968,7 @@ mod tests {
         install_simd_u8(&mut dsp, cpu);
         let enc_dsp = HevcEncDsp::new(cpu);
         let dist = DistortionDsp::<u8>::new(cpu);
-        let ctx = IntraCtx { dsp: &dsp, enc: &enc_dsp, dist: &dist, qp: 26, bit_depth: 8, strong_smoothing: false, bypass: false };
+        let ctx = IntraCtx { dsp: &dsp, enc: &enc_dsp, dist: &dist, qp: 26, bit_depth: 8, strong_smoothing: false, bypass: false, free_to_trim: false };
         let mut pic = InterPicture::<u8>::new(&sps, &pps, 1);
         let (py, pc) = flat.split_at(w * h);
         let (pcb, pcr) = pc.split_at(w * h / 4);
@@ -2078,7 +2087,7 @@ mod tests {
         install_simd_u8(&mut dsp, cpu);
         let enc_dsp = HevcEncDsp::new(cpu);
         let dist = DistortionDsp::<u8>::new(cpu);
-        let ctx = IntraCtx { dsp: &dsp, enc: &enc_dsp, dist: &dist, qp: 30, bit_depth: 8, strong_smoothing: false, bypass: false };
+        let ctx = IntraCtx { dsp: &dsp, enc: &enc_dsp, dist: &dist, qp: 30, bit_depth: 8, strong_smoothing: false, bypass: false, free_to_trim: false };
         let mut pic = InterPicture::<u8>::new(&sps, &pps, 1);
         let (py, pc) = split.split_at(w * h);
         let (pcb, pcr) = pc.split_at(w * h / 4);

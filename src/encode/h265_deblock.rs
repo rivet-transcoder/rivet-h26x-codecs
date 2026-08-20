@@ -330,7 +330,7 @@ mod tests {
                 qp,
                 bit_depth: 8,
                 strong_smoothing: false,
-                bypass,
+                bypass, free_to_trim: false,
             }
         }
     }

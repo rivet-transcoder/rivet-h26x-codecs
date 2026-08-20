@@ -1446,7 +1446,7 @@ mod tests {
             Kit { dsp: HevcDsp::new(Cpu::SCALAR), enc: HevcEncDsp::scalar(), dist: DistortionDsp::scalar() }
         }
         fn ctx(&self, qp: i32) -> MeCtx<'_, u8> {
-            IntraCtx { dsp: &self.dsp, enc: &self.enc, dist: &self.dist, qp, bit_depth: 8, strong_smoothing: false, bypass: false }
+            IntraCtx { dsp: &self.dsp, enc: &self.enc, dist: &self.dist, qp, bit_depth: 8, strong_smoothing: false, bypass: false, free_to_trim: false }
         }
     }
 
