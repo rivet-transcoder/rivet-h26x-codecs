@@ -24,6 +24,18 @@ the encoder does not use. Multi-reference's value is gated on partition size,
 because a large block averages over enough content that one reference always
 serves it. Set BLK to the block size the decision will really be made at, or
 the number means nothing.
+
+The feature itself was built before that was noticed, and measured: two
+references cost 0.80% BD-rate averaged over the corpus, worse on every
+clip and better on none, which is the `ref_idx` bin on every unit paid
+for a choice that never has a better answer. It is correct code — SELF
+and CROSS hold at two references, and the default is byte-identical
+because `ref_idx` is absent from the bitstream when a list has one entry
+— and it is deliberately NOT on develop, because a knob that can only
+lose reads as a feature to whoever finds it next. It is preserved on
+branch `agent/hevc-chroma-inter` as b4bb7db. When sub-CU partitioning
+lands, run this probe at the new partition size first; if it comes back
+non-zero, that commit is where the implementation is.
 """
 
 import sys, os
