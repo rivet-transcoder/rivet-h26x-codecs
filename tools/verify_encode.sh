@@ -85,6 +85,10 @@ cavlc-intra|--codec h264 --qp 26 --gop 0 --cavlc
 cavlc-ip|--codec h264 --qp 26 --gop 8 --cavlc
 cavlc-ipb|--codec h264 --qp 26 --gop 8 --bframes 2 --cavlc
 cavlc40-intra|--codec h264 --qp 40 --gop 0 --cavlc
+cqp-t8x8|--codec h264 --qp 26 --gop 8 --t8x8
+cqp40-t8x8|--codec h264 --qp 40 --gop 8 --t8x8
+cavlc-t8x8|--codec h264 --qp 26 --gop 8 --cavlc --t8x8
+cavlc40-t8x8|--codec h264 --qp 40 --gop 8 --cavlc --t8x8
 hevc-lossless-intra|--codec h265 --lossless --gop 0
 hevc-cqp-intra|--codec h265 --qp 26 --gop 0
 hevc-cqp-ip|--codec h265 --qp 26 --gop 8
