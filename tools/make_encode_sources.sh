@@ -22,6 +22,21 @@ FFMPEG=${FFMPEG:-ffmpeg}
 #   detail  high-frequency detail — the transform and quantiser carry it, and
 #           residual coding has real coefficients to write
 #   motion  fast motion — motion search, B pictures and reference handling
+#   static  the SAME picture held, frame after frame — detailed, but with
+#           nothing moving. Every other clip here is moving detail, and that
+#           uniformity hid a real bug: with no quantiser to round residual
+#           away, a lossless CU on moving content ALWAYS carries some, so no
+#           lossless CU is ever a skip, so the rule that
+#           cu_transquant_bypass_flag precedes cu_skip_flag is never
+#           exercised. Omitting the flag on a skip left the whole
+#           hevc-lossless-ip row green. A held frame predicts exactly, the
+#           residual really is zero, skips appear, and the same mutation
+#           fails SELF at once.
+#
+#           It is not exotic content. A title card, a slate, a letterbox, a
+#           paused shot — "nothing changed" is most of the frames in a great
+#           deal of real video, and the skip, merge-everything and
+#           residual-quantised-to-nothing families are all thin without it.
 gen() { # name filter frames fmt pix
   out="src_$1_${4}.yuv"
   [ -f "$out" ] && { echo "have $out"; return; }
@@ -39,3 +54,6 @@ gen detail "testsrc2=size=64x64:rate=25"                      8 64x64_400 gray
 # One clip whose dimensions are not a multiple of the coding block size, since
 # cropping is signalled in the SPS and is a common place to be wrong.
 gen odd    "testsrc2=size=50x34:rate=25"                      6 50x34_420  yuv420p
+# The held frame: `loop` repeats source frame 0 for the whole clip, so every
+# picture is byte-identical to the first while still carrying real detail.
+gen static "testsrc2=size=64x64:rate=25,loop=loop=-1:size=1:start=0" 8 64x64_420 yuv420p
