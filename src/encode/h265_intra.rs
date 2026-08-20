@@ -959,21 +959,35 @@ enum ModeSignal {
 ///   was then retried on top of it and lost again, 10 cells worse against
 ///   2. So the residual term was a real bug and a separate one.
 ///
-/// Three explanations tested, three out. What remains is the limit named
-/// on the counting itself: these prices are taken at the slice's INITIAL
-/// probabilities, while the mode decision is a 35-way exhaustive search
-/// whose own choices are exactly what the real contexts adapt to.
-/// `intra_chroma_pred_mode` is the sharpest case — a decision that starts
-/// preferring "derived" makes "derived" cheaper still, and a static price
-/// cannot see that loop at all. It is also consistent with where the
-/// damage lands: every regressed cell is a cqp40 row, and the counted
-/// chroma prices swing hardest with QP (ChromaExplicit is 3.69 bits at QP
-/// 26 and 5.64 at QP 40 against a flat 3 here).
+/// - **Not the static probabilities either.** That was the last standing
+///   explanation and it has now been tested. An adapted context array was
+///   carried through the decision pass and advanced CTU by CTU through
+///   the real writer, so each candidate was priced against the model its
+///   CTU would actually be coded with — exact rather than approximate,
+///   because the decision pass and the serialise pass walk CTUs in the
+///   same raster order. It helped the mode rate a great deal and still
+///   was not enough: +0.16% BD-rate against this table, down from a clear
+///   loss under static probabilities, but a loss.
 ///
-/// So: an adapted context array carried through the decision pass is the
-/// next thing to try, and the only one left standing. Until then this
-/// table stays, not because it is right but because it is measurably
-/// less wrong than a correct price under a static model.
+/// FOUR explanations tested, four out. The conclusion is structural
+/// rather than a missing term: **this hand-tuned table is genuinely
+/// competitive with a correct price, and correctness in the rate alone
+/// does not beat it.** It is the fitted-constant effect in its purest
+/// form — the table was never measured against the rate it stood for, so
+/// it absorbed whatever else was off in the same comparison, and what it
+/// absorbs is worth about as much as the error it introduces. Something
+/// other than rate accuracy is carrying the difference, and until that is
+/// identified there is nothing to fix here.
+///
+/// Worth knowing for anyone tempted by the adapted model elsewhere: it
+/// was measured on `cu_bits` at the same time, where every price is also
+/// taken at the slice's initial probabilities, and it moved 24 cells for
+/// **-0.03% BD-rate**. So the "initial rather than adapted" limit those
+/// docblocks name is real and, on this corpus, worth almost nothing. The
+/// plumbing was reverted; the measurement is the result.
+///
+/// This table stays, not because it is right but because it is measurably
+/// the best thing anyone has produced for the job.
 fn mode_signalling_cost(qp: i32, signal: ModeSignal) -> f32 {
     let bins = match signal {
         ModeSignal::LumaMpm(0) => 2,
