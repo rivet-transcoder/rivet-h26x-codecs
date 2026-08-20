@@ -35,6 +35,7 @@
 use crate::bitwriter::BitWriter;
 use crate::cabac_enc::CabacEncoder;
 use crate::encode::h264_intra::{MbDecision, MbKind};
+use crate::encode::h264_cavlc_mb::sub_mb_type_p;
 use crate::encode::h264_me::{InterDecision, InterMbKind};
 use crate::encode::h264_pic::{
     BMb, IntraTools, PMb, PicMotion, code_b_picture, code_intra_picture, code_p_picture,
@@ -46,7 +47,7 @@ use crate::h264::cabac_mb::{
     write_intra_residual_cabac, write_inter_residual_cabac, write_inter_residual_fields_cabac,
     CurMbMvd, write_mb_qp_delta_cabac, write_mb_skip_cabac, write_mb_type_b_cabac,
     write_mb_type_i_cabac, write_mb_type_p_cabac, write_mvd_16x16_cabac, write_mvd_cabac,
-    write_transform_8x8_cabac,
+    write_sub_mb_type_p_cabac, write_transform_8x8_cabac,
 };
 use crate::picture::ChromaFormat;
 
@@ -131,33 +132,42 @@ fn write_p16_body(
     t8x8_mode: bool,
 ) {
     debug_assert!(
-        matches!(
-            d.kind,
-            InterMbKind::P16x16 | InterMbKind::P16x8 | InterMbKind::P8x16
-        ),
+        !matches!(d.kind, InterMbKind::PSkip | InterMbKind::UseIntra),
         "only a coded P macroblock carries this syntax"
     );
     debug_assert_eq!(d.ref_idx, 0, "more than one reference needs ref_idx writing");
     write_mb_type_p_cabac(e, st, d.kind.p_mb_type());
     let lnb = left.map(|m| &m.nb);
     let anb = above.map(|m| &m.nb);
-    // `ref_idx_l0` is absent (one active reference). One mvd per
-    // partition, in `mb_partitions` order, each recorded as it is written
-    // so that the next partition's context can read it — which is what
-    // the reader does with `layer.mvd`.
+    // `P_8x8`'s four `sub_mb_type`s, all before any motion.
+    if d.kind == InterMbKind::P8x8 {
+        for part in 0..4 {
+            write_sub_mb_type_p_cabac(e, st, sub_mb_type_p(d.sub_shape[part]));
+        }
+    }
+    // `ref_idx_l0` is absent (one active reference). Then one mvd per
+    // prediction rectangle, each recorded as it is written so the next
+    // rectangle's context can read it — which is what the reader does
+    // with `layer.mvd`, and the only reason a sub-partitioned macroblock
+    // needs a context source inside itself at all.
     let mut cur = CurMbMvd::default();
-    for (i, &(x, y, w, h)) in d.kind.parts().iter().enumerate() {
-        write_mvd_cabac(e, st, &cur, lnb, anb, 0, x / 4, y / 4, d.mvd[i]);
-        cur.set(0, x, y, w, h, d.mvd[i]);
+    let mut rects = [(0usize, 0usize, 0usize, 0usize); 16];
+    let n = d.rects(&mut rects);
+    for &(x, y, w, h) in rects.iter().take(n) {
+        let mvd = d.mvd[(y / 4) * 4 + x / 4];
+        write_mvd_cabac(e, st, &cur, lnb, anb, 0, x / 4, y / 4, mvd);
+        cur.set(0, x, y, w, h, mvd);
     }
     write_cbp_cabac(e, st, lnb, anb, d.cbp_luma | (d.cbp_chroma << 4), cfi == 1 || cfi == 2);
-    // An inter macroblock's flag comes after the coded block pattern and
-    // only when some luma block is coded — `no_sub_mb_part_less_than_8x8`
-    // holds trivially for a single 16x16 partition.
-    if t8x8_mode && d.cbp_luma != 0 {
+    // An inter macroblock's flag comes after the coded block pattern,
+    // only when some luma block is coded, and only when every
+    // sub-macroblock partition is at least 8x8 (7.3.5).
+    if t8x8_mode && d.cbp_luma != 0 && d.no_sub_mb_part_less_than_8x8() {
         write_transform_8x8_cabac(e, st, lnb, anb, d.transform_8x8);
     }
-    debug_assert!(!d.transform_8x8 || (t8x8_mode && d.cbp_luma != 0));
+    debug_assert!(
+        !d.transform_8x8 || (t8x8_mode && d.cbp_luma != 0 && d.no_sub_mb_part_less_than_8x8())
+    );
     if d.cbp_luma != 0 || d.cbp_chroma != 0 {
         write_mb_qp_delta_cabac(e, st, d.qp_delta as i32);
         st.prev_qp_delta_nonzero = d.qp_delta != 0;

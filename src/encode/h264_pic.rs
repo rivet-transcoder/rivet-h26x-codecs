@@ -496,8 +496,13 @@ pub(crate) fn code_p_picture(
                     left_modes = [Some(2); 4];
                     top_modes[mb_x] = [Some(2); 4];
                 }
-                InterMbKind::P16x16 | InterMbKind::P16x8 | InterMbKind::P8x16 => {
+                InterMbKind::P16x16
+                | InterMbKind::P16x8
+                | InterMbKind::P8x16
+                | InterMbKind::P8x8 => {
                     emit(mb_x, mb_y, PMb::Coded(&dec));
+                    let mut rects = [(0usize, 0usize, 0usize, 0usize); 16];
+                    let n = dec.rects(&mut rects);
                     pm.commit(
                         addr,
                         coded_info(
@@ -506,7 +511,7 @@ pub(crate) fn code_p_picture(
                             dec.transform_8x8,
                             ctx.qp,
                             ctx.qpc,
-                            part_edges_of(dec.kind.parts()),
+                            part_edges_of(&rects[..n]),
                         ),
                         st.motion(),
                     );

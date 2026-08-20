@@ -73,7 +73,8 @@ use crate::encode::h264_intra::{IntraCtx, code_block_8x8, lambda, quad_rasters, 
 use crate::h264::cavlc::sub_block_counts_8x8;
 use crate::encode::h264_syntax::Recon;
 use crate::h264::frame::{BlockMotion, Frame, Mv, PARITY_FRAME};
-use crate::h264::cavlc::mb_partitions;
+use crate::h264::cavlc::{mb_partitions, sub_partition_rect};
+use crate::h264::mb::SubMbShape;
 use crate::h264::mb::{
     MbKind as DecMbKind, MbMotion, MbNeighbours, MotionCache, PicInfo, colocated_block,
     fill_motion, p_skip_mv, predict_mv,
@@ -106,17 +107,26 @@ pub struct InterDecision {
     /// infers 0 — so it is false whenever `cbp_luma` is, and the writers
     /// assert as much.
     pub transform_8x8: bool,
-    /// `mvd_l0` per partition, in [`InterMbKind::parts`] order — one
-    /// entry for `P16x16`, two for `P16x8` and `P8x16`. Meaningless for
-    /// `PSkip` (the syntax carries nothing), and not necessarily zero
-    /// there, because the skip vector can be the zero vector while the
-    /// median predictor is not (8.4.1.1).
+    /// `mvd_l0` per 4x4 block (raster), each partition's difference
+    /// replicated over the blocks it covers — the decoder's own layout
+    /// (`MbLayer::mvd`, and what its CABAC parser stores so that later
+    /// blocks' contexts can read it). Meaningless for `PSkip`, whose
+    /// syntax carries nothing, and not necessarily zero there because the
+    /// skip vector can be zero while the median predictor is not
+    /// (8.4.1.1).
+    ///
+    /// Per 4x4 rather than per partition because `P_8x8` can carry
+    /// sixteen of them, and because it is what both the CABAC context
+    /// derivation and the neighbour record want anyway.
     ///
     /// The *vectors* themselves are not here: they live in the
-    /// [`MbMotionState`] the decision derived them into, in the decoder's
-    /// per-4x4 layout, which is what the picture walk commits and what
-    /// later partitions and macroblocks predict from.
-    pub mvd: [Mv; 4],
+    /// [`MbMotionState`] the decision derived them into, which is what the
+    /// picture walk commits and what later partitions and macroblocks
+    /// predict from.
+    pub mvd: [Mv; 16],
+    /// For `P8x8`: each 8x8 partition's sub-macroblock shape. Meaningless
+    /// for every other kind.
+    pub sub_shape: [SubMbShape; 4],
     /// Reference index into list 0. Always 0 for now: this module searches
     /// exactly one reference picture. The field exists so the serialiser's
     /// contract does not change when more arrive.
@@ -154,12 +164,51 @@ pub struct InterDecision {
     pub nz_chroma: [[u8; 16]; 2],
 }
 
+impl InterDecision {
+    /// The prediction rectangles this macroblock's motion covers, in the
+    /// order the syntax carries them, written into `out`; returns how
+    /// many there are.
+    ///
+    /// For everything but `P8x8` that is `mb_partitions`. For `P8x8` it
+    /// is each 8x8's sub-partitions, which is where the count can reach
+    /// sixteen — and it is what the loop filter's partition edges and the
+    /// motion commit both walk.
+    pub fn rects(&self, out: &mut [(usize, usize, usize, usize); 16]) -> usize {
+        if self.kind != InterMbKind::P8x8 {
+            let parts = self.kind.parts();
+            out[..parts.len()].copy_from_slice(parts);
+            return parts.len();
+        }
+        let mut n = 0;
+        for part in 0..4 {
+            let shape = self.sub_shape[part];
+            for sub in 0..shape.count() {
+                out[n] = sub_partition_rect(part, shape, sub);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// `noSubMbPartSizeLessThan8x8Flag` (7.3.5): whether every
+    /// sub-macroblock partition is at least 8x8, which is one of the
+    /// conditions under which `transform_size_8x8_flag` is present at
+    /// all. Trivially true for every shape but `P8x8`, and there it is
+    /// false as soon as one 8x8 is split — the encoder must not write the
+    /// flag where a reader will not take it.
+    pub fn no_sub_mb_part_less_than_8x8(&self) -> bool {
+        self.kind != InterMbKind::P8x8
+            || self.sub_shape.iter().all(|s| s.count() == 1)
+    }
+}
+
 impl Default for InterDecision {
     fn default() -> Self {
         InterDecision {
             kind: InterMbKind::P16x16,
             transform_8x8: false,
-            mvd: [Mv::ZERO; 4],
+            mvd: [Mv::ZERO; 16],
+            sub_shape: [SubMbShape::S8x8; 4],
             ref_idx: 0,
             cbp_luma: 0,
             cbp_chroma: 0,
@@ -187,6 +236,9 @@ pub enum InterMbKind {
     P16x8,
     /// `P_L0_8x16`: two partitions, left and right.
     P8x16,
+    /// `P_8x8`: four 8x8 partitions, each with its own sub-macroblock
+    /// shape ([`InterDecision::sub_shape`]).
+    P8x8,
     /// Inter lost: code this macroblock with the intra decision instead.
     /// See [`placeholder_inter_or_intra`] for how little that choice
     /// currently knows.
@@ -201,6 +253,7 @@ impl InterMbKind {
             InterMbKind::P16x16 => DecMbKind::Inter16x16,
             InterMbKind::P16x8 => DecMbKind::Inter16x8,
             InterMbKind::P8x16 => DecMbKind::Inter8x16,
+            InterMbKind::P8x8 => DecMbKind::Inter8x8,
             InterMbKind::UseIntra => DecMbKind::I16x16,
         }
     }
@@ -220,6 +273,7 @@ impl InterMbKind {
             InterMbKind::P16x16 => 0,
             InterMbKind::P16x8 => 1,
             InterMbKind::P8x16 => 2,
+            InterMbKind::P8x8 => 3,
             _ => unreachable!("only a coded P macroblock has an mb_type here"),
         }
     }
@@ -237,6 +291,7 @@ impl InterMbKind {
 /// are frequently blocks of this same macroblock: `done` is what makes an
 /// already-derived one readable and a not-yet-derived one absent, and
 /// there is no way to say that with a per-macroblock summary.
+#[derive(Clone, Copy)]
 pub struct MbMotionState {
     cache: MotionCache,
     cur: MbMotion,
@@ -827,6 +882,7 @@ fn placeholder_inter_transform_size(ssd_4x4: u64, ssd_8x8: u64, qp: i32) -> bool
 /// decoder's inverse path in place, coefficients and counts out. Shared
 /// by the P and B paths — the prediction differs between them, the
 /// residual machinery must not.
+#[allow(clippy::too_many_arguments)]
 fn code_inter_mb_residual(
     ctx: &MeCtx,
     rec: &mut [Recon],
@@ -836,6 +892,7 @@ fn code_inter_mb_residual(
     luma_stride: usize,
     src_chroma: [&[u8]; 2],
     chroma_stride: usize,
+    allow_8x8: bool,
 ) -> InterResidual {
     let (px, py) = (mb_x * 16, mb_y * 16);
     let soff = py * luma_stride + px;
@@ -862,7 +919,7 @@ fn code_inter_mb_residual(
     gather16(&rec[0], off, &mut pred);
     code_luma_4x4(ctx, &mut rec[0], off, &src_luma[soff..], luma_stride, &mut out);
 
-    if ctx.t8x8 {
+    if ctx.t8x8 && allow_8x8 {
         // Score what the 4x4 reconstructed, keep it, and try the 8x8 from
         // the same prediction.
         let mut recon4 = [0u8; 256];
@@ -1114,41 +1171,32 @@ pub fn code_macroblock_p(
     // partition of a 16x8 or 8x16 includes the first, already derived.
     // That is why the trials run through `MbMotionState` and reset it
     // between them rather than predicting from a fixed neighbour set.
-    let mut best: Option<(InterMbKind, [Mv; 4], [Mv; 4], u32, f32)> = None;
-    for kind in [InterMbKind::P16x16, InterMbKind::P16x8, InterMbKind::P8x16] {
+    // One search per candidate shape. `Shape` is the flat rectangle list
+    // a shape decomposes into — for `P_8x8` that depends on the four
+    // sub-macroblock shapes, which are themselves chosen here.
+    let mut best: Option<Trial> = None;
+    for kind in [
+        InterMbKind::P16x16,
+        InterMbKind::P16x8,
+        InterMbKind::P8x16,
+        InterMbKind::P8x8,
+    ] {
         if kind != InterMbKind::P16x16 && !ctx.subparts {
             continue;
         }
-        st.reset_mb();
-        let mut mvs = [Mv::ZERO; 4];
-        let mut mvds = [Mv::ZERO; 4];
-        let mut satd = 0u32;
-        for (i, &(x, y, w, h)) in kind.parts().iter().enumerate() {
-            let (ax, ay) = (px + x, py + y);
-            let pred = st.predict(0, 0, x, y, w, h);
-            let (mv, cost) = search_rect(
-                ctx,
-                &refp[0],
-                ax as i32,
-                ay as i32,
-                w,
-                h,
-                &src_luma[ay * luma_stride + ax..],
-                luma_stride,
-                pred,
-            );
-            mvs[i] = mv;
-            mvds[i] = Mv::new(mv.x - pred.x, mv.y - pred.y);
-            satd += cost;
-            st.commit_part(x, y, w, h, [Some(mv), None]);
-        }
-        let cost = placeholder_partition_cost(kind, satd, &mvds, ctx.qp);
-        if best.as_ref().is_none_or(|b| cost < b.4) {
-            best = Some((kind, mvs, mvds, satd, cost));
+        let t = if kind == InterMbKind::P8x8 {
+            trial_8x8(ctx, refp, st, px, py, src_luma, luma_stride)
+        } else {
+            trial_fixed(ctx, refp, st, kind, px, py, src_luma, luma_stride)
+        };
+        if best.as_ref().is_none_or(|b| t.cost < b.cost) {
+            best = Some(t);
         }
     }
-    let (kind, mvs, mvds, satd, _) = best.expect("16x16 is always a candidate");
+    let Trial { kind, sub_shape, rects, n_rects, mvs, mvds, satd, .. } =
+        best.expect("16x16 is always a candidate");
     out.kind = kind;
+    out.sub_shape = sub_shape;
     out.mvd = mvds;
 
     if placeholder_inter_or_intra(ctx.dist, satd, &src_luma[soff..], luma_stride) {
@@ -1161,22 +1209,20 @@ pub fn code_macroblock_p(
     // the decoder's kernels, then code the residual over the whole
     // macroblock and reconstruct in place.
     st.reset_mb();
-    for (i, &(x, y, w, h)) in kind.parts().iter().enumerate() {
-        st.commit_part(x, y, w, h, [Some(mvs[i]), None]);
-        predict_inter_rect(
-            ctx,
-            rec,
-            [refp, refp],
-            px + x,
-            py + y,
-            w,
-            h,
-            [true, false],
-            [mvs[i], Mv::ZERO],
-        );
+    for i in 0..n_rects {
+        let (x, y, w, h) = rects[i];
+        let mv = mvs[(y / 4) * 4 + x / 4];
+        st.commit_part(x, y, w, h, [Some(mv), None]);
+        predict_inter_rect(ctx, rec, [refp, refp], px + x, py + y, w, h, [true, false], [mv, Mv::ZERO]);
     }
+    // `transform_size_8x8_flag` is not present when any sub-macroblock
+    // partition is smaller than 8x8 (7.3.5's
+    // `noSubMbPartSizeLessThan8x8Flag`), so the residual must not use the
+    // 8x8 transform there — coding with it and then dropping the flag
+    // would have a decoder reconstruct 4x4 over 8x8 coefficients.
     let r = code_inter_mb_residual(
         ctx, rec, mb_x, mb_y, src_luma, luma_stride, src_chroma, chroma_stride,
+        out.no_sub_mb_part_less_than_8x8(),
     );
     out.transform_8x8 = r.transform_8x8;
     out.cbp_luma = r.cbp_luma;
@@ -1199,6 +1245,198 @@ pub fn code_macroblock_p(
         out.kind = InterMbKind::PSkip;
     }
     out
+}
+
+/// One searched candidate shape: its rectangles, the vector and vector
+/// difference of each (both indexed by the rectangle's top-left 4x4 in
+/// raster, which is where every consumer looks them up), and its price.
+struct Trial {
+    kind: InterMbKind,
+    sub_shape: [SubMbShape; 4],
+    rects: [(usize, usize, usize, usize); 16],
+    n_rects: usize,
+    mvs: [Mv; 16],
+    mvds: [Mv; 16],
+    satd: u32,
+    cost: f32,
+}
+
+/// Search one rectangle and record it, returning its SATD. The vector is
+/// committed into `st` before returning, so the *next* rectangle predicts
+/// from it exactly as a decoder would.
+#[allow(clippy::too_many_arguments)]
+fn search_and_commit(
+    ctx: &MeCtx,
+    refp: &[Recon],
+    st: &mut MbMotionState,
+    px: usize,
+    py: usize,
+    rect: (usize, usize, usize, usize),
+    src_luma: &[u8],
+    luma_stride: usize,
+    mvs: &mut [Mv; 16],
+    mvds: &mut [Mv; 16],
+) -> u32 {
+    let (x, y, w, h) = rect;
+    let (ax, ay) = (px + x, py + y);
+    let pred = st.predict(0, 0, x, y, w, h);
+    let (mv, cost) = search_rect(
+        ctx,
+        &refp[0],
+        ax as i32,
+        ay as i32,
+        w,
+        h,
+        &src_luma[ay * luma_stride + ax..],
+        luma_stride,
+        pred,
+    );
+    let mvd = Mv::new(mv.x - pred.x, mv.y - pred.y);
+    // Replicated over the rectangle: the decoder's CABAC parser stores
+    // the mvd that way for its neighbour contexts, and the motion state
+    // wants the vector on every block it covers.
+    for by in y / 4..(y + h) / 4 {
+        for bx in x / 4..(x + w) / 4 {
+            mvs[by * 4 + bx] = mv;
+            mvds[by * 4 + bx] = mvd;
+        }
+    }
+    st.commit_part(x, y, w, h, [Some(mv), None]);
+    cost
+}
+
+/// Search one of the fixed shapes — 16x16, 16x8, 8x16.
+#[allow(clippy::too_many_arguments)]
+fn trial_fixed(
+    ctx: &MeCtx,
+    refp: &[Recon],
+    st: &mut MbMotionState,
+    kind: InterMbKind,
+    px: usize,
+    py: usize,
+    src_luma: &[u8],
+    luma_stride: usize,
+) -> Trial {
+    st.reset_mb();
+    let mut t = Trial {
+        kind,
+        sub_shape: [SubMbShape::S8x8; 4],
+        rects: [(0, 0, 0, 0); 16],
+        n_rects: 0,
+        mvs: [Mv::ZERO; 16],
+        mvds: [Mv::ZERO; 16],
+        satd: 0,
+        cost: 0.0,
+    };
+    for &rect in kind.parts() {
+        t.satd += search_and_commit(
+            ctx, refp, st, px, py, rect, src_luma, luma_stride, &mut t.mvs, &mut t.mvds,
+        );
+        t.rects[t.n_rects] = rect;
+        t.n_rects += 1;
+    }
+    t.cost = placeholder_partition_cost(kind, &t.sub_shape, t.satd, &t.mvds, &t.rects, t.n_rects, ctx.qp);
+    t
+}
+
+/// Search `P_8x8`, choosing each 8x8's sub-macroblock shape as it goes.
+///
+/// The four partitions are decided in order and each is *committed*
+/// before the next is searched, because a later partition predicts from
+/// an earlier one — so the sub-shape chosen for partition 0 changes what
+/// partition 1 predicts from. Within a partition the four candidate
+/// shapes are tried against each other and the cheapest kept, which means
+/// re-deriving that partition's rectangles once the winner is known.
+#[allow(clippy::too_many_arguments)]
+fn trial_8x8(
+    ctx: &MeCtx,
+    refp: &[Recon],
+    st: &mut MbMotionState,
+    px: usize,
+    py: usize,
+    src_luma: &[u8],
+    luma_stride: usize,
+) -> Trial {
+    st.reset_mb();
+    let mut t = Trial {
+        kind: InterMbKind::P8x8,
+        sub_shape: [SubMbShape::S8x8; 4],
+        rects: [(0, 0, 0, 0); 16],
+        n_rects: 0,
+        mvs: [Mv::ZERO; 16],
+        mvds: [Mv::ZERO; 16],
+        satd: 0,
+        cost: 0.0,
+    };
+    for part in 0..4 {
+        // The state as this partition starts, so each candidate shape is
+        // tried from the same place.
+        let before = *st;
+        let mut best: Option<(SubMbShape, u32, f32, [Mv; 16], [Mv; 16], MbMotionState)> = None;
+        for shape in [
+            SubMbShape::S8x8,
+            SubMbShape::S8x4,
+            SubMbShape::S4x8,
+            SubMbShape::S4x4,
+        ] {
+            *st = before;
+            let (mut mvs, mut mvds) = (t.mvs, t.mvds);
+            let mut satd = 0u32;
+            for sub in 0..shape.count() {
+                let rect = sub_partition_rect(part, shape, sub);
+                satd += search_and_commit(
+                    ctx, refp, st, px, py, rect, src_luma, luma_stride, &mut mvs, &mut mvds,
+                );
+            }
+            let cost = placeholder_sub_shape_cost(shape, satd, &mvds, part, ctx.qp);
+            if best.as_ref().is_none_or(|b| cost < b.2) {
+                best = Some((shape, satd, cost, mvs, mvds, *st));
+            }
+        }
+        let (shape, satd, _, mvs, mvds, after) = best.expect("S8x8 is always a candidate");
+        *st = after;
+        t.sub_shape[part] = shape;
+        t.satd += satd;
+        t.mvs = mvs;
+        t.mvds = mvds;
+        for sub in 0..shape.count() {
+            t.rects[t.n_rects] = sub_partition_rect(part, shape, sub);
+            t.n_rects += 1;
+        }
+    }
+    t.cost = placeholder_partition_cost(
+        InterMbKind::P8x8, &t.sub_shape, t.satd, &t.mvds, &t.rects, t.n_rects, ctx.qp,
+    );
+    t
+}
+
+/// PLACEHOLDER — which sub-macroblock shape one 8x8 partition takes.
+///
+/// The same shape of estimate as the macroblock-level one: SATD plus
+/// `lambda` times the `sub_mb_type` (its unary tree is one to three bins)
+/// and the mvds this shape spends. Splitting an 8x8 into four 4x4s buys
+/// four vectors and costs three extra mvds, and at any sensible quantiser
+/// that is a poor trade unless the SATD really collapses — which is what
+/// this measures and what a residual-rate term would measure better.
+fn placeholder_sub_shape_cost(
+    shape: SubMbShape,
+    satd: u32,
+    mvds: &[Mv; 16],
+    part: usize,
+    qp: i32,
+) -> f32 {
+    let mut bits = match shape {
+        SubMbShape::S8x8 => 1.0,
+        SubMbShape::S8x4 => 2.0,
+        SubMbShape::S4x8 | SubMbShape::S4x4 => 3.0,
+        SubMbShape::Direct => 1.0,
+    };
+    for sub in 0..shape.count() {
+        let (x, y, _, _) = sub_partition_rect(part, shape, sub);
+        let m = mvds[(y / 4) * 4 + x / 4];
+        bits += se_bits(m.x) + se_bits(m.y);
+    }
+    satd as f32 + lambda(qp) * bits
 }
 
 /// The bits an `se(v)` of this value costs — the exact CAVLC length, and
@@ -1227,15 +1465,36 @@ fn se_bits(v: i16) -> f32 {
 /// What it still does not have — as with every other decision here — is a
 /// rate term for the *residual*, which is the other half of what
 /// splitting buys. One function, one comparison.
-fn placeholder_partition_cost(kind: InterMbKind, satd: u32, mvds: &[Mv; 4], qp: i32) -> f32 {
-    // `mb_type`: one bin for 16x16, three for the two-partition shapes.
+#[allow(clippy::too_many_arguments)]
+fn placeholder_partition_cost(
+    kind: InterMbKind,
+    sub_shape: &[SubMbShape; 4],
+    satd: u32,
+    mvds: &[Mv; 16],
+    rects: &[(usize, usize, usize, usize); 16],
+    n_rects: usize,
+    qp: i32,
+) -> f32 {
+    // `mb_type`: two bins for 16x16 and for P_8x8, three for the
+    // two-partition shapes; plus P_8x8's four `sub_mb_type`s.
     let mut bits = match kind {
-        InterMbKind::P16x16 => 1.0,
+        InterMbKind::P16x16 => 2.0,
         InterMbKind::P16x8 | InterMbKind::P8x16 => 3.0,
+        InterMbKind::P8x8 => {
+            2.0 + sub_shape
+                .iter()
+                .map(|s| match s {
+                    SubMbShape::S8x8 => 1.0,
+                    SubMbShape::S8x4 => 2.0,
+                    _ => 3.0,
+                })
+                .sum::<f32>()
+        }
         _ => unreachable!("only coded shapes are priced"),
     };
-    for i in 0..kind.parts().len() {
-        bits += se_bits(mvds[i].x) + se_bits(mvds[i].y);
+    for &(x, y, _, _) in rects.iter().take(n_rects) {
+        let m = mvds[(y / 4) * 4 + x / 4];
+        bits += se_bits(m.x) + se_bits(m.y);
     }
     satd as f32 + lambda(qp) * bits
 }
@@ -1542,7 +1801,11 @@ pub fn code_macroblock_b16(
         );
         predict_inter_rect(ctx, rec, refs, px + ox, py + oy, 8, 8, out.used, out.mv[part]);
     }
-    let r = code_inter_mb_residual(ctx, rec, mb_x, mb_y, src_luma, luma_stride, src_chroma, chroma_stride);
+    // A B macroblock this encoder writes has no sub-macroblock
+    // partitions, so `noSubMbPartSizeLessThan8x8Flag` holds.
+    let r = code_inter_mb_residual(
+        ctx, rec, mb_x, mb_y, src_luma, luma_stride, src_chroma, chroma_stride, true,
+    );
     out.transform_8x8 = r.transform_8x8;
     out.cbp_luma = r.cbp_luma;
     out.cbp_chroma = r.cbp_chroma;

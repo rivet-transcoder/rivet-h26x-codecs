@@ -35,6 +35,7 @@ use crate::encode::h264_pic::{
 };
 use crate::encode::h264_syntax::{Geometry, Plane, Recon};
 use crate::h264::cavlc::{SCAN8_SUB, SCAN_CHROMA_DC, write_residual_block_cavlc};
+use crate::h264::mb::SubMbShape;
 use crate::h264::mb::raster_of_blk;
 use crate::h264::tables::{
     GOLOMB_TO_INTER_CBP, GOLOMB_TO_INTER_CBP_GRAY, GOLOMB_TO_INTRA4X4_CBP,
@@ -276,8 +277,22 @@ fn write_macroblock(
 /// Write one P_L0_16x16 macroblock — `mb_type` through the residual. The
 /// skip run before it belongs to the caller, which is counting.
 ///
-/// One macroblock of any coded P shape — 16x16, 16x8 or 8x16 — since
-/// after `mb_type` they differ only in how many mvds follow.
+/// `sub_mb_type` for a P sub-macroblock (Table 7-17), the inverse of the
+/// reader's `p_sub_mb_type` (src/h264/cavlc.rs). `Direct` has no P
+/// spelling — it is a B shape — and is refused rather than mis-coded.
+pub(crate) fn sub_mb_type_p(shape: SubMbShape) -> u32 {
+    match shape {
+        SubMbShape::S8x8 => 0,
+        SubMbShape::S8x4 => 1,
+        SubMbShape::S4x8 => 2,
+        SubMbShape::S4x4 => 3,
+        SubMbShape::Direct => unreachable!("B_Direct_8x8 is not a P sub-macroblock type"),
+    }
+}
+
+/// One macroblock of any coded P shape — 16x16, 16x8, 8x16 or 8x8 —
+/// since after `mb_type` (and, for 8x8, its four `sub_mb_type`s) they
+/// differ only in how many mvds follow.
 ///
 /// No `ref_idx_l0` is written: with exactly one active reference the
 /// element is absent from the stream — the reader's `read_ref_idx` is
@@ -295,21 +310,30 @@ fn write_p16_macroblock(
     t8x8_mode: bool,
 ) {
     debug_assert!(
-        matches!(
-            dec.kind,
-            InterMbKind::P16x16 | InterMbKind::P16x8 | InterMbKind::P8x16
-        ),
+        !matches!(dec.kind, InterMbKind::PSkip | InterMbKind::UseIntra),
         "only a coded P macroblock carries this syntax"
     );
     debug_assert_eq!(dec.ref_idx, 0, "more than one reference needs te(v) ref_idx writing");
     w.ue(dec.kind.p_mb_type()); // Table 7-13
-    // `ref_idx_l0` is absent: one active reference, so the reader infers
-    // 0 for every partition (7.3.5.1). Then one mvd per partition, x then
-    // y, in the order `mb_partitions` lists them — the reader's own two
-    // passes, of which the first has nothing to read.
-    for i in 0..dec.kind.parts().len() {
-        w.se(dec.mvd[i].x as i32);
-        w.se(dec.mvd[i].y as i32);
+    // `P_8x8` first spells its four `sub_mb_type`s (Table 7-17), all of
+    // them before any motion — `sub_mb_pred()` is three separate passes
+    // over the partitions, and the reader takes them in that order.
+    if dec.kind == InterMbKind::P8x8 {
+        for part in 0..4 {
+            w.ue(sub_mb_type_p(dec.sub_shape[part]));
+        }
+    }
+    // `ref_idx_l0` is absent throughout: one active reference, so the
+    // reader infers 0 for every partition (7.3.5.1). That is the second
+    // pass, and it has nothing to write.
+    //
+    // Then one mvd per prediction rectangle, x then y, in syntax order.
+    let mut rects = [(0usize, 0usize, 0usize, 0usize); 16];
+    let n = dec.rects(&mut rects);
+    for &(x, y, _, _) in rects.iter().take(n) {
+        let mvd = dec.mvd[(y / 4) * 4 + x / 4];
+        w.se(mvd.x as i32);
+        w.se(mvd.y as i32);
     }
     let cbp = (dec.cbp_luma | (dec.cbp_chroma << 4)) as usize;
     let code = if st.rows != 0 {
@@ -319,13 +343,16 @@ fn write_p16_macroblock(
     };
     w.ue(code as u32);
     // An inter macroblock's `transform_size_8x8_flag` comes after the
-    // coded block pattern and only when some luma block is coded;
-    // `no_sub_mb_part_less_than_8x8` holds trivially for one 16x16
-    // partition.
-    if t8x8_mode && dec.cbp_luma != 0 {
+    // coded block pattern, only when some luma block is coded, and only
+    // when every sub-macroblock partition is at least 8x8 — a `P_8x8`
+    // that split any of its four suppresses it (7.3.5).
+    if t8x8_mode && dec.cbp_luma != 0 && dec.no_sub_mb_part_less_than_8x8() {
         w.flag(dec.transform_8x8);
     }
-    debug_assert!(!dec.transform_8x8 || (t8x8_mode && dec.cbp_luma != 0));
+    debug_assert!(
+        !dec.transform_8x8
+            || (t8x8_mode && dec.cbp_luma != 0 && dec.no_sub_mb_part_less_than_8x8())
+    );
     // mb_qp_delta is present exactly when the reader's `has_residual` says
     // so, which for an inter macroblock is any coded block at all.
     if cbp != 0 {
@@ -840,8 +867,7 @@ mod tests {
     fn a_p16_macroblock_round_trips_through_the_reader() {
         for (mvdx, mvdy, coded) in [(0i16, 0i16, false), (7, -3, true), (-13, 21, true), (1, 0, false)] {
             let mut dec = InterDecision {
-                mvd: [crate::h264::frame::Mv::new(mvdx, mvdy), crate::h264::frame::Mv::ZERO,
-                      crate::h264::frame::Mv::ZERO, crate::h264::frame::Mv::ZERO],
+                mvd: [crate::h264::frame::Mv::new(mvdx, mvdy); 16],
                 ..InterDecision::default()
             };
             if coded {
@@ -1426,8 +1452,7 @@ mod tests {
         use crate::h264::cavlc::sub_block_counts_8x8;
         for (t8x8, coded) in [(true, true), (false, true), (false, false)] {
             let mut dec = InterDecision {
-                mvd: [crate::h264::frame::Mv::new(5, -9), crate::h264::frame::Mv::ZERO,
-                      crate::h264::frame::Mv::ZERO, crate::h264::frame::Mv::ZERO],
+                mvd: [crate::h264::frame::Mv::new(5, -9); 16],
                 transform_8x8: t8x8 && coded,
                 ..InterDecision::default()
             };
