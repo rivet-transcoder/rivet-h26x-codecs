@@ -205,6 +205,10 @@ impl H265Encoder {
             bypass,
         };
         let mut pic = IntraPicture::<u8>::new(cw, ch, g.log2_ctb, 8);
+        // The transform-split search is on: a CU may carry four quarter-size
+        // TUs where that wins the decision module's cost comparison, and the
+        // writer below spells both shapes.
+        pic.try_split = true;
 
         // Parameter sets, then the one slice.
         let mut out = Vec::new();
@@ -265,21 +269,24 @@ impl H265Encoder {
     }
 }
 
-/// Serialise one all-intra CTU holding exactly one `PART_2Nx2N` CU with a
-/// single CU-sized TU — the only shape the decision machinery produces at
-/// CTB 16 or 32, and the geometry guarantees no partial CTUs.
+/// Serialise one all-intra CTU holding exactly one `PART_2Nx2N` CU whose
+/// transform tree is either a single CU-sized TU or one level of splitting
+/// into four quarter TUs — the two shapes the decision machinery produces
+/// at CTB 16 or 32, and the geometry guarantees no partial CTUs.
 ///
-/// The walk is the reader's, specialised to that shape: `coding_quadtree`
+/// The walk is the reader's, specialised to those shapes: `coding_quadtree`
 /// reads one `split_cu_flag` (the CTB is above the minimum CU size, so the
 /// flag is coded, false); `coding_unit` reads the luma mode syntax for one
 /// prediction block and the chroma mode (no `part_mode` — that is read only
 /// at the minimum CU size, which a 16/32 CTB never is); `transform_tree`
-/// reads one coded `split_transform_flag` (false — the SPS makes the maximum
-/// transform equal the CTB precisely so this shape is expressible), the
-/// chroma cbfs at depth 0, `cbf_luma` (always coded for intra), and the up
-/// to three residual blocks. Anything that stops matching the reader here
-/// desyncs the arithmetic coder and fails SELF wholesale, which is exactly
-/// the property the encode gate checks.
+/// reads one coded `split_transform_flag` (the SPS makes the maximum
+/// transform equal the CTB precisely so the unsplit shape is expressible,
+/// and declares hierarchy depth 2 so the split one is too), the chroma cbfs
+/// at depth 0, and then per leaf `cbf_luma` (always coded for intra) and
+/// the residual blocks — see the split branch below for the per-child
+/// ordering. Anything that stops matching the reader here desyncs the
+/// arithmetic coder and fails SELF wholesale, which is exactly the property
+/// the encode gate checks.
 ///
 /// `pps_bypass` mirrors the PPS's `transquant_bypass_enabled_flag`: when
 /// set, `coding_unit` reads a `cu_transquant_bypass_flag` as its very first
@@ -310,12 +317,6 @@ fn write_ctu_intra(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, ctu_
     }
     write_intra_chroma_pred_mode(e, cx, u32::from(d.chroma_syntax));
 
-    // Transform tree: a single TU the size of the CU.
-    write_split_transform_flag(e, cx, log2, false);
-    write_cbf_chroma(e, cx, 0, d.cbf_chroma[0]);
-    write_cbf_chroma(e, cx, 0, d.cbf_chroma[1]);
-    write_cbf_luma(e, cx, 0, d.cbf_luma[0]);
-
     let n = 1usize << log2;
     let params = |log2_size: u32, c_idx: usize, mode: u8| ResidualParams {
         log2_size,
@@ -332,6 +333,57 @@ fn write_ctu_intra(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, ctu_
         persistent_rice: false,
         trace: false,
     };
+    if d.split_tu {
+        // Transform tree: one level of splitting — four quarter-size TUs in
+        // z-order. The walk is the reader's `transform_tree`, specialised:
+        // at depth 0 the split flag is coded (log2 <= max_tb, > min_tb,
+        // depth < the SPS's max_transform_hierarchy_depth_intra of 2) and
+        // says split; the chroma cbfs are coded ONCE here, at depth 0; each
+        // child then codes its own split flag (still coded — child sizes 8
+        // and 16 are above the 4x4 minimum and depth 1 < 2), saying no
+        // further split, its chroma cbfs gated on the parent's per-component
+        // bins (the reader reads a child bin only where the parent's was
+        // set, inferring zero otherwise), its always-coded intra cbf_luma,
+        // and its residuals: luma at the child size, chroma at half that —
+        // both child sizes keep log2 > 2, so chroma splits alongside and the
+        // chroma-at-the-parent rule for 4x4 luma children never triggers.
+        // Prediction is per-PU (one mode for the whole 2Nx2N CU), so every
+        // child TB scans by the same luma mode.
+        write_split_transform_flag(e, cx, log2, true);
+        write_cbf_chroma(e, cx, 0, d.cbf_chroma[0]);
+        write_cbf_chroma(e, cx, 0, d.cbf_chroma[1]);
+        let q = (n / 2) * (n / 2);
+        let qc = (n / 4) * (n / 4);
+        for i in 0..4 {
+            write_split_transform_flag(e, cx, log2 - 1, false);
+            for comp in 0..2 {
+                if d.cbf_chroma[comp] {
+                    write_cbf_chroma(e, cx, 1, d.cbf_chroma_tu[comp][i]);
+                }
+            }
+            write_cbf_luma(e, cx, 1, d.cbf_luma[i]);
+            if d.cbf_luma[i] {
+                write_residual(e, cx, &params(log2 - 1, 0, d.luma_modes[0]), &d.luma[i * q..(i + 1) * q]);
+            }
+            for comp in 0..2 {
+                if d.cbf_chroma[comp] && d.cbf_chroma_tu[comp][i] {
+                    write_residual(
+                        e,
+                        cx,
+                        &params(log2 - 2, comp + 1, d.chroma_mode),
+                        &d.chroma[comp][i * qc..(i + 1) * qc],
+                    );
+                }
+            }
+        }
+        return;
+    }
+
+    // Transform tree: a single TU the size of the CU.
+    write_split_transform_flag(e, cx, log2, false);
+    write_cbf_chroma(e, cx, 0, d.cbf_chroma[0]);
+    write_cbf_chroma(e, cx, 0, d.cbf_chroma[1]);
+    write_cbf_luma(e, cx, 0, d.cbf_luma[0]);
     if d.cbf_luma[0] {
         write_residual(e, cx, &params(log2, 0, d.luma_modes[0]), &d.luma[..n * n]);
     }
@@ -430,6 +482,82 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(!out[0].data.is_empty());
         assert_eq!(e.reconstructions()[0], frame, "bypass reconstruction differs from the source");
+    }
+
+    /// The transform split carries live traffic and round-trips. Content
+    /// built to make the split win — flat CTUs with one busy quadrant —
+    /// must split at the decision level first: that is the guard that keeps
+    /// this test from silently exercising only the single-TU path (a wired
+    /// writer nobody reaches is the vacuity class this crate keeps
+    /// rediscovering). Then the full encoder's stream must decode, in
+    /// process through the production decoder, to the encoder-held
+    /// reconstruction byte for byte — SELF without leaving the harness.
+    #[test]
+    fn a_split_transform_carries_traffic_and_round_trips() {
+        let (w, h) = (64usize, 64usize);
+        let mut frame = vec![128u8; w * h * 3 / 2];
+        // One busy 16x16 quadrant per 32x32 CTU (bottom-right), luma only.
+        let mut seed = 0xb1a5u32;
+        for cty in 0..2usize {
+            for ctx_ in 0..2usize {
+                for y in 16..32 {
+                    for x in 16..32 {
+                        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                        frame[(cty * 32 + y) * w + ctx_ * 32 + x] = (seed >> 24) as u8;
+                    }
+                }
+            }
+        }
+        let config = Config {
+            rate: super::super::RateControl::ConstantQp(30),
+            gop: 0,
+            ..cfg(64, 64, ChromaFormat::Yuv420)
+        };
+
+        // Decision-level guard: this content actually splits.
+        let cpu = Cpu::detect_honouring_env();
+        let mut dsp = HevcDsp::<u8>::SCALAR;
+        install_simd_u8(&mut dsp, cpu);
+        let enc_dsp = HevcEncDsp::new(cpu);
+        let dist = DistortionDsp::<u8>::new(cpu);
+        let ictx = IntraCtx {
+            dsp: &dsp,
+            enc: &enc_dsp,
+            dist: &dist,
+            qp: 30,
+            bit_depth: 8,
+            strong_smoothing: false,
+            bypass: false,
+        };
+        let mut pic = IntraPicture::<u8>::new(64, 64, 5, 8);
+        pic.try_split = true;
+        let (py, pc) = frame.split_at(w * h);
+        let (pcb, pcr) = pc.split_at(w * h / 4);
+        let mut splits = 0usize;
+        for cy in 0..2 {
+            for cx in 0..2 {
+                let d = pic.code_ctu(&ictx, cx, cy, py, w, pcb, pcr, w / 2);
+                splits += usize::from(d.split_tu);
+            }
+        }
+        assert!(
+            splits > 0,
+            "the construction was meant to make splitting win; it did not, and the round trip below would be vacuous"
+        );
+
+        // Full-encoder SELF, in process.
+        let mut e = H265Encoder::new(config).unwrap();
+        let out = e.push(&frame).unwrap();
+        assert_eq!(out.len(), 1);
+        let mut dec = crate::hevc::HevcDecoder::new();
+        dec.push_annexb(&out[0].data).unwrap();
+        dec.flush().unwrap();
+        let decoded = dec.next_picture().expect("one picture");
+        assert_eq!(
+            decoded.into_packed(),
+            e.reconstructions()[0],
+            "decoded bytes differ from the encoder-held reconstruction"
+        );
     }
 
     #[test]
