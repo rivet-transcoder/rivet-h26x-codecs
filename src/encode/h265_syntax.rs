@@ -265,7 +265,14 @@ pub fn write_sps(cfg: &Config, g: &Geometry, log2_max_poc_lsb: u32) -> Vec<u8> {
     w.flag(false); // amp_enabled_flag
     // Turning this on makes `slice_sao_luma_flag` (and, outside
     // monochrome, `slice_sao_chroma_flag`) appear in EVERY slice header,
-    // I slices included - see `SliceHeader::sao`.
+    // I slices included — the reader's block sits outside the non-IDR
+    // branch — so this flag's first effect is on slices that carry no SAO
+    // decision at all. See `SliceHeader::sao`, which is an `Option` for
+    // exactly that reason.
+    //
+    // Third member of the family this header keeps meeting: a parameter
+    // set flag that silently changes how many bits every slice header
+    // holds. The other two are recorded at their sites below.
     w.flag(cfg.sao); // sample_adaptive_offset_enabled_flag
     w.flag(false); // pcm_enabled_flag
     w.ue(0); // num_short_term_ref_pic_sets
@@ -480,14 +487,26 @@ pub fn write_slice_header(h: &SliceHeader, pps_qp: u8, nal_type: u8, deblock: bo
     w.se(h.qp as i32 - pps_qp as i32); // slice_qp_delta
     // slice_loop_filter_across_slices_enabled_flag: the reader reads it
     // when `pps_loop_filter_across_slices_enabled_flag` is set AND either
-    // SAO is on for this slice or deblocking is not disabled (slice.rs).
-    // The PPS always sets the first, so the bit is present whenever either
-    // filter runs — which, since every picture is deblocked, is always.
-    // SAO changes which disjunct is true, not whether the bit exists.
+    // SAO is on for this slice or deblocking is not disabled — a
+    // three-way condition, `slice.rs`. The PPS always sets the first, so
+    // the bit is present whenever *either* filter runs; and since every
+    // picture is deblocked, it is present always. SAO changes which
+    // disjunct is true, not whether the bit exists.
     //
-    // Getting that wrong in either direction shifts every bit after it,
-    // the one-spurious-bit shape this header has been bitten by twice;
-    // the production parser refusing the header is what catches it.
+    // This comment used to say something narrower and, by the end, wrong:
+    // "the SPS disables SAO, so this follows the PPS's deblocking flag
+    // exactly". True when written, stale the moment inter deblocking went
+    // live and every picture started being filtered — and it was then
+    // read, in good faith, as evidence that enabling SAO would make this
+    // bit newly appear. It would not; it had been appearing for a while.
+    // The superseded reasoning is kept rather than deleted because the
+    // failure was reasoning from this comment instead of from the reader,
+    // and a comment that records having misled is worth more than a tidy
+    // one that could do it again.
+    //
+    // Getting the condition wrong in either direction shifts every bit
+    // after it, the one-spurious-bit shape this header has been bitten by
+    // twice; the production parser refusing the header is what catches it.
     let sao_on = h.sao.is_some_and(|s| s.luma || s.chroma == Some(true));
     if deblock || sao_on {
         w.flag(true); // slice_loop_filter_across_slices_enabled_flag

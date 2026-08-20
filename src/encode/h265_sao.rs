@@ -125,6 +125,38 @@ impl Cat {
 
 /// The Lagrangian the SAO decision prices bins with — the intra module's
 /// constant, and the same placeholder standing.
+///
+/// # This is the first thing in this encoder that is not a mirror
+///
+/// Everywhere else, an encoder-side derivation has a decoder-side
+/// counterpart it must agree with, and the rule has been to call that
+/// counterpart rather than reimplement it: the intra decision predicts
+/// through `hevc::intra::predict`, the inter decision derives candidates
+/// through `hevc::mvpred`, both loop filters *are* the decoder's. Drift
+/// is impossible rather than tested against, because there is only one
+/// copy.
+///
+/// SAO has no such counterpart. A decoder applies the offsets it is
+/// handed and has no opinion about which ones it should have been handed;
+/// the standard fixes the classification and the syntax, and leaves the
+/// choice entirely to the encoder. So this module is split down that
+/// line, deliberately:
+///
+/// - **The arithmetic stays theirs.** Classification is mirrored from
+///   `hevc::sao::sao_ctb` line for line, and the offsets are *applied* by
+///   `sao_ctb_row` itself — never by code here.
+/// - **Only the choice is ours**, and it is priced by this function and
+///   [`bins_of`]: a Lagrangian times an approximate bin count, the same
+///   single-function placeholder policy as `h265_intra`'s
+///   `mode_signalling_cost` and `h265_me`'s `lambda`, to be replaced
+///   wholesale when a real bit count exists. Nothing about it is derived
+///   from the standard and nothing in a decoder can contradict it.
+///
+/// The consequence worth stating: a mistake here cannot produce an
+/// illegal stream, and neither SELF nor CROSS can see it. It produces a
+/// legal stream and a worse picture. That is why `sao_picture` checks its
+/// own predicted distortion against the filter's actual result rather
+/// than trusting the two to agree.
 fn lambda(qp: i32) -> f32 {
     0.57 * 2f32.powf((qp - 12) as f32 / 3.0)
 }
