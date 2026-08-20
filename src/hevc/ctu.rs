@@ -1587,6 +1587,49 @@ pub(crate) fn write_merge_idx(e: &mut CabacEncoder, cx: &mut Contexts, max_num_m
     }
 }
 
+/// Write `inter_pred_idc` for a B-slice prediction unit: 0 `PRED_L0`,
+/// 1 `PRED_L1`, 2 `PRED_BI` — the reader's own encoding, `prediction_unit`'s
+/// local `pred_idc`. The caller emits this only inside a B slice and only
+/// on the non-merge path, mirroring the two conditions that surround the
+/// reader's block; a P slice codes nothing here and infers `PRED_L0`.
+///
+/// **`w + h != 12` gates the FIRST BIN, not the element.** That is worth
+/// spelling out, because the compressed form of the rule — "coded when the
+/// slice is B and `w + h != 12`" — is a *different and wrong* claim, and a
+/// writer built to it emits nothing at all for an 8x4 or 4x8 prediction
+/// block and desyncs the arithmetic coder. What `prediction_unit` actually
+/// reads:
+///
+/// - `w + h != 12`: one context-coded bin at
+///   `INTER_PRED_IDC_OFFSET + CtDepth`. Set means `PRED_BI`, and nothing
+///   further is read. Clear selects a second bin at
+///   `INTER_PRED_IDC_OFFSET + 4`, where 0 is `PRED_L0` and 1 `PRED_L1`.
+/// - `w + h == 12` (the 8x4 and 4x8 blocks): the element is **still
+///   present**, as that second bin alone. What the size forbids is
+///   `PRED_BI`, not the syntax — the bi restriction of 8.5.3.2.2, the same
+///   rule [`crate::hevc::mvpred`]'s `finalize` applies to a merge
+///   candidate.
+///
+/// `ct_depth` is `CtDepth` of the *coding block*: the reader indexes
+/// `info.ct_depth` at `(x_cb, y_cb)`, not at the prediction block, so a
+/// whole-CTU CU passes 0 whatever its partitioning.
+#[allow(dead_code)]
+pub(crate) fn write_inter_pred_idc(e: &mut CabacEncoder, cx: &mut Contexts, w: i32, h: i32, ct_depth: u32, idc: u32) {
+    debug_assert!(idc <= 2, "inter_pred_idc is 0 PRED_L0, 1 PRED_L1, 2 PRED_BI");
+    debug_assert!(
+        !(w + h == 12 && idc == 2),
+        "PRED_BI is forbidden on an 8x4 / 4x8 prediction block (8.5.3.2.2)"
+    );
+    if w + h != 12 {
+        debug_assert!((ct_depth as usize) < 4, "CtDepth indexes the first four inter_pred_idc contexts");
+        e.encode_decision(&mut cx.c[INTER_PRED_IDC_OFFSET + ct_depth as usize], (idc == 2) as u32);
+        if idc == 2 {
+            return;
+        }
+    }
+    e.encode_decision(&mut cx.c[INTER_PRED_IDC_OFFSET + 4], (idc == 1) as u32);
+}
+
 /// Write `ref_idx_l0` / `ref_idx_l1` (one shared context pair): the
 /// inverse of `parse_ref_idx` — truncated unary against
 /// cMax = `nref` - 1, the first two bins context-coded, the rest bypass,
@@ -2709,6 +2752,245 @@ mod write_round_trip {
     /// inferred-cbf_luma path: a merged 2Nx2N reads no rqt_root_cbf, its
     /// depth-0 leaf has both chroma cbfs 0, so cbf_luma is inferred 1 and
     /// the leaf must carry real luma coefficients.
+    /// The hand-written B slice segment header, the B sibling of
+    /// [`write_p_header`]. The production `write_slice_header` cannot spell
+    /// one yet; this is the contract it must grow, in the parser's order
+    /// (`SliceHeader::parse`, src/hevc/slice.rs) against this encoder's
+    /// SPS and PPS:
+    ///
+    /// `slice_type` B; the POC lsb; the inline short-term RPS
+    /// (`short_term_ref_pic_set_sps_flag` 0, then `num_negative_pics` and
+    /// `num_positive_pics`, then every negative as
+    /// `delta_poc_s0_minus1` + `used_by_curr_pic_s0_flag` and only then
+    /// every positive as `delta_poc_s1_minus1` + `used_by_curr_pic_s1_flag`
+    /// — negatives first, all of them, which is the ordering trap);
+    /// `num_ref_idx_active_override_flag` with a minus1 per list;
+    /// `mvd_l1_zero_flag`; then `five_minus_max_num_merge_cand` and
+    /// `slice_qp_delta`.
+    ///
+    /// Absent, each because a flag this encoder writes makes it absent
+    /// rather than because it is unsupported: `ref_pic_lists_modification`
+    /// (PPS `lists_modification_present_flag` 0), `cabac_init_flag` (PPS
+    /// `cabac_init_present_flag` 0), `collocated_from_l0_flag` and
+    /// `collocated_ref_idx` (SPS `sps_temporal_mvp_enabled_flag` 0), and
+    /// the prediction weight table (PPS `weighted_bipred_flag` 0).
+    ///
+    /// `mvd_l1_zero` is a parameter rather than a constant because it is
+    /// not merely present-or-not: set, on a `PRED_BI` PU, the reader
+    /// infers `MvdL1` zero and reads **no mvd bins for list 1** while
+    /// still reading `mvp_l1_flag` (`prediction_unit`). Whoever writes the
+    /// production header must change both sides in one commit if they ever
+    /// write a 1.
+    #[allow(clippy::too_many_arguments)]
+    fn write_b_header(w: &mut BitWriter, qp: i32, poc_lsb: u32, log2_max_poc_lsb: u32, nref: [u32; 2], max_merge: u32, mvd_l1_zero: bool) {
+        w.bits(8, ((NAL_TRAIL_R as u32) & 0x3f) << 1);
+        w.bits(8, 1); // nuh_layer_id 0, nuh_temporal_id_plus1 1
+        w.flag(true); // first_slice_segment_in_pic_flag
+        w.ue(0); // slice_pic_parameter_set_id
+        w.ue(0); // slice_type: B
+        w.bits(log2_max_poc_lsb, poc_lsb);
+        w.flag(false); // short_term_ref_pic_set_sps_flag: an inline set
+        w.ue(nref[0]); // num_negative_pics
+        w.ue(nref[1]); // num_positive_pics
+        for _ in 0..nref[0] {
+            w.ue(0); // delta_poc_s0_minus1
+            w.flag(true); // used_by_curr_pic_s0_flag
+        }
+        for _ in 0..nref[1] {
+            w.ue(0); // delta_poc_s1_minus1
+            w.flag(true); // used_by_curr_pic_s1_flag
+        }
+        w.flag(true); // num_ref_idx_active_override_flag
+        w.ue(nref[0] - 1); // num_ref_idx_l0_active_minus1
+        w.ue(nref[1] - 1); // num_ref_idx_l1_active_minus1
+        w.flag(mvd_l1_zero); // mvd_l1_zero_flag
+        w.ue(5 - max_merge); // five_minus_max_num_merge_cand
+        w.se(qp - 26); // slice_qp_delta
+        w.flag(true); // byte_alignment(): alignment_bit_equal_to_one
+        w.align_zero();
+    }
+
+    /// [`decode_p`]'s B sibling: parse the hand-written B header with the
+    /// production parser, assemble the production slice decoder over one
+    /// complete reference in each list, decode every CTU, hand the decoder
+    /// to `check`.
+    ///
+    /// `no_backward_pred` is **derived** here the way `decoder.rs:404`
+    /// derives it — every reference POC at or before the current picture —
+    /// rather than pasted from the P path, which hardcodes true. For a
+    /// real B with one past and one future anchor it comes out false.
+    fn decode_b(rbsp: &[u8], sps: &Sps, pps: &Pps, reference: &SharedFrame<u8>, check: impl FnOnce(&SliceDec<u8>)) {
+        let nal = HevcNalHeader::parse(rbsp).expect("NAL header");
+        let psc = pps.clone();
+        let ssc = sps.clone();
+        let (hdr, pps, sps) = SliceHeader::parse(rbsp, nal, &|_| Some(psc.clone()), &|_| Some(ssc.clone()), None)
+            .expect("the hand-written B header must parse");
+        assert_eq!(hdr.slice_type, SliceType::B);
+        assert_eq!(hdr.data_bit_offset % 8, 0);
+        let nref = [hdr.num_ref_idx[0] as usize, hdr.num_ref_idx[1] as usize];
+        assert!(nref[0] >= 1 && nref[1] >= 1, "a B slice needs a reference in each list");
+        let cur_poc = hdr.poc_lsb as i32;
+        // One past anchor in list 0, one future anchor in list 1.
+        let pocs: [Vec<i32>; 2] = [
+            (0..nref[0]).map(|i| cur_poc - 1 - i as i32).collect(),
+            (0..nref[1]).map(|i| cur_poc + 1 + i as i32).collect(),
+        ];
+        let no_backward_pred = pocs[0].iter().chain(pocs[1].iter()).all(|&p| p <= cur_poc);
+        assert!(!no_backward_pred, "a future anchor must make NoBackwardPredFlag false");
+        let mut frame = Frame::<u8>::new(sps.width as usize, sps.height as usize, ChromaFormat::Yuv420, 8);
+        let geo = Arc::new(PicGeometry::new(&sps, &pps));
+        let mut info = PicInfo::new(geo);
+        // SAFETY: the reference is complete; no writer remains.
+        let rf: &Frame<u8> = unsafe { reference.get() };
+        let cabac = Cabac::new(&rbsp[(hdr.data_bit_offset / 8) as usize..]);
+        let wc = sps.pic_width_in_ctbs() as usize;
+        let hc = sps.pic_height_in_ctbs() as usize;
+        let mut dec = SliceDec {
+            sps: &sps,
+            pps: &pps,
+            hdr: &hdr,
+            frame: &mut frame,
+            info: &mut info,
+            cabac,
+            cx: Contexts::new(0, hdr.slice_qp),
+            refs: RefCtx {
+                pocs,
+                long_term: [vec![false; nref[0]], vec![false; nref[1]]],
+                col: None,
+                cur_poc,
+                no_backward_pred,
+                tmvp: false,
+                max_merge_cand: hdr.max_num_merge_cand as usize,
+                log2_par_mrg_level: pps.log2_parallel_merge_level,
+                is_b: true,
+                num_ref_idx: nref,
+                col_from_l0: true,
+            },
+            ref_frames: [vec![rf; nref[0]], vec![rf; nref[1]]],
+            ref_shared: [vec![reference; nref[0]], vec![reference; nref[1]]],
+            col_shared: None,
+            slice_idx: 0,
+            slice_addr: 0,
+            scaling: None,
+            qp_y: hdr.slice_qp,
+            qp_y_prev: hdr.slice_qp,
+            cu_qp_delta_val: 0,
+            is_cu_qp_delta_coded: false,
+            is_cu_chroma_qp_offset_coded: false,
+            cu_qp_offset_c: [0, 0],
+            qg: (0, 0),
+            qg_qp_prev: hdr.slice_qp,
+            first_qg: true,
+            last_pu_merged: false,
+            ctb_addr_rs: 0,
+            ctb_addr_ts: 0,
+            coeffs: vec![0; 1024],
+            luma_res: Vec::new(),
+            luma_res_valid: false,
+            dsp: HevcDsp::<u8>::SCALAR,
+            mc: McScratch::new(),
+            intra: IntraScratch::default(),
+            warnings: 0,
+            trace: TraceCfg::default(),
+        };
+        for ctb in 0..wc * hc {
+            dec.decode_ctu(ctb, ctb).unwrap_or_else(|e| panic!("B CTU {ctb} did not decode: {e}"));
+            let end = dec.cabac.terminate();
+            assert_eq!(end != 0, ctb == wc * hc - 1, "end_of_slice_segment_flag at CTU {ctb}");
+        }
+        assert!(!dec.cabac.overrun(), "the decoder ran past what the writer wrote");
+        assert_eq!(dec.warnings, 0);
+        check(&dec);
+    }
+
+    /// `inter_pred_idc` round-trips by value in all three shapes, with the
+    /// per-list motion each one implies.
+    ///
+    /// The context-state comparison at the end is the sharp edge: a writer
+    /// that spelled the right *values* through the wrong number of bins —
+    /// which is exactly what the "coded only when `w + h != 12`" misreading
+    /// produces — leaves the arithmetic coder's context array in a
+    /// different state, and this catches that even where the decoded
+    /// motion happens to agree.
+    #[test]
+    fn b_inter_pred_idc_round_trips_by_value() {
+        for (idc, mvd0, mvd1) in [
+            (0u32, Mv::new(6, -2), Mv::ZERO),
+            (1, Mv::ZERO, Mv::new(-9, 5)),
+            (2, Mv::new(6, -2), Mv::new(-9, 5)),
+        ] {
+            scripted_b_amvp(idc, mvd0, mvd1);
+        }
+    }
+
+    fn scripted_b_amvp(idc: u32, mvd0: Mv, mvd1: Mv) {
+        let cfg = Config { width: 32, height: 32, chroma: ChromaFormat::Yuv420, bit_depth: 8, max_refs: 4, ..Config::default() };
+        let g = EncGeometry::new(&cfg);
+        let sps = Sps::parse(&unescape_rbsp(&write_sps(&cfg, &g, 8))).expect("SPS");
+        let mut pps = Pps::parse(&unescape_rbsp(&write_pps(26, false, false))).expect("PPS");
+        pps.resolve_tiles(&sps).expect("one tile");
+        assert_eq!(sps.pic_width_in_ctbs() * sps.pic_height_in_ctbs(), 1, "one CTU by construction");
+        let n = 1i32 << sps.log2_ctb_size;
+        let mut w = BitWriter::new();
+        // POC 4, one anchor at 3 and one at 5; mvd_l1_zero 0 so list 1
+        // carries its mvd like list 0.
+        write_b_header(&mut w, 26, 4, 8, [1, 1], 5, false);
+        let mut cx = Contexts::new(0, 26);
+        {
+            let mut e = CabacEncoder::new(&mut w);
+            let nb = SplitCuNb { left_depth: None, above_depth: None };
+            write_split_cu_flag(&mut e, &mut cx, &nb, 0, false);
+            write_cu_skip_flag(&mut e, &mut cx, None, None, false);
+            write_pred_mode_flag(&mut e, &mut cx, false);
+            write_part_mode_inter(&mut e, &mut cx, PartMode::P2Nx2N);
+            write_merge_flag(&mut e, &mut cx, false);
+            // One CU per CTU, so CtDepth is 0.
+            write_inter_pred_idc(&mut e, &mut cx, n, n, 0, idc);
+            // The reader walks lists outermost and takes ref_idx, mvd and
+            // mvp_flag within each — L0's three, then L1's three, not both
+            // ref_idx then both mvd. One reference per list, so no ref_idx
+            // bins exist at all.
+            for list in 0..2usize {
+                let uses = match idc {
+                    0 => list == 0,
+                    1 => list == 1,
+                    _ => true,
+                };
+                if !uses {
+                    continue;
+                }
+                write_mvd(&mut e, &mut cx, if list == 0 { mvd0 } else { mvd1 });
+                write_mvp_flag(&mut e, &mut cx, false);
+            }
+            write_rqt_root_cbf(&mut e, &mut cx, false);
+            e.encode_terminate(1);
+        }
+        w.align_zero();
+        let rbsp = w.into_rbsp();
+        let reference = complete_reference(&sps, 3);
+        decode_b(&rbsp, &sps, &pps, &reference, |dec| {
+            let tag = format!("idc={idc} mvd0={mvd0:?} mvd1={mvd1:?}");
+            let want_mv = [
+                if idc == 1 { Mv::ZERO } else { mvd0 },
+                if idc == 0 { Mv::ZERO } else { mvd1 },
+            ];
+            let want_ref: [i8; 2] = [if idc == 1 { -1 } else { 0 }, if idc == 0 { -1 } else { 0 }];
+            let w4 = dec.frame.w4;
+            for y4 in 0..8 {
+                for x4 in 0..8 {
+                    let mi = &dec.frame.motion[y4 * w4 + x4];
+                    assert_eq!(mi.ref_idx, want_ref, "{tag}: which lists the PU uses");
+                    for list in 0..2 {
+                        if want_ref[list] >= 0 {
+                            assert_eq!(mi.mv[list], want_mv[list], "{tag}: list {list} motion is the mvd (zero predictor)");
+                        }
+                    }
+                }
+            }
+            assert_eq!(dec.cx.c, cx.c, "{tag}: context states diverged");
+        });
+    }
+
     #[test]
     fn p_merge_and_skip_inherit_motion_by_value() {
         for skip in [false, true] {
