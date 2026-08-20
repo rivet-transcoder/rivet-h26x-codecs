@@ -67,6 +67,14 @@ fi
 # 29 and every row lived below that. At QP 40 the same mutation fails SELF on
 # both entropy coders at once. Any table the codec indexes by QP has the same
 # shape, so one row per codec sits high enough to leave the identity region.
+#
+# It has now happened twice, which is what makes it a rule rather than an
+# anecdote. When H.265's inter path gained its first format-dependent chroma
+# QP derivation, telling that mapping "4:2:0" whatever the real format is was
+# invisible at QP 26 and failed 4:2:2 and 4:4:4 at once at QP 40. Intra and
+# inter reach the table through different code, so a high-QP row for one buys
+# nothing for the other: every combination of codec, entropy coder and
+# prediction mode that indexes a QP table needs its own row above 29.
 CONFIGS=${CONFIGS:-"
 lossless-intra|--codec h264 --lossless --gop 0
 cqp-intra|--codec h264 --qp 26 --gop 0
@@ -81,6 +89,7 @@ hevc-lossless-intra|--codec h265 --lossless --gop 0
 hevc-cqp-intra|--codec h265 --qp 26 --gop 0
 hevc-cqp-ip|--codec h265 --qp 26 --gop 8
 hevc-cqp40-intra|--codec h265 --qp 40 --gop 0
+hevc-cqp40-ip|--codec h265 --qp 40 --gop 8
 "}
 
 one() {
