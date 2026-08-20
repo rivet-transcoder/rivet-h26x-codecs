@@ -35,6 +35,27 @@
 //! replay test at the bottom re-derives every decision on an independently
 //! maintained state to prove the maintenance, not the derivation.
 //!
+//! **And so is chroma, in every format.** All four chroma formats are
+//! coded, and none of the three derivations that differ between them is
+//! written out here:
+//!
+//! - The **chroma motion vector** comes from `predict_block` itself, which
+//!   reads `(SubWidthC, SubHeightC)` off the frame it is writing into and
+//!   scales by `mv * 2 / SubWidthC` per axis (its `mvc` closure,
+//!   8.5.3.2.10). Building [`InterPicture::recon`] in the SPS's own format
+//!   is therefore the entire chroma-MC change: 4:2:2's horizontally
+//!   unscaled, vertically doubled vector is the decoder's derivation, not
+//!   a second copy of it. This is the one rule self-consistency cannot
+//!   check — an encoder and a decoder sharing a wrong vector agree with
+//!   each other — so it is CROSS against libavcodec that arbitrates it.
+//! - The **chroma transform blocks** are placed by
+//!   `h265_intra::chroma_tbs`, which is `transform_unit`'s `here`
+//!   expression plus its `yct = yc + t * nc` stacked-pair loop.
+//! - The **chroma QP** is `hevc::ctu::chroma_qp` told this stream's
+//!   `ChromaArrayType`: Table 8-10 for 4:2:0 and `Min(qPi, 51)` for
+//!   everything else. Note for anyone testing this: the two agree for
+//!   every `qPi` below 30, so a fixed-QP-26 stream cannot tell them apart.
+//!
 //! **TMVP is foreclosed by the bitstream, not skipped by this module.**
 //! `write_sps` writes `sps_temporal_mvp_enabled_flag` = 0, so the slice
 //! header never carries the slice-level flag and the decoder derives
@@ -47,8 +68,16 @@
 //! - **P slices, one reference** (list 0, `ref_idx` 0), `PART_2Nx2N`
 //!   whole-CTU CUs, one CU-sized TU (no transform split — the SPS's
 //!   maximum transform size equals the CTB size precisely so this shape is
-//!   representable). 4:2:0, fixed QP, no weighted prediction
+//!   representable). Fixed QP, no weighted prediction
 //!   (`Weighting::Default`).
+//! - **All four chroma formats.** Monochrome omits every chroma element,
+//!   mirroring the reader's uniform `chroma_array_type != 0` gates in
+//!   `transform_tree` and `transform_unit`; 4:2:0 carries one half-size
+//!   chroma TB per component; 4:2:2 the stacked pair of half-size squares,
+//!   each with its own cbf; 4:4:4 one chroma TB at the luma TB's own size.
+//!   The unsplit depth-0 node is above 4x4 in every geometry this module
+//!   produces, so `transform_unit`'s chroma-at-the-parent case (its
+//!   `blk_idx == 3` arm, for 4x4 luma TBs) never arises here.
 //! - **`MaxNumMergeCand` = 5**: the slice header this decision assumes
 //!   writes `five_minus_max_num_merge_cand` = 0. The PPS writes
 //!   `log2_parallel_merge_level_minus2` = 0 (level 2: no merge-list
@@ -84,8 +113,7 @@
 //!   CU (ctu.rs's `!(part_mode == P2Nx2N && last_pu_merged)` gate), which
 //!   is why this module only produces `Merge` when residual survived (a
 //!   zero-residual merge becomes `Skip`; an invariant a test holds).
-//!   Then the transform tree: `split_transform_flag` 0, `cbf_cb`,
-//!   `cbf_cr`, `cbf_luma`, and the coded residuals.
+//!   Then the transform tree, whose shape is the format's (below).
 //! - [`InterCuKind::Amvp`]: `cu_skip_flag` 0, `pred_mode_flag` 0,
 //!   `part_mode` 2Nx2N, `merge_flag` 0; no `inter_pred_idc` (P slice), no
 //!   `ref_idx_l0` (one active reference); `mvd_l0` (as
@@ -96,9 +124,32 @@
 //!   instead; this module's reconstruction and coefficients are
 //!   meaningless and its planes untouched. See [`prefer_intra`].
 //!
-//! Coefficients are raster within each TU, exactly as in `CuDecision`; the
-//! writer derives the scan (always diagonal for inter TUs — the
-//! mode-dependent scans are intra-only, 7.4.9.11).
+//! The transform tree, at `split_transform_flag` 0 and depth 0, spells in
+//! the reader's order (`transform_tree`, then `transform_unit`):
+//!
+//! 1. `split_transform_flag`, 0.
+//! 2. The chroma cbfs, **only when `chroma_array_type != 0`**: per
+//!    component `cbf_c[c][0]`, and at 4:2:2 `cbf_c[c][1]` immediately
+//!    after it (`transform_tree`'s `cat == 2 && (!split || log2 == 3)`
+//!    arm — an unsplit node always codes both halves of the pair). The
+//!    fields are [`InterCuDecision::cbf_chroma`] and
+//!    [`InterCuDecision::cbf_chroma_bot`].
+//! 3. `cbf_luma` — **but only if some chroma cbf above was set.** At an
+//!    inter leaf of depth 0 with every chroma cbf clear the reader codes
+//!    no bin and infers `cbf_luma` 1, so writing one desyncs. Monochrome
+//!    has no chroma cbf to set and therefore never carries the bin at
+//!    all; such a CU must genuinely have luma coefficients, which this
+//!    module guarantees by spelling a residual-free CU as a skip or as
+//!    `rqt_root_cbf` 0.
+//! 4. The luma residual, if `cbf_luma`.
+//! 5. The chroma residuals, components outermost and the 4:2:2 pair
+//!    within (`transform_unit`'s `for c` around its `for t`), each at the
+//!    TB size and slot [`InterCuDecision::chroma`] documents.
+//!
+//! Coefficients are raster within each TB, exactly as in `CuDecision`; the
+//! writer derives the scan (always diagonal for inter TBs — the
+//! mode-dependent scans are intra-only, and `residual_scan_idx` returns 0
+//! for every non-intra block, 7.4.9.11).
 //!
 //! # Duplication, flagged
 //!
@@ -222,7 +273,7 @@ pub struct InterCuDecision {
     /// | 3 (4:4:4) | `log2_cu` | 1 | `(x0, y0)`, at the luma TB's own size |
     ///
     /// Positions are chroma-plane coordinates; the placement is
-    /// [`super::h265_intra::chroma_tbs`], which mirrors `transform_unit`'s
+    /// `h265_intra::chroma_tbs`, which mirrors `transform_unit`'s
     /// `here` and its `yct = yc + t * nc` loop. Entries beyond the slots a
     /// format uses are zero and meaningless. Sized for the largest case,
     /// a 4:4:4 32x32 chroma TB.
@@ -350,6 +401,12 @@ impl<S: Sample> InterPicture<S> {
     /// On [`InterCuKind::UseIntra`] the reconstruction planes are
     /// untouched and the motion grid holds `MotionInfo::INTRA`: the
     /// caller runs the intra decision, which writes the planes itself.
+    ///
+    /// `src_cb` / `src_cr` are the chroma planes at `c_stride`, in this
+    /// stream's own format — `(width / SubWidthC) x (height / SubHeightC)`.
+    /// Under monochrome they are never read and may be empty, exactly as
+    /// the reader never reads a chroma element when `chroma_array_type`
+    /// is 0.
     #[allow(clippy::too_many_arguments)]
     pub fn code_ctu(
         &mut self,
