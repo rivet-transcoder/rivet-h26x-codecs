@@ -44,8 +44,9 @@ use crate::h264::SliceType;
 use crate::h264::cabac_mb::{
     CabacState, WrittenMb, intra_mb_type_code, write_cbp_cabac, write_intra_pred_modes_cabac,
     write_intra_residual_cabac, write_inter_residual_cabac, write_inter_residual_fields_cabac,
-    write_mb_qp_delta_cabac, write_mb_skip_cabac, write_mb_type_b_cabac, write_mb_type_i_cabac,
-    write_mb_type_p_cabac, write_mvd_16x16_cabac, write_transform_8x8_cabac,
+    CurMbMvd, write_mb_qp_delta_cabac, write_mb_skip_cabac, write_mb_type_b_cabac,
+    write_mb_type_i_cabac, write_mb_type_p_cabac, write_mvd_16x16_cabac, write_mvd_cabac,
+    write_transform_8x8_cabac,
 };
 use crate::picture::ChromaFormat;
 
@@ -129,12 +130,26 @@ fn write_p16_body(
     cfi: u32,
     t8x8_mode: bool,
 ) {
-    debug_assert_eq!(d.kind, InterMbKind::P16x16);
+    debug_assert!(
+        matches!(
+            d.kind,
+            InterMbKind::P16x16 | InterMbKind::P16x8 | InterMbKind::P8x16
+        ),
+        "only a coded P macroblock carries this syntax"
+    );
     debug_assert_eq!(d.ref_idx, 0, "more than one reference needs ref_idx writing");
-    write_mb_type_p_cabac(e, st, 0);
+    write_mb_type_p_cabac(e, st, d.kind.p_mb_type());
     let lnb = left.map(|m| &m.nb);
     let anb = above.map(|m| &m.nb);
-    write_mvd_16x16_cabac(e, st, lnb, anb, 0, d.mvd);
+    // `ref_idx_l0` is absent (one active reference). One mvd per
+    // partition, in `mb_partitions` order, each recorded as it is written
+    // so that the next partition's context can read it — which is what
+    // the reader does with `layer.mvd`.
+    let mut cur = CurMbMvd::default();
+    for (i, &(x, y, w, h)) in d.kind.parts().iter().enumerate() {
+        write_mvd_cabac(e, st, &cur, lnb, anb, 0, x / 4, y / 4, d.mvd[i]);
+        cur.set(0, x, y, w, h, d.mvd[i]);
+    }
     write_cbp_cabac(e, st, lnb, anb, d.cbp_luma | (d.cbp_chroma << 4), cfi == 1 || cfi == 2);
     // An inter macroblock's flag comes after the coded block pattern and
     // only when some luma block is coded — `no_sub_mb_part_less_than_8x8`

@@ -141,7 +141,7 @@ impl H264Encoder {
             plane_dims.push((cw, chh));
             plane_dims.push((cw, chh));
         }
-        let tools = super::h264_pic::IntraTools::new(cfg.transform_8x8);
+        let tools = super::h264_pic::IntraTools::new(cfg.transform_8x8, cfg.subparts);
         let rc = match cfg.rate {
             RateControl::Bitrate { bps } => Some(RateController::new(bps, cfg.fps, cfg.width, cfg.height, cfg.gop, cfg.bframes)),
             _ => None,

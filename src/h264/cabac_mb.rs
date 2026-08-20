@@ -739,7 +739,72 @@ pub(crate) fn write_mvd_16x16_cabac(
     list: usize,
     mvd: Mv,
 ) {
-    let abs = |m: Option<&WrittenMb>, blk: usize| -> (i32, i32) {
+    write_mvd_cabac(e, st, &CurMbMvd::default(), left, above, list, 0, 0, mvd);
+}
+
+/// The `mvd_lX` of the macroblock being written, per 4x4 block — what
+/// this macroblock's *own* later partitions read for their context.
+///
+/// A 16x16 partition never needs it: both its neighbours are in other
+/// macroblocks. Every smaller shape does — the lower half of a 16x8 takes
+/// its B neighbour from the upper half, and the right half of an 8x16 its
+/// A neighbour from the left — which is the mirror of
+/// `mvd_neighbour_abs`'s `addr == nb.addr` branch.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CurMbMvd {
+    /// Per list, per 4x4 (raster). Blocks not yet written are zero, which
+    /// is what the decoder's `layer.reset` leaves them too.
+    pub mvd: [[Mv; 16]; 2],
+}
+
+impl CurMbMvd {
+    /// Record a partition's mvd over the blocks it covers, as the reader
+    /// does once it has parsed that partition — and over the whole
+    /// rectangle, because that is what the reader stores (its CAVLC twin
+    /// keeps only the top-left, having no context to feed).
+    pub fn set(&mut self, list: usize, x: usize, y: usize, w: usize, h: usize, mvd: Mv) {
+        for by in y / 4..(y + h) / 4 {
+            for bx in x / 4..(x + w) / 4 {
+                self.mvd[list][by * 4 + bx] = mvd;
+            }
+        }
+    }
+}
+
+/// Write one `mvd_lX` for the partition whose top-left 4x4 block is
+/// `(bx, by)`: the exact inverse of [`decode_mvd`], its neighbour
+/// derivation included.
+///
+/// The context increment is the sum of the absolute components of the
+/// mvds of the blocks left of and above this one (9.3.3.1.1.7) — *4x4
+/// blocks*, not macroblocks, which is why this takes coordinates. For a
+/// 16x16 partition both land in neighbouring macroblocks, which is all
+/// the 16x16-only writer could express; for any smaller shape at least
+/// one lands inside this macroblock and comes from `cur`.
+///
+/// Both neighbours are read before either component is written, exactly
+/// as `decode_mvd` reads them before decoding either: the horizontal
+/// component's own value must not perturb the vertical component's
+/// context.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_mvd_cabac(
+    e: &mut CabacEncoder,
+    st: &mut CabacState,
+    cur: &CurMbMvd,
+    left: Option<&WrittenMb>,
+    above: Option<&WrittenMb>,
+    list: usize,
+    bx: usize,
+    by: usize,
+    mvd: Mv,
+) {
+    debug_assert!(bx < 4 && by < 4);
+    // `MbNeighbours::block` restricted to the two lookups this makes,
+    // both with 0 <= bx, by < 4: the left neighbour is this macroblock's
+    // own block unless bx is 0, when it is the left macroblock's block 3
+    // of that row; the above neighbour likewise, or the above
+    // macroblock's block 12 + bx.
+    let outside = |m: Option<&WrittenMb>, blk: usize| -> (i32, i32) {
         match m {
             None => (0, 0),
             Some(m) => {
@@ -751,10 +816,14 @@ pub(crate) fn write_mvd_16x16_cabac(
             }
         }
     };
-    let left = abs(left, 3);
-    let above = abs(above, 12);
-    write_mvd_component_cabac(e, st, left.0 + above.0, 0, mvd.x as i32);
-    write_mvd_component_cabac(e, st, left.1 + above.1, 1, mvd.y as i32);
+    let inside = |blk: usize| -> (i32, i32) {
+        let m = cur.mvd[list][blk];
+        (m.x.abs() as i32, m.y.abs() as i32)
+    };
+    let a = if bx > 0 { inside(by * 4 + bx - 1) } else { outside(left, by * 4 + 3) };
+    let b = if by > 0 { inside((by - 1) * 4 + bx) } else { outside(above, 12 + bx) };
+    write_mvd_component_cabac(e, st, a.0 + b.0, 0, mvd.x as i32);
+    write_mvd_component_cabac(e, st, a.1 + b.1, 1, mvd.y as i32);
 }
 
 /// One `mvd_lX` component (9.3.3.1.1.7), given the sum of its neighbours'
@@ -1158,6 +1227,26 @@ fn gate_nz_luma(cbp_luma: u8, nz: &[u8; 16]) -> [u8; 16] {
     out
 }
 
+/// A P macroblock's `mvd_l0` per 4x4 block (raster): each partition's
+/// vector difference over the blocks it covers.
+///
+/// The decoder's CABAC parser replicates a partition's mvd across its
+/// rectangle for exactly this reason — later blocks' ctxIdxInc read
+/// `layer.mvd[blk]` per 4x4 — while its CAVLC parser stores only the
+/// top-left, because CAVLC has no such context. The two disagree
+/// harmlessly there; here the CABAC form is the one that has to be right.
+fn partition_mvd(d: &InterDecision) -> [Mv; 16] {
+    let mut out = [Mv::ZERO; 16];
+    for (i, &(x, y, w, h)) in d.kind.parts().iter().enumerate() {
+        for by in y / 4..(y + h) / 4 {
+            for bx in x / 4..(x + w) / 4 {
+                out[by * 4 + bx] = d.mvd[i];
+            }
+        }
+    }
+    out
+}
+
 /// The luma nonzero counts an 8x8-transformed macroblock leaves for its
 /// neighbours: one count per 8x8 block, on all four of its 4x4s.
 ///
@@ -1267,10 +1356,11 @@ impl WrittenMb {
         }
     }
 
-    /// The state of a P macroblock written from `d`. `P_Skip` stores what
-    /// the decoder stores for one — no residual, reference 0, no mvd.
-    /// `UseIntra` is refused: the macroblock actually coded is the intra
-    /// decision, so build from *that* via [`WrittenMb::from_decision`].
+    /// The state of a P macroblock written from `d`, of any coded shape.
+    /// `P_Skip` stores what the decoder stores for one — no residual,
+    /// reference 0, no mvd. `UseIntra` is refused: the macroblock
+    /// actually coded is the intra decision, so build from *that* via
+    /// [`WrittenMb::from_decision`].
     #[allow(dead_code)] // the picture loop being built is the caller
     pub(crate) fn from_inter_decision(d: &InterDecision, c444: bool) -> Self {
         match d.kind {
@@ -1297,7 +1387,7 @@ impl WrittenMb {
                     direct: false,
                 }
             }
-            InterMbKind::P16x16 => WrittenMb {
+            InterMbKind::P16x16 | InterMbKind::P16x8 | InterMbKind::P8x16 => WrittenMb {
                 pcm: false,
                 i16x16: false,
                 transform_8x8: d.transform_8x8,
@@ -1319,7 +1409,12 @@ impl WrittenMb {
                 skip: false,
                 intra: false,
                 ref_idx: [d.ref_idx; 16],
-                mvd: [[d.mvd; 16], [Mv::ZERO; 16]],
+                // Each partition's mvd over its own 4x4 blocks, which is
+                // what the decoder's CABAC parser stores and what the
+                // *next* macroblock's mvd contexts read across the edge
+                // (`mvd_neighbour_abs`). One vector for all sixteen was
+                // faithful only while there was one partition.
+                mvd: [partition_mvd(d), [Mv::ZERO; 16]],
                 direct: false,
             },
         }
@@ -2278,7 +2373,7 @@ pub(crate) fn write_inter_residual_cabac(
     above: Option<&WrittenMb>,
 ) {
     debug_assert!(
-        d.kind == InterMbKind::P16x16,
+        !matches!(d.kind, InterMbKind::PSkip | InterMbKind::UseIntra),
         "only a coded inter macroblock carries residual syntax (a skip carries none)"
     );
     write_inter_residual_fields_cabac(
@@ -2984,7 +3079,7 @@ mod mb_round_trip {
     use super::*;
     use crate::bitwriter::BitWriter;
     use crate::encode::h264_intra::{PredMode, quad_rasters};
-    use crate::h264::cavlc::{intra_mb_type, p_mb_type, sub_block_counts_8x8};
+    use crate::h264::cavlc::{intra_mb_type, mb_partitions, p_mb_type, sub_block_counts_8x8};
     use crate::h264::frame::BlockMotion;
     use crate::h264::mb::raster_of_blk;
 
@@ -3331,9 +3426,30 @@ mod mb_round_trip {
             d.kind = InterMbKind::PSkip;
             return d;
         }
-        d.kind = InterMbKind::P16x16;
+        // A shape, then one mvd per partition of it. The shapes must be
+        // mixed within a slice: a 16x8's lower half reads its context
+        // from the upper half, and a slice of nothing but 16x16 would
+        // never exercise an in-macroblock mvd neighbour at all.
+        // `ref_idx` is written by the 16x16-only
+        // `write_ref_idx_16x16_cabac`, which hardwires its neighbour
+        // blocks; a multi-reference slice therefore stays 16x16 until a
+        // partition-aware ref_idx writer exists. The production encoder
+        // never reaches this — it declares one reference, so the element
+        // is absent — and `write_p16x16_mb` asserts the limit rather than
+        // spelling something a reader would not take.
+        d.kind = if num_ref > 1 {
+            InterMbKind::P16x16
+        } else {
+            match rng() % 3 {
+                0 => InterMbKind::P16x16,
+                1 => InterMbKind::P16x8,
+                _ => InterMbKind::P8x16,
+            }
+        };
         d.ref_idx = if num_ref > 1 { (rng() % num_ref) as i8 } else { 0 };
-        d.mvd = Mv::new(mvd_comp(rng), mvd_comp(rng));
+        for i in 0..d.kind.parts().len() {
+            d.mvd[i] = Mv::new(mvd_comp(rng), mvd_comp(rng));
+        }
         d.cbp_luma = (rng() % 16) as u8;
         for blk8 in 0..4usize {
             if d.cbp_luma & (1 << blk8) == 0 {
@@ -3449,13 +3565,22 @@ mod mb_round_trip {
         num_ref: u32,
         t8x8: bool,
     ) {
-        write_mb_type_p_cabac(e, st, 0);
+        write_mb_type_p_cabac(e, st, d.kind.p_mb_type());
         let lnb = left.map(|m| &m.nb);
         let anb = above.map(|m| &m.nb);
         if num_ref > 1 {
+            debug_assert_eq!(
+                d.kind,
+                InterMbKind::P16x16,
+                "a multi-reference test writes one ref_idx, so one partition"
+            );
             write_ref_idx_16x16_cabac(e, st, lnb, anb, d.ref_idx);
         }
-        write_mvd_16x16_cabac(e, st, lnb, anb, 0, d.mvd);
+        let mut cur = CurMbMvd::default();
+        for (i, &(x, y, w, h)) in d.kind.parts().iter().enumerate() {
+            write_mvd_cabac(e, st, &cur, lnb, anb, 0, x / 4, y / 4, d.mvd[i]);
+            cur.set(0, x, y, w, h, d.mvd[i]);
+        }
         write_cbp_cabac(e, st, lnb, anb, d.cbp_luma | (d.cbp_chroma << 4), cfi == 1 || cfi == 2);
         // After the coded block pattern, and only when some luma block is
         // coded.
@@ -3490,22 +3615,46 @@ mod mb_round_trip {
         let t = decode_mb_type(c, st, ctx, info, nb).expect("mb_type rejected");
         let intra_t = if ctx.slice_type == SliceType::P {
             if t < 5 {
-                // parse_mb_cabac's inter partition walk, restricted to the
-                // one 16x16 partition these tests write.
+                // `parse_mb_cabac`'s inter partition walk, over the
+                // shapes these tests write: 16x16, 16x8 and 8x16. Both
+                // passes go in the reader's order — every ref_idx, then
+                // every mvd — because that ordering is part of what the
+                // writers have to invert.
                 p_mb_type(t, layer).expect("P mb_type rejected");
-                assert_eq!(layer.kind, MbKind::Inter16x16, "tests only write P_L0_16x16");
-                let n = ctx.num_ref_idx[0];
-                let ri = if n <= 1 {
-                    0
-                } else {
-                    decode_ref_idx(c, st, info, layer, nb, frame_motion, 0, 0, 0)
+                assert!(
+                    matches!(
+                        layer.kind,
+                        MbKind::Inter16x16 | MbKind::Inter16x8 | MbKind::Inter8x16
+                    ),
+                    "tests write no sub-macroblock partitions yet"
+                );
+                let parts = mb_partitions(layer.kind);
+                for &(x, y, w, h) in parts {
+                    let n = ctx.num_ref_idx[0];
+                    let ri = if n <= 1 {
+                        0
+                    } else {
+                        decode_ref_idx(
+                            c, st, info, layer, nb, frame_motion, 0, (x / 4) as i32, (y / 4) as i32,
+                        )
                         .expect("ref_idx rejected")
-                };
-                assert!((ri as u32) < n.max(1), "ref_idx out of range");
-                layer.ref_idx[0] = [ri; 4];
-                let (mx, my) = decode_mvd(c, st, info, layer, nb, 0, 0, 0).expect("mvd rejected");
-                for entry in layer.mvd.iter_mut() {
-                    entry.mvd[0] = Mv::new(mx, my);
+                    };
+                    assert!((ri as u32) < n.max(1), "ref_idx out of range");
+                    for by in y / 8..(y + h) / 8 {
+                        for bx in x / 8..(x + w) / 8 {
+                            layer.ref_idx[0][by * 2 + bx] = ri;
+                        }
+                    }
+                }
+                for &(x, y, w, h) in parts {
+                    let (mx, my) =
+                        decode_mvd(c, st, info, layer, nb, 0, (x / 4) as i32, (y / 4) as i32)
+                            .expect("mvd rejected");
+                    for by in y / 4..(y + h) / 4 {
+                        for bx in x / 4..(x + w) / 4 {
+                            layer.mvd[by * 4 + bx].mvd[0] = Mv::new(mx, my);
+                        }
+                    }
                 }
                 None
             } else {
@@ -3525,7 +3674,7 @@ mod mb_round_trip {
             }
         }
         match layer.kind {
-            MbKind::Inter16x16 => {}
+            MbKind::Inter16x16 | MbKind::Inter16x8 | MbKind::Inter8x16 => {}
             MbKind::IPcm => {
                 let n = 256
                     + match ctx.chroma_format_idc {
@@ -3790,11 +3939,23 @@ mod mb_round_trip {
     /// the decoder's bookkeeping stores.
     fn check_inter_mb(addr: usize, d: &InterDecision, layer: &MbLayer, ctx: &SliceCtx, num_ref: u32) {
         let c444 = ctx.chroma_format_idc == 3;
-        assert_eq!(layer.kind, MbKind::Inter16x16, "mb {addr} kind");
+        assert_eq!(layer.kind, d.kind.dec_kind(), "mb {addr} kind");
         let want_ri = if num_ref > 1 { d.ref_idx } else { 0 };
         assert_eq!(layer.ref_idx[0], [want_ri; 4], "mb {addr} ref_idx");
-        for blk in 0..16 {
-            assert_eq!(layer.mvd[blk].mvd[0], d.mvd, "mb {addr} mvd block {blk}");
+        // Each partition's mvd over the blocks it covers — the reader
+        // replicates it there, and the *next* partition's context reads
+        // it back out, so comparing every block and not just the corner
+        // is what makes a wrong replication visible.
+        for (i, &(x, y, w, h)) in d.kind.parts().iter().enumerate() {
+            for by in y / 4..(y + h) / 4 {
+                for bx in x / 4..(x + w) / 4 {
+                    assert_eq!(
+                        layer.mvd[by * 4 + bx].mvd[0],
+                        d.mvd[i],
+                        "mb {addr} partition {i} mvd block ({bx},{by})"
+                    );
+                }
+            }
         }
         assert_eq!(layer.transform_8x8, d.transform_8x8, "mb {addr} transform_size_8x8_flag");
         assert_eq!(layer.cbp, (d.cbp_luma & 15) | (d.cbp_chroma << 4), "mb {addr} cbp");
@@ -3950,9 +4111,12 @@ mod mb_round_trip {
                             // the qp-delta carry clears, as the decoder's
                             // slice loop clears it.
                             InterMbKind::PSkip => enc_st.prev_qp_delta_nonzero = false,
-                            InterMbKind::P16x16 => write_p16x16_mb(
-                                &mut e, &mut enc_st, d, left, above, cfi, field, num_ref, t8x8,
-                            ),
+                            InterMbKind::P16x16 | InterMbKind::P16x8 | InterMbKind::P8x16 => {
+                                write_p16x16_mb(
+                                    &mut e, &mut enc_st, d, left, above, cfi, field, num_ref,
+                                    t8x8,
+                                )
+                            }
                             InterMbKind::UseIntra => {
                                 unreachable!("tests spell intra via TestMb::Intra")
                             }
@@ -4620,7 +4784,7 @@ mod mb_round_trip {
                     // the forced skips: the carry must clear across them.
                     4 => {
                         let mut d = InterDecision::default();
-                        d.mvd = Mv::new(7, -3);
+                        d.mvd[0] = Mv::new(7, -3);
                         d.cbp_luma = 1;
                         d.luma[0][0] = 4;
                         d.luma[0][5] = -1;

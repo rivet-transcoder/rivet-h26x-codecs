@@ -139,6 +139,16 @@ pub struct Config {
     /// already is, and it is ignored by H.265 — whose transform sizes are
     /// a different mechanism entirely.
     pub transform_8x8: bool,
+    /// H.264: offer inter partitions smaller than 16x16 — 16x8, 8x16 and
+    /// the 8x8 sub-macroblock tree. Off by default, so a stream that does
+    /// not ask for them is byte-identical to one from an encoder that
+    /// never had them.
+    ///
+    /// Unlike [`Config::transform_8x8`] nothing in a parameter set
+    /// announces this: every profile admits the shapes, so it is purely
+    /// the encoder's own switch. Ignored by H.265, whose prediction units
+    /// are a different mechanism.
+    pub subparts: bool,
     /// Worker threads; 0 asks for one per core, matching the decoders.
     pub threads: usize,
     /// Frames per second. Nothing in either bitstream carries it — H.265
@@ -171,6 +181,7 @@ impl Default for Config {
             rate: RateControl::ConstantQp(26),
             entropy: Entropy::Cabac,
             transform_8x8: false,
+            subparts: false,
             threads: 0,
             sao: false,
             fps: 30,

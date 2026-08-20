@@ -276,6 +276,9 @@ fn write_macroblock(
 /// Write one P_L0_16x16 macroblock — `mb_type` through the residual. The
 /// skip run before it belongs to the caller, which is counting.
 ///
+/// One macroblock of any coded P shape — 16x16, 16x8 or 8x16 — since
+/// after `mb_type` they differ only in how many mvds follow.
+///
 /// No `ref_idx_l0` is written: with exactly one active reference the
 /// element is absent from the stream — the reader's `read_ref_idx` is
 /// only reached when `num_ref_idx_active > 1` (7.3.5.1) — and this
@@ -291,12 +294,23 @@ fn write_p16_macroblock(
     top: bool,
     t8x8_mode: bool,
 ) {
-    debug_assert_eq!(dec.kind, InterMbKind::P16x16);
+    debug_assert!(
+        matches!(
+            dec.kind,
+            InterMbKind::P16x16 | InterMbKind::P16x8 | InterMbKind::P8x16
+        ),
+        "only a coded P macroblock carries this syntax"
+    );
     debug_assert_eq!(dec.ref_idx, 0, "more than one reference needs te(v) ref_idx writing");
-    w.ue(0); // mb_type: P_L0_16x16 (Table 7-13)
-    // mvd_l0 for the single partition, x then y (7.3.5.1).
-    w.se(dec.mvd.x as i32);
-    w.se(dec.mvd.y as i32);
+    w.ue(dec.kind.p_mb_type()); // Table 7-13
+    // `ref_idx_l0` is absent: one active reference, so the reader infers
+    // 0 for every partition (7.3.5.1). Then one mvd per partition, x then
+    // y, in the order `mb_partitions` lists them — the reader's own two
+    // passes, of which the first has nothing to read.
+    for i in 0..dec.kind.parts().len() {
+        w.se(dec.mvd[i].x as i32);
+        w.se(dec.mvd[i].y as i32);
+    }
     let cbp = (dec.cbp_luma | (dec.cbp_chroma << 4)) as usize;
     let code = if st.rows != 0 {
         INTER_CBP_TO_GOLOMB[cbp]
@@ -825,7 +839,11 @@ mod tests {
     #[test]
     fn a_p16_macroblock_round_trips_through_the_reader() {
         for (mvdx, mvdy, coded) in [(0i16, 0i16, false), (7, -3, true), (-13, 21, true), (1, 0, false)] {
-            let mut dec = InterDecision { mvd: crate::h264::frame::Mv::new(mvdx, mvdy), ..InterDecision::default() };
+            let mut dec = InterDecision {
+                mvd: [crate::h264::frame::Mv::new(mvdx, mvdy), crate::h264::frame::Mv::ZERO,
+                      crate::h264::frame::Mv::ZERO, crate::h264::frame::Mv::ZERO],
+                ..InterDecision::default()
+            };
             if coded {
                 dec.luma[0][0] = 5;
                 dec.luma[0][7] = -2;
@@ -957,7 +975,7 @@ mod tests {
     #[test]
     fn a_444_intra_macroblock_round_trips_through_the_reader() {
         use crate::h264::frame::LUMA_PAD;
-        let tools = IntraTools::new(false);
+        let tools = IntraTools::new(false, false);
         let mut seed = 77u32;
         let mut lcg = move || -> u8 {
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
@@ -976,6 +994,7 @@ mod tests {
                 chroma_h: 16,
                 c444: true,
                 t8x8: false,
+                subparts: false,
             };
             let mut rec = vec![
                 recon_plane(16, 16, LUMA_PAD),
@@ -1217,7 +1236,7 @@ mod tests {
     /// residual), across the QP range.
     #[test]
     fn coded_macroblocks_round_trip_through_the_reader() {
-        let tools = IntraTools::new(false);
+        let tools = IntraTools::new(false, false);
         let fill = |f: &mut dyn FnMut(usize, usize) -> u8| {
             let mut y = vec![0u8; 16 * 16];
             for r in 0..16 {
@@ -1261,6 +1280,7 @@ mod tests {
                     chroma_h: 8,
                     c444: false,
                     t8x8: false,
+                    subparts: false,
                 };
                 let mut rec = vec![
                     recon_plane(16, 16, LUMA_PAD),
@@ -1291,7 +1311,7 @@ mod tests {
     /// in the 8x8's raster and not in four separate ones.
     #[test]
     fn coded_8x8_macroblocks_round_trip_through_the_reader() {
-        let tools = IntraTools::new(true);
+        let tools = IntraTools::new(true, false);
         let mut seed = 0x8080_8080u32;
         let mut lcg = move |x: usize, y: usize| -> u8 {
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223 ^ ((x * 31 + y) as u32));
@@ -1325,6 +1345,7 @@ mod tests {
                     chroma_h,
                     c444,
                     t8x8: true,
+                    subparts: false,
                 };
                 let cpad = if c444 { LUMA_PAD } else { CHROMA_PAD };
                 let cw = if c444 { 16 } else { 8 };
@@ -1405,7 +1426,8 @@ mod tests {
         use crate::h264::cavlc::sub_block_counts_8x8;
         for (t8x8, coded) in [(true, true), (false, true), (false, false)] {
             let mut dec = InterDecision {
-                mvd: crate::h264::frame::Mv::new(5, -9),
+                mvd: [crate::h264::frame::Mv::new(5, -9), crate::h264::frame::Mv::ZERO,
+                      crate::h264::frame::Mv::ZERO, crate::h264::frame::Mv::ZERO],
                 transform_8x8: t8x8 && coded,
                 ..InterDecision::default()
             };

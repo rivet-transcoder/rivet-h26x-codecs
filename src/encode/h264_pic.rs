@@ -25,10 +25,11 @@ use crate::encode::h264_deblock::{deblock_recon, nz_mask_of};
 use crate::encode::h264_intra::{IntraCtx, MbAvail, MbDecision, MbKind, code_macroblock};
 use crate::encode::h264_me::{
     BDecision, BMbKind, InterDecision, InterMbKind, MbMotionState, code_macroblock_b16,
-    code_macroblock_p16,
+    code_macroblock_p,
 };
 use crate::encode::h264_syntax::{Geometry, Plane, Recon};
 use crate::h264::frame::{BlockMotion, Frame, Mv};
+use crate::h264::cavlc::mb_partitions;
 use crate::h264::mb::{MbInfo, MbKind as DecKind, MbMotion, MbNeighbours, PicInfo, chroma_qp};
 use crate::h264::sps::ScalingLists;
 use crate::h264::transform::Dequant;
@@ -50,6 +51,8 @@ pub struct IntraTools {
     /// is what it looks like: one constant per encoder, shared by every
     /// walk, and impossible to pass to one path and forget on another.
     pub(crate) transform_8x8: bool,
+    /// Whether inter partitions smaller than 16x16 are on offer.
+    pub(crate) subparts: bool,
 }
 
 impl IntraTools {
@@ -59,7 +62,7 @@ impl IntraTools {
     /// lists a decoder will derive — and that is as true of the 8x8 lists
     /// as of the 4x4 ones, since the PPS declares
     /// `pic_scaling_matrix_present_flag` zero either way.
-    pub fn new(transform_8x8: bool) -> Self {
+    pub fn new(transform_8x8: bool, subparts: bool) -> Self {
         let lists = ScalingLists { list4x4: [[16; 16]; 6], list8x8: [[16; 64]; 6] };
         let cpu = Cpu::detect_honouring_env();
         IntraTools {
@@ -69,13 +72,14 @@ impl IntraTools {
             quant: Quant::new(&lists),
             dequant: Dequant::new(&lists),
             transform_8x8,
+            subparts,
         }
     }
 }
 
 impl Default for IntraTools {
     fn default() -> Self {
-        Self::new(false)
+        Self::new(false, false)
     }
 }
 
@@ -160,7 +164,14 @@ impl PicMotion {
 /// documentation in src/h264/mb.rs). It is true of every shape this
 /// encoder codes today and must be derived, the way `derive_motion` does
 /// it, the day that changes.
-fn coded_info(kind: DecKind, nz_mask: u16, transform_8x8: bool, qp: i32, qpc: [i32; 2]) -> MbInfo {
+fn coded_info(
+    kind: DecKind,
+    nz_mask: u16,
+    transform_8x8: bool,
+    qp: i32,
+    qpc: [i32; 2],
+    part_edges: [u16; 2],
+) -> MbInfo {
     MbInfo {
         kind,
         decoded: true,
@@ -169,33 +180,36 @@ fn coded_info(kind: DecKind, nz_mask: u16, transform_8x8: bool, qp: i32, qpc: [i
         qpc: [qpc[0] as i8, qpc[1] as i8],
         transform_8x8,
         nz_mask,
-        part_edges: [0; 2],
+        part_edges,
         ..MbInfo::default()
     }
 }
 
-/// One macroblock's motion in the decoder's layout, from the single
-/// 16x16 record this encoder's inter decisions still produce.
+/// The internal 4x4 edges that are partition boundaries, derived the way
+/// `derive_motion` derives them (src/h264/recon.rs): each partition's own
+/// left edge and top edge, where those are not the macroblock's.
 ///
-/// Transitional: one vector per list is a faithful record only while
-/// every partition is the whole macroblock. It goes when the shapes that
-/// break that premise land, and each partition fills its own rectangle
-/// through `MbMotionState::commit_part` instead.
-pub(crate) fn mb_motion_16x16(l0: Option<Mv>, l1: Option<Mv>) -> MbMotion {
-    let mut mot: MbMotion = [[BlockMotion::default(); 16]; 2];
-    for (l, mv) in [(0usize, l0), (1usize, l1)] {
-        let Some(mv) = mv else { continue };
-        // `ref_id` is an identity the derivations only compare for
-        // equality; one reference per list makes 1 and 2 distinct names,
-        // as `deblock_recon` already spells them.
-        mot[l] = [BlockMotion {
-            mv,
-            ref_idx: 0,
-            ref_parity: crate::h264::frame::PARITY_FRAME,
-            ref_id: 1 + l as u16,
-        }; 16];
+/// The two halves are indexed differently and that is the decoder's
+/// layout rather than a slip: `[0]` is keyed by `(x / 4) * 4 + row` — the
+/// edge column major — and `[1]` by `(y / 4) * 4 + column`. Getting them
+/// the same way round would filter the right edges at the wrong strength
+/// on one axis only, which is the kind of thing that shows up as a faint
+/// directional artefact rather than as a failure.
+fn part_edges_of(parts: &[(usize, usize, usize, usize)]) -> [u16; 2] {
+    let mut e = [0u16; 2];
+    for &(x, y, w, h) in parts {
+        if x > 0 {
+            for k in y / 4..(y + h) / 4 {
+                e[0] |= 1 << ((x / 4) * 4 + k);
+            }
+        }
+        if y > 0 {
+            for k in x / 4..(x + w) / 4 {
+                e[1] |= 1 << ((y / 4) * 4 + k);
+            }
+        }
     }
-    mot
+    e
 }
 
 /// The decoder's name for an intra decision's kind — what the loop
@@ -293,6 +307,7 @@ impl<'a> PicCoding<'a> {
             chroma_h,
             c444: g.chroma == ChromaFormat::Yuv444,
             t8x8: tools.transform_8x8,
+            subparts: tools.subparts,
         };
         let (mbs_wide, mbs_high) = (g.mbs_wide as usize, g.mbs_high as usize);
         let luma_stride = g.coded_width as usize;
@@ -391,6 +406,7 @@ pub(crate) fn code_intra_picture(
                     dec.transform_8x8,
                     ctx.qp,
                     ctx.qpc,
+                    [0; 2],
                 ),
                 &[[BlockMotion::default(); 16]; 2],
             );
@@ -457,7 +473,7 @@ pub(crate) fn code_p_picture(
         for mb_x in 0..mbs_wide {
             let addr = mb_y * mbs_wide + mb_x;
             st.start(&pm.frame, &pm.info, addr, &mut dnb);
-            let dec = code_macroblock_p16(
+            let dec = code_macroblock_p(
                 ctx,
                 rec,
                 refp,
@@ -467,31 +483,32 @@ pub(crate) fn code_p_picture(
                 pc.luma_stride,
                 [src_cb, src_cr],
                 pc.chroma_stride,
-                &st,
+                &mut st,
             );
             match dec.kind {
                 InterMbKind::PSkip => {
                     emit(mb_x, mb_y, PMb::Skip(&dec));
                     pm.commit(
                         addr,
-                        coded_info(DecKind::PSkip, 0, false, ctx.qp, ctx.qpc),
-                        &mb_motion_16x16(Some(dec.mv), None),
+                        coded_info(DecKind::PSkip, 0, false, ctx.qp, ctx.qpc, [0; 2]),
+                        st.motion(),
                     );
                     left_modes = [Some(2); 4];
                     top_modes[mb_x] = [Some(2); 4];
                 }
-                InterMbKind::P16x16 => {
+                InterMbKind::P16x16 | InterMbKind::P16x8 | InterMbKind::P8x16 => {
                     emit(mb_x, mb_y, PMb::Coded(&dec));
                     pm.commit(
                         addr,
                         coded_info(
-                            DecKind::Inter16x16,
+                            dec.kind.dec_kind(),
                             nz_mask_of(&dec.nz_luma, dec.transform_8x8),
                             dec.transform_8x8,
                             ctx.qp,
                             ctx.qpc,
+                            part_edges_of(dec.kind.parts()),
                         ),
-                        &mb_motion_16x16(Some(dec.mv), None),
+                        st.motion(),
                     );
                     left_modes = [Some(2); 4];
                     top_modes[mb_x] = [Some(2); 4];
@@ -525,6 +542,7 @@ pub(crate) fn code_p_picture(
                             idec.transform_8x8,
                             ctx.qp,
                             ctx.qpc,
+                            [0; 2],
                         ),
                         &[[BlockMotion::default(); 16]; 2],
                     );
@@ -601,7 +619,7 @@ pub(crate) fn code_b_picture(
                 pc.luma_stride,
                 [src_cb, src_cr],
                 pc.chroma_stride,
-                &st,
+                &mut st,
                 col,
                 addr,
             );
@@ -634,6 +652,7 @@ pub(crate) fn code_b_picture(
                         idec.transform_8x8,
                         ctx.qp,
                         ctx.qpc,
+                        [0; 2],
                     ),
                     &[[BlockMotion::default(); 16]; 2],
                 );
@@ -662,11 +681,26 @@ pub(crate) fn code_b_picture(
                     dec.transform_8x8,
                     ctx.qp,
                     ctx.qpc,
+                    // A direct macroblock is *four 8x8 partitions*, not
+                    // one: `direct_partitions` pushes a job per 8x8 under
+                    // `direct_8x8_inference` (src/h264/recon.rs), so a
+                    // decoder records the 8x8 cross as partition edges
+                    // and compares motion across them. An explicit 16x16
+                    // has no internal edge.
+                    //
+                    // Passing [0, 0] here was harmless while direct gave
+                    // all four the same vector — the comparison it
+                    // skipped would have come out bS 0 anyway — and
+                    // became a real desync the moment colZeroFlag started
+                    // varying per 8x8. It cost six cells of
+                    // `--subparts --t8x8 --bframes 2`.
+                    if dec.kind == BMbKind::B16 {
+                        [0; 2]
+                    } else {
+                        part_edges_of(mb_partitions(DecKind::Inter8x8))
+                    },
                 ),
-                &mb_motion_16x16(
-                    dec.used[0].then_some(dec.mv[0]),
-                    dec.used[1].then_some(dec.mv[1]),
-                ),
+                st.motion(),
             );
             left_modes = [Some(2); 4];
             top_modes[mb_x] = [Some(2); 4];

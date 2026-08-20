@@ -211,6 +211,12 @@ pub struct IntraCtx<'a> {
     /// element does not exist in the bitstream at all and no decision may
     /// produce it.
     pub t8x8: bool,
+    /// Inter partitions smaller than 16x16 are on offer. Unlike `t8x8`
+    /// this gates nothing in the bitstream — every profile admits the
+    /// shapes and no parameter set announces them — so it is purely the
+    /// encoder's own switch, and its only job is to keep the streams that
+    /// do not ask for them byte-identical to what came before.
+    pub subparts: bool,
 }
 
 /// Whether a 4x4 block's top-right neighbour has been reconstructed by the
@@ -1413,6 +1419,7 @@ mod tests {
                 chroma_h: 16,
                 c444: true,
                 t8x8: true,
+                subparts: false,
             };
             // (the encoder's 8x8 list index, the plane it codes, whether
             // the macroblock is inter, and the QP that plane is coded at)
@@ -1497,6 +1504,7 @@ mod tests {
             chroma_h: 8,
             c444: false,
             t8x8: false,
+            subparts: false,
         };
         let mut rec = crate::encode::h264_syntax::recon_plane(32, 32, 16);
         for v in rec.data.iter_mut() {

@@ -21,7 +21,7 @@ fn die(msg: &str) -> ! {
         "usage: h26xenc --input F --size WxH [--format 400|420|422|444] --output F\n\
          \x20      [--recon F] [--codec h264|h265] [--qp N | --lossless | --bitrate BPS]\n\
          \x20      [--fps N]\n\
-         \x20      [--gop N] [--bframes N] [--cavlc] [--t8x8] [--sao]\n\
+         \x20      [--gop N] [--bframes N] [--cavlc] [--t8x8] [--subparts] [--sao]\n\
          \x20      [--depth N] [--threads N]"
     );
     std::process::exit(2);
@@ -81,6 +81,8 @@ fn main() {
             // H.265 only: offer sample adaptive offset. Refused on H.264,
             // which has no such filter.
             "--sao" => cfg.sao = true,
+            // H.264 only: offer inter partitions below 16x16.
+            "--subparts" => cfg.subparts = true,
             other => die(&format!("unknown argument {other}")),
         }
         i += 1;
