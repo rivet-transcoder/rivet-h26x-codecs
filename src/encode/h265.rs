@@ -1278,6 +1278,85 @@ mod tests {
         }
     }
 
+    /// The acceptance property of the rate model: what [`Rate`] says a
+    /// shape costs is EXACTLY the number of bits `write_cu_inter` emits
+    /// for it.
+    ///
+    /// This is the whole point of counting rather than estimating. The
+    /// numbers it replaced — `tr_bins`, and an `mvd_cost` approximating
+    /// exponential-Golomb as `5 + 2 * log2(a - 1)` — could not be checked
+    /// by anything the project had: SELF and CROSS pass whatever the
+    /// decision picks, and PSNR moves by fractions. A counted cost has a
+    /// right answer, and this asserts it against the production writer
+    /// rather than against a second opinion about the writer.
+    ///
+    /// Two shapes are compared, and they are the two for which
+    /// `write_cu_inter` emits signalling and stops: a skip (the reader
+    /// infers the whole transform tree away) and an AMVP CU whose
+    /// `rqt_root_cbf` is 0 (the writer returns there). A merge CU has no
+    /// such boundary — its `rqt_root_cbf` is inferred TRUE, so a transform
+    /// tree always follows — which is the same reader-side rule that makes
+    /// a residual-free merge unspellable.
+    #[test]
+    fn counted_rate_equals_the_bits_the_writer_emits() {
+        use super::super::h265_me::Rate;
+        use crate::hevc::frame::Mv;
+        let log2 = 5u32;
+        // Bits `write_cu_inter` emits for `d`, counted rather than
+        // written, against the neutral neighbour context `Rate` prices in.
+        let emitted = |d: &InterCuDecision, qp: i32| -> u32 {
+            let mut cx = Contexts::new(1, qp);
+            let mut e = CabacEncoder::counting();
+            write_cu_inter(&mut e, &mut cx, d, None, None, 1, false);
+            e.bits_counted() as u32
+        };
+
+        for qp in [22i32, 26, 34, 40] {
+            let rate = Rate::new(qp, false, log2);
+
+            for idx in 0..MAX_MERGE_CAND as u8 {
+                let d = InterCuDecision {
+                    log2_cu: log2,
+                    kind: InterCuKind::Skip { merge_idx: idx },
+                    ..InterCuDecision::default()
+                };
+                assert_eq!(
+                    rate.skip(idx),
+                    emitted(&d, qp),
+                    "qp {qp} skip idx {idx}: counted cost is not the bits written"
+                );
+            }
+
+            // Vectors that reach every arm of write_mvd: zero, one, the
+            // Golomb remainder, and both ends of the component range.
+            for &(x, y) in &[
+                (0i16, 0i16),
+                (1, 0),
+                (0, -1),
+                (2, 2),
+                (-3, 5),
+                (17, -9),
+                (100, -1000),
+                (32767, -32767),
+                (-32768, 32767),
+            ] {
+                for flag in [0u8, 1] {
+                    let d = InterCuDecision {
+                        log2_cu: log2,
+                        kind: InterCuKind::Amvp { mvp_flag: flag, mvd: Mv::new(x, y) },
+                        rqt_root_cbf: false,
+                        ..InterCuDecision::default()
+                    };
+                    assert_eq!(
+                        rate.amvp(Mv::new(x, y), flag, false),
+                        emitted(&d, qp),
+                        "qp {qp} amvp mvd ({x},{y}) flag {flag}: counted cost is not the bits written"
+                    );
+                }
+            }
+        }
+    }
+
     /// A lossless inter picture over STATIC content, which is the only way
     /// this suite reaches a bypassed **skip** CU.
     ///

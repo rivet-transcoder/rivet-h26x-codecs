@@ -165,7 +165,13 @@
 
 use crate::dsp::hevc_enc::{qbits, quant_offset, quant_scale};
 use crate::encode::h265_intra::{CuDecision, Geo, IntraCtx, chroma_tbs, code_cu_2nx2n_intra, sub_wh};
-use crate::hevc::ctu::chroma_qp;
+use crate::cabac_enc::CabacEncoder;
+use crate::hevc::ctu::{
+    PartMode, SplitCuNb, chroma_qp, write_cu_skip_flag, write_inter_pred_idc, write_merge_flag,
+    write_merge_idx, write_mvd, write_mvp_flag, write_part_mode_inter, write_pred_mode_flag,
+    write_rqt_root_cbf, write_split_cu_flag,
+};
+use crate::hevc::ctx::Contexts;
 use crate::hevc::frame::{Frame, MotionInfo, Mv, Plane16, fill_motion};
 use crate::hevc::inter::{McScratch, Weighting, predict_block};
 use crate::hevc::intra::IntraScratch;
@@ -584,6 +590,7 @@ impl<S: Sample> InterPicture<S> {
         // vectors; only the first occurrence of a vector matters (a later
         // duplicate signals strictly more bins for the same prediction).
         let lam = lambda(ctx.qp);
+        let rate = Rate::new(ctx.qp, false, self.log2_cu);
         let mut best_merge: Option<(usize, u32)> = None; // (idx, satd)
         let mut best_merge_cost = f32::INFINITY;
         let mut seen: Vec<Mv> = Vec::with_capacity(MAX_MERGE_CAND);
@@ -594,8 +601,11 @@ impl<S: Sample> InterPicture<S> {
             seen.push(cand.mv[0]);
             let satd = self.satd_at(ctx, &refp.y, x0, y0, n, src, y_stride, cand.mv[0]);
             // cu_skip_flag or merge_flag, plus the TR-coded index.
-            let bins = 2 + tr_bins(idx, MAX_MERGE_CAND - 1);
-            let cost = satd as f32 + lam * bins as f32;
+            // Skip and merge differ in signalling, and a zero-residual
+            // candidate becomes a skip, so price each at the shape it
+            // would actually take.
+            let bits = rate.skip(idx as u8).min(rate.merge(idx as u8));
+            let cost = satd as f32 + lam * bits as f32;
             if cost < best_merge_cost {
                 best_merge_cost = cost;
                 best_merge = Some((idx, satd));
@@ -605,11 +615,11 @@ impl<S: Sample> InterPicture<S> {
         // predictors (the reader's uLX sum is a wrapping add, so the mvd
         // is a wrapping difference).
         let mvd_for = |p: Mv| Mv::new(mv_me.x.wrapping_sub(p.x), mv_me.y.wrapping_sub(p.y));
-        let amvp_flag = if mvd_cost(mvd_for(mvp[1])) < mvd_cost(mvd_for(mvp[0])) { 1u8 } else { 0 };
+        let amvp_flag = if rate.amvp(mvd_for(mvp[1]), 1, true) < rate.amvp(mvd_for(mvp[0]), 0, true) { 1u8 } else { 0 };
         let mvd = mvd_for(mvp[amvp_flag as usize]);
         // merge_flag 0, mvp_l0_flag, rqt_root_cbf, plus the mvd bins
         // (cu_skip_flag and pred_mode/part_mode surround both shapes).
-        let amvp_cost = satd_me as f32 + lam * (3 + mvd_cost(mvd)) as f32;
+        let amvp_cost = satd_me as f32 + lam * rate.amvp(mvd, amvp_flag, true) as f32;
 
         let merge_wins = best_merge.is_some_and(|_| best_merge_cost <= amvp_cost);
         let (mv, inter_satd) = if merge_wins {
@@ -741,6 +751,7 @@ impl<S: Sample> InterPicture<S> {
         }
 
         let lam = lambda(ctx.qp);
+        let rate = Rate::new(ctx.qp, true, self.log2_cu);
 
         // The three AMVP shapes. `inter_pred_idc` costs two bins for a uni
         // shape and one for BI (the reader stops after a set first bin),
@@ -753,7 +764,15 @@ impl<S: Sample> InterPicture<S> {
         for list in 0..2usize {
             let a = mvd_for(uni[list].0, mvp[list][0]);
             let b = mvd_for(uni[list].0, mvp[list][1]);
-            let pick1 = mvd_cost(b) < mvd_cost(a);
+            let idc_for = |l: usize| if l == 0 { 0u8 } else { 1 };
+            let one = |m: Mv, f: u8| {
+                let mut mvd = [Mv::ZERO; 2];
+                mvd[list] = m;
+                let mut fl = [0u8; 2];
+                fl[list] = f;
+                rate.amvp_b(idc_for(list), mvd, fl, true)
+            };
+            let pick1 = one(b, 1) < one(a, 0);
             best_flag[list] = u8::from(pick1);
             best_mvd[list] = if pick1 { b } else { a };
         }
@@ -761,8 +780,12 @@ impl<S: Sample> InterPicture<S> {
         let mut best: Option<(u8, u32)> = None; // (idc, satd)
         let mut best_cost = f32::INFINITY;
         for (list, u) in uni.iter().enumerate() {
-            let bins = 3 + 2 + mvd_cost(best_mvd[list]);
-            let cost = u.1 as f32 + lam * bins as f32;
+            let mut mvd = [Mv::ZERO; 2];
+            mvd[list] = best_mvd[list];
+            let mut fl = [0u8; 2];
+            fl[list] = best_flag[list];
+            let bits = rate.amvp_b(list as u8, mvd, fl, true);
+            let cost = u.1 as f32 + lam * bits as f32;
             if cost < best_cost {
                 best_cost = cost;
                 best = Some((list as u8, u.1));
@@ -771,8 +794,8 @@ impl<S: Sample> InterPicture<S> {
         // idc 2: the bi trial at the two winners.
         let bi_satd = self.satd_bi_at(ctx, &ref0.y, &ref1.y, x0, y0, n, src, y_stride, uni[0].0, uni[1].0);
         {
-            let bins = 3 + 1 + 1 + mvd_cost(best_mvd[0]) + mvd_cost(best_mvd[1]);
-            let cost = bi_satd as f32 + lam * bins as f32;
+            let bits = rate.amvp_b(2, best_mvd, best_flag, true);
+            let cost = bi_satd as f32 + lam * bits as f32;
             if cost < best_cost {
                 best_cost = cost;
                 best = Some((2, bi_satd));
@@ -797,8 +820,8 @@ impl<S: Sample> InterPicture<S> {
                 (false, true) => self.satd_at(ctx, &ref1.y, x0, y0, n, src, y_stride, cand.mv[1]),
                 (false, false) => unreachable!("filtered above"),
             };
-            let bins = 2 + tr_bins(idx, MAX_MERGE_CAND - 1);
-            let cost = satd as f32 + lam * bins as f32;
+            let bits = rate.skip(idx as u8).min(rate.merge(idx as u8));
+            let cost = satd as f32 + lam * bits as f32;
             if cost < best_merge_cost {
                 best_merge_cost = cost;
                 best_merge = Some((idx, satd));
@@ -1184,25 +1207,137 @@ fn lambda(qp: i32) -> f32 {
     0.85f32 * ((qp - 12) as f32 / 3.0).exp2()
 }
 
-/// Bins of a truncated-Rice-coded index with the given `c_max` (how the
-/// reader parses `merge_idx`).
-fn tr_bins(idx: usize, c_max: usize) -> u32 {
-    (idx + 1).min(c_max) as u32
+/// What a candidate shape costs to *signal*, in real bits.
+///
+/// This replaces the hand-rolled bin counts this module used to carry —
+/// `tr_bins`, and an `mvd_cost` that approximated `write_mvd`'s
+/// exponential-Golomb remainder as `5 + 2 * log2(a - 1)`. The trouble with
+/// those was never accuracy: it was that nothing could check them. A wrong
+/// cost changes which shape wins, and every check this project has — SELF,
+/// CROSS, the replays — passes whatever the decision picks.
+///
+/// So the bins are no longer guessed at. Each shape is priced by running
+/// **the production writers** through a counting [`CabacEncoder`], which
+/// tallies exactly the bits it would have written (an equality asserted in
+/// `cabac_enc`'s round trip). `write_mvd`'s Golomb coding, `write_merge_idx`'s
+/// truncated unary and its `MaxNumMergeCand` cap, the context each bin
+/// lands in — all of it is the real thing rather than a model of it.
+///
+/// # What this is not, stated precisely
+///
+/// **The probabilities are the slice's initial ones, not the ones in force
+/// at this CU.** The decision runs in its own pass, before serialisation —
+/// SAO forced that split — so the live context array does not exist yet
+/// when a shape is chosen. Pricing therefore starts from a freshly
+/// initialised `Contexts` for this slice type and QP. The bin *sequence*
+/// is exact; the bit *width* of each bin is priced under the slice's
+/// starting model rather than its adapted one.
+///
+/// **The neighbour-dependent contexts are the neutral ones.**
+/// `cu_skip_flag`'s context counts skipped neighbours and
+/// `split_cu_flag`'s counts deeper ones; both are serialiser state. They
+/// are priced here as if no neighbour were available, which is what the
+/// first CU of a slice genuinely sees.
+///
+/// **Residual bits are not included**, matching the scope of the counts it
+/// replaces: at shape-choice time the residual has not been coded. What is
+/// compared is signalling against signalling.
+///
+/// Each of those is a bounded, named offset shared by every candidate at
+/// the same CU, which is what a comparison needs — the shapes are ranked
+/// against each other, and a common offset cancels.
+pub(crate) struct Rate {
+    /// The slice's initial contexts, cloned per pricing.
+    cx: Contexts,
+    /// log2 of the CU size, for `inter_pred_idc`'s block dimensions.
+    log2_cu: u32,
 }
 
-/// Approximate bins of one `mvd_l0` (both components): the greater0 /
-/// greater1 flags, the EG1-coded remainder's rough width, and the sign.
-/// A placeholder in the intra module's single-function tradition.
-fn mvd_cost(mvd: Mv) -> u32 {
-    let comp = |v: i16| -> u32 {
-        let a = v.unsigned_abs() as u32;
-        match a {
-            0 => 1,
-            1 => 3,
-            _ => 5 + 2 * (32 - (a - 1).leading_zeros()),
-        }
-    };
-    comp(mvd.x) + comp(mvd.y)
+impl Rate {
+    /// `init_type` as `code_inter_picture` derives it: 1 for P, 2 for B.
+    pub(crate) fn new(qp: i32, is_b: bool, log2_cu: u32) -> Self {
+        Rate { cx: Contexts::new(if is_b { 2 } else { 1 }, qp), log2_cu }
+    }
+
+    /// Run `f` over a counting encoder and a private copy of the contexts.
+    fn count(&self, f: impl FnOnce(&mut CabacEncoder<'static>, &mut Contexts)) -> u32 {
+        let mut cx = self.cx.clone();
+        let mut e = CabacEncoder::counting();
+        f(&mut e, &mut cx);
+        e.bits_counted() as u32
+    }
+
+    /// The elements every inter CU spells before its shape diverges:
+    /// `split_cu_flag` then `cu_skip_flag`. `nb` is the neutral neighbour
+    /// context described on [`Rate`].
+    fn prefix(e: &mut CabacEncoder<'static>, cx: &mut Contexts, skip: bool) {
+        let nb = SplitCuNb { left_depth: None, above_depth: None };
+        write_split_cu_flag(e, cx, &nb, 0, false);
+        write_cu_skip_flag(e, cx, None, None, skip);
+    }
+
+    /// `cu_skip_flag` 1 and a `merge_idx`; the reader infers the rest.
+    pub(crate) fn skip(&self, merge_idx: u8) -> u32 {
+        self.count(|e, cx| {
+            Self::prefix(e, cx, true);
+            write_merge_idx(e, cx, MAX_MERGE_CAND as u32, u32::from(merge_idx));
+        })
+    }
+
+    /// A non-skip 2Nx2N merge CU. `rqt_root_cbf` is not coded — the reader
+    /// infers it — so nothing stands in for it here either.
+    pub(crate) fn merge(&self, merge_idx: u8) -> u32 {
+        self.count(|e, cx| {
+            Self::prefix(e, cx, false);
+            write_pred_mode_flag(e, cx, false);
+            write_part_mode_inter(e, cx, PartMode::P2Nx2N);
+            write_merge_flag(e, cx, true);
+            write_merge_idx(e, cx, MAX_MERGE_CAND as u32, u32::from(merge_idx));
+        })
+    }
+
+    /// P-slice AMVP: one list, its `mvd` and `mvp_l0_flag`, then
+    /// `rqt_root_cbf` — whose value is a parameter because it is a coded
+    /// bin with a cost, and because it is what lets a test price exactly
+    /// the shape `write_cu_inter` emits.
+    pub(crate) fn amvp(&self, mvd: Mv, mvp_flag: u8, root_cbf: bool) -> u32 {
+        self.count(|e, cx| {
+            Self::prefix(e, cx, false);
+            write_pred_mode_flag(e, cx, false);
+            write_part_mode_inter(e, cx, PartMode::P2Nx2N);
+            write_merge_flag(e, cx, false);
+            write_mvd(e, cx, mvd);
+            write_mvp_flag(e, cx, mvp_flag != 0);
+            write_rqt_root_cbf(e, cx, root_cbf);
+        })
+    }
+
+    /// B-slice AMVP: `inter_pred_idc`, then per list — interleaved as
+    /// `prediction_unit` reads them — the `mvd` and `mvp_lX_flag` of each
+    /// list the shape uses.
+    pub(crate) fn amvp_b(&self, idc: u8, mvd: [Mv; 2], mvp_flag: [u8; 2], root_cbf: bool) -> u32 {
+        let n = 1i32 << self.log2_cu;
+        self.count(|e, cx| {
+            Self::prefix(e, cx, false);
+            write_pred_mode_flag(e, cx, false);
+            write_part_mode_inter(e, cx, PartMode::P2Nx2N);
+            write_merge_flag(e, cx, false);
+            write_inter_pred_idc(e, cx, n, n, 0, u32::from(idc));
+            for list in 0..2usize {
+                let uses = match idc {
+                    0 => list == 0,
+                    1 => list == 1,
+                    _ => true,
+                };
+                if !uses {
+                    continue;
+                }
+                write_mvd(e, cx, mvd[list]);
+                write_mvp_flag(e, cx, mvp_flag[list] != 0);
+            }
+            write_rqt_root_cbf(e, cx, root_cbf);
+        })
+    }
 }
 
 /// Whether to hand this CU to the intra decision: the H.264 module's
