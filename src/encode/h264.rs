@@ -283,12 +283,14 @@ impl H264Encoder {
                 log2_max_frame_num: LOG2_MAX_FRAME_NUM,
                 log2_max_poc_lsb: LOG2_MAX_POC_LSB,
                 reference: c.reference,
-                // The transform paths write bitstreams whose reconstruction
-                // this encoder does not deblock, so the slice header turns
-                // the loop filter off — the same temporary switch for intra
-                // and inter, and it flips on when the encoder learns to run
-                // the filter over its own reconstruction.
-                deblock: !(transform_intra || transform_p),
+                // Always on. The transform picture writers run the
+                // decoder's own loop filter over their reconstruction
+                // (`h264_deblock`), so the header may finally say so; the
+                // PCM and all-skip pictures always could — an all-I_PCM
+                // picture filters at qP 0 (below every threshold) and an
+                // all-skip one is bS 0 on every edge, so the filter leaves
+                // both untouched.
+                deblock: true,
             },
             qp,
             &mut w,

@@ -32,6 +32,7 @@ use crate::dsp::Cpu;
 use crate::dsp::distortion::DistortionDsp;
 use crate::dsp::h264::H264Dsp;
 use crate::dsp::h264_enc::{H264EncDsp, Quant};
+use crate::encode::h264_deblock::{FilterMb, deblock_recon, nz_mask_of};
 use crate::encode::h264_intra::{IntraCtx, MbAvail, MbDecision, MbKind, code_macroblock};
 use crate::encode::h264_me::{
     InterDecision, InterMbKind, MotionNeighbours, code_macroblock_p16, nb_inter, nb_intra,
@@ -582,6 +583,7 @@ pub fn write_intra_picture(
     let (src_y, src_cb, src_cr) = (&pc.src_y[..], &pc.src_cb[..], &pc.src_cr[..]);
 
     let mut st = NzState::new(mbs_wide, pc.rows);
+    let mut fmbs: Vec<FilterMb> = Vec::with_capacity(mbs_wide * mbs_high);
     // The neighbouring macroblocks' 4x4 modes along the shared edges, for
     // the prediction of 8.3.1.1: `Some(2)` for an available macroblock
     // that was not I_NxN (see the module documentation), `None` only where
@@ -611,6 +613,14 @@ pub fn write_intra_picture(
                 &top_modes[mb_x],
             );
             write_macroblock(w, &dec, &mut st, mb_x, mb.left, mb.top, 0);
+            fmbs.push(FilterMb {
+                kind: match dec.kind {
+                    MbKind::I4x4 => crate::h264::mb::MbKind::I4x4,
+                    MbKind::I16x16 => crate::h264::mb::MbKind::I16x16,
+                },
+                nz_mask: nz_mask_of(&dec.nz_luma),
+                mv: crate::h264::frame::Mv::ZERO,
+            });
             (left_modes, top_modes[mb_x]) = match dec.kind {
                 MbKind::I4x4 => (
                     [Some(modes[3]), Some(modes[7]), Some(modes[11]), Some(modes[15])],
@@ -620,6 +630,11 @@ pub fn write_intra_picture(
             };
         }
     }
+    // The loop filter, last: the whole picture is reconstructed (intra
+    // prediction read its unfiltered neighbours above, as a decoder's
+    // does), and what leaves this function — toward the SELF check and
+    // the reference list — is the filtered picture a decoder emits.
+    deblock_recon(&tools.dsp, g, qp, &fmbs, rec);
 }
 
 /// Code and write every macroblock of a P CAVLC picture — motion search,
@@ -660,6 +675,7 @@ pub fn write_p_picture(
     let (src_y, src_cb, src_cr) = (&pc.src_y[..], &pc.src_cb[..], &pc.src_cr[..]);
 
     let mut st = NzState::new(mbs_wide, pc.rows);
+    let mut fmbs: Vec<FilterMb> = Vec::with_capacity(mbs_wide * mbs_high);
     let mut top_modes: Vec<[Option<u8>; 4]> = vec![[None; 4]; mbs_wide];
     let mut top_motion: Vec<NbMotion> = vec![NbMotion::NONE; mbs_wide];
     // `mb_skip_run`: counted here, written before each coded macroblock,
@@ -701,6 +717,11 @@ pub fn write_p_picture(
                 InterMbKind::PSkip => {
                     skip_run += 1;
                     skip_nz(&mut st, mb_x);
+                    fmbs.push(FilterMb {
+                        kind: crate::h264::mb::MbKind::PSkip,
+                        nz_mask: 0,
+                        mv: dec.mv,
+                    });
                     let m = nb_inter(dec.mv);
                     left_motion = m;
                     top_motion[mb_x] = m;
@@ -711,6 +732,11 @@ pub fn write_p_picture(
                     w.ue(skip_run);
                     skip_run = 0;
                     write_p16_macroblock(w, &dec, &mut st, mb_x, mb_x > 0, mb_y > 0);
+                    fmbs.push(FilterMb {
+                        kind: crate::h264::mb::MbKind::Inter16x16,
+                        nz_mask: nz_mask_of(&dec.nz_luma),
+                        mv: dec.mv,
+                    });
                     let m = nb_inter(dec.mv);
                     left_motion = m;
                     top_motion[mb_x] = m;
@@ -742,6 +768,14 @@ pub fn write_p_picture(
                     // Intra in a P slice: the same macroblock, `mb_type`
                     // shifted by 5 (Table 7-11's note).
                     write_macroblock(w, &idec, &mut st, mb_x, mb.left, mb.top, 5);
+                    fmbs.push(FilterMb {
+                        kind: match idec.kind {
+                            MbKind::I4x4 => crate::h264::mb::MbKind::I4x4,
+                            MbKind::I16x16 => crate::h264::mb::MbKind::I16x16,
+                        },
+                        nz_mask: nz_mask_of(&idec.nz_luma),
+                        mv: crate::h264::frame::Mv::ZERO,
+                    });
                     left_motion = nb_intra();
                     top_motion[mb_x] = nb_intra();
                     (left_modes, top_modes[mb_x]) = match idec.kind {
@@ -758,6 +792,10 @@ pub fn write_p_picture(
     if skip_run > 0 {
         w.ue(skip_run);
     }
+    // The loop filter, after the whole picture is reconstructed and before
+    // the reconstruction becomes the next picture's reference — the
+    // decoder's own ordering.
+    deblock_recon(&tools.dsp, g, qp, &fmbs, rec);
 }
 
 #[cfg(test)]
