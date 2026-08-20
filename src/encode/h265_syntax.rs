@@ -252,7 +252,12 @@ pub fn write_sps(cfg: &Config, g: &Geometry, log2_max_poc_lsb: u32) -> Vec<u8> {
 }
 
 /// Picture parameter set.
-pub fn write_pps(qp: u8) -> Vec<u8> {
+///
+/// `bypass` writes `transquant_bypass_enabled_flag` — the lossless switch.
+/// It changes nothing else here or in the slice header (the parser reads no
+/// other syntax conditionally on it); what it changes is the coding tree,
+/// where every CU then carries a `cu_transquant_bypass_flag`.
+pub fn write_pps(qp: u8, bypass: bool) -> Vec<u8> {
     let mut w = BitWriter::with_capacity(32);
     w.ue(0); // pps_pic_parameter_set_id
     w.ue(0); // pps_seq_parameter_set_id
@@ -272,7 +277,7 @@ pub fn write_pps(qp: u8) -> Vec<u8> {
     w.flag(false); // pps_slice_chroma_qp_offsets_present_flag
     w.flag(false); // weighted_pred_flag
     w.flag(false); // weighted_bipred_flag
-    w.flag(false); // transquant_bypass_enabled_flag
+    w.flag(bypass); // transquant_bypass_enabled_flag
     w.flag(false); // tiles_enabled_flag
     w.flag(false); // entropy_coding_sync_enabled_flag
     w.flag(true); // pps_loop_filter_across_slices_enabled_flag

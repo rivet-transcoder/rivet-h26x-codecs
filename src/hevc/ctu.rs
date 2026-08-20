@@ -1394,6 +1394,18 @@ pub(crate) fn write_split_cu_flag(e: &mut CabacEncoder, cx: &mut Contexts, nb: &
     e.encode_decision(&mut cx.c[SPLIT_CODING_UNIT_FLAG_OFFSET + inc], split as u32);
 }
 
+/// Write `cu_transquant_bypass_flag`: the inverse of the read at the top of
+/// `coding_unit` — the first bin of every CU, before the skip flag and the
+/// intra syntax, coded only when the PPS sets
+/// `transquant_bypass_enabled_flag` (write nothing otherwise; the reader
+/// infers false). One context, no neighbours. Under bypass the CU's
+/// residuals are raw spatial differences — see `write_residual` for what
+/// that does and does not change in the spelling.
+#[allow(dead_code)]
+pub(crate) fn write_cu_transquant_bypass_flag(e: &mut CabacEncoder, cx: &mut Contexts, bypass: bool) {
+    e.encode_decision(&mut cx.c[CU_TRANSQUANT_BYPASS_FLAG_OFFSET], bypass as u32);
+}
+
 /// Write `part_mode` for an intra CU: the inverse of `parse_part_mode`
 /// with `intra` true — a single context-coded bin, 1 for 2Nx2N, 0 for NxN.
 /// Coded only when `log2_cb == log2_min_cb_size` (the reader does not read
@@ -1581,12 +1593,17 @@ mod write_round_trip {
         intra_mode: Vec<u8>,
         /// Expected `PicInfo::cbf_luma` after the decode.
         exp_cbf_luma: Vec<u8>,
+        /// Expected `PicInfo::filter_exempt`: 3 over every bypass CU.
+        exp_exempt: Vec<u8>,
+        /// The PPS's `transquant_bypass_enabled_flag`: when set, every CU
+        /// writes a `cu_transquant_bypass_flag` and may carry raw residuals.
+        pps_bypass: bool,
         cx: Contexts,
         rng: Lcg,
     }
 
     impl CtuWriter {
-        fn new(sps: &Sps, qp: i32, seed: u64) -> Self {
+        fn new(sps: &Sps, qp: i32, seed: u64, pps_bypass: bool) -> Self {
             let w4 = (sps.width as usize).div_ceil(4);
             let h4 = (sps.height as usize).div_ceil(4);
             CtuWriter {
@@ -1604,6 +1621,8 @@ mod write_round_trip {
                 // expectation.
                 intra_mode: vec![1; w4 * h4],
                 exp_cbf_luma: vec![0; w4 * h4],
+                exp_exempt: vec![0; w4 * h4],
+                pps_bypass,
                 cx: Contexts::new(0, qp),
                 rng: Lcg(seed),
             }
@@ -1703,6 +1722,17 @@ mod write_round_trip {
         fn cu(&mut self, e: &mut CabacEncoder, x0: i32, y0: i32, log2_cb: u32, depth: u32) {
             let n = 1i32 << log2_cb;
             debug_assert!(x0 + n <= self.pw && y0 + n <= self.ph, "leaf CUs lie inside the coded picture");
+            // cu_transquant_bypass_flag is the first bin of the CU when the
+            // PPS enables it — before part_mode, mirroring the reader.
+            let by = self.pps_bypass && self.rng.chance(65);
+            if self.pps_bypass {
+                write_cu_transquant_bypass_flag(e, &mut self.cx, by);
+            }
+            if by {
+                // The decoder records bypass CUs as filter-exempt (bit 0)
+                // and transquant-bypassed (bit 1).
+                PicInfo::fill4(&mut self.exp_exempt, self.w4, x0 as usize, y0 as usize, n as usize, n as usize, 3u8);
+            }
             // The reader records CtDepth for the whole CU before parsing
             // inside it; later siblings' split_cu_flag contexts read it.
             PicInfo::fill4(&mut self.ct_depth, self.w4, x0 as usize, y0 as usize, n as usize, n as usize, depth as u8);
@@ -1758,13 +1788,13 @@ mod write_round_trip {
             // rqt_root_cbf is not coded for intra CUs; the tree follows.
             let intra_split = nxn;
             let max_depth = self.max_depth_intra + intra_split as u32;
-            self.tt(e, x0, y0, log2_cb, 0, 0, [true; 2], intra_split, max_depth, chroma_mode);
+            self.tt(e, x0, y0, log2_cb, 0, 0, [true; 2], intra_split, max_depth, chroma_mode, by);
         }
 
         /// The writer's `transform_tree`, over the same inference
         /// conditions as the reader's.
         #[allow(clippy::too_many_arguments)]
-        fn tt(&mut self, e: &mut CabacEncoder, x0: i32, y0: i32, log2: u32, depth: u32, blk_idx: u32, parent_cbf: [bool; 2], intra_split: bool, max_depth: u32, chroma_mode: u32) {
+        fn tt(&mut self, e: &mut CabacEncoder, x0: i32, y0: i32, log2: u32, depth: u32, blk_idx: u32, parent_cbf: [bool; 2], intra_split: bool, max_depth: u32, chroma_mode: u32, bypass: bool) {
             let split = if log2 <= self.log2_max_tb && log2 > self.log2_min_tb && depth < max_depth && !(intra_split && depth == 0) {
                 let s = self.rng.chance(40);
                 write_split_transform_flag(e, &mut self.cx, log2, s);
@@ -1787,10 +1817,10 @@ mod write_round_trip {
             }
             if split {
                 let half = 1i32 << (log2 - 1);
-                self.tt(e, x0, y0, log2 - 1, depth + 1, 0, cbf_c, intra_split, max_depth, chroma_mode);
-                self.tt(e, x0 + half, y0, log2 - 1, depth + 1, 1, cbf_c, intra_split, max_depth, chroma_mode);
-                self.tt(e, x0, y0 + half, log2 - 1, depth + 1, 2, cbf_c, intra_split, max_depth, chroma_mode);
-                self.tt(e, x0 + half, y0 + half, log2 - 1, depth + 1, 3, cbf_c, intra_split, max_depth, chroma_mode);
+                self.tt(e, x0, y0, log2 - 1, depth + 1, 0, cbf_c, intra_split, max_depth, chroma_mode, bypass);
+                self.tt(e, x0 + half, y0, log2 - 1, depth + 1, 1, cbf_c, intra_split, max_depth, chroma_mode, bypass);
+                self.tt(e, x0, y0 + half, log2 - 1, depth + 1, 2, cbf_c, intra_split, max_depth, chroma_mode, bypass);
+                self.tt(e, x0 + half, y0 + half, log2 - 1, depth + 1, 3, cbf_c, intra_split, max_depth, chroma_mode, bypass);
                 return;
             }
             // A leaf: cbf_luma is always coded for intra CUs. All-zero-cbf
@@ -1799,8 +1829,8 @@ mod write_round_trip {
             write_cbf_luma(e, &mut self.cx, depth, cbf_luma);
             if cbf_luma {
                 let mode = self.intra_mode[self.idx4(x0, y0)] as u32;
-                let coeffs = self.gen_coeffs(log2);
-                let p = res_params(log2, 0, crate::hevc::residual::residual_scan_idx(true, log2, 0, 1, mode));
+                let coeffs = self.gen_coeffs(log2, bypass);
+                let p = res_params(log2, 0, crate::hevc::residual::residual_scan_idx(true, log2, 0, 1, mode), bypass);
                 write_residual(e, &mut self.cx, &p, &coeffs);
                 let nn = 1usize << log2;
                 PicInfo::fill4(&mut self.exp_cbf_luma, self.w4, x0 as usize, y0 as usize, nn, nn, 1);
@@ -1819,8 +1849,8 @@ mod write_round_trip {
             if let Some(log2c) = here {
                 for c in 0..2usize {
                     if cbf_c[c] {
-                        let p = res_params(log2c, 1 + c, crate::hevc::residual::residual_scan_idx(true, log2c, 1 + c, 1, chroma_mode));
-                        let coeffs = self.gen_coeffs(log2c);
+                        let p = res_params(log2c, 1 + c, crate::hevc::residual::residual_scan_idx(true, log2c, 1 + c, 1, chroma_mode), bypass);
+                        let coeffs = self.gen_coeffs(log2c, bypass);
                         write_residual(e, &mut self.cx, &p, &coeffs);
                     }
                 }
@@ -1830,8 +1860,11 @@ mod write_round_trip {
         /// Coefficient blocks shaped like the ones that matter: runs of ±1
         /// (quantised residual is mostly that), single outliers that drive
         /// the Rice escape, only-DC sub-blocks (the inference path), dense
-        /// blocks, and sparse noise.
-        fn gen_coeffs(&mut self, log2: u32) -> Vec<i16> {
+        /// blocks, and sparse noise. Under `bypass` the levels are raw
+        /// spatial residuals, so a slice of them is overwritten with
+        /// full-range 8-bit values (±128..±255) — the magnitudes a real
+        /// lossless block carries and quantised blocks rarely do.
+        fn gen_coeffs(&mut self, log2: u32, bypass: bool) -> Vec<i16> {
             let n = 1usize << log2;
             let mut c = vec![0i16; n * n];
             loop {
@@ -1883,6 +1916,14 @@ mod write_round_trip {
                         }
                     }
                 }
+                if bypass && self.rng.chance(60) {
+                    for v in c.iter_mut() {
+                        if self.rng.chance(25) {
+                            let m = 128 + self.rng.below(128) as i16;
+                            *v = if self.rng.chance(50) { -m } else { m };
+                        }
+                    }
+                }
                 if c.iter().any(|&v| v != 0) {
                     return c;
                 }
@@ -1890,12 +1931,12 @@ mod write_round_trip {
         }
     }
 
-    fn res_params(log2: u32, c_idx: usize, scan_idx: u32) -> ResidualParams {
+    fn res_params(log2: u32, c_idx: usize, scan_idx: u32, bypass: bool) -> ResidualParams {
         ResidualParams {
             log2_size: log2,
             c_idx,
             scan_idx,
-            bypass: false,
+            bypass,
             transform_skip_allowed: false,
             sign_hiding: false,
             intra: true,
@@ -1916,15 +1957,20 @@ mod write_round_trip {
     /// spelling), the luma cbfs, the QP map, and — the desync detector —
     /// the entire CABAC context state after the last CTU.
     fn round_trip(width: u32, height: u32, qp: i32, seed: u64) {
+        round_trip_cfg(width, height, qp, seed, false);
+    }
+
+    fn round_trip_cfg(width: u32, height: u32, qp: i32, seed: u64, bypass: bool) {
         // The configuration under test is the one the encoder actually
         // writes: parse the written SPS/PPS with the production parsers and
         // drive both sides from the result.
         let cfg = Config { width, height, chroma: ChromaFormat::Yuv420, bit_depth: 8, ..Config::default() };
         let g = EncGeometry::new(&cfg);
         let sps = Sps::parse(&unescape_rbsp(&write_sps(&cfg, &g, 8))).expect("the encoder's SPS must parse");
-        let mut pps = Pps::parse(&unescape_rbsp(&write_pps(26))).expect("the encoder's PPS must parse");
+        let mut pps = Pps::parse(&unescape_rbsp(&write_pps(26, bypass))).expect("the encoder's PPS must parse");
         pps.resolve_tiles(&sps).expect("one tile covering the picture");
         assert!(!pps.sign_data_hiding && !pps.transform_skip_enabled && !pps.cu_qp_delta_enabled);
+        assert_eq!(pps.transquant_bypass_enabled, bypass, "the PPS must carry the bypass switch");
 
         // The slice NAL: two header bytes, the slice segment header, byte
         // alignment, CABAC slice data (a terminate after every CTU).
@@ -1937,7 +1983,7 @@ mod write_round_trip {
         write_slice_header(&eh, 26, NAL_IDR_N_LP, &mut w);
         w.flag(true); // byte_alignment(): alignment_bit_equal_to_one
         w.align_zero();
-        let mut wr = CtuWriter::new(&sps, qp, seed);
+        let mut wr = CtuWriter::new(&sps, qp, seed, bypass);
         {
             let mut e = CabacEncoder::new(&mut w);
             for ctb in 0..wc * hc {
@@ -2026,6 +2072,7 @@ mod write_round_trip {
         assert_eq!(dec.info.ct_depth, wr.ct_depth, "{tag}: CtDepth differs");
         assert_eq!(dec.info.intra_mode, wr.intra_mode, "{tag}: intra modes differ");
         assert_eq!(dec.info.cbf_luma, wr.exp_cbf_luma, "{tag}: cbf_luma differs");
+        assert_eq!(dec.info.filter_exempt, wr.exp_exempt, "{tag}: the bypass CUs (filter-exempt map) differ");
         assert!(dec.info.pred_mode.iter().all(|&p| p == 1), "{tag}: every CU is intra");
         assert!(dec.info.qp_y.iter().all(|&q| q as i32 == qp), "{tag}: QP map differs");
         // …and the whole context state: bins can agree while states
@@ -2069,6 +2116,22 @@ mod write_round_trip {
             round_trip(24, 16, 45, seed); // 16x16 CTUs, right column partial
         }
         round_trip(72, 48, 18, 8); // 64x64 CTUs, both edges partial
+    }
+
+    /// Transquant bypass: the PPS enables the switch, every CU spells a
+    /// `cu_transquant_bypass_flag` (about a third decline it, so both
+    /// values of the flag and the mix of bypassed and quantised residual
+    /// share one context state), and bypass CUs carry full-range raw
+    /// residuals (±255) — the magnitudes lossless coding actually
+    /// produces. The decoded filter-exempt map proves the flag's *value*
+    /// arrived, not merely that a bin did.
+    #[test]
+    fn round_trips_transquant_bypass() {
+        for (qp, seed) in [(26, 21u64), (26, 22), (12, 23), (51, 24)] {
+            round_trip_cfg(64, 64, qp, seed, true);
+        }
+        round_trip_cfg(96, 96, 33, 25, true); // 32x32 CTUs, 3x3
+        round_trip_cfg(40, 40, 26, 26, true); // partial CTBs under bypass
     }
 }
 

@@ -29,9 +29,9 @@ use crate::dsp::hevc_enc::HevcEncDsp;
 use crate::dsp::Cpu;
 use crate::hevc::ctx::Contexts;
 use crate::hevc::ctu::{
-    SplitCuNb, write_cbf_chroma, write_cbf_luma, write_intra_chroma_pred_mode, write_mpm_idx,
-    write_prev_intra_luma_pred_flag, write_rem_intra_luma_pred_mode, write_split_cu_flag,
-    write_split_transform_flag,
+    SplitCuNb, write_cbf_chroma, write_cbf_luma, write_cu_transquant_bypass_flag,
+    write_intra_chroma_pred_mode, write_mpm_idx, write_prev_intra_luma_pred_flag,
+    write_rem_intra_luma_pred_mode, write_split_cu_flag, write_split_transform_flag,
 };
 use crate::hevc::residual::{ResidualParams, residual_scan_idx, write_residual};
 use crate::{Error, Result};
@@ -149,16 +149,17 @@ impl H265Encoder {
                 "H.265 encode: chroma formats other than 4:2:0 (encoder in progress)",
             ));
         }
+        // Lossless is transquant bypass: the PPS enables it, every CU says
+        // it, and the residuals travel raw. The QP still appears in the
+        // headers because the syntax demands one, and it still matters to
+        // exactly one thing — the CABAC context initialisation, which both
+        // sides derive from the slice QP — while scaling never runs: the
+        // decoder's residual path skips dequantisation and the transform for
+        // a bypassed CU, so any legal value would decode identically. 26 is
+        // the middle of the road and needs no explanation in a debugger.
+        let bypass = matches!(self.cfg.rate, RateControl::Lossless);
         let qp = match self.cfg.rate {
-            RateControl::Lossless => {
-                // Bypass needs the PPS to enable transquant_bypass and the
-                // coding-unit writer to spell the per-CU flag; neither is
-                // wired yet, and a lossy stream sold as lossless would be
-                // the worst possible answer.
-                return Err(Error::unsupported(
-                    "H.265 encode: transquant bypass (encoder in progress)",
-                ));
-            }
+            RateControl::Lossless => 26,
             RateControl::ConstantQp(q) => q.min(51),
         };
         if c.kind != Kind::Idr {
@@ -201,7 +202,7 @@ impl H265Encoder {
             qp: qp as i32,
             bit_depth: 8,
             strong_smoothing: false,
-            bypass: false,
+            bypass,
         };
         let mut pic = IntraPicture::<u8>::new(cw, ch, g.log2_ctb, 8);
 
@@ -212,7 +213,7 @@ impl H265Encoder {
             syn::NAL_SPS,
             &syn::write_sps(&self.cfg, &g, LOG2_MAX_POC_LSB),
         ));
-        out.extend_from_slice(&syn::annexb(syn::NAL_PPS, &syn::write_pps(qp)));
+        out.extend_from_slice(&syn::annexb(syn::NAL_PPS, &syn::write_pps(qp, bypass)));
 
         let mut w = BitWriter::with_capacity(cw * ch / 2);
         syn::write_slice_header(
@@ -237,7 +238,7 @@ impl H265Encoder {
             for cy in 0..hc {
                 for cxu in 0..wc {
                     let d = pic.code_ctu(&ictx, cxu, cy, &py, cw, &pcb, &pcr, ccw);
-                    write_ctu_intra(&mut e, &mut cx, &d, cxu, cy);
+                    write_ctu_intra(&mut e, &mut cx, &d, cxu, cy, bypass);
                     e.encode_terminate(u32::from(cy == hc - 1 && cxu == wc - 1));
                 }
             }
@@ -279,10 +280,16 @@ impl H265Encoder {
 /// to three residual blocks. Anything that stops matching the reader here
 /// desyncs the arithmetic coder and fails SELF wholesale, which is exactly
 /// the property the encode gate checks.
-fn write_ctu_intra(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, ctu_x: usize, ctu_y: usize) {
+///
+/// `pps_bypass` mirrors the PPS's `transquant_bypass_enabled_flag`: when
+/// set, `coding_unit` reads a `cu_transquant_bypass_flag` as its very first
+/// bin, so this writer spells one — the CU's own choice, `d.bypass` — and
+/// when clear, nothing is written and the CU must not claim bypass.
+fn write_ctu_intra(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, ctu_x: usize, ctu_y: usize, pps_bypass: bool) {
     let log2 = d.log2_cu;
     debug_assert!((4..=5).contains(&log2), "one CU per CTU wants CTB 16 or 32");
     debug_assert!(!d.nxn, "PART_NxN exists only at the minimum CU size");
+    debug_assert!(pps_bypass || !d.bypass, "a bypass CU is unspellable unless the PPS enables the flag");
     // Every coded neighbour has depth 0 (one CU per CTU), and in a single
     // slice availability is picture geometry.
     let nb = SplitCuNb {
@@ -290,6 +297,9 @@ fn write_ctu_intra(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, ctu_
         above_depth: (ctu_y > 0).then_some(0),
     };
     write_split_cu_flag(e, cx, &nb, 0, false);
+    if pps_bypass {
+        write_cu_transquant_bypass_flag(e, cx, d.bypass);
+    }
 
     let syn0 = d.luma_syntax[0];
     write_prev_intra_luma_pred_flag(e, cx, syn0.prev_flag);
@@ -311,7 +321,7 @@ fn write_ctu_intra(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, ctu_
         log2_size,
         c_idx,
         scan_idx: residual_scan_idx(true, log2_size, c_idx, 1, u32::from(mode)),
-        bypass: false,
+        bypass: d.bypass,
         transform_skip_allowed: false,
         sign_hiding: false,
         intra: true,
@@ -374,12 +384,8 @@ mod tests {
         assert_eq!(e.reconstructions().len(), 1);
 
         // The named holes.
-        let holes: [(Config, &str); 3] = [
+        let holes: [(Config, &str); 2] = [
             (Config { gop: 8, ..cfg(64, 64, ChromaFormat::Yuv420) }, "inter prediction"),
-            (
-                Config { rate: super::super::RateControl::Lossless, gop: 0, ..cfg(64, 64, ChromaFormat::Yuv420) },
-                "transquant bypass",
-            ),
             (Config { gop: 0, ..cfg(64, 64, ChromaFormat::Yuv422) }, "chroma formats"),
         ];
         for (config, want) in holes {
@@ -400,6 +406,30 @@ mod tests {
             }
             assert!(named, "never reached the {want:?} hole");
         }
+    }
+
+    /// Lossless (transquant bypass) reconstructs the source exactly: the
+    /// encoder-held reconstruction — what SELF compares the decode against —
+    /// must equal the input byte for byte, on content with real detail in
+    /// it, not only on flat frames whose residual is zero everywhere.
+    #[test]
+    fn lossless_reconstruction_equals_the_source() {
+        let mut e = H265Encoder::new(Config {
+            rate: super::super::RateControl::Lossless,
+            gop: 0,
+            ..cfg(48, 32, ChromaFormat::Yuv420)
+        })
+        .unwrap();
+        let mut frame = vec![0u8; 48 * 32 * 3 / 2];
+        let mut seed = 0x5eedu32;
+        for v in frame.iter_mut() {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            *v = (seed >> 24) as u8;
+        }
+        let out = e.push(&frame).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].data.is_empty());
+        assert_eq!(e.reconstructions()[0], frame, "bypass reconstruction differs from the source");
     }
 
     #[test]

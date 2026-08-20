@@ -550,17 +550,26 @@ pub fn parse_residual(cabac: &mut Cabac, cx: &mut Contexts, p: &ResidualParams, 
 /// previous level — and every rule read off different lines twice is a
 /// desync waiting to surface hundreds of blocks later.
 ///
-/// Only the configuration this crate's encoder writes is spellable —
-/// no transquant bypass, no transform skip, no sign data hiding, none of
-/// the range-extension coding tools — and the writer refuses the rest
-/// (debug assertions) rather than half-supporting it: `sign_hiding`
-/// especially would change which sign bins exist, not just their values.
+/// Only the configuration this crate's encoder writes is spellable — no
+/// transform skip, no sign data hiding, none of the range-extension coding
+/// tools — and the writer refuses the rest (debug assertions) rather than
+/// half-supporting it: `sign_hiding` especially would change which sign
+/// bins exist, not just their values.
+///
+/// `bypass` (`cu_transquant_bypass_flag`) IS spellable, and changes nothing
+/// in the spelling under this configuration. Read off the parser: bypass
+/// suppresses the `transform_skip_flag` read (the PPS keeps it off anyway),
+/// forces sign hiding off (off anyway), and feeds only range-extension
+/// tools otherwise (RDPCM, the single significance context, the persistent
+/// Rice statistic — all absent from our SPS). What differs is the *values*:
+/// the levels are raw spatial residuals rather than quantised coefficients,
+/// up to the full sample range — well inside the binarisation, which the
+/// escape covers to i16 either way.
 ///
 /// Nothing outside the tests calls it yet — the H.265 encoder that will is
 /// being built alongside it; drop the allow when it lands.
 #[allow(dead_code)]
 pub(crate) fn write_residual(e: &mut CabacEncoder, cx: &mut Contexts, p: &ResidualParams, coeffs: &[i16]) {
-    debug_assert!(!p.bypass, "cu_transquant_bypass residual writing is not supported");
     debug_assert!(!p.transform_skip_allowed, "transform_skip_flag writing is not supported (PPS keeps it off)");
     debug_assert!(!p.sign_hiding, "sign data hiding is not supported (PPS keeps it off)");
     debug_assert!(!p.explicit_rdpcm && !p.persistent_rice && !p.ts_context, "range-extension residual tools are not supported");
@@ -1195,6 +1204,49 @@ mod write_round_trip {
             }
             one(26, params(log2, c_idx, scan), c);
         }
+    }
+
+    /// Transquant-bypass blocks: same spelling (the parser's bypass path
+    /// only suppresses syntax our configuration already keeps off), raw
+    /// full-range levels — dense ±255, alternating extremes, and bypass
+    /// blocks chained with quantised ones through one context state, since
+    /// that is exactly what a stream with per-CU bypass flags looks like.
+    #[test]
+    fn round_trips_bypass_blocks() {
+        let byp = |log2: u32, c_idx: usize, scan: u32| -> ResidualParams {
+            ResidualParams { bypass: true, ..params(log2, c_idx, scan) }
+        };
+        for (log2, c_idx, scan) in shapes() {
+            let n = 1usize << log2;
+            // Dense full-range: every position at an 8-bit residual extreme.
+            let mut c = vec![0i16; n * n];
+            for (i, v) in c.iter_mut().enumerate() {
+                *v = match i % 4 {
+                    0 => 255,
+                    1 => -255,
+                    2 => 128,
+                    _ => -1,
+                };
+            }
+            one(26, byp(log2, c_idx, scan), c);
+            // A flat-ish bypass block: one large residual in a zero field.
+            let mut c = vec![0i16; n * n];
+            c[n + 1] = -255;
+            one(26, byp(log2, c_idx, scan), c);
+        }
+        // Bypassed and quantised blocks interleaved in one codeword: the
+        // per-CU flag makes this mix, and the context state is shared.
+        let mut blocks = Vec::new();
+        for (k, (log2, c_idx, scan)) in shapes().into_iter().enumerate() {
+            let n = 1usize << log2;
+            let mut c = vec![0i16; n * n];
+            for (i, v) in c.iter_mut().enumerate().take(n) {
+                *v = if k % 2 == 0 { [255, -37, 1, -255][i % 4] } else { [1, -1, 2, 0][i % 4] };
+            }
+            let p = if k % 2 == 0 { byp(log2, c_idx, scan) } else { params(log2, c_idx, scan) };
+            blocks.push((p, c));
+        }
+        round_trip(26, &blocks);
     }
 
     /// Pseudo-random blocks of every shape chained through one codeword and
