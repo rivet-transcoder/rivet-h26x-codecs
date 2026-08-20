@@ -155,6 +155,9 @@ fn main() {
             // a log sees the shape of the error without dividing.
             eprintln!("rate: achieved {achieved:.0} bps, target {target:.0} bps, ratio {:.3}", achieved / target);
         }
+        if enc.recodes() != 0 {
+            eprintln!("rate: {} extra codings to fit the declared buffer", enc.recodes());
+        }
         return;
     }
 

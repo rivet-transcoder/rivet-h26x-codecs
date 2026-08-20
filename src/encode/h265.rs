@@ -80,11 +80,42 @@ pub struct H265Encoder {
     pps_qp: u8,
     /// Bytes emitted so far, to hold the controller's ledger to.
     emitted: u64,
+    /// How many pictures had to be coded more than once to fit the
+    /// declared buffer, and how many extra codings that cost.
+    ///
+    /// Reported rather than hidden: re-coding is the encoder doing a
+    /// picture's work twice, and a caller choosing a buffer size deserves
+    /// to see what that choice costs before it shows up as a slow encode
+    /// nobody can account for.
+    recoded: u64,
     /// The coded picture buffer this stream declares, when it declares one.
     /// The *declared* values, snapped to what the syntax carries — the
     /// controller is handed these rather than the caller's request, so what
     /// it aims at and what the stream promises are one number.
     cpb: Option<Cpb>,
+}
+
+/// One coded picture, before anything about it has been kept.
+///
+/// A picture that will not fit the declared buffer is coded again at a
+/// higher quantiser, and the attempt that lost must leave no trace: it
+/// must not appear in the reconstructions the SELF check reads, and above
+/// all it must not become the reference the *next* picture predicts from,
+/// which would make every later picture depend on bytes no decoder will
+/// ever see.
+///
+/// Keeping the commit out of the coding functions is what makes that
+/// impossible rather than merely avoided. They hand back what they made;
+/// only [`H265Encoder::code_picture`] decides to keep it.
+struct Attempt {
+    access: Access,
+    /// The reconstruction, cropped to display size.
+    rec: Vec<u8>,
+    /// The reconstruction as a reference frame, uncropped.
+    frame: crate::hevc::frame::Frame<u8>,
+    /// Whether this picture empties the reference buffer first, which is
+    /// what makes an IDR a random access point.
+    clears_refs: bool,
 }
 
 /// The POC LSB width the SPS declares. Fixed and generous, as on the H.264
@@ -167,6 +198,7 @@ impl H265Encoder {
             rc,
             pps_qp,
             emitted: 0,
+            recoded: 0,
             cfg,
             held: std::collections::BTreeMap::new(),
             recon: Vec::new(),
@@ -197,6 +229,14 @@ impl H265Encoder {
             _ => return None,
         };
         Some((rc.achieved_bps(self.cfg.fps), target))
+    }
+
+    /// How many extra codings the declared buffer cost: pictures that came
+    /// out too large for it and had to be coded again at a higher
+    /// quantiser. Zero when no buffer was declared, because then nothing
+    /// can fail to fit.
+    pub fn recodes(&self) -> u64 {
+        self.recoded
     }
 
     /// The reconstructions produced so far, in coding order.
@@ -266,7 +306,82 @@ impl H265Encoder {
     /// (the geometry guarantees whole CTUs of 16 or 32), decided by the
     /// intra machinery and serialised through the coding-tree writers that
     /// live beside their readers. Everything else refuses by name.
+    /// Code one picture, re-coding it at a higher quantiser if it will not
+    /// fit the buffer this stream declares.
+    ///
+    /// The quantiser is chosen **once**. What the loop does is escalate
+    /// from it, using the same law the controller steers by, and the
+    /// controller is told afterwards which quantiser the picture was
+    /// actually coded at — so the complexity model learns from the picture
+    /// that shipped rather than from one that was thrown away.
+    ///
+    /// Without a declared buffer there is nothing to fit and the loop runs
+    /// exactly once, which is why every stream that does not ask for a
+    /// buffer is byte-identical to what it was before this existed.
     fn code_picture(&mut self, c: Coded, src: &[u8]) -> Result<Access> {
+        let mut qp = self.pick_picture_qp(&c)?;
+        let bypass = matches!(self.cfg.rate, RateControl::Lossless);
+        for attempt in 0..super::rc::MAX_ATTEMPTS {
+            let a = self.code_attempt(c, src, qp, bypass)?;
+            let bits = a.access.data.len() as u64 * 8;
+            // What the buffer can hand over at this picture's removal time.
+            // `None` means no buffer was declared and nothing can fail.
+            let affordable = self.rc.as_ref().and_then(|rc| rc.affordable_bits());
+            let Some(afford) = affordable else {
+                return Ok(self.commit(&c, a));
+            };
+            if bits <= afford {
+                if let Some(rc) = self.rc.as_mut() {
+                    rc.note_recode(qp);
+                }
+                return Ok(self.commit(&c, a));
+            }
+            if attempt + 1 == super::rc::MAX_ATTEMPTS || qp >= 51 {
+                // The declared buffer is smaller than this content can be
+                // coded into. That is a configuration error, and emitting
+                // a stream that declares a buffer it violates is the one
+                // outcome this whole feature exists to prevent — so it
+                // refuses by name rather than shipping it.
+                return Err(Error::unsupported(format!(
+                    "H.265 encode: picture {} needs {bits} bits and the declared buffer affords {afford}                      even at quantiser {qp} (the coded picture buffer is too small for this content)",
+                    c.poc
+                )));
+            }
+            self.recoded += 1;
+            qp = RateController::escalate(qp, bits, afford);
+        }
+        unreachable!("the loop returns or errors on its last attempt")
+    }
+
+    /// Keep what an attempt made: the reconstruction the SELF check reads,
+    /// and the reference the next picture predicts from.
+    fn commit(&mut self, c: &Coded, a: Attempt) -> Access {
+        self.recon.push(a.rec);
+        if a.clears_refs {
+            self.refs.clear();
+        }
+        self.retain_reference(c, a.frame);
+        a.access
+    }
+
+    /// The quantiser this picture starts at, before any buffer escalation.
+    fn pick_picture_qp(&mut self, c: &Coded) -> Result<u8> {
+        Ok(match self.cfg.rate {
+            RateControl::Lossless => 26,
+            RateControl::ConstantQp(q) => q.min(51),
+            RateControl::Bitrate { .. } => {
+                let kind = match c.kind {
+                    Kind::Idr | Kind::I => PicKind::Intra,
+                    Kind::P => PicKind::Inter,
+                    Kind::B => PicKind::B,
+                };
+                self.rc.as_mut().expect("a bitrate configuration builds a controller").pick_qp(kind)
+            }
+        })
+    }
+
+    /// Code one picture at a given quantiser, keeping nothing.
+    fn code_attempt(&mut self, c: Coded, src: &[u8], qp: u8, bypass: bool) -> Result<Attempt> {
         let g = self.geom;
         let pps_qp = self.pps_qp;
         // Lossless is transquant bypass: the PPS enables it, every CU says
@@ -277,21 +392,10 @@ impl H265Encoder {
         // decoder's residual path skips dequantisation and the transform for
         // a bypassed CU, so any legal value would decode identically. 26 is
         // the middle of the road and needs no explanation in a debugger.
-        let bypass = matches!(self.cfg.rate, RateControl::Lossless);
-        let qp = match self.cfg.rate {
-            RateControl::Lossless => 26,
-            RateControl::ConstantQp(q) => q.min(51),
-            // The controller chooses, once per picture, in coding order.
-            // `account` below closes the loop with what it actually cost.
-            RateControl::Bitrate { .. } => {
-                let kind = match c.kind {
-                    Kind::Idr | Kind::I => PicKind::Intra,
-                    Kind::P => PicKind::Inter,
-                    Kind::B => PicKind::B,
-                };
-                self.rc.as_mut().expect("a bitrate configuration builds a controller").pick_qp(kind)
-            }
-        };
+        //
+        // Both arrive as arguments: the quantiser is chosen once by the
+        // caller and escalated by it, so an attempt cannot quietly pick a
+        // different one than the buffer arithmetic is reasoning about.
         if c.kind != Kind::Idr {
             return self.code_inter_picture(c, src, qp, bypass);
         }
@@ -473,18 +577,17 @@ impl H265Encoder {
             crop(&pic.recon.cb, cdw, cdh, &mut rec);
             crop(&pic.recon.cr, cdw, cdh, &mut rec);
         }
-        self.recon.push(rec);
-
-        // Keep the picture as a reference the way the decoder keeps it:
-        // borders extended for motion compensation, POC set, motion grid
-        // intact. An IDR empties the buffer first - everything before it
-        // is discarded, which is what makes it a random access point.
-        // An IDR empties the buffer: everything before it is discarded,
-        // which is what makes it a random access point.
-        self.refs.clear();
-        self.retain_reference(&c, pic.recon);
-
-        Ok(Access { data: out, keyframe: true, poc: c.poc, encode_index: c.encode })
+        // Handed back rather than kept: an attempt that does not fit the
+        // buffer is coded again, and it must leave nothing behind. An IDR
+        // empties the reference buffer when it is *committed* — everything
+        // before it is discarded, which is what makes it a random access
+        // point — and not before.
+        Ok(Attempt {
+            access: Access { data: out, keyframe: true, poc: c.poc, encode_index: c.encode },
+            rec,
+            frame: pic.recon,
+            clears_refs: true,
+        })
     }
 
     /// Keep a coded picture as a reference the way a decoder keeps it —
@@ -527,7 +630,7 @@ impl H265Encoder {
     /// most sharply that a non-skip 2Nx2N merge CU never codes
     /// `rqt_root_cbf` (the reader infers it true), which is why a merge
     /// with nothing left to code must be spelled as a skip instead.
-    fn code_inter_picture(&mut self, c: Coded, src: &[u8], qp: u8, bypass: bool) -> Result<Access> {
+    fn code_inter_picture(&mut self, c: Coded, src: &[u8], qp: u8, bypass: bool) -> Result<Attempt> {
         let g = self.geom;
         let pps_qp = self.pps_qp;
         let (dw, dh) = (self.cfg.width as usize, self.cfg.height as usize);
@@ -748,11 +851,13 @@ impl H265Encoder {
             crop(&pic.recon.cb, cdw, cdh, &mut rec);
             crop(&pic.recon.cr, cdw, cdh, &mut rec);
         }
-        self.recon.push(rec);
-
-        self.retain_reference(&c, pic.recon);
-
-        Ok(Access { data: out, keyframe: false, poc: c.poc, encode_index: c.encode })
+        // Handed back rather than kept — see the intra path.
+        Ok(Attempt {
+            access: Access { data: out, keyframe: false, poc: c.poc, encode_index: c.encode },
+            rec,
+            frame: pic.recon,
+            clears_refs: false,
+        })
     }
 }
 

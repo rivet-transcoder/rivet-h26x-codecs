@@ -61,7 +61,10 @@
 #               is why the row is restricted to src_cut below.
 #
 #               Its mutation: make the controller ignore the buffer it was
-#               given, and the row must go red.
+#               given, and the row must go red. So does forbidding the
+#               encoder to code a picture twice - at this buffer size the
+#               cap alone lands 632 bits short, so the row is carried by
+#               the re-code and not merely by the aim.
 #
 # Usage: verify_encode.sh [encoder] [decoder]
 #   H26X_WORK=dir   scratch directory holding the source clips (default: here)
@@ -207,7 +210,7 @@ hevc-abr-64k|--codec h265 --bitrate 64000 --gop 8
 hevc-abr-96k|--codec h265 --bitrate 96000 --gop 8
 abr-64k|--codec h264 --bitrate 64000 --gop 8
 abr-128k|--codec h264 --bitrate 128000 --gop 8
-hevc-vbv-175@src_cut|--codec h265 --bitrate 64000 --cpb-ms 175 --gop 8
+hevc-vbv-125@src_cut|--codec h265 --bitrate 64000 --cpb-ms 125 --gop 8
 "}
 
 one() {

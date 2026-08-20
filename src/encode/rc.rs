@@ -271,6 +271,16 @@ const INSENSITIVE_BAND: f64 = 0.06;
 /// deliberately not here: see the module header.
 const CPB_AIM: f64 = 0.75;
 
+/// How many times a picture may be coded before the encoder gives up on
+/// fitting it into the buffer — the first attempt plus this many more.
+///
+/// Two, because the correction is computed rather than searched: the same
+/// law the controller steers by says how many quantiser steps a given
+/// overshoot needs, so one re-code should land. The second exists because
+/// the law is an approximation and the first correction can undershoot;
+/// a third would be chasing a model that more attempts do not improve.
+pub const MAX_ATTEMPTS: u32 = 3;
+
 /// Quantiser bounds. The syntax allows 0..=51 and both ends are legal;
 /// these are the same bounds `ConstantQp` clamps to.
 const QP_MIN: i32 = 0;
@@ -473,6 +483,51 @@ impl RateController {
         // not flatten them.
         let correction = (self.budget / CORRECTION_PICTURES).clamp(-0.5 * base, 0.5 * base);
         (base + correction).max(16.0)
+    }
+
+    /// How many bits the buffer can hand over at the next picture's
+    /// removal time, or `None` when no buffer was declared.
+    ///
+    /// **This is the same arithmetic `encode::hrd` checks with, and
+    /// deliberately the same function rather than a second copy of a leaky
+    /// bucket.** What makes that checker independent is its *inputs* — it
+    /// reads the declared parameters out of the emitted stream and the
+    /// sizes off the bytes, where this reads what the encoder believes —
+    /// not having two implementations that can drift apart. Two copies of
+    /// this formula would be two things to keep in step, and the one that
+    /// went stale would be the one nobody ran.
+    pub fn affordable_bits(&self) -> Option<u64> {
+        self.cpb.map(|(size, fullness)| (fullness + self.per_picture).min(size).max(0.0) as u64)
+    }
+
+    /// The quantiser to try next after a picture came out at `actual` bits
+    /// when only `affordable` were available.
+    ///
+    /// The step is computed, not searched: bits halve for every six added
+    /// to the quantiser, so the overshoot names its own correction —
+    /// `6 * log2(actual / affordable)`, rounded up, plus one step of
+    /// margin because the law is an approximation and a re-code that still
+    /// does not fit has cost a whole picture for nothing.
+    pub fn escalate(qp: u8, actual: u64, affordable: u64) -> u8 {
+        if affordable == 0 || actual <= affordable {
+            return (qp as i32 + 1).clamp(QP_MIN, QP_MAX) as u8;
+        }
+        let steps = (6.0 * (actual as f64 / affordable as f64).log2()).ceil() as i32 + 1;
+        (qp as i32 + steps.max(1)).clamp(QP_MIN, QP_MAX) as u8
+    }
+
+    /// Tell the controller the quantiser the picture was **actually** coded
+    /// at, when a re-code moved it away from what [`RateController::pick_qp`]
+    /// chose.
+    ///
+    /// Without this the model would learn from an attempt that was thrown
+    /// away — the complexity estimate would be pinned against a quantiser
+    /// no picture in the stream was ever coded at, and every later decision
+    /// would inherit the error.
+    pub fn note_recode(&mut self, qp: u8) {
+        if let Some((kind, _)) = self.pending {
+            self.pending = Some((kind, qp));
+        }
     }
 
     /// Choose the quantiser for the next picture. Call once per picture,
