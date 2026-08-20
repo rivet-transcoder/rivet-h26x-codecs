@@ -2923,6 +2923,68 @@ mod write_round_trip {
         }
     }
 
+    /// The 8x4 / 4x8 shape: `inter_pred_idc` is **still coded** there, as
+    /// the `+4` bin alone.
+    ///
+    /// This one is writer-only, and deliberately so. The round trip above
+    /// cannot reach `w + h == 12`, because the only partitioning this
+    /// encoder can spell is `PART_2Nx2N` over a whole CTU — 16x16 or
+    /// 32x32, so `w + h` is 32 or 64 — and `write_part_mode_inter`
+    /// debug-asserts exactly that. So the misreading this writer's
+    /// docblock warns about ("coded only when B and `w + h != 12`", which
+    /// would emit nothing here) is invisible to every round trip that
+    /// exists, and stays invisible until AMP or NxN can be coded. A
+    /// mutation test proved that: seeding the early return that the
+    /// misreading implies leaves the round trip green.
+    ///
+    /// What is observable without a reader is the context array. Writing
+    /// the element must advance the `+4` context and leave the four
+    /// CtDepth contexts alone; the misreading advances nothing at all.
+    /// That is weaker than a round trip and it is the strongest check
+    /// available until the geometry exists — recorded here rather than
+    /// left as a silent gap.
+    #[test]
+    fn b_inter_pred_idc_is_still_coded_on_an_8x4_block() {
+        for (idc, second_bin) in [(0u32, 0u32), (1, 1)] {
+            let before = Contexts::new(0, 26);
+            let mut cx = Contexts::new(0, 26);
+            let mut w = BitWriter::new();
+            {
+                let mut e = CabacEncoder::new(&mut w);
+                // 8x4: w + h == 12. PRED_BI is forbidden by the size, and
+                // the writer debug-asserts that; L0 and L1 are legal.
+                write_inter_pred_idc(&mut e, &mut cx, 8, 4, 0, idc);
+                e.encode_terminate(1);
+            }
+            let tail = INTER_PRED_IDC_OFFSET + 4;
+            assert_ne!(
+                cx.c[tail], before.c[tail],
+                "idc={idc}: the +4 bin was not written — inter_pred_idc is still present at w + h == 12, \
+                 as that bin alone; what the size forbids is PRED_BI, not the syntax"
+            );
+            for d in 0..4 {
+                assert_eq!(
+                    cx.c[INTER_PRED_IDC_OFFSET + d],
+                    before.c[INTER_PRED_IDC_OFFSET + d],
+                    "idc={idc}: the CtDepth bin must not be written at w + h == 12"
+                );
+            }
+            // And the value really is carried by that one bin: writing the
+            // same bin directly from a fresh state must land identically.
+            let mut cx2 = Contexts::new(0, 26);
+            let mut w2 = BitWriter::new();
+            {
+                let mut e = CabacEncoder::new(&mut w2);
+                e.encode_decision(&mut cx2.c[tail], second_bin);
+                e.encode_terminate(1);
+            }
+            assert_eq!(cx.c, cx2.c, "idc={idc}: not the single +4 bin the reader reads");
+            w.align_zero();
+            w2.align_zero();
+            assert_eq!(w.into_rbsp(), w2.into_rbsp(), "idc={idc}: bits differ from the single +4 bin");
+        }
+    }
+
     fn scripted_b_amvp(idc: u32, mvd0: Mv, mvd1: Mv) {
         let cfg = Config { width: 32, height: 32, chroma: ChromaFormat::Yuv420, bit_depth: 8, max_refs: 4, ..Config::default() };
         let g = EncGeometry::new(&cfg);
