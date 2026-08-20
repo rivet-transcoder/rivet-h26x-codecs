@@ -95,28 +95,37 @@ static INTER_CBP_TO_GOLOMB_GRAY: [u8; 16] = {
 /// skips stay zero, which is what the reader's per-macroblock reset
 /// leaves behind.
 struct NzState {
-    /// Per 4x4 luma column of the picture: the count of the bottom block
-    /// of the macroblock above (`mbs_wide * 4`).
-    top_luma: Vec<u8>,
-    /// Per 4x4 luma row: the count of the rightmost block of the
-    /// macroblock to the left.
-    left_luma: [u8; 4],
-    /// The same for the chroma blocks, per component (`mbs_wide * 2`).
+    /// Per luma-*like* plane (luma; in 4:4:4 also Cb and Cr, which the
+    /// reader's `nC` treats as three luma planes — `nb.nz_top` /
+    /// `nb.nz_left` in `MbNeighbours::gather_nz`), per 4x4 column of the
+    /// picture: the count of the bottom block of the macroblock above
+    /// (`mbs_wide * 4`).
+    top_luma: [Vec<u8>; 3],
+    /// Per luma-like plane and 4x4 row: the count of the rightmost block
+    /// of the macroblock to the left.
+    left_luma: [[u8; 4]; 3],
+    /// The same for the 4:2:x chroma blocks, per component
+    /// (`mbs_wide * 2`). Unused in 4:4:4, whose chroma is luma-like.
     top_chroma: [Vec<u8>; 2],
     /// Chroma left column; `rows` entries are meaningful.
     left_chroma: [[u8; 4]; 2],
-    /// Chroma AC block rows: 0 (monochrome), 2 (4:2:0) or 4 (4:2:2).
+    /// Chroma AC block rows: 2 (4:2:0), 4 (4:2:2), 0 (monochrome and
+    /// 4:4:4 — the latter flagged separately below).
     rows: usize,
+    /// ChromaArrayType 3: planes 1 and 2 of the luma-like state are live.
+    c444: bool,
 }
 
 impl NzState {
-    fn new(mbs_wide: usize, rows: usize) -> Self {
+    fn new(mbs_wide: usize, rows: usize, c444: bool) -> Self {
+        debug_assert!(!c444 || rows == 0, "4:4:4 has no 4:2:x chroma rows");
         NzState {
-            top_luma: vec![0; mbs_wide * 4],
-            left_luma: [0; 4],
+            top_luma: [vec![0; mbs_wide * 4], vec![0; mbs_wide * 4], vec![0; mbs_wide * 4]],
+            left_luma: [[0; 4]; 3],
             top_chroma: [vec![0; mbs_wide * 2], vec![0; mbs_wide * 2]],
             left_chroma: [[0; 4]; 2],
             rows,
+            c444,
         }
     }
 }
@@ -145,7 +154,7 @@ fn widen(levels: &[i16; 16]) -> [i32; 16] {
 
 /// The chroma DC block widened: four meaningful entries in 4:2:0, eight
 /// in 4:2:2. Always eight wide — the writer only reads the scan's span.
-fn widen_dc(levels: &[i16; 8]) -> [i32; 8] {
+fn widen_dc(levels: &[i16; 16]) -> [i32; 8] {
     let mut out = [0i32; 8];
     for (o, &v) in out.iter_mut().zip(levels) {
         *o = v as i32;
@@ -287,14 +296,89 @@ fn write_p16_macroblock(
 /// read. Forgetting this — leaving the previous coded macroblock's counts
 /// in the left column — desyncs the very next residual block's tables.
 fn skip_nz(st: &mut NzState, mb_x: usize) {
-    st.left_luma = [0; 4];
-    st.top_luma[mb_x * 4..mb_x * 4 + 4].fill(0);
+    for p in 0..3 {
+        st.left_luma[p] = [0; 4];
+        st.top_luma[p][mb_x * 4..mb_x * 4 + 4].fill(0);
+    }
     for comp in 0..2 {
         st.left_chroma[comp] = [0; 4];
         if st.rows != 0 {
             st.top_chroma[comp][mb_x * 2..mb_x * 2 + 2].fill(0);
         }
     }
+}
+
+/// One luma-like plane's residual — the DC block for `Intra_16x16`, then
+/// the coded 8x8s' 4x4 blocks — with plane `p`'s own `nC` bookkeeping,
+/// updated for the next macroblocks. The mirror of
+/// `parse_residual_luma_like` (src/h264/cavlc.rs) for one plane: luma is
+/// plane 0; in 4:4:4 Cb and Cr are planes 1 and 2 coded the same way,
+/// gated by the *same* luma coded-block-pattern bits.
+#[allow(clippy::too_many_arguments)]
+fn write_plane_residual(
+    w: &mut BitWriter,
+    st: &mut NzState,
+    p: usize,
+    mb_x: usize,
+    left: bool,
+    top: bool,
+    dc: Option<&[i16; 16]>,
+    cbp: usize,
+    levels: &[[i16; 16]; 16],
+    nz: &[u8; 16],
+) {
+    let mut cur = [0u8; 16];
+    let nc_at = |cur: &[u8; 16], st: &NzState, bx: usize, by: usize| -> i32 {
+        let a = if bx > 0 {
+            Some(cur[by * 4 + bx - 1])
+        } else if left {
+            Some(st.left_luma[p][by])
+        } else {
+            None
+        };
+        let b = if by > 0 {
+            Some(cur[(by - 1) * 4 + bx])
+        } else if top {
+            Some(st.top_luma[p][mb_x * 4 + bx])
+        } else {
+            None
+        };
+        nc_of(a, b)
+    };
+    if let Some(dc) = dc {
+        // The DC block first. Its own count is not stored anywhere — the
+        // reader discards it too — so the return is deliberately dropped.
+        let nc = nc_at(&cur, st, 0, 0);
+        let _ = write_residual_block_cavlc(w, nc, &widen(dc), &ZIGZAG4X4, 0, 15, 16);
+    }
+    for blk8 in 0..4 {
+        if cbp & (1 << blk8) == 0 {
+            continue;
+        }
+        let (bx8, by8) = ((blk8 & 1) * 2, (blk8 >> 1) * 2);
+        for sub in 0..4 {
+            let (bx, by) = (bx8 + (sub & 1), by8 + (sub >> 1));
+            let raster = by * 4 + bx;
+            let nc = nc_at(&cur, st, bx, by);
+            let lv = widen(&levels[raster]);
+            // I_16x16 AC blocks start at scan position one — the DC went
+            // in the block above — and so carry at most fifteen.
+            let n = if dc.is_some() {
+                write_residual_block_cavlc(w, nc, &lv, &ZIGZAG4X4, 1, 15, 15)
+            } else {
+                write_residual_block_cavlc(w, nc, &lv, &ZIGZAG4X4, 0, 15, 16)
+            };
+            debug_assert_eq!(
+                n, nz[raster] as usize,
+                "plane {p} block ({bx},{by}): the decision's count disagrees with the writer's"
+            );
+            cur[raster] = n as u8;
+        }
+    }
+    // What the neighbours will read: the right column and the bottom row,
+    // including the zeros of blocks nothing coded.
+    st.left_luma[p] = [cur[3], cur[7], cur[11], cur[15]];
+    st.top_luma[p][mb_x * 4..mb_x * 4 + 4].copy_from_slice(&cur[12..16]);
 }
 
 /// The residual and its `nC` bookkeeping, shared by the intra and inter
@@ -316,62 +400,29 @@ fn write_mb_residual(
     luma_dc: Option<&[i16; 16]>,
     cbp: usize,
     luma: &[[i16; 16]; 16],
-    chroma_dc: &[[i16; 8]; 2],
-    chroma_ac: &[[[i16; 16]; 8]; 2],
+    chroma_dc: &[[i16; 16]; 2],
+    chroma_ac: &[[[i16; 16]; 16]; 2],
     nz_luma: &[u8; 16],
-    nz_chroma: &[[u8; 8]; 2],
+    nz_chroma: &[[u8; 16]; 2],
 ) {
     let chroma = st.rows != 0;
-    let i16x16 = luma_dc.is_some();
-    let mut cur = [0u8; 16];
     let mut curc = [[0u8; 8]; 2];
-    let luma_nc = |cur: &[u8; 16], st: &NzState, bx: usize, by: usize| -> i32 {
-        let a = if bx > 0 {
-            Some(cur[by * 4 + bx - 1])
-        } else if left {
-            Some(st.left_luma[by])
-        } else {
-            None
-        };
-        let b = if by > 0 {
-            Some(cur[(by - 1) * 4 + bx])
-        } else if top {
-            Some(st.top_luma[mb_x * 4 + bx])
-        } else {
-            None
-        };
-        nc_of(a, b)
-    };
 
-    if let Some(dc) = luma_dc {
-        // The DC block first. Its own count is not stored anywhere — the
-        // reader discards it too — so the return is deliberately dropped.
-        let nc = luma_nc(&cur, st, 0, 0);
-        let _ = write_residual_block_cavlc(w, nc, &widen(dc), &ZIGZAG4X4, 0, 15, 16);
-    }
-    for blk8 in 0..4 {
-        if cbp & (1 << blk8) == 0 {
-            continue;
-        }
-        let (bx8, by8) = ((blk8 & 1) * 2, (blk8 >> 1) * 2);
-        for sub in 0..4 {
-            let (bx, by) = (bx8 + (sub & 1), by8 + (sub >> 1));
-            let raster = by * 4 + bx;
-            let nc = luma_nc(&cur, st, bx, by);
-            let lv = widen(&luma[raster]);
-            // I_16x16 AC blocks start at scan position one — the DC went
-            // in the block above — and so carry at most fifteen.
-            let n = if i16x16 {
-                write_residual_block_cavlc(w, nc, &lv, &ZIGZAG4X4, 1, 15, 15)
-            } else {
-                write_residual_block_cavlc(w, nc, &lv, &ZIGZAG4X4, 0, 15, 16)
-            };
-            debug_assert_eq!(
-                n, nz_luma[raster] as usize,
-                "luma block ({bx},{by}): the decision's count disagrees with the writer's"
-            );
-            cur[raster] = n as u8;
-        }
+    // Luma, then (4:4:4) Cb and Cr coded the same way — the mirror of
+    // `parse_residual_cavlc`'s plane order, each plane's `nC` from its own
+    // neighbour counts (`plane_nc` in src/h264/cavlc.rs).
+    write_plane_residual(w, st, 0, mb_x, left, top, luma_dc, cbp, luma, nz_luma);
+    if st.c444 {
+        write_plane_residual(
+            w, st, 1, mb_x, left, top,
+            luma_dc.is_some().then_some(&chroma_dc[0]),
+            cbp, &chroma_ac[0], &nz_chroma[0],
+        );
+        write_plane_residual(
+            w, st, 2, mb_x, left, top,
+            luma_dc.is_some().then_some(&chroma_dc[1]),
+            cbp, &chroma_ac[1], &nz_chroma[1],
+        );
     }
     if chroma && cbp & 0x30 != 0 {
         for comp in 0..2 {
@@ -412,10 +463,8 @@ fn write_mb_residual(
         }
     }
 
-    // What the neighbours will read: the right column and the bottom row,
-    // including the zeros of blocks nothing coded.
-    st.left_luma = [cur[3], cur[7], cur[11], cur[15]];
-    st.top_luma[mb_x * 4..mb_x * 4 + 4].copy_from_slice(&cur[12..16]);
+    // What the neighbours will read of the 4:2:x chroma state (the
+    // luma-like planes updated theirs above).
     for comp in 0..2 {
         for r in 0..st.rows {
             st.left_chroma[comp][r] = curc[comp][r * 2 + 1];
@@ -447,8 +496,8 @@ pub fn write_intra_picture(
     rec: &mut [Recon],
 ) -> Vec<FilterMb> {
     let mbs_wide = g.mbs_wide as usize;
-    let rows = g.chroma_mb().1 as usize / 4;
-    let mut st = NzState::new(mbs_wide, rows);
+    let rows = if g.chroma == crate::picture::ChromaFormat::Yuv444 { 0 } else { g.chroma_mb().1 as usize / 4 };
+    let mut st = NzState::new(mbs_wide, rows, g.chroma == crate::picture::ChromaFormat::Yuv444);
     code_intra_picture(g, tools, qp, planes, rec, |mb_x, mb_y, dec| {
         write_macroblock(w, dec, &mut st, mb_x, mb_x > 0, mb_y > 0, 0);
     })
@@ -474,8 +523,8 @@ pub fn write_p_picture(
     refp: &[Recon],
 ) -> Vec<FilterMb> {
     let mbs_wide = g.mbs_wide as usize;
-    let rows = g.chroma_mb().1 as usize / 4;
-    let mut st = NzState::new(mbs_wide, rows);
+    let rows = if g.chroma == crate::picture::ChromaFormat::Yuv444 { 0 } else { g.chroma_mb().1 as usize / 4 };
+    let mut st = NzState::new(mbs_wide, rows, g.chroma == crate::picture::ChromaFormat::Yuv444);
     // `mb_skip_run`: counted here, written before each coded macroblock,
     // and flushed after the last one — the reader expects a run before
     // *every* coded macroblock (zero included) and a bare trailing run
@@ -582,8 +631,8 @@ pub fn write_b_picture(
     col: &[FilterMb],
 ) -> Vec<FilterMb> {
     let mbs_wide = g.mbs_wide as usize;
-    let rows = g.chroma_mb().1 as usize / 4;
-    let mut st = NzState::new(mbs_wide, rows);
+    let rows = if g.chroma == crate::picture::ChromaFormat::Yuv444 { 0 } else { g.chroma_mb().1 as usize / 4 };
+    let mut st = NzState::new(mbs_wide, rows, g.chroma == crate::picture::ChromaFormat::Yuv444);
     let mut skip_run: u32 = 0;
     let fmbs = code_b_picture(g, tools, qp, planes, rec, refs, col, |mb_x, mb_y, mb| match mb {
         BMb::Skip(_) => {
@@ -713,7 +762,7 @@ mod tests {
                 dec.cbp_chroma = 2;
             }
 
-            let mut st = NzState::new(1, 2);
+            let mut st = NzState::new(1, 2, false);
             let mut w = BitWriter::new();
             write_p16_macroblock(&mut w, &dec, &mut st, 0, false, false);
             w.rbsp_trailing_bits();
@@ -777,7 +826,7 @@ mod tests {
             dec.chroma_dc[0][1] = 2;
             dec.cbp_chroma = 1;
 
-            let mut st = NzState::new(1, 2);
+            let mut st = NzState::new(1, 2, false);
             let mut w = BitWriter::new();
             write_b16_macroblock(&mut w, &dec, &mut st, 0, false, false, direct);
             w.rbsp_trailing_bits();
@@ -821,6 +870,100 @@ mod tests {
         }
     }
 
+    /// A 4:4:4 intra macroblock — decided by the real mode decision,
+    /// its chroma planes replaying the luma modes luma-style — written
+    /// and handed to the production reader with `chroma_format_idc` 3:
+    /// the kind, the shared coded block pattern, and every plane's
+    /// nonzero counts (the `nC` state a next macroblock's three planes
+    /// would read) must come back as coded. No `intra_chroma_pred_mode`
+    /// exists on the wire, which the reader enforces by construction.
+    #[test]
+    fn a_444_intra_macroblock_round_trips_through_the_reader() {
+        use crate::h264::frame::LUMA_PAD;
+        let tools = IntraTools::new();
+        let mut seed = 77u32;
+        let mut lcg = move || -> u8 {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 16) as u8
+        };
+        for qp in [14u8, 26, 40] {
+            let qpc = chroma_qp(qp as i32, 0, 0);
+            let ctx = IntraCtx {
+                dsp: &tools.dsp,
+                enc: &tools.enc,
+                dist: &tools.dist,
+                quant: &tools.quant,
+                dequant: &tools.dequant,
+                qp: qp as i32,
+                qpc: [qpc; 2],
+                chroma_h: 16,
+                c444: true,
+            };
+            let mut rec = vec![
+                recon_plane(16, 16, LUMA_PAD),
+                recon_plane(16, 16, LUMA_PAD),
+                recon_plane(16, 16, LUMA_PAD),
+            ];
+            let mut y = vec![0u8; 16 * 16];
+            let mut cb = vec![0u8; 16 * 16];
+            let mut cr = vec![0u8; 16 * 16];
+            for i in 0..256 {
+                y[i] = lcg();
+                cb[i] = lcg();
+                cr[i] = lcg();
+            }
+            let mb = MbAvail { left: false, top: false, top_left: false, top_right: false };
+            let (dec, _modes) = code_macroblock(
+                &ctx, &mut rec, 0, 0, &y, 16, [&cb, &cr], 16, mb, &[None; 4], &[None; 4],
+            );
+            assert_eq!(dec.cbp_chroma, 0, "ChromaArrayType 3 has no chroma cbp");
+
+            let mut st = NzState::new(1, 0, true);
+            let mut w = BitWriter::new();
+            write_macroblock(&mut w, &dec, &mut st, 0, false, false, 0);
+            w.rbsp_trailing_bits();
+            let rbsp = w.into_rbsp();
+
+            let sctx = SliceCtx { chroma_format_idc: 3, ..p_ctx() };
+            let sctx = SliceCtx { slice_type: SliceType::I, num_ref_idx: [0, 0], ..sctx };
+            let info = PicInfo::new(1, 1);
+            let nb = MbNeighbours { mb_width: 1, ..MbNeighbours::default() };
+            let dq = Dequant::new(&flat());
+            let mut qps = QpState { prev_qp: qp as i32, chroma_offset: [0, 0] };
+            let mut r = BitReader::new(&rbsp);
+            let t = r.ue();
+            let mut layer = MbLayer::new(DecKind::I4x4);
+            parse_mb_cavlc(&mut r, &sctx, &info, &nb, t, &mut layer, &dq, &mut qps)
+                .expect("the reader rejected the 4:4:4 macroblock");
+            assert!(!r.overrun());
+
+            match dec.kind {
+                MbKind::I4x4 => assert_eq!(layer.kind, DecKind::I4x4, "qp={qp}"),
+                MbKind::I16x16 => {
+                    assert_eq!(layer.kind, DecKind::I16x16, "qp={qp}");
+                    assert_eq!(layer.intra16_mode, dec.intra16_mode);
+                    let want: Vec<i32> = dec.luma_dc.iter().map(|&v| v as i32).collect();
+                    assert_eq!(&layer.dc[0][..], &want[..], "luma DC");
+                    for comp in 0..2 {
+                        let want: Vec<i32> =
+                            dec.chroma_dc[comp].iter().map(|&v| v as i32).collect();
+                        assert_eq!(&layer.dc[1 + comp][..], &want[..], "plane {comp} DC");
+                    }
+                }
+            }
+            assert_eq!(layer.cbp, dec.cbp_luma, "qp={qp} shared cbp");
+            for blk in 0..16 {
+                assert_eq!(layer.nz[0][blk], dec.nz_luma[blk], "qp={qp} luma nz {blk}");
+                for comp in 0..2 {
+                    assert_eq!(
+                        layer.nz[1 + comp][blk], dec.nz_chroma[comp][blk],
+                        "qp={qp} plane {comp} nz {blk}"
+                    );
+                }
+            }
+        }
+    }
+
     /// An intra macroblock in a P slice is the same macroblock with
     /// `mb_type` shifted by 5, and the production reader must unmap it to
     /// the same kind, mode and coded block pattern.
@@ -831,7 +974,7 @@ mod tests {
             chroma_mode: 2,
             ..MbDecision::default()
         };
-        let mut st = NzState::new(1, 2);
+        let mut st = NzState::new(1, 2, false);
         let mut w = BitWriter::new();
         w.ue(0); // the mb_skip_run a coded macroblock follows
         write_macroblock(&mut w, &dec, &mut st, 0, false, false, 5);
@@ -884,7 +1027,7 @@ mod tests {
     /// and the raw DC levels. The AC levels come back dequantised, and
     /// their coverage is the residual writer's own round-trip test.
     fn round_trip(dec: &MbDecision, chosen_modes: Option<&[u8; 16]>, qp: u8) {
-        let mut st = NzState::new(1, 2);
+        let mut st = NzState::new(1, 2, false);
         let mut w = BitWriter::new();
         write_macroblock(&mut w, dec, &mut st, 0, false, false, 0);
         w.rbsp_trailing_bits();
@@ -1001,6 +1144,7 @@ mod tests {
                     qp: qp as i32,
                     qpc: [qpc; 2],
                     chroma_h: 8,
+                    c444: false,
                 };
                 let mut rec = vec![
                     recon_plane(16, 16, LUMA_PAD),

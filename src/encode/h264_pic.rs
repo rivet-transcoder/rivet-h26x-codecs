@@ -109,7 +109,6 @@ struct PicCoding<'a> {
 
 impl<'a> PicCoding<'a> {
     fn new(g: &Geometry, tools: &'a IntraTools, qp: u8, planes: &[Plane<'_>]) -> Self {
-        debug_assert!(g.chroma != ChromaFormat::Yuv444, "ChromaArrayType 3 has no path here");
         let (cw, ch) = g.chroma_mb();
         let chroma_h = ch as usize;
         // 8-bit only (the encoder refuses deeper at construction), and the
@@ -124,6 +123,7 @@ impl<'a> PicCoding<'a> {
             qp: qp as i32,
             qpc: [qpc; 2],
             chroma_h,
+            c444: g.chroma == ChromaFormat::Yuv444,
         };
         let (mbs_wide, mbs_high) = (g.mbs_wide as usize, g.mbs_high as usize);
         let luma_stride = g.coded_width as usize;

@@ -161,7 +161,7 @@ pub fn write_intra_picture_cabac(
         write_mb_type_i_cabac(&mut e, &mut st, inc, intra_mb_type_code(dec));
         write_intra_body(&mut e, &mut st, dec, left, above, cfi);
         coded.push(Coded {
-            nb: WrittenMb::from_decision(dec),
+            nb: WrittenMb::from_decision(dec, cfi == 3),
             not_nxn: dec.kind != MbKind::I4x4,
             chroma_nonzero: dec.chroma_mode != 0,
         });
@@ -209,7 +209,7 @@ pub fn write_p_picture_cabac(
                 // clears it when it takes the skip branch.
                 st.prev_qp_delta_nonzero = false;
                 Coded {
-                    nb: WrittenMb::from_inter_decision(dec),
+                    nb: WrittenMb::from_inter_decision(dec, cfi == 3),
                     not_nxn: true,
                     chroma_nonzero: false,
                 }
@@ -217,7 +217,7 @@ pub fn write_p_picture_cabac(
             PMb::Coded(dec) => {
                 write_p16_body(&mut e, &mut st, dec, left, above, cfi);
                 Coded {
-                    nb: WrittenMb::from_inter_decision(dec),
+                    nb: WrittenMb::from_inter_decision(dec, cfi == 3),
                     not_nxn: true,
                     chroma_nonzero: false,
                 }
@@ -228,7 +228,7 @@ pub fn write_p_picture_cabac(
                 write_mb_type_p_cabac(&mut e, &mut st, 5 + intra_mb_type_code(idec));
                 write_intra_body(&mut e, &mut st, idec, left, above, cfi);
                 Coded {
-                    nb: WrittenMb::from_decision(idec),
+                    nb: WrittenMb::from_decision(idec, cfi == 3),
                     not_nxn: idec.kind != MbKind::I4x4,
                     chroma_nonzero: idec.chroma_mode != 0,
                 }
@@ -285,7 +285,7 @@ pub fn write_b_picture_cabac(
             BMb::Skip(dec) => {
                 st.prev_qp_delta_nonzero = false;
                 Coded {
-                    nb: WrittenMb::from_b_decision(dec),
+                    nb: WrittenMb::from_b_decision(dec, cfi == 3),
                     not_nxn: true,
                     chroma_nonzero: false,
                 }
@@ -332,7 +332,7 @@ pub fn write_b_picture_cabac(
                     st.prev_qp_delta_nonzero = false;
                 }
                 Coded {
-                    nb: WrittenMb::from_b_decision(dec),
+                    nb: WrittenMb::from_b_decision(dec, cfi == 3),
                     not_nxn: true,
                     chroma_nonzero: false,
                 }
@@ -343,7 +343,7 @@ pub fn write_b_picture_cabac(
                 write_mb_type_b_cabac(&mut e, &mut st, inc, 23 + intra_mb_type_code(idec));
                 write_intra_body(&mut e, &mut st, idec, left, above, cfi);
                 Coded {
-                    nb: WrittenMb::from_decision(idec),
+                    nb: WrittenMb::from_decision(idec, cfi == 3),
                     not_nxn: idec.kind != MbKind::I4x4,
                     chroma_nonzero: idec.chroma_mode != 0,
                 }
@@ -375,10 +375,10 @@ pub fn write_skip_picture_cabac(w: &mut BitWriter, g: &Geometry, qp: u8, is_b: b
     // kept anyway, because a shortcut here would be a second spelling of
     // the rule. A skipped B macroblock leaves the same state a skipped P
     // one does: the contexts only ever read `skip`.
-    let skipped = WrittenMb::from_inter_decision(&InterDecision {
-        kind: InterMbKind::PSkip,
-        ..InterDecision::default()
-    });
+    let skipped = WrittenMb::from_inter_decision(
+        &InterDecision { kind: InterMbKind::PSkip, ..InterDecision::default() },
+        false,
+    );
     for idx in 0..total {
         let left = (idx % mbw > 0).then_some(&skipped);
         let above = (idx >= mbw).then_some(&skipped);

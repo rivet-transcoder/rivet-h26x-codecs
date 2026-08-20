@@ -126,16 +126,16 @@ pub struct InterDecision {
     pub luma: [[i16; 16]; 16],
     /// Chroma DC levels per component: four entries used in 4:2:0, eight
     /// in 4:2:2. Same layout as `MbDecision::chroma_dc`.
-    pub chroma_dc: [[i16; 8]; 2],
+    pub chroma_dc: [[i16; 16]; 2],
     /// Chroma AC levels per component, per 4x4 block, position 0 zeroed
     /// (the DC lives in `chroma_dc`). Same layout as
     /// `MbDecision::chroma_ac`.
-    pub chroma_ac: [[[i16; 16]; 8]; 2],
+    pub chroma_ac: [[[i16; 16]; 16]; 2],
     /// Nonzero count per luma 4x4 block (raster), which CAVLC's `nC` needs
     /// from the neighbours and which is free to count while quantising.
     pub nz_luma: [u8; 16],
     /// The same per chroma 4x4 block.
-    pub nz_chroma: [[u8; 8]; 2],
+    pub nz_chroma: [[u8; 16]; 2],
 }
 
 impl Default for InterDecision {
@@ -149,10 +149,10 @@ impl Default for InterDecision {
             cbp_chroma: 0,
             qp_delta: 0,
             luma: [[0; 16]; 16],
-            chroma_dc: [[0; 8]; 2],
-            chroma_ac: [[[0; 16]; 8]; 2],
+            chroma_dc: [[0; 16]; 2],
+            chroma_ac: [[[0; 16]; 16]; 2],
             nz_luma: [0; 16],
-            nz_chroma: [[0; 8]; 2],
+            nz_chroma: [[0; 16]; 2],
         }
     }
 }
@@ -506,9 +506,29 @@ fn predict_inter_16x16(
         luma_pred_into(ctx, &refs[l][0], px as i32, py as i32, mv[l], &mut a);
         (ctx.dsp.copy)(&mut rec[0].data[off..], stride, &a, 16, 16);
     }
-    // Chroma.
+    // Chroma. 4:4:4 interpolates its chroma with the luma six-tap kernel
+    // at the unscaled vector (8.4.2.2: mvCLX = mvLX) — the `c444` branch
+    // of `predict_partition` in src/h264/inter.rs — so the planes go
+    // through the same helper the luma did.
     let h = ctx.chroma_h;
     if h == 0 {
+        return;
+    }
+    if ctx.c444 {
+        for comp in 0..2 {
+            let plane = &mut rec[comp + 1];
+            let off = plane.offset(px as isize, py as isize);
+            let stride = plane.stride;
+            if used[0] && used[1] {
+                luma_pred_into(ctx, &refs[0][comp + 1], px as i32, py as i32, mv[0], &mut a);
+                luma_pred_into(ctx, &refs[1][comp + 1], px as i32, py as i32, mv[1], &mut b);
+                (ctx.dsp.avg)(&mut plane.data[off..], stride, &a, &b, 16, 16);
+            } else {
+                let l = if used[0] { 0 } else { 1 };
+                luma_pred_into(ctx, &refs[l][comp + 1], px as i32, py as i32, mv[l], &mut a);
+                (ctx.dsp.copy)(&mut plane.data[off..], stride, &a, 16, 16);
+            }
+        }
         return;
     }
     let (cx, cy) = ((px / 16) * 8, (py / 16) * h);
@@ -541,11 +561,11 @@ struct InterResidual {
     /// Nonzero count per luma block.
     nz_luma: [u8; 16],
     /// Chroma DC levels per component.
-    chroma_dc: [[i16; 8]; 2],
+    chroma_dc: [[i16; 16]; 2],
     /// Chroma AC levels per component and block, position 0 zeroed.
-    chroma_ac: [[[i16; 16]; 8]; 2],
+    chroma_ac: [[[i16; 16]; 16]; 2],
     /// Nonzero count per chroma block.
-    nz_chroma: [[u8; 8]; 2],
+    nz_chroma: [[u8; 16]; 2],
 }
 
 /// Code the residual of a 16x16 inter macroblock whose *prediction*
@@ -571,9 +591,9 @@ fn code_inter_mb_residual(
         cbp_chroma: 0,
         luma: [[0; 16]; 16],
         nz_luma: [0; 16],
-        chroma_dc: [[0; 8]; 2],
-        chroma_ac: [[[0; 16]; 8]; 2],
-        nz_chroma: [[0; 8]; 2],
+        chroma_dc: [[0; 16]; 2],
+        chroma_ac: [[[0; 16]; 16]; 2],
+        nz_chroma: [[0; 16]; 2],
     };
 
     // Luma: each 4x4 coded and reconstructed in place. Raster order —
@@ -596,13 +616,43 @@ fn code_inter_mb_residual(
         }
     }
 
-    // Chroma, per component: per-4x4 AC with the DC pulled into the 2x2
-    // (4:2:0) or 2x4 (4:2:2) Hadamard, reconstruction back through the
-    // decoder's DC transform and residual add.
     let h = ctx.chroma_h;
     if h == 0 {
         return out;
     }
+    if ctx.c444 {
+        // 4:4:4: the chroma planes code luma-style — each 4x4 keeps its
+        // own DC (no Hadamard split outside Intra_16x16), inter scaling
+        // lists 4 and 5 at the chroma QP — and their coefficients ride
+        // the *same* coded-block-pattern bits as luma, so the planes'
+        // contributions are ORed in.
+        for comp in 0..2 {
+            let src = &src_chroma[comp][soff..];
+            let plane = &mut rec[comp + 1];
+            let off = plane.offset(px as isize, py as isize);
+            let qp = ctx.qpc[comp];
+            for blk in 0..16 {
+                let (bx, by) = (blk % 4, blk / 4);
+                let boff = off + by * 4 * plane.stride + bx * 4;
+                let bsoff = by * 4 * luma_stride + bx * 4;
+                let (lv, n, _) =
+                    code_inter_4x4(ctx, plane, boff, &src[bsoff..], luma_stride, 4 + comp, qp, true);
+                out.chroma_ac[comp][blk] = lv;
+                out.nz_chroma[comp][blk] = n as u8;
+                add_residual_4x4(ctx, plane, boff, &lv, 4 + comp, qp, None);
+            }
+            for blk8 in 0..4 {
+                let (ox, oy) = ((blk8 % 2) * 2, (blk8 / 2) * 2);
+                if (0..4).any(|k| out.nz_chroma[comp][(oy + k / 2) * 4 + ox + k % 2] != 0) {
+                    out.cbp_luma |= 1 << blk8;
+                }
+            }
+        }
+        return out;
+    }
+    // Chroma, per component: per-4x4 AC with the DC pulled into the 2x2
+    // (4:2:0) or 2x4 (4:2:2) Hadamard, reconstruction back through the
+    // decoder's DC transform and residual add.
     let (cx, cy) = (mb_x * 8, mb_y * h);
     let coff = cy * chroma_stride + cx;
     let blocks = h / 4 * 2;
@@ -615,8 +665,8 @@ fn code_inter_mb_residual(
         let qp = ctx.qpc[comp];
         let list = 4 + comp; // Cb inter, Cr inter
         let mut dcs = [0i32; 8];
-        let mut levels = [[0i16; 16]; 8];
-        let mut nz = [0u8; 8];
+        let mut levels = [[0i16; 16]; 16];
+        let mut nz = [0u8; 16];
         for blk in 0..blocks {
             let (bx, by) = (blk % 2, blk / 2);
             let boff = off + by * 4 * plane.stride + bx * 4;
@@ -632,7 +682,7 @@ fn code_inter_mb_residual(
         let m = (qp % 6) as usize;
         let qbits = qbits4(qp) + 1;
         let offset = quant_offset(qbits, false);
-        let mut dc_levels = [0i16; 8];
+        let mut dc_levels = [0i16; 16];
         if blocks == 4 {
             let mut d = [dcs[0], dcs[1], dcs[2], dcs[3]];
             (ctx.enc.hadamard2x2)(&mut d);
@@ -828,13 +878,13 @@ pub struct BDecision {
     /// entropy writer's. Identical layout to [`InterDecision::luma`].
     pub luma: [[i16; 16]; 16],
     /// Chroma DC levels per component.
-    pub chroma_dc: [[i16; 8]; 2],
+    pub chroma_dc: [[i16; 16]; 2],
     /// Chroma AC levels per component and block, position 0 zeroed.
-    pub chroma_ac: [[[i16; 16]; 8]; 2],
+    pub chroma_ac: [[[i16; 16]; 16]; 2],
     /// Nonzero count per luma block.
     pub nz_luma: [u8; 16],
     /// The same per chroma block.
-    pub nz_chroma: [[u8; 8]; 2],
+    pub nz_chroma: [[u8; 16]; 2],
 }
 
 impl Default for BDecision {
@@ -849,10 +899,10 @@ impl Default for BDecision {
             cbp_chroma: 0,
             qp_delta: 0,
             luma: [[0; 16]; 16],
-            chroma_dc: [[0; 8]; 2],
-            chroma_ac: [[[0; 16]; 8]; 2],
+            chroma_dc: [[0; 16]; 2],
+            chroma_ac: [[[0; 16]; 16]; 2],
             nz_luma: [0; 16],
-            nz_chroma: [[0; 8]; 2],
+            nz_chroma: [[0; 16]; 2],
         }
     }
 }
@@ -1084,6 +1134,7 @@ mod tests {
                 qp,
                 qpc: [qp, qp],
                 chroma_h: 8,
+                c444: false,
             }
         }
     }

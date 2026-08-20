@@ -230,7 +230,14 @@ impl H264Encoder {
         let mut recon: Vec<syn::Recon> =
             vec![syn::recon_plane(g.coded_width, g.coded_height, crate::h264::frame::LUMA_PAD)];
         if cw != 0 {
-            let pad = crate::h264::frame::CHROMA_PAD;
+            // 4:4:4 chroma is a luma-like plane: its motion compensation
+            // runs the six-tap luma kernel, whose windows assume the luma
+            // border (Frame::new gives its own 4:4:4 chroma the same).
+            let pad = if self.cfg.chroma == crate::ChromaFormat::Yuv444 {
+                crate::h264::frame::LUMA_PAD
+            } else {
+                crate::h264::frame::CHROMA_PAD
+            };
             recon.push(syn::recon_plane(g.mbs_wide * cw, g.mbs_high * ch, pad));
             recon.push(syn::recon_plane(g.mbs_wide * cw, g.mbs_high * ch, pad));
         }
@@ -249,8 +256,7 @@ impl H264Encoder {
         // luma, a fourth residual layout); CABAC intra stays PCM until its
         // macroblock writer exists.
         let transform_intra = idr
-            && matches!(self.cfg.rate, RateControl::ConstantQp(_))
-            && self.cfg.chroma != crate::ChromaFormat::Yuv444;
+            && matches!(self.cfg.rate, RateControl::ConstantQp(_));
         // Whether a P picture takes the motion-search path rather than
         // all-skip. The same envelope as the intra transform path, plus
         // `bframes == 0`: a stream with B pictures must keep its P motion
@@ -261,8 +267,7 @@ impl H264Encoder {
         // real B pictures (or replicating direct derivation) lifts this.
         let transform_p = !idr
             && c.kind == Kind::P
-            && matches!(self.cfg.rate, RateControl::ConstantQp(_))
-            && self.cfg.chroma != crate::ChromaFormat::Yuv444;
+            && matches!(self.cfg.rate, RateControl::ConstantQp(_));
         // B pictures share the envelope: inside it every picture type is
         // transform-coded, so a colocated picture's motion is always the
         // real record the direct derivation needs; outside it everything
@@ -273,8 +278,7 @@ impl H264Encoder {
         // and real B pictures model colocated motion instead.
         let transform_b = !idr
             && c.kind == Kind::B
-            && matches!(self.cfg.rate, RateControl::ConstantQp(_))
-            && self.cfg.chroma != crate::ChromaFormat::Yuv444;
+            && matches!(self.cfg.rate, RateControl::ConstantQp(_));
         let mut out = Vec::new();
         out.extend_from_slice(&syn::annexb(
             syn::NAL_SPS,

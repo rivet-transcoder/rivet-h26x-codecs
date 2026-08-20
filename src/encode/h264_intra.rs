@@ -65,14 +65,14 @@ pub struct MbDecision {
     pub luma: [[i16; 16]; 16],
     /// Chroma DC levels per component: four entries in 4:2:0, eight in
     /// 4:2:2.
-    pub chroma_dc: [[i16; 8]; 2],
+    pub chroma_dc: [[i16; 16]; 2],
     /// Chroma AC levels per component, per 4x4 block.
-    pub chroma_ac: [[[i16; 16]; 8]; 2],
+    pub chroma_ac: [[[i16; 16]; 16]; 2],
     /// Nonzero count per luma block, which CAVLC's `nC` needs from the
     /// neighbours and which is free to count while quantising.
     pub nz_luma: [u8; 16],
     /// The same per chroma block.
-    pub nz_chroma: [[u8; 8]; 2],
+    pub nz_chroma: [[u8; 16]; 2],
 }
 
 impl Default for MbDecision {
@@ -87,10 +87,10 @@ impl Default for MbDecision {
             qp_delta: 0,
             luma_dc: [0; 16],
             luma: [[0; 16]; 16],
-            chroma_dc: [[0; 8]; 2],
-            chroma_ac: [[[0; 16]; 8]; 2],
+            chroma_dc: [[0; 16]; 2],
+            chroma_ac: [[[0; 16]; 16]; 2],
             nz_luma: [0; 16],
-            nz_chroma: [[0; 8]; 2],
+            nz_chroma: [[0; 16]; 2],
         }
     }
 }
@@ -149,9 +149,13 @@ pub struct IntraCtx<'a> {
     pub qp: i32,
     /// Chroma QP per component.
     pub qpc: [i32; 2],
-    /// Chroma height in samples: 8 for 4:2:0, 16 for 4:2:2, 0 for
-    /// monochrome.
+    /// Chroma height in samples: 8 for 4:2:0, 16 for 4:2:2 *and* 4:4:4,
+    /// 0 for monochrome.
     pub chroma_h: usize,
+    /// ChromaArrayType 3: the chroma planes are coded luma-style — the
+    /// luma prediction modes, transforms and (per-plane) scaling lists at
+    /// the chroma QP — and there is no `intra_chroma_pred_mode`.
+    pub c444: bool,
 }
 
 /// Whether a 4x4 block's top-right neighbour has been reconstructed by the
@@ -290,6 +294,36 @@ fn code_i16x16(
     mb: MbAvail,
     out: &mut MbDecision,
 ) {
+    let (dc_levels, levels, nz) = code_i16x16_plane(ctx, rec, px, py, src, src_stride, mode, mb, 0, ctx.qp);
+    out.kind = MbKind::I16x16;
+    out.intra16_mode = mode;
+    out.luma = levels;
+    out.luma_dc = dc_levels;
+    out.nz_luma = nz;
+    // I_16x16 codes luma AC all-or-nothing.
+    out.cbp_luma = if nz.iter().any(|&n| n != 0) { 15 } else { 0 };
+}
+
+/// The `Intra_16x16` coding of one luma-*style* plane at `(list, qp)`:
+/// prediction, the forward transforms with the DCs pulled through the
+/// Hadamard, and the reconstruction back through the decoder's inverse
+/// path. The luma plane runs it at list 0 and the slice QP; in 4:4:4 the
+/// chroma planes run the *same* function at their own list and QP, which
+/// is exactly the decoder's plane loop (`derive()` in src/h264/recon.rs:
+/// `plane_qp = [qp, qpc[0], qpc[1]]`, scaling list `p`).
+#[allow(clippy::too_many_arguments)]
+fn code_i16x16_plane(
+    ctx: &IntraCtx,
+    rec: &mut Recon,
+    px: usize,
+    py: usize,
+    src: &[u8],
+    src_stride: usize,
+    mode: u8,
+    mb: MbAvail,
+    list: usize,
+    qp: i32,
+) -> ([i16; 16], [[i16; 16]; 16], [u8; 16]) {
     let off = rec.offset(px as isize, py as isize);
     let av = IntraAvail {
         top: mb.top,
@@ -307,7 +341,7 @@ fn code_i16x16(
         let (bx, by) = (blk % 4, blk / 4);
         let boff = off + by * 4 * rec.stride + bx * 4;
         let soff = by * 4 * src_stride + bx * 4;
-        let (lv, n, dc) = code_block_4x4(ctx, rec, boff, &src[soff..], src_stride, 0, ctx.qp, false);
+        let (lv, n, dc) = code_block_4x4(ctx, rec, boff, &src[soff..], src_stride, list, qp, false);
         levels[blk] = lv;
         nz[blk] = n as u8;
         dcs[blk] = dc;
@@ -317,13 +351,13 @@ fn code_i16x16(
     // position-0 multiplier, which is what 8.5.10 inverts.
     let mut dc_i32 = dcs;
     (ctx.enc.hadamard4)(&mut dc_i32);
-    let m = (ctx.qp % 6) as usize;
-    let qbits = qbits4(ctx.qp) + 1;
+    let m = (qp % 6) as usize;
+    let qbits = qbits4(qp) + 1;
     let offset = quant_offset(qbits, true);
     let mut dc_levels = [0i16; 16];
     for i in 0..16 {
         let c = dc_i32[i];
-        let mf = ctx.quant.mf4[0][m][0] as i64;
+        let mf = ctx.quant.mf4[list][m][0] as i64;
         let v = ((c.unsigned_abs() as i64 * mf + offset as i64) >> qbits) as i32;
         dc_levels[i] = if c < 0 { -v as i16 } else { v as i16 };
     }
@@ -334,20 +368,51 @@ fn code_i16x16(
     for i in 0..16 {
         dc_rec[i] = dc_levels[i] as i32;
     }
-    luma_dc_transform(&mut dc_rec, ctx.dequant.scale4[0][m][0], ctx.qp);
+    luma_dc_transform(&mut dc_rec, ctx.dequant.scale4[list][m][0], qp);
     for blk in 0..16 {
         let (bx, by) = (blk % 4, blk / 4);
         let boff = off + by * 4 * rec.stride + bx * 4;
-        reconstruct_4x4(ctx, rec, boff, &levels[blk], 0, ctx.qp, Some(dc_rec[blk]));
+        reconstruct_4x4(ctx, rec, boff, &levels[blk], list, qp, Some(dc_rec[blk]));
     }
+    (dc_levels, levels, nz)
+}
 
-    out.kind = MbKind::I16x16;
-    out.intra16_mode = mode;
-    out.luma = levels;
-    out.luma_dc = dc_levels;
-    out.nz_luma = nz;
-    // I_16x16 codes luma AC all-or-nothing.
-    out.cbp_luma = if nz.iter().any(|&n| n != 0) { 15 } else { 0 };
+/// The `Intra_4x4` coding of one luma-style plane with the modes already
+/// fixed: 4:4:4's chroma planes replay the luma decision's modes block by
+/// block in decode order — each block predicting from this plane's own
+/// reconstruction of those before it — exactly as the decoder's `I4x4`
+/// plane loop does (`derive()` walks each plane's sixteen blocks with the
+/// shared `layer.intra_modes`).
+#[allow(clippy::too_many_arguments)]
+fn code_i4x4_plane_fixed(
+    ctx: &IntraCtx,
+    rec: &mut Recon,
+    px: usize,
+    py: usize,
+    src: &[u8],
+    src_stride: usize,
+    mb: MbAvail,
+    modes: &[u8; 16],
+    list: usize,
+    qp: i32,
+) -> ([[i16; 16]; 16], [u8; 16]) {
+    let base = rec.offset(px as isize, py as isize);
+    let mut levels = [[0i16; 16]; 16];
+    let mut nz = [0u8; 16];
+    for scan in 0..16 {
+        let bx = crate::h264::tables::BLK4X4_X[scan] as usize;
+        let by = crate::h264::tables::BLK4X4_Y[scan] as usize;
+        let raster = by * 4 + bx;
+        let boff = base + by * 4 * rec.stride + bx * 4;
+        let soff = by * 4 * src_stride + bx * 4;
+        let av = avail_4x4(bx, by, mb);
+        let _ = predict_4x4(rec, boff, rec.stride, modes[raster], av, 8);
+        let (lv, n, _) = code_block_4x4(ctx, rec, boff, &src[soff..], src_stride, list, qp, true);
+        levels[raster] = lv;
+        nz[raster] = n as u8;
+        reconstruct_4x4(ctx, rec, boff, &lv, list, qp, None);
+    }
+    (levels, nz)
 }
 
 /// Code one macroblock as `I_4x4`, choosing each block's mode by SATD
@@ -480,8 +545,8 @@ fn code_chroma(
         let qp = ctx.qpc[comp];
         let list = 1 + comp; // Cb intra, Cr intra
         let mut dcs = [0i32; 8];
-        let mut levels = [[0i16; 16]; 8];
-        let mut nz = [0u8; 8];
+        let mut levels = [[0i16; 16]; 16];
+        let mut nz = [0u8; 16];
         for blk in 0..blocks {
             let (bx, by) = (blk % 2, blk / 2);
             let boff = off + by * 4 * plane.stride + bx * 4;
@@ -513,7 +578,7 @@ fn code_chroma(
         let m = (qp % 6) as usize;
         let qbits = qbits4(qp) + 1;
         let offset = quant_offset(qbits, true);
-        let mut dc_levels = [0i16; 8];
+        let mut dc_levels = [0i16; 16];
         if blocks == 4 {
             let mut d = [dcs[0], dcs[1], dcs[2], dcs[3]];
             (ctx.enc.hadamard2x2)(&mut d);
@@ -585,6 +650,13 @@ fn code_chroma(
     } else {
         0
     };
+}
+
+/// The fixed 4x4 modes the 4:4:4 chroma planes replay: the luma
+/// decision's chosen modes (`chosen_4x4` from [`code_macroblock`]'s I4x4
+/// path — meaningless, and unused, for I_16x16).
+fn chosen_4x4_modes(_out: &MbDecision, chosen: &[u8; 16]) -> [u8; 16] {
+    *chosen
 }
 
 /// The Lagrangian multiplier H.264 mode decision conventionally uses,
@@ -689,7 +761,65 @@ pub fn code_macroblock(
         chosen_4x4 = modes;
     }
 
-    if ctx.chroma_h != 0 {
+    if ctx.c444 {
+        // 4:4:4: the chroma planes are coded luma-style with the modes the
+        // luma decision just chose, at their own QP and scaling list —
+        // no chroma prediction mode exists, and the coded block pattern is
+        // shared: a luma cbp bit covers that 8x8 in all three planes, so
+        // the planes' contributions are ORed in (I_16x16 stays
+        // all-or-nothing across the three).
+        let mut any_ac = false;
+        for comp in 0..2 {
+            let (cx, cy) = (mb_x * 16, mb_y * 16);
+            let coff = cy * chroma_stride + cx;
+            let (levels, nz) = match out.kind {
+                MbKind::I16x16 => {
+                    let (dc, levels, nz) = code_i16x16_plane(
+                        ctx,
+                        &mut rec[comp + 1],
+                        cx,
+                        cy,
+                        &src_chroma[comp][coff..],
+                        chroma_stride,
+                        out.intra16_mode,
+                        mb,
+                        1 + comp,
+                        ctx.qpc[comp],
+                    );
+                    out.chroma_dc[comp] = dc;
+                    (levels, nz)
+                }
+                MbKind::I4x4 => code_i4x4_plane_fixed(
+                    ctx,
+                    &mut rec[comp + 1],
+                    cx,
+                    cy,
+                    &src_chroma[comp][coff..],
+                    chroma_stride,
+                    mb,
+                    &chosen_4x4_modes(&out, &chosen_4x4),
+                    1 + comp,
+                    ctx.qpc[comp],
+                ),
+            };
+            out.chroma_ac[comp] = levels;
+            out.nz_chroma[comp] = nz;
+            any_ac |= nz.iter().any(|&n| n != 0);
+            if out.kind == MbKind::I4x4 {
+                for blk8 in 0..4 {
+                    let (ox, oy) = ((blk8 % 2) * 2, (blk8 / 2) * 2);
+                    if (0..4).any(|k| nz[(oy + k / 2) * 4 + ox + k % 2] != 0) {
+                        out.cbp_luma |= 1 << blk8;
+                    }
+                }
+            }
+        }
+        if out.kind == MbKind::I16x16 && (any_ac || out.cbp_luma != 0) {
+            out.cbp_luma = 15;
+        }
+        // `cbp_chroma` does not exist for ChromaArrayType 3 (the coded
+        // block pattern is 0..=15); it stays 0.
+    } else if ctx.chroma_h != 0 {
         let (cw, ch) = (8usize, ctx.chroma_h);
         let (cx, cy) = (mb_x * cw, mb_y * ch);
         let coff = cy * chroma_stride + cx;
@@ -812,6 +942,7 @@ mod tests {
             qp: 26,
             qpc: [26, 26],
             chroma_h: 8,
+            c444: false,
         };
         let mut rec = crate::encode::h264_syntax::recon_plane(32, 32, 16);
         for v in rec.data.iter_mut() {
