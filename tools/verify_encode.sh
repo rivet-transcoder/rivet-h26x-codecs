@@ -75,6 +75,31 @@ fi
 # inter reach the table through different code, so a high-QP row for one buys
 # nothing for the other: every combination of codec, entropy coder and
 # prediction mode that indexes a QP table needs its own row above 29.
+#
+# The third instance sharpened it again, and this time about the clips
+# rather than the configurations. Coding 4:4:4's luma-style chroma planes
+# at the luma quantiser under the 8x8 transform is a *literal no-op* at QP
+# 26 — the two expressions are the same integer, the bitstream is byte for
+# byte what the unmutated encoder writes — and fatal at QP 40. But it lives
+# inside a 4:4:4 branch, so a high-QP row catches it only because a 4:4:4
+# clip is in the source list. The quantiser axis lives here; the chroma
+# format axis lives in the sources; a QP table reached under one format
+# alone needs both, and a row above 29 is necessary rather than
+# sufficient.
+# Nothing below this line may be a comment. CONFIGS is a quoted string, so
+# a leading # is data: the reader takes the whole line as a configuration
+# name with no flags and runs the encoder's defaults under it, which
+# passes, tests nothing, and inflates the count. Seven such lines once
+# added forty-nine cells that all quietly re-ran the same default
+# configuration. Notes go above.
+#
+# The SAO rows are carried by two of the seven clips, and it is worth
+# knowing which. On the gradient and odd clips the decision selects "off"
+# for every component of every coding tree block — correctly, there is
+# nothing there for SAO to shape — so those cells prove the syntax and
+# prove nothing about the filter. detail and motion are where the filter
+# actually runs. A row is only as strong as the clips that make it do
+# something.
 CONFIGS=${CONFIGS:-"
 lossless-intra|--codec h264 --lossless --gop 0
 cqp-intra|--codec h264 --qp 26 --gop 0
@@ -90,18 +115,13 @@ cqp40-t8x8|--codec h264 --qp 40 --gop 8 --t8x8
 cavlc-t8x8|--codec h264 --qp 26 --gop 8 --cavlc --t8x8
 cavlc40-t8x8|--codec h264 --qp 40 --gop 8 --cavlc --t8x8
 hevc-lossless-intra|--codec h265 --lossless --gop 0
+hevc-lossless-ip|--codec h265 --lossless --gop 8
+hevc-lossless-ipb|--codec h265 --lossless --gop 8 --bframes 2
 hevc-cqp-intra|--codec h265 --qp 26 --gop 0
 hevc-cqp-ip|--codec h265 --qp 26 --gop 8
 hevc-cqp40-intra|--codec h265 --qp 40 --gop 0
 hevc-cqp40-ip|--codec h265 --qp 40 --gop 8
 hevc-cqp-ipb|--codec h265 --qp 26 --gop 8 --bframes 2
-# The SAO rows are carried by two of the seven clips, and it is worth
-# knowing which. On the gradient and odd clips the decision selects "off"
-# for every component of every coding tree block — correctly, there is no
-# quantisation structure there to shape — so those cells prove the syntax
-# and prove nothing about the filter. detail and motion are where the
-# filter actually runs. A row is only as strong as the clips that make it
-# do something.
 hevc-cqp40-sao-intra|--codec h265 --qp 40 --gop 0 --sao
 hevc-cqp40-sao-ip|--codec h265 --qp 40 --gop 8 --sao
 "}
@@ -211,6 +231,14 @@ results="$OUT/results.txt"
 for src in $SOURCES; do
   echo "$CONFIGS" | while IFS='|' read -r name flags; do
     [ -z "$name" ] && continue
+    # A configuration with no flags is always a mistake — most often a
+    # comment line, which is data inside this quoted string rather than a
+    # comment. Refuse it instead of running the defaults under its name.
+    case "$name" in
+      *' '*|'#'*)
+        echo "verify_encode.sh: not a configuration: $name" >&2
+        exit 2 ;;
+    esac
     echo "$src|$name|$flags"
   done
 done | xargs -P "$JOBS" -I{} bash -c 'IFS="|" read -r s n f <<< "{}"; one "$s" "$n" "$f"' \
