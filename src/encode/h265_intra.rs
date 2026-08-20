@@ -933,16 +933,28 @@ enum ModeSignal {
 ///   QP 26 and 5.64 at QP 40, against 3 here: understated by 88% at high
 ///   QP, where these cells regressed. `ChromaDerived` is 0.53 and 0.12
 ///   against 1.
-/// - So the correction is real, and pricing it correctly still lost —
-///   which says the imbalance is not in this function alone. Doubling the
-///   Lagrangian made it worse again (size +1.36%), so it is not a scale
-///   error either. The residual term in [`lambda_bits`] — a flat three
-///   bins per nonzero level — is the remaining suspect, since it is the
-///   larger number and the one this function's callers compare against.
+/// - So the correction is real, and pricing it correctly still lost.
 ///
-/// Fixing the rate of one syntax element while the residual beside it is
-/// still guessed at makes the total *less* balanced, not more. The inter
-/// side had no such companion guess and a real count won there.
+/// Two explanations were tested and BOTH are wrong, which is worth more
+/// than the guesses would have been:
+///
+/// - **Not the Lagrangian.** Doubling it made things worse again (size
+///   +1.36%), so the imbalance is not a uniform scale error.
+/// - **Not the residual charge beside it.** The obvious suspect was
+///   [`lambda_bits`]'s flat three bins per nonzero level, since it is the
+///   larger number and the one these costs are compared against. Sweeping
+///   it to 6 and 9 with the counted mode rate enabled recovered nothing:
+///   13, 15 and 17 cells regressed at 3, 6 and 9 respectively. The scale
+///   of the residual term is not what makes a correct mode rate lose.
+///
+/// What that leaves is the limit named on the counting itself: these
+/// prices are taken at the slice's INITIAL probabilities, and the mode
+/// decision is a 35-way exhaustive search whose own choices are what the
+/// real contexts adapt to. `intra_chroma_pred_mode`'s context is the
+/// sharpest case — a decision that starts preferring "derived" makes
+/// "derived" cheaper still, and a static price cannot see that loop.
+/// Whoever picks this up should try an adapted context array through the
+/// decision pass before touching anything else.
 fn mode_signalling_cost(qp: i32, signal: ModeSignal) -> f32 {
     let bins = match signal {
         ModeSignal::LumaMpm(0) => 2,
