@@ -10,20 +10,19 @@
 //! # State of it
 //!
 //! Configuration, picture typing and coding order, the access-unit envelope,
-//! and real compression on both picture types: all-intra CAVLC pictures go
-//! through prediction, transform and quantisation
-//! ([`super::h264_cavlc_mb::write_intra_picture`]), and CAVLC P pictures
-//! carry real motion — search, P_Skip where it is legal, the intra decision
-//! where inter loses ([`super::h264_cavlc_mb::write_p_picture`]). What still
-//! codes as `I_PCM` does so for a stated reason each — lossless, because PCM
-//! *is* the exact mode and the transform path is lossy; 4:4:4, which the
-//! intra coder does not cover yet; and CABAC intra, whose macroblock writer
-//! is not built. B pictures are all-skip — and so are the P pictures of a
-//! stream that *has* B pictures, because an all-skip B assumes zero motion
-//! in its colocated picture (see `transform_p` below). CABAC inter refuses
-//! with `Unsupported` by name. `tools/verify_encode.sh` reports each hole as
-//! what it is, which is the honest state: the plumbing is proven and every
-//! hole has a name.
+//! and real compression on both picture types through both entropy coders:
+//! intra and P pictures go through prediction, transform, quantisation and
+//! the loop filter, decided once in the shared walks of
+//! [`super::h264_pic`] and spelled by the CAVLC
+//! ([`super::h264_cavlc_mb`]) or CABAC ([`super::h264_cabac_mb`]) writers.
+//! What still codes as `I_PCM` does so for a stated reason each —
+//! lossless, because PCM *is* the exact mode and the transform path is
+//! lossy; and 4:4:4, which the intra coder does not cover yet. B pictures
+//! are all-skip — and so are the P pictures of a stream that *has* B
+//! pictures, because an all-skip B assumes zero motion in its colocated
+//! picture (see `transform_p` below). `tools/verify_encode.sh` reports
+//! each hole as what it is, which is the honest state: the plumbing is
+//! proven and every hole has a name.
 
 use super::gop::{Coded, Kind, Scheduler};
 use super::h264_syntax as syn;
@@ -63,7 +62,7 @@ pub struct H264Encoder {
     /// Plane sizes of one source picture, derived once.
     plane_dims: Vec<(u32, u32)>,
     /// Kernels and derived tables for the transform intra path, built once.
-    tools: super::h264_cavlc_mb::IntraTools,
+    tools: super::h264_pic::IntraTools,
 }
 
 /// The exponents the SPS declares. Fixed rather than derived: 16 bits of
@@ -117,7 +116,7 @@ impl H264Encoder {
             frame_num: 0,
             idr_pic_id: 0,
             plane_dims,
-            tools: super::h264_cavlc_mb::IntraTools::new(),
+            tools: super::h264_pic::IntraTools::new(),
         })
     }
 
@@ -171,25 +170,13 @@ impl H264Encoder {
         Ok(out)
     }
 
-    /// Code one picture.
-    ///
-    /// Every macroblock is `I_PCM` for now: samples carried raw, no
-    /// prediction, no transform, no residual. That is a legal H.264 stream
-    /// and an exactly lossless one, which is what makes it the right first
-    /// output — it proves the parameter sets, the slice header, the
-    /// macroblock layer, NAL framing and emulation prevention against a real
-    /// decoder before any question of quality exists.
+    /// Code one picture: parameter sets, slice header, then the slice data
+    /// of whichever path the configuration selects — the transform writers
+    /// (either entropy coder), PCM where exactness or 4:4:4 demands it, or
+    /// the all-skip inter fallback.
     fn code_picture(&mut self, c: Coded, src: &[u8]) -> Result<Access> {
         let g = self.geom;
         let idr = c.kind == Kind::Idr;
-        if !idr && self.cfg.entropy == Entropy::Cabac {
-            // Skipping through CABAC is `mb_skip_flag` per macroblock against a
-            // context derived from the neighbours, not an `mb_skip_run` count.
-            // Different enough to be its own piece of work.
-            return Err(Error::unsupported(
-                "H.264 encode: CABAC inter slices (encoder in progress; --cavlc works)",
-            ));
-        }
         // Reference lists, by picture order count: list0 runs backwards from
         // the current picture, list1 forwards. A P picture uses list0 only.
         let (past, future) = self.lists_for(c.poc);
@@ -247,7 +234,6 @@ impl H264Encoder {
         // luma, a fourth residual layout); CABAC intra stays PCM until its
         // macroblock writer exists.
         let transform_intra = idr
-            && self.cfg.entropy == Entropy::Cavlc
             && matches!(self.cfg.rate, RateControl::ConstantQp(_))
             && self.cfg.chroma != crate::ChromaFormat::Yuv444;
         // Whether a P picture takes the motion-search path rather than
@@ -261,7 +247,6 @@ impl H264Encoder {
         let transform_p = !idr
             && c.kind == Kind::P
             && self.cfg.bframes == 0
-            && self.cfg.entropy == Entropy::Cavlc
             && matches!(self.cfg.rate, RateControl::ConstantQp(_))
             && self.cfg.chroma != crate::ChromaFormat::Yuv444;
         let mut out = Vec::new();
@@ -272,6 +257,7 @@ impl H264Encoder {
         ));
         out.extend_from_slice(&syn::annexb(syn::NAL_PPS, 3, &syn::write_pps(&self.cfg, qp)));
 
+        let cabac = self.cfg.entropy == Entropy::Cabac;
         let mut w = BitWriter::with_capacity(self.frame_bytes + 256);
         syn::write_slice_header(
             &syn::SliceHeader {
@@ -291,21 +277,27 @@ impl H264Encoder {
                 // all-skip one is bS 0 on every edge, so the filter leaves
                 // both untouched.
                 deblock: true,
+                cabac,
             },
             qp,
             &mut w,
         );
-        let cabac = self.cfg.entropy == Entropy::Cabac;
         if idr {
-            if cabac {
-                // Closes the slice itself: the arithmetic coder flush writes
-                // the stop bit, so there is no `rbsp_trailing_bits` after it.
-                syn::write_pcm_slice_data_cabac(&mut w, &g, qp, &planes, &mut recon);
+            // A CABAC slice's final terminate flushes the codeword and its
+            // last one *is* the rbsp_stop_one_bit, so the CABAC writers
+            // close the slice themselves and no `rbsp_trailing_bits`
+            // follows them (9.3.4.6) — on both the transform and PCM paths.
+            if transform_intra && cabac {
+                super::h264_cabac_mb::write_intra_picture_cabac(
+                    &mut w, &g, &self.tools, qp, &planes, &mut recon,
+                );
             } else if transform_intra {
                 super::h264_cavlc_mb::write_intra_picture(
                     &mut w, &g, &self.tools, qp, &planes, &mut recon,
                 );
                 w.rbsp_trailing_bits();
+            } else if cabac {
+                syn::write_pcm_slice_data_cabac(&mut w, &g, qp, &planes, &mut recon);
             } else {
                 for mb_y in 0..g.mbs_high {
                     for mb_x in 0..g.mbs_wide {
@@ -316,18 +308,31 @@ impl H264Encoder {
             }
         } else if transform_p {
             // A real P picture: motion search, skip where it is legal and
-            // free, the intra decision where inter loses.
+            // free, the intra decision where inter loses. One decision
+            // walk, two spellings (`encode::h264_pic`).
             let p0 = past.expect("checked above");
-            super::h264_cavlc_mb::write_p_picture(
-                &mut w,
-                &g,
-                &self.tools,
-                qp,
-                &planes,
-                &mut recon,
-                &self.refs[p0].1,
-            );
-            w.rbsp_trailing_bits();
+            if cabac {
+                super::h264_cabac_mb::write_p_picture_cabac(
+                    &mut w,
+                    &g,
+                    &self.tools,
+                    qp,
+                    &planes,
+                    &mut recon,
+                    &self.refs[p0].1,
+                );
+            } else {
+                super::h264_cavlc_mb::write_p_picture(
+                    &mut w,
+                    &g,
+                    &self.tools,
+                    qp,
+                    &planes,
+                    &mut recon,
+                    &self.refs[p0].1,
+                );
+                w.rbsp_trailing_bits();
+            }
         } else {
             // Every macroblock skipped — still what B pictures do, and what
             // P pictures fall back to outside the transform envelope.
@@ -339,7 +344,11 @@ impl H264Encoder {
             // Deblocking does not disturb it either: every edge has matching
             // motion, the same reference and no coefficients, so every
             // boundary strength is zero.
-            w.ue(g.mbs_wide * g.mbs_high); // mb_skip_run
+            if cabac {
+                super::h264_cabac_mb::write_skip_picture_cabac(&mut w, &g, qp, c.kind == Kind::B);
+            } else {
+                w.ue(g.mbs_wide * g.mbs_high); // mb_skip_run
+            }
             let p0 = past.expect("checked above");
             match c.kind {
                 Kind::B => {
@@ -361,7 +370,9 @@ impl H264Encoder {
                     }
                 }
             }
-            w.rbsp_trailing_bits();
+            if !cabac {
+                w.rbsp_trailing_bits();
+            }
         }
         out.extend_from_slice(&syn::annexb(
             if idr { syn::NAL_IDR } else { syn::NAL_SLICE },
@@ -509,13 +520,16 @@ mod tests {
         assert!(format!("{err}").contains("expected"), "{err}");
     }
 
-    /// The hole is where it should be: the plumbing above it runs, and what
-    /// fails names itself. Entropy coding is no longer the hole — both
-    /// coders write a whole intra picture — so what this pins now is that an
-    /// all-intra configuration codes, and that the next thing missing
-    /// announces itself as inter prediction rather than failing obscurely.
+    /// Both entropy coders code whole GOPs now — all-intra and IP alike —
+    /// so what this pins is that no configuration in that envelope errors,
+    /// and that the pictures come out typed as expected. The named holes
+    /// that remain (4:4:4 transform coding, B pictures with real motion)
+    /// are stated in the module docs rather than asserted here, because a
+    /// hole is verified by the encode gate reporting it, not by a unit
+    /// test guarding its error string.
     #[test]
-    fn intra_codes_and_the_remaining_hole_says_what_it_is() {
+    fn both_entropy_coders_code_intra_and_inter_gops() {
+        let frame = vec![0u8; 64 * 64 * 3 / 2];
         for entropy in [Entropy::Cabac, Entropy::Cavlc] {
             let mut e = H264Encoder::new(Config {
                 gop: 0,
@@ -523,41 +537,25 @@ mod tests {
                 ..cfg(64, 64, ChromaFormat::Yuv420, 8)
             })
             .unwrap();
-            let out = e.push(&vec![0u8; 64 * 64 * 3 / 2]).unwrap();
+            let out = e.push(&frame).unwrap();
             assert_eq!(out.len(), 1, "{entropy:?}: an all-intra picture should code");
             assert!(out[0].keyframe, "{entropy:?}: the first picture is an IDR");
-        }
 
-        // Inter through CAVLC codes; inter through CABAC is the hole that
-        // remains, and it must name itself as CABAC rather than as inter,
-        // because inter is not what is missing.
-        let frame = vec![0u8; 64 * 64 * 3 / 2];
-        let mut e = H264Encoder::new(Config {
-            gop: 8,
-            entropy: Entropy::Cavlc,
-            ..cfg(64, 64, ChromaFormat::Yuv420, 8)
-        })
-        .unwrap();
-        for i in 0..4 {
-            e.push(&frame).unwrap_or_else(|e| panic!("CAVLC inter picture {i}: {e}"));
-        }
-
-        let mut e = H264Encoder::new(Config {
-            gop: 8,
-            entropy: Entropy::Cabac,
-            ..cfg(64, 64, ChromaFormat::Yuv420, 8)
-        })
-        .unwrap();
-        let mut named = false;
-        for _ in 0..4 {
-            if let Err(err) = e.push(&frame) {
-                let s = format!("{err}");
-                assert!(s.contains("CABAC inter"), "{s}");
-                named = true;
-                break;
+            let mut e = H264Encoder::new(Config {
+                gop: 8,
+                entropy,
+                ..cfg(64, 64, ChromaFormat::Yuv420, 8)
+            })
+            .unwrap();
+            let mut coded = 0;
+            for i in 0..4 {
+                let out = e
+                    .push(&frame)
+                    .unwrap_or_else(|err| panic!("{entropy:?} inter picture {i}: {err}"));
+                coded += out.len();
             }
+            assert_eq!(coded, 4, "{entropy:?}: every pushed picture codes");
         }
-        assert!(named, "a CABAC GOP longer than one should have reached the CABAC inter hole");
     }
 
     /// Every picture offered must be codable exactly once, whatever the GOP
@@ -581,15 +579,7 @@ mod tests {
                 // never held, which is the bookkeeping fault this exists to
                 // catch, and it would otherwise look like a coding bug.
                 if let Err(err) = e.push(&frame) {
-                    let s = format!("{err}");
-                    assert!(
-                        !s.contains("absent picture"),
-                        "gop={gop} b={bframes} picture {i}: {s}"
-                    );
-                    assert!(
-                        s.contains("CABAC inter"),
-                        "gop={gop} b={bframes} picture {i}: {s}"
-                    );
+                    panic!("gop={gop} b={bframes} picture {i}: {err}");
                 }
             }
             // Flushing releases whatever is still held, and must not find a

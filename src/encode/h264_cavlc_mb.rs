@@ -28,25 +28,16 @@
 //! two macroblocks later.
 
 use crate::bitwriter::BitWriter;
-use crate::dsp::Cpu;
-use crate::dsp::distortion::DistortionDsp;
-use crate::dsp::h264::H264Dsp;
-use crate::dsp::h264_enc::{H264EncDsp, Quant};
-use crate::encode::h264_deblock::{FilterMb, deblock_recon, nz_mask_of};
-use crate::encode::h264_intra::{IntraCtx, MbAvail, MbDecision, MbKind, code_macroblock};
-use crate::encode::h264_me::{
-    InterDecision, InterMbKind, MotionNeighbours, code_macroblock_p16, nb_inter, nb_intra,
-};
+use crate::encode::h264_intra::{MbDecision, MbKind};
+use crate::encode::h264_me::{InterDecision, InterMbKind};
+use crate::encode::h264_pic::{IntraTools, PMb, code_intra_picture, code_p_picture};
 use crate::encode::h264_syntax::{Geometry, Plane, Recon};
 use crate::h264::cavlc::{SCAN_CHROMA_DC, write_residual_block_cavlc};
-use crate::h264::mb::{NbMotion, chroma_qp, raster_of_blk};
-use crate::h264::sps::ScalingLists;
+use crate::h264::mb::raster_of_blk;
 use crate::h264::tables::{
     GOLOMB_TO_INTER_CBP, GOLOMB_TO_INTER_CBP_GRAY, GOLOMB_TO_INTRA4X4_CBP,
     GOLOMB_TO_INTRA4X4_CBP_GRAY, SCAN_CHROMA_DC_422, ZIGZAG4X4,
 };
-use crate::h264::transform::Dequant;
-use crate::picture::ChromaFormat;
 
 /// `coded_block_pattern` me(v) for intra: cbp -> codeNum, the inverse of
 /// the reader's codeNum -> cbp table, derived from it at compile time.
@@ -94,40 +85,6 @@ static INTER_CBP_TO_GOLOMB_GRAY: [u8; 16] = {
     }
     inv
 };
-
-/// The kernels and derived tables the intra transform path runs on, built
-/// once per encoder. Nothing in here is CAVLC-specific — the CABAC intra
-/// writer will want the same set — but this module is its first user.
-pub struct IntraTools {
-    dsp: H264Dsp<u8>,
-    enc: H264EncDsp,
-    dist: DistortionDsp<u8>,
-    quant: Quant,
-    dequant: Dequant,
-}
-
-impl IntraTools {
-    /// Build for the running CPU. The scaling lists are flat sixteens
-    /// because the parameter sets this encoder writes carry no scaling
-    /// matrices, which makes flat the lists a decoder will derive.
-    pub fn new() -> Self {
-        let lists = ScalingLists { list4x4: [[16; 16]; 6], list8x8: [[16; 64]; 6] };
-        let cpu = Cpu::detect_honouring_env();
-        IntraTools {
-            dsp: H264Dsp::new(cpu),
-            enc: H264EncDsp::new(cpu),
-            dist: DistortionDsp::new(cpu),
-            quant: Quant::new(&lists),
-            dequant: Dequant::new(&lists),
-        }
-    }
-}
-
-impl Default for IntraTools {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// The per-picture nonzero-coefficient state `nC` (9.2.1) predicts from:
 /// what the reader gathers per macroblock in `MbNeighbours::gather_nz`,
@@ -470,98 +427,10 @@ fn write_mb_residual(
     }
 }
 
-/// A source plane grown to the coded size by edge replication — the same
-/// fill the PCM path uses, and for the same reason: the cropping
-/// rectangle hides these samples, and repeating the edge keeps the coded
-/// picture free of an artificial boundary that would cost bits.
-fn pad_to(src: &Plane<'_>, w: usize, h: usize) -> Vec<u8> {
-    let mut out = vec![0u8; w * h];
-    let sw = (src.width as usize).min(w);
-    for y in 0..h {
-        let sy = y.min(src.height as usize - 1);
-        let row = &src.data[sy * src.stride..sy * src.stride + sw];
-        let dst = &mut out[y * w..y * w + w];
-        dst[..sw].copy_from_slice(row);
-        for d in dst[sw..].iter_mut() {
-            *d = row[sw - 1];
-        }
-    }
-    out
-}
-
-/// The coding context and padded sources a picture writer works from —
-/// built one way for intra and inter pictures alike, so the two cannot
-/// disagree about geometry or quantisation.
-struct PicCoding<'a> {
-    /// The per-picture context both mode-decision modules take.
-    ctx: IntraCtx<'a>,
-    /// Picture size in macroblocks.
-    mbs_wide: usize,
-    /// See `mbs_wide`.
-    mbs_high: usize,
-    /// Chroma AC block rows: 0 (monochrome), 2 (4:2:0) or 4 (4:2:2).
-    rows: usize,
-    /// Stride of `src_y` (the coded width).
-    luma_stride: usize,
-    /// Stride of `src_cb` / `src_cr`; 0 for monochrome.
-    chroma_stride: usize,
-    /// The source planes at coded size, edge-replicated.
-    src_y: Vec<u8>,
-    /// See `src_y` (empty for monochrome).
-    src_cb: Vec<u8>,
-    /// See `src_y`.
-    src_cr: Vec<u8>,
-}
-
-impl<'a> PicCoding<'a> {
-    fn new(g: &Geometry, tools: &'a IntraTools, qp: u8, planes: &[Plane<'_>]) -> Self {
-        debug_assert!(g.chroma != ChromaFormat::Yuv444, "ChromaArrayType 3 has no path here");
-        let (cw, ch) = g.chroma_mb();
-        let chroma_h = ch as usize;
-        // 8-bit only (the encoder refuses deeper at construction), and the
-        // PPS writes both chroma QP offsets as zero.
-        let qpc = chroma_qp(qp as i32, 0, 0);
-        let ctx = IntraCtx {
-            dsp: &tools.dsp,
-            enc: &tools.enc,
-            dist: &tools.dist,
-            quant: &tools.quant,
-            dequant: &tools.dequant,
-            qp: qp as i32,
-            qpc: [qpc; 2],
-            chroma_h,
-        };
-        let (mbs_wide, mbs_high) = (g.mbs_wide as usize, g.mbs_high as usize);
-        let luma_stride = g.coded_width as usize;
-        let src_y = pad_to(&planes[0], luma_stride, g.coded_height as usize);
-        let (chroma_stride, src_cb, src_cr) = if cw != 0 {
-            let stride = mbs_wide * cw as usize;
-            let height = mbs_high * chroma_h;
-            (
-                stride,
-                pad_to(&planes[1], stride, height),
-                pad_to(&planes[2], stride, height),
-            )
-        } else {
-            (0, Vec::new(), Vec::new())
-        };
-        PicCoding {
-            ctx,
-            mbs_wide,
-            mbs_high,
-            rows: chroma_h / 4,
-            luma_stride,
-            chroma_stride,
-            src_y,
-            src_cb,
-            src_cr,
-        }
-    }
-}
-
-/// Code and write every macroblock of an all-intra CAVLC picture, leaving
-/// the reconstruction in `rec`. The slice header is already written; the
-/// caller closes the RBSP.
+/// Write every macroblock of an all-intra CAVLC picture: the shared walk
+/// (`h264_pic::code_intra_picture`) makes the decisions, reconstructs and runs the
+/// loop filter; this side only spells bits and keeps the `nC` state. The
+/// slice header is already written; the caller closes the RBSP.
 ///
 /// `qp` is the slice QP, which every macroblock is coded at —
 /// [`MbDecision::qp_delta`] passes through as `mb_qp_delta` and is zero
@@ -576,89 +445,24 @@ pub fn write_intra_picture(
     planes: &[Plane<'_>],
     rec: &mut [Recon],
 ) {
-    let pc = PicCoding::new(g, tools, qp, planes);
-    let ctx = &pc.ctx;
-    let (mbs_wide, mbs_high) = (pc.mbs_wide, pc.mbs_high);
-    let (luma_stride, chroma_stride) = (pc.luma_stride, pc.chroma_stride);
-    let (src_y, src_cb, src_cr) = (&pc.src_y[..], &pc.src_cb[..], &pc.src_cr[..]);
-
-    let mut st = NzState::new(mbs_wide, pc.rows);
-    let mut fmbs: Vec<FilterMb> = Vec::with_capacity(mbs_wide * mbs_high);
-    // The neighbouring macroblocks' 4x4 modes along the shared edges, for
-    // the prediction of 8.3.1.1: `Some(2)` for an available macroblock
-    // that was not I_NxN (see the module documentation), `None` only where
-    // there is no macroblock — though an absent side is never read, since
-    // the availability flags gate it first.
-    let mut top_modes: Vec<[Option<u8>; 4]> = vec![[None; 4]; mbs_wide];
-    for mb_y in 0..mbs_high {
-        let mut left_modes: [Option<u8>; 4] = [None; 4];
-        for mb_x in 0..mbs_wide {
-            let mb = MbAvail {
-                left: mb_x > 0,
-                top: mb_y > 0,
-                top_left: mb_x > 0 && mb_y > 0,
-                top_right: mb_y > 0 && mb_x + 1 < mbs_wide,
-            };
-            let (dec, modes) = code_macroblock(
-                ctx,
-                rec,
-                mb_x,
-                mb_y,
-                src_y,
-                luma_stride,
-                [src_cb, src_cr],
-                chroma_stride,
-                mb,
-                &left_modes,
-                &top_modes[mb_x],
-            );
-            write_macroblock(w, &dec, &mut st, mb_x, mb.left, mb.top, 0);
-            fmbs.push(FilterMb {
-                kind: match dec.kind {
-                    MbKind::I4x4 => crate::h264::mb::MbKind::I4x4,
-                    MbKind::I16x16 => crate::h264::mb::MbKind::I16x16,
-                },
-                nz_mask: nz_mask_of(&dec.nz_luma),
-                mv: crate::h264::frame::Mv::ZERO,
-            });
-            (left_modes, top_modes[mb_x]) = match dec.kind {
-                MbKind::I4x4 => (
-                    [Some(modes[3]), Some(modes[7]), Some(modes[11]), Some(modes[15])],
-                    [Some(modes[12]), Some(modes[13]), Some(modes[14]), Some(modes[15])],
-                ),
-                MbKind::I16x16 => ([Some(2); 4], [Some(2); 4]),
-            };
-        }
-    }
-    // The loop filter, last: the whole picture is reconstructed (intra
-    // prediction read its unfiltered neighbours above, as a decoder's
-    // does), and what leaves this function — toward the SELF check and
-    // the reference list — is the filtered picture a decoder emits.
-    deblock_recon(&tools.dsp, g, qp, &fmbs, rec);
+    let mbs_wide = g.mbs_wide as usize;
+    let rows = g.chroma_mb().1 as usize / 4;
+    let mut st = NzState::new(mbs_wide, rows);
+    code_intra_picture(g, tools, qp, planes, rec, |mb_x, mb_y, dec| {
+        write_macroblock(w, dec, &mut st, mb_x, mb_x > 0, mb_y > 0, 0);
+    });
 }
 
-/// Code and write every macroblock of a P CAVLC picture — motion search,
-/// skip, and the intra fallback — leaving the reconstruction in `rec`.
-/// The slice header is already written; the caller closes the RBSP.
+/// Write every macroblock of a P CAVLC picture: the shared walk
+/// (`h264_pic::code_p_picture`) owns the motion search, the skip decision, the
+/// intra fallback and every neighbour state a decoder derives; this side
+/// spells the bits — the `mb_skip_run` bookkeeping and the macroblock
+/// layers — and keeps the `nC` state. The slice header is already
+/// written; the caller closes the RBSP.
 ///
 /// `refp` is the reference picture's reconstruction, borders already
 /// replicated ([`crate::encode::h264_me::prepare_reference`]); exactly one
 /// reference is active, which is why no `ref_idx` is ever written.
-///
-/// Three per-macroblock states walk the picture together, each mirroring
-/// what the reader derives rather than what would be convenient:
-///
-/// - **Motion** ([`MotionNeighbours`]): an inter macroblock contributes
-///   its vector with `ref_idx` 0 — a *skipped* one contributes the
-///   derived skip vector, because a decoder stores exactly that — and an
-///   intra macroblock contributes "available, not used for inter
-///   prediction". The above-left value is saved before the row entry is
-///   overwritten, or every D neighbour would be one picture-row too new.
-/// - **`nC` counts** (`NzState`): coded macroblocks store what the
-///   residual writer returns; skipped ones store zeros (`skip_nz`).
-/// - **Intra modes**: `Some(2)` for every available macroblock that is
-///   not `I_NxN` — skip and P_16x16 included — because that is the DC the
-///   reader's mode prediction derives for them (8.3.1.1).
 pub fn write_p_picture(
     w: &mut BitWriter,
     g: &Geometry,
@@ -668,143 +472,47 @@ pub fn write_p_picture(
     rec: &mut [Recon],
     refp: &[Recon],
 ) {
-    let pc = PicCoding::new(g, tools, qp, planes);
-    let ctx = &pc.ctx;
-    let (mbs_wide, mbs_high) = (pc.mbs_wide, pc.mbs_high);
-    let (luma_stride, chroma_stride) = (pc.luma_stride, pc.chroma_stride);
-    let (src_y, src_cb, src_cr) = (&pc.src_y[..], &pc.src_cb[..], &pc.src_cr[..]);
-
-    let mut st = NzState::new(mbs_wide, pc.rows);
-    let mut fmbs: Vec<FilterMb> = Vec::with_capacity(mbs_wide * mbs_high);
-    let mut top_modes: Vec<[Option<u8>; 4]> = vec![[None; 4]; mbs_wide];
-    let mut top_motion: Vec<NbMotion> = vec![NbMotion::NONE; mbs_wide];
+    let mbs_wide = g.mbs_wide as usize;
+    let rows = g.chroma_mb().1 as usize / 4;
+    let mut st = NzState::new(mbs_wide, rows);
     // `mb_skip_run`: counted here, written before each coded macroblock,
     // and flushed after the last one — the reader expects a run before
     // *every* coded macroblock (zero included) and a bare trailing run
     // when the slice ends in skips (7.3.4).
     let mut skip_run: u32 = 0;
-    for mb_y in 0..mbs_high {
-        let mut left_modes: [Option<u8>; 4] = [None; 4];
-        let mut left_motion = NbMotion::NONE;
-        let mut topleft_motion = NbMotion::NONE;
-        for mb_x in 0..mbs_wide {
-            let nbm = MotionNeighbours {
-                a: left_motion,
-                b: if mb_y > 0 { top_motion[mb_x] } else { NbMotion::NONE },
-                c: if mb_y > 0 && mb_x + 1 < mbs_wide {
-                    top_motion[mb_x + 1]
-                } else {
-                    NbMotion::NONE
-                },
-                d: topleft_motion,
-            };
-            let dec = code_macroblock_p16(
-                ctx,
-                rec,
-                refp,
-                mb_x,
-                mb_y,
-                src_y,
-                luma_stride,
-                [src_cb, src_cr],
-                chroma_stride,
-                &nbm,
-            );
-            // The above-left of the *next* column is what stands in this
-            // column's row entry now, before this macroblock replaces it.
-            topleft_motion = if mb_y > 0 { top_motion[mb_x] } else { NbMotion::NONE };
-            match dec.kind {
-                InterMbKind::PSkip => {
-                    skip_run += 1;
-                    skip_nz(&mut st, mb_x);
-                    fmbs.push(FilterMb {
-                        kind: crate::h264::mb::MbKind::PSkip,
-                        nz_mask: 0,
-                        mv: dec.mv,
-                    });
-                    let m = nb_inter(dec.mv);
-                    left_motion = m;
-                    top_motion[mb_x] = m;
-                    left_modes = [Some(2); 4];
-                    top_modes[mb_x] = [Some(2); 4];
-                }
-                InterMbKind::P16x16 => {
-                    w.ue(skip_run);
-                    skip_run = 0;
-                    write_p16_macroblock(w, &dec, &mut st, mb_x, mb_x > 0, mb_y > 0);
-                    fmbs.push(FilterMb {
-                        kind: crate::h264::mb::MbKind::Inter16x16,
-                        nz_mask: nz_mask_of(&dec.nz_luma),
-                        mv: dec.mv,
-                    });
-                    let m = nb_inter(dec.mv);
-                    left_motion = m;
-                    top_motion[mb_x] = m;
-                    left_modes = [Some(2); 4];
-                    top_modes[mb_x] = [Some(2); 4];
-                }
-                InterMbKind::UseIntra => {
-                    let mb = MbAvail {
-                        left: mb_x > 0,
-                        top: mb_y > 0,
-                        top_left: mb_x > 0 && mb_y > 0,
-                        top_right: mb_y > 0 && mb_x + 1 < mbs_wide,
-                    };
-                    let (idec, modes) = code_macroblock(
-                        ctx,
-                        rec,
-                        mb_x,
-                        mb_y,
-                        src_y,
-                        luma_stride,
-                        [src_cb, src_cr],
-                        chroma_stride,
-                        mb,
-                        &left_modes,
-                        &top_modes[mb_x],
-                    );
-                    w.ue(skip_run);
-                    skip_run = 0;
-                    // Intra in a P slice: the same macroblock, `mb_type`
-                    // shifted by 5 (Table 7-11's note).
-                    write_macroblock(w, &idec, &mut st, mb_x, mb.left, mb.top, 5);
-                    fmbs.push(FilterMb {
-                        kind: match idec.kind {
-                            MbKind::I4x4 => crate::h264::mb::MbKind::I4x4,
-                            MbKind::I16x16 => crate::h264::mb::MbKind::I16x16,
-                        },
-                        nz_mask: nz_mask_of(&idec.nz_luma),
-                        mv: crate::h264::frame::Mv::ZERO,
-                    });
-                    left_motion = nb_intra();
-                    top_motion[mb_x] = nb_intra();
-                    (left_modes, top_modes[mb_x]) = match idec.kind {
-                        MbKind::I4x4 => (
-                            [Some(modes[3]), Some(modes[7]), Some(modes[11]), Some(modes[15])],
-                            [Some(modes[12]), Some(modes[13]), Some(modes[14]), Some(modes[15])],
-                        ),
-                        MbKind::I16x16 => ([Some(2); 4], [Some(2); 4]),
-                    };
-                }
-            }
+    code_p_picture(g, tools, qp, planes, rec, refp, |mb_x, mb_y, mb| match mb {
+        PMb::Skip(_) => {
+            skip_run += 1;
+            skip_nz(&mut st, mb_x);
         }
-    }
+        PMb::Coded(dec) => {
+            w.ue(skip_run);
+            skip_run = 0;
+            write_p16_macroblock(w, dec, &mut st, mb_x, mb_x > 0, mb_y > 0);
+        }
+        PMb::Intra(idec) => {
+            w.ue(skip_run);
+            skip_run = 0;
+            // Intra in a P slice: the same macroblock, `mb_type` shifted
+            // by 5 (Table 7-11's note).
+            write_macroblock(w, idec, &mut st, mb_x, mb_x > 0, mb_y > 0, 5);
+        }
+    });
     if skip_run > 0 {
         w.ue(skip_run);
     }
-    // The loop filter, after the whole picture is reconstructed and before
-    // the reconstruction becomes the next picture's reference — the
-    // decoder's own ordering.
-    deblock_recon(&tools.dsp, g, qp, &fmbs, rec);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bitreader::BitReader;
-    use crate::encode::h264_intra::PredMode;
+    use crate::encode::h264_intra::{IntraCtx, MbAvail, PredMode, code_macroblock};
     use crate::encode::h264_syntax::recon_plane;
     use crate::h264::SliceType;
+    use crate::h264::mb::chroma_qp;
+    use crate::h264::sps::ScalingLists;
+    use crate::h264::transform::Dequant;
     use crate::h264::cavlc::{intra_mb_type, parse_mb_cavlc};
     use crate::h264::frame::{CHROMA_PAD, LUMA_PAD};
     use crate::h264::mb::{MbKind as DecKind, MbLayer, MbNeighbours, PicInfo, SliceCtx};

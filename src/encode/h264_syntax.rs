@@ -224,16 +224,17 @@ pub struct SliceHeader {
     pub log2_max_poc_lsb: u32,
     /// Whether later pictures may reference this one.
     pub reference: bool,
-    /// Whether the deblocking filter runs over this slice.
-    ///
-    /// The PCM and all-skip paths leave it on, where it provably does
-    /// nothing (PCM macroblocks average to a qP of zero, all-skip edges
-    /// have boundary strength zero). The transform intra path turns it
-    /// off, because the encoder does not yet run the filter over its own
-    /// reconstruction — a filtered decode against an unfiltered
-    /// reconstruction would fail SELF on every coded edge. When the
-    /// encoder learns to deblock, this flips on for the quality it buys.
+    /// Whether the deblocking filter runs over this slice. Always true
+    /// today: the transform picture writers run the decoder's own filter
+    /// over their reconstruction, and on the PCM and all-skip paths the
+    /// filter provably does nothing (PCM macroblocks average to a qP of
+    /// zero, all-skip edges have boundary strength zero). Kept as a field
+    /// because a slice that legitimately wants the filter off — offsets,
+    /// rate experiments — is a header question, not a rewrite.
     pub deblock: bool,
+    /// Whether the slice is entropy-coded with CABAC — a P or B header
+    /// then carries `cabac_init_idc`.
+    pub cabac: bool,
 }
 
 /// `slice_type` for an I, P or B slice, in the "all slices of this picture
@@ -275,6 +276,14 @@ pub fn write_slice_header(h: &SliceHeader, pps_qp: u8, w: &mut BitWriter) {
         } else {
             w.flag(false); // adaptive_ref_pic_marking_mode_flag
         }
+    }
+    if h.cabac && h.kind != Kind::Idr && h.kind != Kind::I {
+        // `cabac_init_idc`, the missing-bit twin of the one-spurious-bit
+        // class: the reader takes it on every CABAC P/B slice, before
+        // `slice_qp_delta` (7.3.3), and a writer that omits it hands the
+        // QP field's bits to the initialisation index. Zero, matching the
+        // `CabacState::new(_, 0, _)` the slice-data writers run.
+        w.ue(0);
     }
     w.se(h.qp as i32 - pps_qp as i32); // slice_qp_delta
     // deblocking_filter_control_present_flag is 1 in the PPS. The offsets
