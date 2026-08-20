@@ -1618,11 +1618,55 @@ mod tests {
     #[test]
     fn every_b_decision_replays_through_an_independent_decoder_state() {
         for chroma in [ChromaFormat::Monochrome, ChromaFormat::Yuv420, ChromaFormat::Yuv422, ChromaFormat::Yuv444] {
-            replay_b_one_format(chroma);
+            // Three sources per format, because ONE source does not reach
+            // the shapes. An earlier version of this test used only the
+            // bi fixture and every CU came out `Merge` at the zero vector;
+            // `BAmvp` never occurred at all, and a mutation sweep showed
+            // five of six seeded faults passing. The scenarios exist to
+            // drive each `inter_pred_idc` for real.
+            let mut seen_idc = [false; 3];
+            for scen in [BScenario::Uni0, BScenario::Uni1, BScenario::Bi] {
+                replay_b_one_format(chroma, scen, &mut seen_idc);
+            }
+            assert!(seen_idc[0], "{chroma:?}: no CU ever coded PRED_L0 through AMVP");
+            assert!(seen_idc[1], "{chroma:?}: no CU ever coded PRED_L1 through AMVP");
+            // PRED_BI through AMVP is deliberately NOT asserted, and the
+            // reason is a property of the decision rather than a gap in
+            // this test. Whenever both lists find good vectors, the merge
+            // list already holds an equivalent two-list candidate — from a
+            // neighbour, a combined bi-predictive pair, or the bi zero
+            // candidate — and merge costs a couple of bins against AMVP-BI's
+            // `inter_pred_idc` plus two mvds plus two mvp flags. Merge
+            // therefore wins on rate, correctly. Bi prediction and bi
+            // reconstruction ARE exercised here, through those merge CUs
+            // (the `BScenario::Bi` guard below requires a coded two-list
+            // CU); what is not exercised is the AMVP-BI *signalling*.
+            //
+            // That signalling is covered where it can be driven directly:
+            // `hevc::ctu`'s `b_inter_pred_idc_round_trips_by_value` writes
+            // all three `inter_pred_idc` values through the production
+            // writer and reads them back with the production decoder. If
+            // an iterative bi refinement ever lands, AMVP-BI should start
+            // winning here and this comment becomes an assertion.
+            let _ = seen_idc[2];
         }
     }
 
-    fn replay_b_one_format(chroma: ChromaFormat) {
+    /// What the source of a B replay looks like, and therefore which
+    /// signalling the decision should reach for.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum BScenario {
+        /// An exact translation of the list-0 anchor: `PRED_L0` should win.
+        Uni0,
+        /// An exact translation of the list-1 anchor: `PRED_L1` should win.
+        Uni1,
+        /// The average of both anchors, each moved toward this picture —
+        /// what default-weighted bi-prediction produces, so `PRED_BI`
+        /// should win.
+        Bi,
+    }
+
+    fn replay_b_one_format(chroma: ChromaFormat, scen: BScenario, seen_idc: &mut [bool; 3]) {
         let kit = Kit::new();
         let ctx = kit.ctx(30);
         let (sps, pps) = parsed_sets_fmt(64, 64, chroma);
@@ -1630,35 +1674,47 @@ mod tests {
         // Two anchors around the current picture: POC 1 in the past, POC 3
         // in the future, current POC 2 — a real B, so NoBackwardPredFlag
         // is false and both lists are live.
+        // The two anchors must carry DIFFERENT texture, not the same
+        // grating at an offset. With identical structure, a per-list
+        // search cannot tell which anchor it is looking at: both lists
+        // converge on the same vector, their average equals either half,
+        // and PRED_BI can never beat a uni shape on rate — so the bi path
+        // would go untested however the source were built. Independent
+        // noise per anchor is what makes each list's own vector findable
+        // and makes averaging genuinely better than either half, which is
+        // the whole premise of bi-prediction.
         let mut ref0 = reference_fmt(64, 64, 17, chroma);
-        ref0.poc = 1;
-        ref0.extend_rows(0, 64);
-        // The future anchor is the same content shifted, so the two lists
-        // genuinely disagree and averaging them is not the same as either.
         let mut ref1 = reference_fmt(64, 64, 23, chroma);
-        for y in 0..64usize {
-            for x in 0..64usize {
-                let off = ref1.y.offset(x as isize, y as isize);
-                let v = ref1.y.data[off] as i32;
-                ref1.y.data[off] = (v + 9).clamp(0, 255) as u8;
+        for (f, mut seed) in [(&mut ref0, 0x51ed_u64), (&mut ref1, 0xb0a7_u64)] {
+            for y in 0..64usize {
+                for x in 0..64usize {
+                    let off = f.y.offset(x as isize, y as isize);
+                    let d = (lcg(&mut seed) % 24) as i32 - 12;
+                    f.y.data[off] = (f.y.data[off] as i32 + d).clamp(0, 255) as u8;
+                }
             }
         }
+        ref0.poc = 1;
+        ref0.extend_rows(0, 64);
         ref1.poc = 3;
         ref1.extend_rows(0, 64);
 
-        // Source: what a picture midway between the two anchors actually
-        // looks like — each anchor's content moved toward it and the two
-        // averaged, which is precisely what default-weighted
-        // bi-prediction produces. A source that were an exact translation
-        // of ONE anchor would make that list win every CU and leave the
-        // bi path untested; the vacuity guard below caught exactly that
-        // while this test was being written.
-        let (mut sy, scb, scr) = bi_translated(&ref0, (2, 1), &ref1, (-2, -1));
+        // The source this scenario asks for. Even vectors throughout, so
+        // the chroma translation is integral in every format and the
+        // fixture matches what `predict_block` derives.
+        let (mut sy, scb, scr) = match scen {
+            BScenario::Uni0 => translated(&ref0, 4, 2),
+            BScenario::Uni1 => translated(&ref1, -4, -2),
+            BScenario::Bi => bi_translated(&ref0, (4, 2), &ref1, (-4, -2)),
+        };
+        // Light damage, so residual survives and the AMVP shapes are
+        // reached rather than everything collapsing to skip. Kept well
+        // below the level that would make intra win.
         let mut s = 41u64;
         for yy in 0..64usize {
             for xx in 0..64usize {
                 if (xx / 16 + yy / 16) % 3 == 0 {
-                    let d = (lcg(&mut s) % 40) as i32 - 20;
+                    let d = (lcg(&mut s) % 16) as i32 - 8;
                     let v = &mut sy[yy * 64 + xx];
                     *v = (*v as i32 + d).clamp(0, 255) as u8;
                 }
@@ -1677,14 +1733,33 @@ mod tests {
             }
         }
         assert_invariants(&decisions, cat);
+        let tag = format!("{chroma:?}/{scen:?}");
+        // Record which `inter_pred_idc` values were reached, for the
+        // caller's aggregate coverage check. Only a CODED CU counts: a
+        // `UseIntra` decision still carries the motion fields this module
+        // filled before the intra check, so counting those would make the
+        // guard vacuous — which is exactly how the earlier version of this
+        // test managed to prove nothing.
+        for d in &decisions {
+            if let InterCuKind::BAmvp { idc, .. } = d.kind {
+                seen_idc[idc as usize] = true;
+            }
+        }
         assert!(
-            decisions.iter().any(|d| matches!(d.kind, InterCuKind::BAmvp { idc: 2, .. }) || d.ref_idx >= 0 && d.ref_idx_l1 >= 0),
-            "{chroma:?}: no CU used both lists — the bi path is untested here"
+            decisions.iter().any(|d| !matches!(d.kind, InterCuKind::UseIntra)),
+            "{tag}: every CU went intra; the inter path is untested here"
         );
-        assert!(
-            decisions.iter().any(|d| d.ref_idx_l1 >= 0),
-            "{chroma:?}: list 1 was never used at all"
-        );
+        // The scenario must actually reach the shape it is named for,
+        // through some CU: uni scenarios a single-list CU, the bi scenario
+        // a two-list one. Merge candidates count here — they carry lists
+        // too — but intra decisions do not.
+        let coded = decisions.iter().filter(|d| !matches!(d.kind, InterCuKind::UseIntra));
+        let hit = match scen {
+            BScenario::Uni0 => coded.clone().any(|d| d.ref_idx >= 0 && d.ref_idx_l1 < 0),
+            BScenario::Uni1 => coded.clone().any(|d| d.ref_idx < 0 && d.ref_idx_l1 >= 0),
+            BScenario::Bi => coded.clone().any(|d| d.ref_idx >= 0 && d.ref_idx_l1 >= 0),
+        };
+        assert!(hit, "{tag}: the scenario never reached its own prediction shape");
 
         // The independent state.
         let geo = std::sync::Arc::new(Geometry::new(&sps, &pps));
@@ -1800,10 +1875,10 @@ mod tests {
             fill_motion(&mut frame.motion, frame.w4, x0, y0, n, n, mi);
             PicInfo::fill4(&mut info.pred_mode, w4, x0, y0, n, n, 0);
         }
-        assert_eq!(frame.y.data, pic.recon.y.data, "{chroma:?}: luma reconstruction differs from the replay");
-        assert_eq!(frame.cb.data, pic.recon.cb.data, "{chroma:?}: cb reconstruction differs from the replay");
-        assert_eq!(frame.cr.data, pic.recon.cr.data, "{chroma:?}: cr reconstruction differs from the replay");
-        assert_eq!(frame.motion, pic.recon.motion, "{chroma:?}: motion grids diverged");
+        assert_eq!(frame.y.data, pic.recon.y.data, "{tag}: luma reconstruction differs from the replay");
+        assert_eq!(frame.cb.data, pic.recon.cb.data, "{tag}: cb reconstruction differs from the replay");
+        assert_eq!(frame.cr.data, pic.recon.cr.data, "{tag}: cr reconstruction differs from the replay");
+        assert_eq!(frame.motion, pic.recon.motion, "{tag}: motion grids diverged");
     }
 
     /// The anchor: every decision, replayed through the decoder's own
