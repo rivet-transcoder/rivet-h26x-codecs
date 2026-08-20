@@ -335,18 +335,32 @@ fn interp(r: &Recon, x0: i32, y0: i32, ww: usize, hh: usize, out: &mut [u8], ker
     }
 }
 
-/// Interpolate the 16x16 luma prediction for `mv` at macroblock position
+/// Interpolate a `w` by `h` luma prediction for `mv` at position
 /// `(x, y)` into a [`PRED_STRIDE`]-strided scratch block, through the
 /// decoder's own quarter-sample kernel — the addressing is
 /// `predict_partition`'s (src/h264/inter.rs): six-tap window two left of
 /// and two above the integer position, kernel picked by the two fraction
 /// bits of each component.
-fn luma_pred_into(ctx: &MeCtx, r: &Recon, x: i32, y: i32, mv: Mv, dst: &mut [u8; 16 * PRED_STRIDE]) {
+///
+/// `(x, y)` is the *partition's* position in the picture, not the
+/// macroblock's: a partition interpolates from its own corner, so a 16x8
+/// lower half reads eight rows further down and its window moves with it.
+#[allow(clippy::too_many_arguments)]
+fn luma_pred_into(
+    ctx: &MeCtx,
+    r: &Recon,
+    x: i32,
+    y: i32,
+    mv: Mv,
+    w: usize,
+    h: usize,
+    dst: &mut [u8; 16 * PRED_STRIDE],
+) {
     let xi = x + (mv.x as i32 >> 2);
     let yi = y + (mv.y as i32 >> 2);
     let pos = ((mv.y & 3) as usize) * 4 + (mv.x & 3) as usize;
     let k = ctx.dsp.qpel[pos];
-    interp(r, xi - 2, yi - 2, 16 + 5, 16 + 5, dst, |o, s, st| k(o, s, st, 16, 16, 255));
+    interp(r, xi - 2, yi - 2, w + 5, h + 5, dst, |o, s, st| k(o, s, st, w, h, 255));
 }
 
 /// Interpolate one chroma component's prediction (8 wide, `ch` high) for
@@ -355,7 +369,18 @@ fn luma_pred_into(ctx: &MeCtx, r: &Recon, x: i32, y: i32, mv: Mv, dst: &mut [u8;
 /// `predict_partition`'s (src/h264/inter.rs, 8.4.1.4), progressive frames
 /// only: eighth-sample fractions in 4:2:0; in 4:2:2 the vertical component
 /// is in quarter *chroma* samples, so the fraction doubles.
-fn chroma_pred_into(ctx: &MeCtx, r: &Recon, cx: i32, cy: i32, mv: Mv, ch: usize, dst: &mut [u8; 16 * PRED_STRIDE]) {
+#[allow(clippy::too_many_arguments)]
+fn chroma_pred_into(
+    ctx: &MeCtx,
+    r: &Recon,
+    cx: i32,
+    cy: i32,
+    mv: Mv,
+    cw: usize,
+    ch_h: usize,
+    ch: usize,
+    dst: &mut [u8; 16 * PRED_STRIDE],
+) {
     let xci = cx + (mv.x as i32 >> 3);
     let (yci, yf) = if ch == 8 {
         (cy + (mv.y as i32 >> 3), (mv.y & 7) as i32)
@@ -364,7 +389,7 @@ fn chroma_pred_into(ctx: &MeCtx, r: &Recon, cx: i32, cy: i32, mv: Mv, ch: usize,
     };
     let xf = (mv.x & 7) as i32;
     let kc = ctx.dsp.chroma;
-    interp(r, xci, yci, 8 + 1, ch + 1, dst, |o, s, st| kc(o, s, st, 8, ch, xf, yf));
+    interp(r, xci, yci, cw + 1, ch_h + 1, dst, |o, s, st| kc(o, s, st, cw, ch_h, xf, yf));
 }
 
 // ---------------------------------------------------------------------------
@@ -374,17 +399,32 @@ fn chroma_pred_into(ctx: &MeCtx, r: &Recon, cx: i32, cy: i32, mv: Mv, ch: usize,
 /// Search range: full samples either side of the (clamped) predictor.
 const RANGE: i32 = 16;
 
-/// Find the 16x16 vector for the macroblock at luma position `(x, y)`,
-/// returning it with its SATD. See the module docs for the algorithm, its
-/// limits and its cost.
-fn search_16x16(ctx: &MeCtx, r: &Recon, x: i32, y: i32, src: &[u8], src_stride: usize, pred: Mv) -> (Mv, u32) {
+/// Find the vector for the `w` by `h` partition at luma position
+/// `(x, y)`, returning it with its SATD. See the module docs for the
+/// algorithm, its limits and its cost.
+///
+/// `(x, y)` and the size are the *partition's*: a 16x8 lower half
+/// searches from its own corner over its own eight rows, which is what
+/// makes two halves able to find different motion.
+#[allow(clippy::too_many_arguments)]
+fn search_rect(
+    ctx: &MeCtx,
+    r: &Recon,
+    x: i32,
+    y: i32,
+    w: usize,
+    h: usize,
+    src: &[u8],
+    src_stride: usize,
+    pred: Mv,
+) -> (Mv, u32) {
     // The searchable full-sample window: every position whose own six-tap
     // window is a direct read, shrunk by one on the low side so quarter
     // refinement (which can lower the floor by one) stays a direct read
     // too. See "Window legality" in the module docs.
     let pad = r.pad as i32;
-    let (lo_x, hi_x) = (3 - pad - x, r.width as i32 + pad - 19 - x);
-    let (lo_y, hi_y) = (3 - pad - y, r.height as i32 + pad - 19 - y);
+    let (lo_x, hi_x) = (3 - pad - x, r.width as i32 + pad - (w as i32 + 3) - x);
+    let (lo_y, hi_y) = (3 - pad - y, r.height as i32 + pad - (h as i32 + 3) - y);
     debug_assert!(lo_x <= hi_x && lo_y <= hi_y, "plane too small to search");
 
     // Seed at the predictor rounded to full samples, clamped legal; the
@@ -399,7 +439,7 @@ fn search_16x16(ctx: &MeCtx, r: &Recon, x: i32, y: i32, src: &[u8], src_stride: 
         // so scoring against the plane directly is the same arithmetic
         // without the copy.
         let off = r.offset((x + fx) as isize, (y + fy) as isize);
-        (ctx.dist.sad)(src, src_stride, &r.data[off..], r.stride, 16, 16)
+        (ctx.dist.sad)(src, src_stride, &r.data[off..], r.stride, w, h)
     };
 
     // Greedy small diamond on SAD. `visited` is indexed relative to the
@@ -447,8 +487,8 @@ fn search_16x16(ctx: &MeCtx, r: &Recon, x: i32, y: i32, src: &[u8], src_stride: 
     // with SATD first, because SAD and SATD are not on the same scale.
     let mut scratch = [0u8; 16 * PRED_STRIDE];
     let mut satd_of = |mv: Mv| -> u32 {
-        luma_pred_into(ctx, r, x, y, mv, &mut scratch);
-        (ctx.dist.satd)(src, src_stride, &scratch, PRED_STRIDE, 16, 16)
+        luma_pred_into(ctx, r, x, y, mv, w, h, &mut scratch);
+        (ctx.dist.satd)(src, src_stride, &scratch, PRED_STRIDE, w, h)
     };
     let mut mv = Mv::new((best.1.0 * 4) as i16, (best.1.1 * 4) as i16);
     let mut cost = satd_of(mv);
@@ -456,7 +496,13 @@ fn search_16x16(ctx: &MeCtx, r: &Recon, x: i32, y: i32, src: &[u8], src_stride: 
         let base = mv;
         for (dx, dy) in [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
             let cand = Mv::new(base.x + dx * step, base.y + dy * step);
-            if !window_ok(r, x + (cand.x as i32 >> 2) - 2, y + (cand.y as i32 >> 2) - 2, 21, 21) {
+            if !window_ok(
+                r,
+                x + (cand.x as i32 >> 2) - 2,
+                y + (cand.y as i32 >> 2) - 2,
+                w as i32 + 5,
+                h as i32 + 5,
+            ) {
                 continue;
             }
             let s = satd_of(cand);
@@ -523,18 +569,21 @@ fn add_residual_4x4(ctx: &MeCtx, rec: &mut Recon, off: usize, levels: &[i16; 16]
     (ctx.dsp.residual4)(&mut rec.data[off..], rec.stride, &coefs, dc.unwrap_or(NO_DC), 255);
 }
 
-/// Write the 16x16 inter prediction for one or two references into the
-/// reconstruction planes, through the decoder's kernels and — when both
+/// Write one partition's inter prediction for one or two references into
+/// the reconstruction planes, through the decoder's kernels and — when both
 /// lists predict — the decoder's default bi-predictive combine
 /// (`(a + b + 1) >> 1`, the `dsp.avg` kernel `predict_partition` runs for
 /// `Weighting::Default`). What stands in `rec` afterwards is bit-identical
 /// to what a decoder derives for the same vectors.
-fn predict_inter_16x16(
+#[allow(clippy::too_many_arguments)]
+fn predict_inter_rect(
     ctx: &MeCtx,
     rec: &mut [Recon],
     refs: [&[Recon]; 2],
     px: usize,
     py: usize,
+    pw: usize,
+    ph: usize,
     used: [bool; 2],
     mv: [Mv; 2],
 ) {
@@ -545,13 +594,13 @@ fn predict_inter_16x16(
     let off = rec[0].offset(px as isize, py as isize);
     let stride = rec[0].stride;
     if used[0] && used[1] {
-        luma_pred_into(ctx, &refs[0][0], px as i32, py as i32, mv[0], &mut a);
-        luma_pred_into(ctx, &refs[1][0], px as i32, py as i32, mv[1], &mut b);
-        (ctx.dsp.avg)(&mut rec[0].data[off..], stride, &a, &b, 16, 16);
+        luma_pred_into(ctx, &refs[0][0], px as i32, py as i32, mv[0], pw, ph, &mut a);
+        luma_pred_into(ctx, &refs[1][0], px as i32, py as i32, mv[1], pw, ph, &mut b);
+        (ctx.dsp.avg)(&mut rec[0].data[off..], stride, &a, &b, pw, ph);
     } else {
         let l = if used[0] { 0 } else { 1 };
-        luma_pred_into(ctx, &refs[l][0], px as i32, py as i32, mv[l], &mut a);
-        (ctx.dsp.copy)(&mut rec[0].data[off..], stride, &a, 16, 16);
+        luma_pred_into(ctx, &refs[l][0], px as i32, py as i32, mv[l], pw, ph, &mut a);
+        (ctx.dsp.copy)(&mut rec[0].data[off..], stride, &a, pw, ph);
     }
     // Chroma. 4:4:4 interpolates its chroma with the luma six-tap kernel
     // at the unscaled vector (8.4.2.2: mvCLX = mvLX) — the `c444` branch
@@ -567,30 +616,34 @@ fn predict_inter_16x16(
             let off = plane.offset(px as isize, py as isize);
             let stride = plane.stride;
             if used[0] && used[1] {
-                luma_pred_into(ctx, &refs[0][comp + 1], px as i32, py as i32, mv[0], &mut a);
-                luma_pred_into(ctx, &refs[1][comp + 1], px as i32, py as i32, mv[1], &mut b);
-                (ctx.dsp.avg)(&mut plane.data[off..], stride, &a, &b, 16, 16);
+                luma_pred_into(ctx, &refs[0][comp + 1], px as i32, py as i32, mv[0], pw, ph, &mut a);
+                luma_pred_into(ctx, &refs[1][comp + 1], px as i32, py as i32, mv[1], pw, ph, &mut b);
+                (ctx.dsp.avg)(&mut plane.data[off..], stride, &a, &b, pw, ph);
             } else {
                 let l = if used[0] { 0 } else { 1 };
-                luma_pred_into(ctx, &refs[l][comp + 1], px as i32, py as i32, mv[l], &mut a);
-                (ctx.dsp.copy)(&mut plane.data[off..], stride, &a, 16, 16);
+                luma_pred_into(ctx, &refs[l][comp + 1], px as i32, py as i32, mv[l], pw, ph, &mut a);
+                (ctx.dsp.copy)(&mut plane.data[off..], stride, &a, pw, ph);
             }
         }
         return;
     }
-    let (cx, cy) = ((px / 16) * 8, (py / 16) * h);
+    // The partition's chroma rectangle: horizontally always halved, and
+    // vertically halved in 4:2:0 but not in 4:2:2 — `chroma_h` carries
+    // exactly that ratio (8 or 16 chroma rows per macroblock).
+    let (cx, cy) = (px / 2, py * h / 16);
+    let (cw, crh) = (pw / 2, ph * h / 16);
     for comp in 0..2 {
         let plane = &mut rec[comp + 1];
         let off = plane.offset(cx as isize, cy as isize);
         let stride = plane.stride;
         if used[0] && used[1] {
-            chroma_pred_into(ctx, &refs[0][comp + 1], cx as i32, cy as i32, mv[0], h, &mut a);
-            chroma_pred_into(ctx, &refs[1][comp + 1], cx as i32, cy as i32, mv[1], h, &mut b);
-            (ctx.dsp.avg)(&mut plane.data[off..], stride, &a, &b, 8, h);
+            chroma_pred_into(ctx, &refs[0][comp + 1], cx as i32, cy as i32, mv[0], cw, crh, h, &mut a);
+            chroma_pred_into(ctx, &refs[1][comp + 1], cx as i32, cy as i32, mv[1], cw, crh, h, &mut b);
+            (ctx.dsp.avg)(&mut plane.data[off..], stride, &a, &b, cw, crh);
         } else {
             let l = if used[0] { 0 } else { 1 };
-            chroma_pred_into(ctx, &refs[l][comp + 1], cx as i32, cy as i32, mv[l], h, &mut a);
-            (ctx.dsp.copy)(&mut plane.data[off..], stride, &a, 8, h);
+            chroma_pred_into(ctx, &refs[l][comp + 1], cx as i32, cy as i32, mv[l], cw, crh, h, &mut a);
+            (ctx.dsp.copy)(&mut plane.data[off..], stride, &a, cw, crh);
         }
     }
 }
@@ -1013,7 +1066,8 @@ pub fn code_macroblock_p16(
     // 8.4.1.3 through the decoder's own derivation, over the state it
     // would itself hold at this point in the picture.
     let pred = st.predict(0, 0, 0, 0, 16, 16);
-    let (mv, satd) = search_16x16(ctx, &refp[0], px as i32, py as i32, &src_luma[soff..], luma_stride, pred);
+    let (mv, satd) =
+        search_rect(ctx, &refp[0], px as i32, py as i32, 16, 16, &src_luma[soff..], luma_stride, pred);
     out.mv = mv;
     out.mvd = Mv::new(mv.x - pred.x, mv.y - pred.y);
 
@@ -1025,7 +1079,7 @@ pub fn code_macroblock_p16(
     // The chosen vector's prediction into the reconstruction planes
     // (through the decoder's kernels), then the residual coded and
     // reconstructed in place.
-    predict_inter_16x16(ctx, rec, [refp, refp], px, py, [true, false], [mv, Mv::ZERO]);
+    predict_inter_rect(ctx, rec, [refp, refp], px, py, 16, 16, [true, false], [mv, Mv::ZERO]);
     let r = code_inter_mb_residual(
         ctx, rec, mb_x, mb_y, src_luma, luma_stride, src_chroma, chroma_stride,
     );
@@ -1213,13 +1267,13 @@ fn b_luma_satd(
     if used[0] && used[1] {
         let mut b = [0u8; 16 * PRED_STRIDE];
         let mut c = [0u8; 16 * PRED_STRIDE];
-        luma_pred_into(ctx, &refs[0][0], px, py, mv[0], &mut a);
-        luma_pred_into(ctx, &refs[1][0], px, py, mv[1], &mut b);
+        luma_pred_into(ctx, &refs[0][0], px, py, mv[0], 16, 16, &mut a);
+        luma_pred_into(ctx, &refs[1][0], px, py, mv[1], 16, 16, &mut b);
         (ctx.dsp.avg)(&mut c, PRED_STRIDE, &a, &b, 16, 16);
         (ctx.dist.satd)(src, src_stride, &c, PRED_STRIDE, 16, 16)
     } else {
         let l = if used[0] { 0 } else { 1 };
-        luma_pred_into(ctx, &refs[l][0], px, py, mv[l], &mut a);
+        luma_pred_into(ctx, &refs[l][0], px, py, mv[l], 16, 16, &mut a);
         (ctx.dist.satd)(src, src_stride, &a, PRED_STRIDE, 16, 16)
     }
 }
@@ -1270,8 +1324,8 @@ pub fn code_macroblock_b16(
     // Explicit candidates: one search per list around that list's median
     // predictor, then the bi combination of the two winners.
     let pred = [st.predict(0, 0, 0, 0, 16, 16), st.predict(1, 0, 0, 0, 16, 16)];
-    let (mv0, _) = search_16x16(ctx, &refs[0][0], px as i32, py as i32, src, luma_stride, pred[0]);
-    let (mv1, _) = search_16x16(ctx, &refs[1][0], px as i32, py as i32, src, luma_stride, pred[1]);
+    let (mv0, _) = search_rect(ctx, &refs[0][0], px as i32, py as i32, 16, 16, src, luma_stride, pred[0]);
+    let (mv1, _) = search_rect(ctx, &refs[1][0], px as i32, py as i32, 16, 16, src, luma_stride, pred[1]);
     for (used, label_mv) in [
         ([true, false], [mv0, Mv::ZERO]),
         ([false, true], [Mv::ZERO, mv1]),
@@ -1301,7 +1355,7 @@ pub fn code_macroblock_b16(
 
     // Commit: the winner's prediction into the reconstruction planes,
     // then the shared residual machinery.
-    predict_inter_16x16(ctx, rec, refs, px, py, out.used, out.mv);
+    predict_inter_rect(ctx, rec, refs, px, py, 16, 16, out.used, out.mv);
     let r = code_inter_mb_residual(ctx, rec, mb_x, mb_y, src_luma, luma_stride, src_chroma, chroma_stride);
     out.transform_8x8 = r.transform_8x8;
     out.cbp_luma = r.cbp_luma;
@@ -1837,7 +1891,7 @@ mod tests {
             // Luma: prediction through the same decoder kernel, residual
             // through the test-only inverse pair.
             let mut pred = [0u8; 16 * PRED_STRIDE];
-            luma_pred_into(&ctx, &refp[0], 16, 16, d.mv, &mut pred);
+            luma_pred_into(&ctx, &refp[0], 16, 16, d.mv, 16, 16, &mut pred);
             let off = rec[0].offset(16, 16);
             for blk in 0..16 {
                 let (bx, by) = (blk % 4, blk / 4);
@@ -1862,7 +1916,7 @@ mod tests {
             for comp in 0..2 {
                 let plane = &rec[comp + 1];
                 let mut cpred = [0u8; 16 * PRED_STRIDE];
-                chroma_pred_into(&ctx, &refp[comp + 1], 8, 8, d.mv, 8, &mut cpred);
+                chroma_pred_into(&ctx, &refp[comp + 1], 8, 8, d.mv, 8, 8, 8, &mut cpred);
                 let coff = plane.offset(8, 8);
                 let m = (qp % 6) as usize;
                 let mut dc = [0i32; 4];
