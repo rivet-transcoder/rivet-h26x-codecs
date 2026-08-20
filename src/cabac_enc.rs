@@ -44,13 +44,57 @@
 use crate::bitwriter::BitWriter;
 use crate::cabac::{Ctx, LPS_RANGE, NEXT_STATE_LPS, NEXT_STATE_MPS};
 
+/// Where an encoder's output goes: a caller's writer, or nowhere.
+///
+/// Counting exists so a decision can ask what a shape *costs* without
+/// producing it. The alternative — a table of what each syntax element
+/// usually costs — is the thing this crate keeps deleting: a second model
+/// of the writer, free to drift from the writer. Here there is one
+/// arithmetic coder and one set of writers; counting changes only whether
+/// the bits land in a buffer or in a tally, so a counted cost cannot
+/// disagree with the emitted one about anything except where it was put.
+enum Out<'a> {
+    /// Write the bits.
+    Bits(&'a mut BitWriter),
+    /// Count them and throw them away.
+    Count(u64),
+}
+
+impl Out<'_> {
+    #[inline]
+    fn bit(&mut self, v: u32) {
+        match self {
+            Out::Bits(w) => w.bit(v),
+            Out::Count(n) => *n += 1,
+        }
+    }
+    #[inline]
+    fn bits(&mut self, n: u32, v: u32) {
+        match self {
+            Out::Bits(w) => w.bits(n, v),
+            Out::Count(c) => *c += n as u64,
+        }
+    }
+    #[inline]
+    fn position(&self) -> u64 {
+        match self {
+            Out::Bits(w) => w.position(),
+            Out::Count(n) => *n,
+        }
+    }
+}
+
 /// The arithmetic encoder, writing into a caller's [`BitWriter`].
 ///
 /// It borrows the writer rather than owning one because CABAC slice data
 /// continues the same RBSP the slice header was written into, and the header
 /// is plain bits.
+///
+/// A *counting* encoder ([`CabacEncoder::counting`]) runs the identical
+/// arithmetic over the identical bins and tallies the bits instead of
+/// writing them — see [`Out`].
 pub struct CabacEncoder<'a> {
-    w: &'a mut BitWriter,
+    w: Out<'a>,
     /// `codILow`.
     low: u32,
     /// `codIRange`.
@@ -68,7 +112,30 @@ impl<'a> CabacEncoder<'a> {
     /// H.264 that means after `cabac_alignment_one_bit`.
     pub fn new(w: &'a mut BitWriter) -> Self {
         debug_assert!(w.byte_aligned(), "CABAC data starts on a byte boundary");
-        Self { w, low: 0, range: 510, outstanding: 0, first: true }
+        Self { w: Out::Bits(w), low: 0, range: 510, outstanding: 0, first: true }
+    }
+
+    /// An encoder that counts the bits it would write and produces none.
+    ///
+    /// The register state is the standard's start-of-codeword one, the same
+    /// [`CabacEncoder::new`] begins from, so counting a whole slice from a
+    /// freshly initialised context array yields *exactly* the bit count
+    /// writing it would produce — that equality is asserted in this
+    /// module's tests, and it is what makes a counted cost a measurement
+    /// rather than an estimate.
+    ///
+    /// Counting a *fragment* mid-stream is a different question, and an
+    /// honest answer to it is smaller than exact: an arithmetic coder
+    /// carries fractional state between bins, so no prefix of a codeword
+    /// has a bit count of its own. A fragment counted from this neutral
+    /// start is therefore within a bit or two of the bits it would add in
+    /// place. That is the right tool for *comparing two candidates at the
+    /// same point* — both are counted from the same start, so the
+    /// difference between them is what the comparison needs and the shared
+    /// offset cancels. Callers wanting an absolute figure should count the
+    /// whole slice.
+    pub fn counting() -> CabacEncoder<'static> {
+        CabacEncoder { w: Out::Count(0), low: 0, range: 510, outstanding: 0, first: true }
     }
 
     /// `PutBit(b)` (9.3.4.3): emit `b`, then settle every outstanding bit as
@@ -183,8 +250,17 @@ impl<'a> CabacEncoder<'a> {
         self.w.bits(2, ((self.low >> 7) & 3) | 1);
     }
 
-    /// Bits written into the underlying writer so far.
+    /// Bits written into the underlying writer so far — or, for a counting
+    /// encoder, the bits it would have written.
     pub fn position(&self) -> u64 {
+        self.w.position()
+    }
+
+    /// Bits this encoder has accounted for. Identical to
+    /// [`CabacEncoder::position`] for a counting encoder, which starts at
+    /// zero; on a writing encoder the writer may already hold a slice
+    /// header, so prefer taking a difference of `position`.
+    pub fn bits_counted(&self) -> u64 {
         self.w.position()
     }
 }
@@ -237,8 +313,29 @@ mod tests {
             // A terminate of 1 both ends the codeword and flushes it.
             e.encode_terminate(1);
         }
+        let written = w.position();
         w.align_zero();
         let data = w.into_rbsp();
+
+        // The counting encoder must account for EXACTLY the bits the
+        // writing one produced, over the same bins from the same start.
+        // This is the property that lets a decision price a shape by
+        // running the real writers instead of guessing: if the two ever
+        // disagreed, every cost derived from counting would be wrong by an
+        // amount nothing else in the crate could detect.
+        let mut cnt_ctx = contexts();
+        let mut c = CabacEncoder::counting();
+        for op in ops {
+            match *op {
+                Op::Decision(i, b) => c.encode_decision(&mut cnt_ctx[i], b),
+                Op::Bypass(b) => c.encode_bypass(b),
+                Op::BypassBits(n, v) => c.encode_bypass_bits(n, v),
+                Op::Terminate => c.encode_terminate(0),
+            }
+        }
+        c.encode_terminate(1);
+        assert_eq!(c.bits_counted(), written, "counted bits differ from the bits written");
+        assert_eq!(cnt_ctx, enc_ctx, "counting advanced the contexts differently from writing");
 
         let mut dec_ctx = contexts();
         let mut d = Cabac::new(&data);
