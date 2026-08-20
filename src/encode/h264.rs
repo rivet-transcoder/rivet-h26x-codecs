@@ -92,6 +92,15 @@ impl H264Encoder {
                 "H.264 encode: bit depth above 8 (encoder in progress)",
             ));
         }
+        if let RateControl::Bitrate { .. } = cfg.rate {
+            // Not "never": H.264 could have a rate controller, and the one
+            // being built for H.265 is deliberately codec-agnostic in its
+            // arithmetic. What it is not is wired here, and a --bitrate
+            // silently coded at a fixed quantiser is the worst answer.
+            return Err(Error::unsupported(
+                "H.264 encode: bitrate rate control (encoder in progress; H.265 has it)",
+            ));
+        }
         if cfg.sao {
             // Not "in progress": H.264 has no sample adaptive offset at
             // all. Refusing names that rather than silently ignoring a
@@ -534,6 +543,10 @@ impl H264Encoder {
     /// own and reports the lowest.
     pub fn picture_qp(&self, kind: Kind) -> u8 {
         match self.cfg.rate {
+            // Refused in `new`, so unreachable — but spelled rather than
+            // wildcarded, so adding a mode makes this a compile error
+            // instead of a silent fixed quantiser.
+            RateControl::Bitrate { .. } => 26,
             RateControl::Lossless => 0,
             RateControl::ConstantQp(q) => match kind {
                 // The usual offsets: anchors are coded better than the

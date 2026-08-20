@@ -23,6 +23,27 @@
 #               REPORTED, never gated, except in lossless mode where it must be
 #               infinite and the check becomes exact like the others.
 #
+#   4. RATE     Only for --bitrate rows, and a different kind of property from
+#               the three above: did the encoder achieve the objective it was
+#               HANDED, rather than describe correctly what it did? A rate
+#               controller that ignores its target produces a perfectly legal
+#               stream that passes SELF, passes CROSS and reports a fine PSNR.
+#               Nothing above can see it.
+#
+#               So these rows assert a band: achieved within [0.5x, 2.0x] of
+#               target. That is wide, and wide on purpose - the clips here are
+#               six to twelve frames, which gives a controller almost no time
+#               to converge and lets the opening keyframe dominate. A tighter
+#               tolerance would be flaky rather than rigorous, and a flaky row
+#               teaches people to re-run it. The tightness is bought back by
+#               the targets instead: they sit inside every clip's achievable
+#               range but on opposite sides of different clips' natural rates,
+#               so some clips must compress harder and others must spend more,
+#               and a controller stuck at one quantiser fails on both counts.
+#
+#               The test that a rate row is worth having: replace the
+#               controller with a constant quantiser and it must go red.
+#
 # Usage: verify_encode.sh [encoder] [decoder]
 #   H26X_WORK=dir   scratch directory holding the source clips (default: here)
 #   JOBS=n          configurations in parallel (default 4)
@@ -124,6 +145,8 @@ hevc-cqp40-ip|--codec h265 --qp 40 --gop 8
 hevc-cqp-ipb|--codec h265 --qp 26 --gop 8 --bframes 2
 hevc-cqp40-sao-intra|--codec h265 --qp 40 --gop 0 --sao
 hevc-cqp40-sao-ip|--codec h265 --qp 40 --gop 8 --sao
+hevc-abr-64k|--codec h265 --bitrate 64000 --gop 8
+hevc-abr-96k|--codec h265 --bitrate 96000 --gop 8
 "}
 
 one() {
@@ -178,6 +201,25 @@ one() {
     return 1
   fi
 
+  # 4. RATE. Only where a target was given. The encoder reports what it
+  # achieved rather than this script recomputing it: it knows the frame
+  # count, the frame rate and the exact bytes emitted, and a second
+  # implementation of that division here is a second thing that can be
+  # wrong.
+  case "$flags" in
+    *--bitrate*)
+      ratio=$(sed -n 's/.*ratio \([0-9.]*\).*/\1/p' "$OUT/$base.$name.enc.log" | tail -1)
+      if [ -z "$ratio" ]; then
+        echo "RATE-FAIL   $tag: the encoder reported no achieved rate"
+        return 1
+      fi
+      if ! awk -v r="$ratio" 'BEGIN { exit !(r >= 0.5 && r <= 2.0) }'; then
+        echo "RATE-FAIL   $tag: achieved $(printf '%.2f' "$ratio")x of target, outside [0.50, 2.00]"
+        return 1
+      fi
+      ;;
+  esac
+
   # 3. QUALITY. Gated only when the configuration claims to be lossless.
   psnr=$(psnr_of "$src" "$rec")
   size=$(stat -c %s "$bs")
@@ -188,6 +230,8 @@ one() {
         return 1
       fi
       echo "PASS        $tag (lossless, exact, $size bytes)" ;;
+    *--bitrate*)
+      echo "PASS        $tag ($size bytes, PSNR $psnr dB, rate $(printf '%.2f' "$ratio")x)" ;;
     *)
       echo "PASS        $tag ($size bytes, PSNR $psnr dB)" ;;
   esac
@@ -245,7 +289,11 @@ done | xargs -P "$JOBS" -I{} bash -c 'IFS="|" read -r s n f <<< "{}"; one "$s" "
      | sort | tee "$results"
 
 pass=$(grep -c '^PASS' "$results")
-bad=$(grep -cE '^(ENCODE|SELF|CROSS|LOSSLESS)-FAIL' "$results")
+# Every failure prefix `one` can print must appear here. A row whose
+# failure prefix is missing from this pattern reports its failure and is
+# then counted as green - which is how the RATE rows first shipped, caught
+# only by running the mutation they exist to catch.
+bad=$(grep -cE '^(ENCODE|SELF|CROSS|LOSSLESS|RATE)-FAIL' "$results")
 echo
 echo "encode: $pass passed, $bad failed"
 [ "$bad" = 0 ] || fail=1

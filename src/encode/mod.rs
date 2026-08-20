@@ -69,6 +69,7 @@ pub mod h265;
 pub mod h265_deblock;
 pub mod h265_intra;
 pub mod h265_me;
+pub(crate) mod h265_rc;
 pub(crate) mod h265_sao;
 pub mod h265_syntax;
 
@@ -83,6 +84,18 @@ pub enum RateControl {
     /// whose output can be checked *exactly* against the source rather than
     /// scored, which turns quality into a pass/fail.
     Lossless,
+    /// Average bitrate: the encoder picks a quantiser per picture to spend
+    /// roughly this many bits per second, given [`Config::fps`].
+    ///
+    /// The first mode whose correctness is not a property of the bitstream.
+    /// A controller that ignores this number entirely still produces a
+    /// perfectly legal stream that decodes identically on every decoder —
+    /// see the module documentation of `encode::h265_rc` for what is checked
+    /// instead, and how.
+    Bitrate {
+        /// Target, in bits per second.
+        bps: u32,
+    },
 }
 
 /// Entropy coder, where the standard offers a choice.
@@ -128,6 +141,12 @@ pub struct Config {
     pub transform_8x8: bool,
     /// Worker threads; 0 asks for one per core, matching the decoders.
     pub threads: usize,
+    /// Frames per second. Nothing in either bitstream carries it — H.265
+    /// puts frame rate in the optional VUI, which this encoder does not
+    /// write — so it exists for exactly one reason: a target in bits per
+    /// *second* is meaningless without it. It is declared rather than
+    /// assumed so that a caller who cares can set it.
+    pub fps: u32,
     /// Sample adaptive offset, the second in-loop filter (H.265 only).
     ///
     /// Off by default and a switch rather than something always applied,
@@ -154,6 +173,7 @@ impl Default for Config {
             transform_8x8: false,
             threads: 0,
             sao: false,
+            fps: 30,
         }
     }
 }

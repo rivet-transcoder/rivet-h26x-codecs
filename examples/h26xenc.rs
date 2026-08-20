@@ -19,7 +19,8 @@ fn die(msg: &str) -> ! {
     eprintln!("h26xenc: {msg}");
     eprintln!(
         "usage: h26xenc --input F --size WxH [--format 400|420|422|444] --output F\n\
-         \x20      [--recon F] [--codec h264|h265] [--qp N | --lossless]\n\
+         \x20      [--recon F] [--codec h264|h265] [--qp N | --lossless | --bitrate BPS]\n\
+         \x20      [--fps N]\n\
          \x20      [--gop N] [--bframes N] [--cavlc] [--t8x8] [--sao]\n\
          \x20      [--depth N] [--threads N]"
     );
@@ -58,6 +59,11 @@ fn main() {
                 cfg.rate = RateControl::ConstantQp(q);
             }
             "--lossless" => cfg.rate = RateControl::Lossless,
+            "--bitrate" => {
+                let b: u32 = val(&mut i, &args, "--bitrate").parse().unwrap_or_else(|_| die("--bitrate"));
+                cfg.rate = RateControl::Bitrate { bps: b };
+            }
+            "--fps" => cfg.fps = val(&mut i, &args, "--fps").parse().unwrap_or_else(|_| die("--fps")),
             "--gop" => cfg.gop = val(&mut i, &args, "--gop").parse().unwrap_or_else(|_| die("--gop")),
             "--bframes" => {
                 cfg.bframes = val(&mut i, &args, "--bframes").parse().unwrap_or_else(|_| die("--bframes"))
@@ -141,6 +147,11 @@ fn main() {
             write_recon_display_order(&path, enc.reconstructions(), &pocs);
         }
         eprintln!("{} pictures, {} bytes", pocs.len(), stream.len());
+        if let Some((achieved, target)) = enc.rate_report() {
+            // The gate parses this line. Ratio included so a human reading
+            // a log sees the shape of the error without dividing.
+            eprintln!("rate: achieved {achieved:.0} bps, target {target:.0} bps, ratio {:.3}", achieved / target);
+        }
         return;
     }
 

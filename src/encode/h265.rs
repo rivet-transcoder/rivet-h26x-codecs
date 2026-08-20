@@ -21,6 +21,7 @@ use super::gop::{Coded, Kind, Scheduler};
 use super::h265_deblock::{deblock_inter_picture, deblock_picture};
 use super::h265_intra::{CuDecision, IntraCtx, IntraPicture};
 use super::h265_me::{InterCuDecision, InterCuKind, InterPicture, PCuDecision, MAX_MERGE_CAND};
+use super::h265_rc::{PicKind, RateController};
 use super::h265_sao::{SaoPlan, sao_picture};
 use super::h265_syntax as syn;
 use super::{Access, Config, RateControl};
@@ -63,6 +64,22 @@ pub struct H265Encoder {
     /// inter decision predicts through the decoder's own MC, which reads
     /// padded planes, and derives candidates from stored motion.
     refs: Vec<crate::hevc::frame::Frame<u8>>,
+    /// The rate controller, when the configuration asked for a bitrate.
+    /// `None` at a constant quantiser, which is the mode every other one
+    /// is measured against.
+    rc: Option<RateController>,
+    /// `init_qp_minus26 + 26`: the quantiser the PPS declares, **fixed for
+    /// the whole stream**.
+    ///
+    /// It has to be fixed, because there is one PPS and every slice refers
+    /// to it; a per-picture quantiser is carried by `slice_qp_delta`
+    /// instead, which `write_slice_header` computes as `slice_qp -
+    /// pps_qp`. At a constant quantiser this equals that quantiser and
+    /// every delta is zero, which is exactly what the streams before rate
+    /// control carried — that is why enabling this changed no bytes.
+    pps_qp: u8,
+    /// Bytes emitted so far, to hold the controller's ledger to.
+    emitted: u64,
 }
 
 /// The POC LSB width the SPS declares. Fixed and generous, as on the H.264
@@ -102,9 +119,27 @@ impl H265Encoder {
             2 * (cfg.width as usize).div_ceil(sw as usize)
                 * (cfg.height as usize).div_ceil(sh as usize)
         };
+        let g = syn::Geometry::new(&cfg);
+        // The PPS quantiser: the constant one where there is one, and the
+        // middle of the road where the controller will vary it per picture.
+        // Its only effect on the stream is the size of each
+        // `slice_qp_delta`, since both sides derive everything else from
+        // the slice quantiser.
+        let pps_qp = match cfg.rate {
+            RateControl::ConstantQp(q) => q.min(51),
+            RateControl::Lossless => 26,
+            RateControl::Bitrate { .. } => 26,
+        };
+        let rc = match cfg.rate {
+            RateControl::Bitrate { bps } => Some(RateController::new(bps, cfg.fps, cfg.width, cfg.height, cfg.gop)),
+            _ => None,
+        };
         Ok(Self {
-            geom: syn::Geometry::new(&cfg),
+            geom: g,
             sched: Scheduler::new(cfg.gop, cfg.bframes),
+            rc,
+            pps_qp,
+            emitted: 0,
             cfg,
             held: std::collections::BTreeMap::new(),
             recon: Vec::new(),
@@ -117,6 +152,24 @@ impl H265Encoder {
     /// How many bytes one source picture must be.
     pub fn frame_bytes(&self) -> usize {
         self.frame_bytes
+    }
+
+    /// What the rate controller achieved against what it was asked for,
+    /// in bits per second — `None` at a constant quantiser, where there
+    /// was no target to miss.
+    ///
+    /// Reported by the encoder rather than recomputed by whoever is
+    /// watching: the encoder knows the frame count, the frame rate and the
+    /// exact bytes emitted, and a second implementation of that division
+    /// somewhere else is a second thing that can be wrong. The gate reads
+    /// this line rather than doing the arithmetic itself.
+    pub fn rate_report(&self) -> Option<(f64, f64)> {
+        let rc = self.rc.as_ref()?;
+        let target = match self.cfg.rate {
+            RateControl::Bitrate { bps } => bps as f64,
+            _ => return None,
+        };
+        Some((rc.achieved_bps(self.cfg.fps), target))
     }
 
     /// The reconstructions produced so far, in coding order.
@@ -152,7 +205,30 @@ impl H265Encoder {
             let src = self.held.remove(&c.display).ok_or_else(|| {
                 Error::bitstream("H.265 encode: scheduler released an absent picture")
             })?;
-            out.push(self.code_picture(c, &src)?);
+            let access = self.code_picture(c, &src)?;
+            // The ledger closes here, at the one place every picture of
+            // every kind passes through — an accounting call inside each
+            // coding path could be forgotten in one of them, and the
+            // symptom would be a controller that quietly believes it has
+            // spent less than it has.
+            //
+            // What is counted is the whole access unit: start codes, NAL
+            // headers, parameter sets and slice payload, because that is
+            // what the target is measured against. Counting the payload
+            // alone would run about a percent low on these clips and
+            // rather more on small pictures, and nothing else here would
+            // notice.
+            self.emitted += access.data.len() as u64 * 8;
+            let emitted = self.emitted;
+            if let Some(rc) = self.rc.as_mut() {
+                rc.account(access.data.len());
+                debug_assert_eq!(
+                    rc.bits_spent, emitted,
+                    "rate-control ledger drifted: the controller has {} bits, the encoder emitted {emitted}",
+                    rc.bits_spent
+                );
+            }
+            out.push(access);
         }
         Ok(out)
     }
@@ -165,6 +241,7 @@ impl H265Encoder {
     /// live beside their readers. Everything else refuses by name.
     fn code_picture(&mut self, c: Coded, src: &[u8]) -> Result<Access> {
         let g = self.geom;
+        let pps_qp = self.pps_qp;
         // Lossless is transquant bypass: the PPS enables it, every CU says
         // it, and the residuals travel raw. The QP still appears in the
         // headers because the syntax demands one, and it still matters to
@@ -177,6 +254,12 @@ impl H265Encoder {
         let qp = match self.cfg.rate {
             RateControl::Lossless => 26,
             RateControl::ConstantQp(q) => q.min(51),
+            // The controller chooses, once per picture, in coding order.
+            // `account` below closes the loop with what it actually cost.
+            RateControl::Bitrate { .. } => {
+                let kind = if c.kind == Kind::Idr { PicKind::Intra } else { PicKind::Inter };
+                self.rc.as_mut().expect("a bitrate configuration builds a controller").pick_qp(kind)
+            }
         };
         if c.kind != Kind::Idr {
             return self.code_inter_picture(c, src, qp, bypass);
@@ -262,7 +345,7 @@ impl H265Encoder {
         // does not, SELF fails on every coded edge while CROSS stays
         // green.
         let deblock = true;
-        out.extend_from_slice(&syn::annexb(syn::NAL_PPS, &syn::write_pps(qp, bypass, deblock)));
+        out.extend_from_slice(&syn::annexb(syn::NAL_PPS, &syn::write_pps(self.pps_qp, bypass, deblock)));
 
         let mut w = BitWriter::with_capacity(cw * ch / 2);
         syn::write_slice_header(
@@ -278,7 +361,7 @@ impl H265Encoder {
                 // flag only outside monochrome - the reader's two gates.
                 sao: sao_flags(self.cfg.sao, cat),
             },
-            qp,
+            pps_qp,
             syn::NAL_IDR_N_LP,
             deblock,
             &mut w,
@@ -402,6 +485,7 @@ impl H265Encoder {
     /// with nothing left to code must be spelled as a skip instead.
     fn code_inter_picture(&mut self, c: Coded, src: &[u8], qp: u8, bypass: bool) -> Result<Access> {
         let g = self.geom;
+        let pps_qp = self.pps_qp;
         let (dw, dh) = (self.cfg.width as usize, self.cfg.height as usize);
         let (cw, ch) = (g.coded_width as usize, g.coded_height as usize);
         // Per-format chroma geometry, exactly as the intra path derives it:
@@ -450,7 +534,18 @@ impl H265Encoder {
         let sps_rbsp = syn::write_sps(&self.cfg, &g, LOG2_MAX_POC_LSB);
         // The very bytes the IDR access unit carried: `code_picture`
         // writes one PPS for the stream, with the deblocking filter on.
-        let pps_rbsp = syn::write_pps(qp, bypass, true);
+        // The very bytes the IDR access unit carried — which means the
+        // *stream's* PPS quantiser, not this picture's.
+        //
+        // This line used to pass `qp`, under a comment making the same
+        // claim. That was true only while every picture shared one
+        // quantiser; the moment rate control varied it per picture the
+        // comment would have become a lie and this struct would have
+        // disagreed with the PPS the stream actually carries. Nothing
+        // downstream reads `init_qp_minus26` out of it, so it was never
+        // going to break — it was going to sit here being wrong, which is
+        // how the last two stale comments started.
+        let pps_rbsp = syn::write_pps(self.pps_qp, bypass, true);
         let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&sps_rbsp))?;
         let mut pps = crate::hevc::pps::Pps::parse(&crate::nal::unescape_rbsp(&pps_rbsp))?;
         pps.resolve_tiles(&sps)?;
@@ -509,7 +604,7 @@ impl H265Encoder {
                 // As in `code_picture`, and from the same switch.
                 sao: sao_flags(self.cfg.sao, cat),
             },
-            qp,
+            pps_qp,
             syn::NAL_TRAIL_R,
             // Filtered, like every other picture, and the header must
             // agree with the PPS this stream carries.
