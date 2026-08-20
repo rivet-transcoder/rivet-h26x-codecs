@@ -959,7 +959,7 @@ fn write_cu_inter(
 /// set, `coding_unit` reads a `cu_transquant_bypass_flag` as its very first
 /// bin, so this writer spells one — the CU's own choice, `d.bypass` — and
 /// when clear, nothing is written and the CU must not claim bypass.
-fn write_ctu_intra(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, ctu_x: usize, ctu_y: usize, pps_bypass: bool, cat: u32) {
+pub(crate) fn write_ctu_intra(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, ctu_x: usize, ctu_y: usize, pps_bypass: bool, cat: u32) {
     debug_assert!(pps_bypass || !d.bypass, "a bypass CU is unspellable unless the PPS enables the flag");
     // Every coded neighbour has depth 0 (one CU per CTU), and in a single
     // slice availability is picture geometry.

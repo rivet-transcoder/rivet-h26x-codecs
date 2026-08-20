@@ -674,12 +674,13 @@ pub(crate) fn code_cu_2nx2n_intra<S: Sample>(
     // no state needs saving — whichever loses is simply
     // recomputed, the way the H.264 side puts back the I_4x4
     // coding its I_16x16 trials overwrote.
-    let (ssd_u, nz_u) = code_cu_2nx2n(
+    let (ssd_u, _nz_u) = code_cu_2nx2n(
         ctx, geo, recon, scratch, x0, y0, mode, cmode, false, [false; 4], &src_y[soff..], y_stride, scb, scr, c_stride, &mut out,
     );
     if split_depth >= 1 {
         assert!(split_depth <= 2, "split_depth {split_depth} above the SPS transform depth of 2");
-        let cost_u = ssd_u as f32 + tu_structure_cost(geo.cat, ctx.qp, &out, nz_u);
+        let lam = 0.85f32 * ((ctx.qp - 12) as f32 / 3.0).exp2();
+        let cost_u = ssd_u as f32 + lam * cu_bits(&out, geo.cat, ctx.qp, ctx.bypass);
         // The split trial, children in decode order. With the
         // deeper search on, each child is coded unsplit, re-coded
         // subdivided, and settled — losing structure recomputed —
@@ -691,13 +692,13 @@ pub(crate) fn code_cu_2nx2n_intra<S: Sample>(
         // is code_cu_2nx2n's own split path verbatim, so the
         // decisions are bit-identical to the one-level search.
         clear_for_trial(&mut out, true);
-        let (mut ssd_s, mut nz_s) = (0u64, 0u32);
+        let mut ssd_s = 0u64;
         for i in 0..4 {
             let (mut ssd_i, mut nz_i) = code_child(ctx, geo, recon, scratch, x0, y0, i, false, mode, cmode, &src_y[soff..], y_stride, scb, scr, c_stride, &mut out);
             if split_depth >= 2 {
-                let cost_a = ssd_i as f32 + lambda_bits(ctx.qp, child_structure_bins(geo.cat, geo.log2_cu, false), nz_i);
+                let cost_a = ssd_i as f32 + lam * cu_bits(&out, geo.cat, ctx.qp, ctx.bypass);
                 let (ssd_b, nz_b) = code_child(ctx, geo, recon, scratch, x0, y0, i, true, mode, cmode, &src_y[soff..], y_stride, scb, scr, c_stride, &mut out);
-                let cost_b = ssd_b as f32 + lambda_bits(ctx.qp, child_structure_bins(geo.cat, geo.log2_cu, true), nz_b);
+                let cost_b = ssd_b as f32 + lam * cu_bits(&out, geo.cat, ctx.qp, ctx.bypass);
                 if cost_a <= cost_b {
                     let (sa, na) = code_child(ctx, geo, recon, scratch, x0, y0, i, false, mode, cmode, &src_y[soff..], y_stride, scb, scr, c_stride, &mut out);
                     ssd_i = sa;
@@ -708,14 +709,14 @@ pub(crate) fn code_cu_2nx2n_intra<S: Sample>(
                 }
             }
             ssd_s += ssd_i;
-            nz_s += nz_i;
+            let _ = nz_i;
         }
         if geo.cat != 0 {
             for comp in 0..2 {
                 out.cbf_chroma[comp] = out.cbf_chroma_tu[comp].iter().any(|&f| f) || out.cbf_chroma_tu_bot[comp].iter().any(|&f| f);
             }
         }
-        let cost_s = ssd_s as f32 + tu_structure_cost(geo.cat, ctx.qp, &out, nz_s);
+        let cost_s = ssd_s as f32 + lam * cu_bits(&out, geo.cat, ctx.qp, ctx.bypass);
         if cost_u <= cost_s {
             let _ = code_cu_2nx2n(
                 ctx, geo, recon, scratch, x0, y0, mode, cmode, false, [false; 4], &src_y[soff..], y_stride, scb, scr, c_stride, &mut out,
@@ -986,6 +987,7 @@ fn lambda_bits(qp: i32, bins: u32, nz: u32) -> f32 {
 /// otherwise, doubled for 4:2:2 pairs. Exact syntax counts except that
 /// the parent-gate conditioning of chroma bins is ignored (counted as if
 /// always coded); the pricing itself is [`lambda_bits`]'s business.
+#[allow(dead_code)] // superseded by `cu_bits`; kept for the accounting it documents
 fn child_structure_bins(cat: u32, log2_cu: u32, deeper: bool) -> u32 {
     let halves = if cat == 2 { 2 } else { 1 };
     let mut bins = 1; // the child's split_transform_flag
@@ -1561,6 +1563,31 @@ fn code_cu_2nx2n<S: Sample>(
 /// [`mode_signalling_cost`], here paired with SSD rather than SATD, which
 /// a real RD pass would want to revisit along with everything else in
 /// this function.
+fn cu_bits(d: &CuDecision, cat: u32, qp: i32, bypass: bool) -> f32 {
+    use crate::cabac_enc::CabacEncoder;
+    use crate::hevc::ctx::Contexts;
+    let mut cx = Contexts::new(0, qp);
+    let mut e = CabacEncoder::counting();
+    // The production serialiser, over the decision as coded: every
+    // signalling bin AND every residual block, at their real widths.
+    //
+    // Counting `write_ctu_intra` rather than re-deriving the transform
+    // tree is the whole point. The transform-block layout, the cbf
+    // gating, the mode-dependent scan and the coefficient binarisation
+    // are the writer's own here, not a copy of them that can drift —
+    // and the residual is where nearly all the bits are, so a copy would
+    // have been the largest guess in the encoder rather than the
+    // smallest.
+    //
+    // (1, 1) as the CTU position gives the neutral neighbour context the
+    // other counted costs use. Two structures of the same CU carry the
+    // same mode syntax and the same neighbours, so everything shared
+    // cancels in the difference that decides between them.
+    crate::encode::h265::write_ctu_intra(&mut e, &mut cx, d, 1, 1, bypass, cat);
+    e.fractional_bits() as f32
+}
+
+#[allow(dead_code)]
 fn tu_structure_cost(cat: u32, qp: i32, d: &CuDecision, nz: u32) -> f32 {
     // split_transform_flag itself is one bin either way.
     let mut bins = 1u32;
