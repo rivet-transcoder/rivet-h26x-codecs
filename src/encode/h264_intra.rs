@@ -1351,6 +1351,111 @@ mod tests {
         }
     }
 
+    /// The 8x8 reconstruction has to scale its coefficients exactly as
+    /// the decoder's parser will, and "exactly" here means three things
+    /// that are easy to get separately wrong: the right one of the six
+    /// 8x8 scaling lists, the right row of it for this QP, and the right
+    /// shift.
+    ///
+    /// So this does not restate the rule — it asks the *reader* for the
+    /// table and shift ([`MbDequant::for_mb`], which is what
+    /// `parse_residual_luma_like` and its CABAC twin are handed), applies
+    /// them with the reader's own [`dequant_level`], and requires the
+    /// samples to match what [`reconstruct_8x8`] produced. A wrong list
+    /// index, a wrong row or a wrong shift each break it.
+    ///
+    /// Every QP from 0 to 51 — the shift changes band every six, and
+    /// above 29 the chroma QP map stops being the identity, which is
+    /// where a chroma plane coded at the luma quantiser stops looking
+    /// right — and every plane and prediction kind the encoder codes 8x8.
+    #[test]
+    fn the_8x8_reconstruction_scales_as_the_reader_will() {
+        use crate::h264::mb::{MbDequant, MbKind as DecKind, SliceCtx, chroma_qp, dequant_level};
+        use crate::h264::SliceType;
+        let dsp = H264Dsp::<u8>::new(Cpu::SCALAR);
+        let enc = H264EncDsp::SCALAR;
+        let dist = DistortionDsp::<u8>::scalar();
+        let quant = Quant::new(&flat());
+        let dequant = Dequant::new(&flat());
+        let dq = Dequant::new(&flat());
+        let sctx = SliceCtx {
+            slice_type: SliceType::I,
+            slice_num: 0,
+            num_ref_idx: [0; 2],
+            direct_spatial: false,
+            transform_8x8_mode: true,
+            constrained_intra_pred: false,
+            direct_8x8_inference: true,
+            chroma_format_idc: 3,
+            cabac: true,
+            bit_depth: 8,
+            transform_bypass: false,
+            scaling_plane: 0,
+            x264_old_444: false,
+            field_pic: false,
+            mbaff: false,
+        };
+        let mut seed = 0x51ded00du64;
+        let mut lcg = move || -> i16 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 40) & 0x3f) as i16 - 32
+        };
+        for qp in 0..52i32 {
+            let qpc = chroma_qp(qp, 0, 0);
+            let ctx = IntraCtx {
+                dsp: &dsp,
+                enc: &enc,
+                dist: &dist,
+                quant: &quant,
+                dequant: &dequant,
+                qp,
+                qpc: [qpc; 2],
+                chroma_h: 16,
+                c444: true,
+                t8x8: true,
+            };
+            // (the encoder's 8x8 list index, the plane it codes, whether
+            // the macroblock is inter, and the QP that plane is coded at)
+            // — the whole set this encoder produces.
+            for &(list8, plane, inter, plane_qp) in &[
+                (0usize, 0usize, false, qp),
+                (1, 0, true, qp),
+                (2, 1, false, qpc),
+                (3, 1, true, qpc),
+                (4, 2, false, qpc),
+                (5, 2, true, qpc),
+            ] {
+                let mut levels = [0i16; 64];
+                for l in levels.iter_mut() {
+                    *l = lcg();
+                }
+                let mut rec = crate::encode::h264_syntax::recon_plane(16, 16, 16);
+                for (i, v) in rec.data.iter_mut().enumerate() {
+                    *v = (i % 251) as u8;
+                }
+                let off = rec.offset(0, 0);
+                let before: Vec<u8> = rec.data.clone();
+                reconstruct_8x8(&ctx, &mut rec, off, &levels, list8, plane_qp);
+
+                // The reader's own answer, built the way a parser gets it.
+                let kind = if inter { DecKind::Inter16x16 } else { DecKind::I8x8 };
+                let mbdq = MbDequant::for_mb(&dq, &sctx, [0, 0], kind, qp).expect("not lossless");
+                let (table, shift) = mbdq.q8[plane];
+                let mut coefs = [0i32; 64];
+                for (i, c) in coefs.iter_mut().enumerate() {
+                    *c = dequant_level(levels[i] as i32, table[i], shift);
+                }
+                let mut want = before;
+                (dsp.residual8)(&mut want[off..], rec.stride, &coefs, 255);
+                assert_eq!(
+                    rec.data, want,
+                    "qp={qp} list8={list8} plane={plane} inter={inter}: \
+                     the 8x8 reconstruction disagrees with the reader's scaling"
+                );
+            }
+        }
+    }
+
     /// The mode-to-syntax mapping has to round-trip: what the writer emits
     /// is what a decoder derives back.
     #[test]

@@ -742,7 +742,8 @@ pub fn write_b_picture(
 mod tests {
     use super::*;
     use crate::bitreader::BitReader;
-    use crate::encode::h264_intra::{IntraCtx, MbAvail, PredMode, code_macroblock};
+    use crate::encode::h264_intra::{IntraCtx, MbAvail, PredMode, code_macroblock, quad_rasters};
+    use crate::h264::tables::ZIGZAG8X8;
     use crate::encode::h264_syntax::recon_plane;
     use crate::h264::SliceType;
     use crate::h264::mb::chroma_qp;
@@ -1104,9 +1105,27 @@ mod tests {
     /// and the raw DC levels. The AC levels come back dequantised, and
     /// their coverage is the residual writer's own round-trip test.
     fn round_trip(dec: &MbDecision, chosen_modes: Option<&[u8; 16]>, qp: u8) {
-        let mut st = NzState::new(1, 2, false);
+        round_trip_fmt(dec, chosen_modes, qp, 1, false)
+    }
+
+    /// As [`round_trip`], with the chroma format and whether the PPS
+    /// offers the 8x8 transform spelled out.
+    fn round_trip_fmt(
+        dec: &MbDecision,
+        chosen_modes: Option<&[u8; 16]>,
+        qp: u8,
+        cfi: u32,
+        t8x8: bool,
+    ) {
+        let c444 = cfi == 3;
+        let rows = match cfi {
+            1 => 2,
+            2 => 4,
+            _ => 0,
+        };
+        let mut st = NzState::new(1, rows, c444);
         let mut w = BitWriter::new();
-        write_macroblock(&mut w, dec, &mut st, 0, false, false, 0, false);
+        write_macroblock(&mut w, dec, &mut st, 0, false, false, 0, t8x8);
         w.rbsp_trailing_bits();
         let rbsp = w.into_rbsp();
 
@@ -1115,10 +1134,10 @@ mod tests {
             slice_num: 0,
             num_ref_idx: [0; 2],
             direct_spatial: false,
-            transform_8x8_mode: false,
+            transform_8x8_mode: t8x8,
             constrained_intra_pred: false,
             direct_8x8_inference: true,
-            chroma_format_idc: 1,
+            chroma_format_idc: cfi,
             cabac: false,
             bit_depth: 8,
             transform_bypass: false,
@@ -1139,10 +1158,18 @@ mod tests {
         assert!(!r.overrun());
 
         match dec.kind {
-            MbKind::I4x4 | MbKind::I8x8 => {
+            MbKind::I4x4 => {
                 assert_eq!(layer.kind, DecKind::I4x4);
                 if let Some(modes) = chosen_modes {
                     assert_eq!(&layer.intra_modes, modes, "decoded 4x4 modes");
+                }
+            }
+            MbKind::I8x8 => {
+                assert_eq!(layer.kind, DecKind::I8x8);
+                // The reader replicates each quad's mode over its four
+                // 4x4s, which is the form the decision keeps too.
+                if let Some(modes) = chosen_modes {
+                    assert_eq!(&layer.intra_modes, modes, "decoded 8x8 modes");
                 }
             }
             MbKind::I16x16 => {
@@ -1152,23 +1179,33 @@ mod tests {
                 assert_eq!(&layer.dc[0][..], &dc[..], "luma DC levels");
             }
         }
+        assert_eq!(layer.transform_8x8, dec.transform_8x8, "transform_size_8x8_flag");
         assert_eq!(layer.cbp, dec.cbp_luma | (dec.cbp_chroma << 4), "cbp");
         assert_eq!(layer.chroma_mode, dec.chroma_mode);
         assert_eq!(layer.qp_delta, dec.qp_delta as i32);
         assert_eq!(layer.qp, qp as i32);
-        for blk in 0..16 {
-            assert_eq!(layer.nz[0][blk], dec.nz_luma[blk], "luma nz {blk}");
-        }
-        for comp in 0..2 {
-            for blk in 0..4 {
-                assert_eq!(
-                    layer.chroma_nz[comp][blk], dec.nz_chroma[comp][blk],
-                    "chroma nz {comp}/{blk}"
-                );
+        // CAVLC stores exactly the counts the decision carries — its four
+        // sub-scan counts under the 8x8 transform, one per 4x4 otherwise —
+        // because those *are* the four blocks it codes.
+        assert_eq!(layer.nz[0], dec.nz_luma, "luma nz");
+        if c444 {
+            for comp in 0..2 {
+                assert_eq!(layer.nz[1 + comp], dec.nz_chroma[comp], "plane {comp} nz");
             }
-            if dec.cbp_chroma != 0 {
-                let dc: Vec<i32> = dec.chroma_dc[comp][..4].iter().map(|&v| v as i32).collect();
-                assert_eq!(&layer.chroma_dc[comp][..4], &dc[..], "chroma DC {comp}");
+        } else {
+            for comp in 0..2 {
+                for blk in 0..2 * rows {
+                    assert_eq!(
+                        layer.chroma_nz[comp][blk], dec.nz_chroma[comp][blk],
+                        "chroma nz {comp}/{blk}"
+                    );
+                }
+                if dec.cbp_chroma != 0 {
+                    let n_dc = if rows == 4 { 8 } else { 4 };
+                    let dc: Vec<i32> =
+                        dec.chroma_dc[comp][..n_dc].iter().map(|&v| v as i32).collect();
+                    assert_eq!(&layer.chroma_dc[comp][..n_dc], &dc[..], "chroma DC {comp}");
+                }
             }
         }
     }
@@ -1235,6 +1272,210 @@ mod tests {
                 );
                 let chosen = (dec.kind == MbKind::I4x4).then_some(&modes);
                 round_trip(&dec, chosen, qp);
+            }
+        }
+    }
+
+    /// Real `I_8x8` macroblocks, decided by the real mode decision with
+    /// the 8x8 transform on offer, written and handed to the production
+    /// CAVLC reader — over the chroma formats and the QP range, and over
+    /// sources that reach the shapes the decision actually picks between.
+    ///
+    /// The two things this covers that no 4x4 test can: the four
+    /// prediction-mode elements land where the reader takes them (before
+    /// the coded block pattern, after a `transform_size_8x8_flag` that
+    /// is itself read before `mb_pred()`), and the residual is four
+    /// *interleaved* sub-scans of one 8x8 rather than four 4x4 blocks —
+    /// so the `nC` bookkeeping is per sub-scan, and the levels come back
+    /// in the 8x8's raster and not in four separate ones.
+    #[test]
+    fn coded_8x8_macroblocks_round_trip_through_the_reader() {
+        let tools = IntraTools::new(true);
+        let mut seed = 0x8080_8080u32;
+        let mut lcg = move |x: usize, y: usize| -> u8 {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223 ^ ((x * 31 + y) as u32));
+            (seed >> 16) as u8
+        };
+        // Smooth enough that the 8x8 candidate wins somewhere, detailed
+        // enough that it does not always.
+        let mut y = vec![0u8; 16 * 16];
+        let mut cb = vec![0u8; 16 * 16];
+        let mut cr = vec![0u8; 16 * 16];
+        for r in 0..16 {
+            for c in 0..16 {
+                let smooth = (40 + 5 * c + 3 * r) as u8;
+                y[r * 16 + c] = smooth.wrapping_add(lcg(c, r) / 8);
+                cb[r * 16 + c] = smooth.wrapping_add(20);
+                cr[r * 16 + c] = smooth.wrapping_sub(20);
+            }
+        }
+        let mut saw_8x8 = false;
+        for &(cfi, chroma_h, c444) in &[(1u32, 8usize, false), (2, 16, false), (3, 16, true)] {
+            for qp in [10u8, 26, 33, 40] {
+                let qpc = chroma_qp(qp as i32, 0, 0);
+                let ctx = IntraCtx {
+                    dsp: &tools.dsp,
+                    enc: &tools.enc,
+                    dist: &tools.dist,
+                    quant: &tools.quant,
+                    dequant: &tools.dequant,
+                    qp: qp as i32,
+                    qpc: [qpc; 2],
+                    chroma_h,
+                    c444,
+                    t8x8: true,
+                };
+                let cpad = if c444 { LUMA_PAD } else { CHROMA_PAD };
+                let cw = if c444 { 16 } else { 8 };
+                let mut rec = vec![
+                    recon_plane(16, 16, LUMA_PAD),
+                    recon_plane(cw, chroma_h as u32, cpad),
+                    recon_plane(cw, chroma_h as u32, cpad),
+                ];
+                let mb = MbAvail { left: false, top: false, top_left: false, top_right: false };
+                let cstride = cw as usize;
+                let (dec, modes) = code_macroblock(
+                    &ctx, &mut rec, 0, 0, &y, 16, [&cb, &cr], cstride, mb, &[None; 4], &[None; 4],
+                );
+                saw_8x8 |= dec.kind == MbKind::I8x8;
+                let chosen = dec.kind.is_nxn().then_some(&modes);
+                round_trip_fmt(&dec, chosen, qp, cfi, true);
+            }
+        }
+        assert!(saw_8x8, "no configuration chose the 8x8 transform; the test proved nothing");
+    }
+
+    /// A hand-built `I_8x8` decision, so the writer's 8x8 syntax is
+    /// exercised whatever the mode decision above happens to choose —
+    /// including an 8x8 whose coefficients land in only some of its four
+    /// sub-scans, which is the case where a sub-scan count of zero has to
+    /// travel intact through `nC` (and where a writer that summed them,
+    /// as CABAC's neighbour record must, would desync the very next
+    /// block's tables).
+    #[test]
+    fn a_synthetic_i8x8_macroblock_round_trips() {
+        use crate::h264::cavlc::sub_block_counts_8x8;
+        let mut dec = MbDecision {
+            kind: MbKind::I8x8,
+            transform_8x8: true,
+            luma_pred: [PredMode { use_predicted: true, rem: 0 }; 16],
+            chroma_mode: 1,
+            ..MbDecision::default()
+        };
+        // 8x8 blocks 0 and 3 coded. Block 0's coefficients sit only at
+        // scan positions congruent to 0 and 2 mod 4, so sub-scans 1 and 3
+        // count zero; block 3 is dense.
+        let mut b0 = [0i16; 64];
+        for i in 0..16 {
+            b0[ZIGZAG8X8[4 * i] as usize] = if i % 3 == 0 { 3 } else { 0 };
+            b0[ZIGZAG8X8[4 * i + 2] as usize] = if i % 5 == 0 { -2 } else { 0 };
+        }
+        let mut b3 = [0i16; 64];
+        for (i, v) in b3.iter_mut().enumerate() {
+            *v = ((i as i16 % 7) - 3) * if i % 2 == 0 { 1 } else { -1 };
+        }
+        dec.luma.as_flattened_mut()[0..64].copy_from_slice(&b0);
+        dec.luma.as_flattened_mut()[192..256].copy_from_slice(&b3);
+        for (blk8, b) in [(0usize, &b0), (3, &b3)] {
+            let counts = sub_block_counts_8x8(b);
+            for (sub, &r) in quad_rasters(blk8).iter().enumerate() {
+                dec.nz_luma[r] = counts[sub];
+            }
+        }
+        assert!(
+            quad_rasters(0).iter().any(|&r| dec.nz_luma[r] == 0),
+            "the interesting case is an 8x8 with an empty sub-scan"
+        );
+        dec.cbp_luma = 0b1001;
+        dec.chroma_dc[0][0] = 3;
+        dec.chroma_dc[1][1] = 2;
+        dec.chroma_ac[0][2][5] = -4;
+        dec.nz_chroma[0][2] = 1;
+        dec.cbp_chroma = 2;
+        round_trip_fmt(&dec, Some(&[2u8; 16]), 28, 1, true);
+    }
+
+    /// The inter placement of the flag: after `coded_block_pattern`, and
+    /// only when some luma block is coded. Both states of the flag, and a
+    /// macroblock with no luma residual at all — where the element is
+    /// absent from the wire and a decoder infers zero.
+    #[test]
+    fn a_p16_macroblock_with_the_8x8_transform_round_trips() {
+        use crate::h264::cavlc::sub_block_counts_8x8;
+        for (t8x8, coded) in [(true, true), (false, true), (false, false)] {
+            let mut dec = InterDecision {
+                mvd: crate::h264::frame::Mv::new(5, -9),
+                transform_8x8: t8x8 && coded,
+                ..InterDecision::default()
+            };
+            if coded {
+                if t8x8 {
+                    let mut b = [0i16; 64];
+                    for (i, v) in b.iter_mut().enumerate() {
+                        *v = ((i as i16 % 5) - 2) * if i % 3 == 0 { 2 } else { -1 };
+                    }
+                    dec.luma.as_flattened_mut()[64..128].copy_from_slice(&b);
+                    let counts = sub_block_counts_8x8(&b);
+                    for (sub, &r) in quad_rasters(1).iter().enumerate() {
+                        dec.nz_luma[r] = counts[sub];
+                    }
+                    dec.cbp_luma = 0b0010;
+                } else {
+                    dec.luma[2][0] = 5;
+                    dec.luma[2][7] = -2;
+                    dec.nz_luma[2] = 2;
+                    dec.cbp_luma = 0b0010;
+                }
+                dec.chroma_dc[1][0] = -3;
+                dec.cbp_chroma = 1;
+            }
+
+            let mut st = NzState::new(1, 2, false);
+            let mut w = BitWriter::new();
+            write_p16_macroblock(&mut w, &dec, &mut st, 0, false, false, true);
+            w.rbsp_trailing_bits();
+            let rbsp = w.into_rbsp();
+
+            let ctx = SliceCtx { transform_8x8_mode: true, ..p_ctx() };
+            let info = PicInfo::new(1, 1);
+            let nb = MbNeighbours { mb_width: 1, ..MbNeighbours::default() };
+            let dq = Dequant::new(&flat());
+            let mut qps = QpState { prev_qp: 28, chroma_offset: [0, 0] };
+            let mut r = BitReader::new(&rbsp);
+            let t = r.ue();
+            let mut layer = MbLayer::new(DecKind::I4x4);
+            parse_mb_cavlc(&mut r, &ctx, &info, &nb, t, &mut layer, &dq, &mut qps)
+                .expect("the reader rejected what the writer produced");
+            assert!(!r.overrun());
+            assert_eq!(layer.kind, DecKind::Inter16x16);
+            assert_eq!(layer.transform_8x8, dec.transform_8x8, "t8x8={t8x8} coded={coded}");
+            assert_eq!(layer.cbp, dec.cbp_luma | (dec.cbp_chroma << 4));
+            assert_eq!(layer.nz[0], dec.nz_luma, "t8x8={t8x8} coded={coded} luma nz");
+            // The reader scales as it parses, so the levels come back
+            // dequantised — and asking *it* for the table and shift is
+            // what pins the 8x8 inter scaling list (index 1, since the
+            // 8x8 lists run `2 * plane + inter`) and the `qP / 6` shift.
+            let mbdq = crate::h264::mb::MbDequant::for_mb(
+                &dq, &ctx, [0, 0], DecKind::Inter16x16, layer.qp,
+            )
+            .expect("not lossless");
+            let (table, shift) = mbdq.q8[0];
+            for i in 0..256 {
+                let want = if dec.transform_8x8 {
+                    crate::h264::mb::dequant_level(
+                        dec.luma.as_flattened()[i] as i32,
+                        table[i % 64],
+                        shift,
+                    )
+                } else {
+                    let (blk, k) = (i / 16, i % 16);
+                    crate::h264::mb::dequant_level(
+                        dec.luma[blk][k] as i32,
+                        mbdq.q4[0].0[k],
+                        mbdq.q4[0].1,
+                    )
+                };
+                assert_eq!(layer.coef[0][i], want, "t8x8={t8x8} coded={coded} coeff {i}");
             }
         }
     }
