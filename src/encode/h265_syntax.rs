@@ -495,6 +495,96 @@ mod tests {
         assert_eq!((g.log2_ctb, g.coded_width, g.coded_height), (4, 64, 48));
     }
 
+    /// The reference picture set a P or B slice carries is written here
+    /// and read by the production parser, so this test drives both: build
+    /// the header, hand it to `SliceHeader::parse` with the encoder's own
+    /// SPS and PPS, and check the reference pictures come back.
+    ///
+    /// The ordering is the trap. The set is not a list of deltas in POC
+    /// order: it is *all* the negatives, nearest first, each coded as a
+    /// difference from the previous one, and only then all the positives
+    /// the same way. A B slice with one anchor either side is the
+    /// smallest case that can tell the two arrangements apart — writing
+    /// them interleaved parses as two negatives and puts the future
+    /// anchor in the past.
+    #[test]
+    fn a_slice_header_carries_its_reference_pictures_where_the_parser_looks() {
+        use crate::nal::HevcNalHeader;
+        use crate::hevc::pps::Pps;
+        use crate::hevc::slice::{SliceHeader as ParsedHeader, SliceType};
+        use crate::hevc::sps::Sps;
+
+        let (cfg, g) = geom(64, 64, ChromaFormat::Yuv420);
+        let sps = Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 16))).expect("SPS");
+        let mut pps = Pps::parse(&crate::nal::unescape_rbsp(&write_pps(26, false, true))).expect("PPS");
+        pps.resolve_tiles(&sps).expect("tiles");
+
+        // Coding order puts this picture between its anchors: POC 4, with
+        // POC 2 behind it and POC 8 ahead.
+        for (kind, deltas, want_neg, want_pos) in [
+            (Kind::P, vec![-2i32], vec![-2i32], vec![]),
+            (Kind::B, vec![-2, 4], vec![-2], vec![4]),
+            (Kind::B, vec![4, -2], vec![-2], vec![4]),
+        ] {
+            let h = SliceHeader {
+                kind,
+                poc_lsb: 4,
+                qp: 30,
+                log2_max_poc_lsb: 16,
+                ref_deltas: deltas.clone(),
+            };
+            let mut w = BitWriter::with_capacity(64);
+            w.bits(8, ((NAL_TRAIL_R as u32) & 0x3f) << 1);
+            w.bits(8, 1);
+            write_slice_header(&h, 26, NAL_TRAIL_R, true, &mut w);
+            w.flag(true); // byte_alignment()
+            w.align_zero();
+            let rbsp = w.into_rbsp();
+
+            let nal = HevcNalHeader::parse(&rbsp).expect("NAL header");
+            let (parsed, _, _) = ParsedHeader::parse(
+                &rbsp,
+                nal,
+                &|_| Some(pps.clone()),
+                &|_| Some(sps.clone()),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{kind:?} header with {deltas:?} must parse: {e}"));
+
+            assert_eq!(
+                parsed.slice_type,
+                match kind {
+                    Kind::B => SliceType::B,
+                    Kind::P => SliceType::P,
+                    _ => SliceType::I,
+                },
+                "slice type"
+            );
+            assert_eq!(parsed.slice_qp, 30, "slice QP");
+            let neg: Vec<i32> = parsed.st_rps.neg.iter().map(|&(d, _)| d).collect();
+            let pos: Vec<i32> = parsed.st_rps.pos.iter().map(|&(d, _)| d).collect();
+            assert_eq!(neg, want_neg, "past references for {kind:?} {deltas:?}");
+            assert_eq!(pos, want_pos, "future references for {kind:?} {deltas:?}");
+            assert!(
+                parsed.st_rps.neg.iter().chain(parsed.st_rps.pos.iter()).all(|&(_, used)| used),
+                "every reference this encoder writes is used by the current picture"
+            );
+            // One active reference per list, taken from the PPS defaults
+            // rather than overridden — and B gets a second list where P
+            // does not.
+            assert_eq!(
+                parsed.num_ref_idx,
+                match kind {
+                    Kind::B => [1, 1],
+                    _ => [1, 0],
+                },
+                "active reference counts for {kind:?}"
+            );
+            assert_eq!(parsed.max_num_merge_cand, 5, "MaxNumMergeCand");
+            assert!(!parsed.mvd_l1_zero, "mvd_l1_zero_flag is written false");
+        }
+    }
+
     #[test]
     fn the_nal_header_is_two_bytes_and_carries_temporal_id_plus_one() {
         let n = annexb(NAL_SPS, &[0xaa]);
