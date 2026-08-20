@@ -303,7 +303,7 @@ pub fn write_pps(qp: u8, bypass: bool) -> Vec<u8> {
 }
 
 /// What a slice segment header needs beyond the parameter sets.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SliceHeader {
     /// What the slice is coded as.
     pub kind: Kind,
@@ -313,6 +313,12 @@ pub struct SliceHeader {
     pub qp: u8,
     /// Width of the `poc_lsb` field, from the SPS.
     pub log2_max_poc_lsb: u32,
+    /// POC deltas of the reference pictures, relative to this slice's POC:
+    /// negative for the past (list 0), positive for the future (list 1).
+    /// Empty for an I or IDR slice. These become the slice's inline short
+    /// term reference picture set, in the order the reader expects —
+    /// negatives nearest-first, then positives nearest-first.
+    pub ref_deltas: Vec<i32>,
 }
 
 /// Slice segment header, up to but not including the coded tree.
@@ -331,14 +337,74 @@ pub fn write_slice_header(h: &SliceHeader, pps_qp: u8, nal_type: u8, w: &mut Bit
     // definition and everything before it is discarded.
     if !(16..=23).contains(&nal_type) {
         w.bits(h.log2_max_poc_lsb, h.poc_lsb);
-        w.flag(true); // short_term_ref_pic_set_sps_flag would be here; with
-                      // num_short_term_ref_pic_sets 0 this encoder must send
-                      // an inline set, which arrives with inter prediction.
+        // The SPS declares num_short_term_ref_pic_sets = 0, so there is no
+        // set to select and the slice must carry its own inline.
+        // (This flag was once written as 1 with nothing behind it — a
+        // placeholder that claimed an SPS set that does not exist, dead
+        // only because every non-IDR path refused before reaching here. It
+        // would have gone live the instant inter prediction landed; the
+        // writers-beside-readers work on the coding tree is what found it.)
+        w.flag(false); // short_term_ref_pic_set_sps_flag
+        // st_ref_pic_set(0): with no earlier set to predict from,
+        // inter_ref_pic_set_prediction_flag is not read at idx 0.
+        let mut negative: Vec<i32> = h.ref_deltas.iter().copied().filter(|d| *d < 0).collect();
+        let mut positive: Vec<i32> = h.ref_deltas.iter().copied().filter(|d| *d > 0).collect();
+        // Nearest first, as the deltas are coded as successive differences.
+        negative.sort_by_key(|d| -d);
+        positive.sort();
+        w.ue(negative.len() as u32);
+        w.ue(positive.len() as u32);
+        let mut prev = 0i32;
+        for d in &negative {
+            w.ue((prev - d - 1) as u32); // delta_poc_s0_minus1
+            w.flag(true); // used_by_curr_pic_s0_flag
+            prev = *d;
+        }
+        let mut prev = 0i32;
+        for d in &positive {
+            w.ue((d - prev - 1) as u32); // delta_poc_s1_minus1
+            w.flag(true); // used_by_curr_pic_s1_flag
+            prev = *d;
+        }
+        // slice_temporal_mvp_enabled_flag is absent: the SPS disables
+        // temporal MVP, so the reader never reads the slice-level flag —
+        // which is also what makes the spatial candidate derivation the
+        // complete one rather than a subset of it.
     }
     // slice_sao_luma_flag / slice_sao_chroma_flag are absent: SAO is
     // disabled in the SPS. (A flag was once written here anyway — one
     // spurious bit that shifted everything after it, unnoticed because
     // nothing could decode past the header until the coding tree existed.)
+    if matches!(h.kind, Kind::P | Kind::B) {
+        // num_ref_idx_active_override_flag: 0, taking the PPS defaults.
+        // Both num_ref_idx_lX_default_active_minus1 are 0 there, so the
+        // reader resolves [1, 0] for P and [1, 1] for B — exactly the one
+        // reference per list the decision modules search. Verified against
+        // the header parser, not inferred: it copies the PPS defaults and
+        // overwrites them only when this flag is set.
+        //
+        // The coupling this buys is worth naming: change those PPS
+        // defaults and every slice header written this way silently means
+        // something else. Both are written from one contract in this file,
+        // which is why the shorter form wins.
+        w.flag(false);
+        // lists_modification_present_flag is 0 in the PPS, so no list
+        // modification syntax follows; mvd_l1_zero_flag is read for B.
+        if h.kind == Kind::B {
+            w.flag(false); // mvd_l1_zero_flag
+        }
+        // cabac_init_present_flag is 0 in the PPS: no cabac_init_flag, and
+        // both sides derive the P/B initialisation type from the slice
+        // type alone.
+        //
+        // collocated_from_l0_flag / collocated_ref_idx are absent because
+        // slice_temporal_mvp_enabled is off; the weighted prediction
+        // tables are absent because weighted_pred_flag and
+        // weighted_bipred_flag are both 0 — default weighting is not a
+        // simplification, it is the only combination this bitstream can
+        // ask the reader for.
+        w.ue(0); // five_minus_max_num_merge_cand -> MaxNumMergeCand 5
+    }
     w.se(h.qp as i32 - pps_qp as i32); // slice_qp_delta
     // slice_loop_filter_across_slices_enabled_flag is NOT written: the
     // reader reads it only when SAO is on for the slice or deblocking is

@@ -2296,7 +2296,7 @@ mod write_round_trip {
         let mut w = BitWriter::new();
         w.bits(8, ((NAL_IDR_N_LP as u32) & 0x3f) << 1);
         w.bits(8, 1); // nuh_layer_id 0, nuh_temporal_id_plus1 1
-        let eh = EncSliceHeader { kind: Kind::Idr, poc_lsb: 0, qp: qp as u8, log2_max_poc_lsb: 8 };
+        let eh = EncSliceHeader { kind: Kind::Idr, poc_lsb: 0, qp: qp as u8, log2_max_poc_lsb: 8, ref_deltas: Vec::new() };
         write_slice_header(&eh, 26, NAL_IDR_N_LP, &mut w);
         w.flag(true); // byte_alignment(): alignment_bit_equal_to_one
         w.align_zero();

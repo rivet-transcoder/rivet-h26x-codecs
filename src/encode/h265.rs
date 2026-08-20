@@ -19,6 +19,7 @@
 
 use super::gop::{Coded, Kind, Scheduler};
 use super::h265_intra::{CuDecision, IntraCtx, IntraPicture};
+use super::h265_me::{InterCuDecision, InterCuKind, InterPicture, MAX_MERGE_CAND};
 use super::h265_syntax as syn;
 use super::{Access, Config, RateControl};
 use crate::bitwriter::BitWriter;
@@ -29,7 +30,9 @@ use crate::dsp::hevc_enc::HevcEncDsp;
 use crate::dsp::Cpu;
 use crate::hevc::ctx::Contexts;
 use crate::hevc::ctu::{
-    SplitCuNb, write_cbf_chroma, write_cbf_luma, write_cu_transquant_bypass_flag,
+    SplitCuNb, write_cbf_chroma, write_cbf_luma, write_cu_skip_flag,
+    write_cu_transquant_bypass_flag, write_merge_flag, write_merge_idx, write_mvd,
+    write_mvp_flag, write_part_mode_inter, write_pred_mode_flag, write_rqt_root_cbf,
     write_intra_chroma_pred_mode, write_mpm_idx, write_prev_intra_luma_pred_flag,
     write_rem_intra_luma_pred_mode, write_split_cu_flag, write_split_transform_flag,
 };
@@ -52,6 +55,11 @@ pub struct H265Encoder {
     /// releases pictures as fast as they arrive.
     next_display: u64,
     geom: syn::Geometry,
+    /// Reference pictures as the decoder holds them — full `Frame`s with
+    /// their motion grids and extended borders, not cropped bytes: the
+    /// inter decision predicts through the decoder's own MC, which reads
+    /// padded planes, and derives candidates from stored motion.
+    refs: Vec<crate::hevc::frame::Frame<u8>>,
 }
 
 /// The POC LSB width the SPS declares. Fixed and generous, as on the H.264
@@ -89,6 +97,7 @@ impl H265Encoder {
             recon: Vec::new(),
             frame_bytes: luma + chroma,
             next_display: 0,
+            refs: Vec::new(),
         })
     }
 
@@ -157,9 +166,25 @@ impl H265Encoder {
             RateControl::ConstantQp(q) => q.min(51),
         };
         if c.kind != Kind::Idr {
-            return Err(Error::unsupported(
-                "H.265 encode: inter prediction (encoder in progress; --gop 0 works)",
-            ));
+            if bypass {
+                // Transquant bypass on an inter CU is legal, but the inter
+                // decision does not model it and a lossy stream sold as
+                // lossless is the worst possible answer.
+                return Err(Error::unsupported(
+                    "H.265 encode: lossless inter pictures (encoder in progress)",
+                ));
+            }
+            if self.cfg.chroma != crate::ChromaFormat::Yuv420 {
+                return Err(Error::unsupported(
+                    "H.265 encode: inter pictures outside 4:2:0 (encoder in progress)",
+                ));
+            }
+            if c.kind == Kind::B {
+                return Err(Error::unsupported(
+                    "H.265 encode: B pictures (encoder in progress; P works)",
+                ));
+            }
+            return self.code_p_picture(c, src, qp);
         }
 
         // Sources at coded size, edge-replicated: the coded picture is a
@@ -241,6 +266,9 @@ impl H265Encoder {
                 poc_lsb: (c.poc as u32) & ((1 << LOG2_MAX_POC_LSB) - 1),
                 qp,
                 log2_max_poc_lsb: LOG2_MAX_POC_LSB,
+                // An IDR references nothing, so its reference picture set
+                // is empty.
+                ref_deltas: Vec::new(),
             },
             qp,
             syn::NAL_IDR_N_LP,
@@ -282,7 +310,264 @@ impl H265Encoder {
         }
         self.recon.push(rec);
 
+        // Keep the picture as a reference the way the decoder keeps it:
+        // borders extended for motion compensation, POC set, motion grid
+        // intact. An IDR empties the buffer first - everything before it
+        // is discarded, which is what makes it a random access point.
+        let mut frame = pic.recon;
+        frame.poc = c.poc as i32;
+        frame.extend_rows(0, frame.height);
+        self.refs.clear();
+        self.refs.push(frame);
+
         Ok(Access { data: out, keyframe: true, poc: c.poc, encode_index: c.encode })
+    }
+
+    /// Code one P picture: every CTU one inter CU, decided against the
+    /// single stored reference and serialised through the coding-tree
+    /// writers that live beside their readers.
+    ///
+    /// The two halves meet here and nowhere else. The decision module
+    /// chooses skip / merge / AMVP by calling the decoder's own candidate
+    /// derivation, so what this writes is what that decoder will rebuild;
+    /// the writers spell each shape in the reader's element order. The
+    /// shapes and their inference traps are documented on `InterCuKind` -
+    /// most sharply that a non-skip 2Nx2N merge CU never codes
+    /// `rqt_root_cbf` (the reader infers it true), which is why a merge
+    /// with nothing left to code must be spelled as a skip instead.
+    fn code_p_picture(&mut self, c: Coded, src: &[u8], qp: u8) -> Result<Access> {
+        let g = self.geom;
+        let (dw, dh) = (self.cfg.width as usize, self.cfg.height as usize);
+        let (cw, ch) = (g.coded_width as usize, g.coded_height as usize);
+        let (cdw, cdh) = (dw.div_ceil(2), dh.div_ceil(2));
+        let (ccw, cch) = (cw / 2, ch / 2);
+        let pad = |src: &[u8], sw: usize, sh: usize, tw: usize, th: usize| -> Vec<u8> {
+            let mut out = vec![0u8; tw * th];
+            for y in 0..th {
+                let sy = y.min(sh - 1);
+                for x in 0..tw {
+                    out[y * tw + x] = src[sy * sw + x.min(sw - 1)];
+                }
+            }
+            out
+        };
+        let py = pad(&src[..dw * dh], dw, dh, cw, ch);
+        let pcb = pad(&src[dw * dh..dw * dh + cdw * cdh], cdw, cdh, ccw, cch);
+        let pcr = pad(&src[dw * dh + cdw * cdh..], cdw, cdh, ccw, cch);
+
+        // The parameter sets this picture is coded against, parsed back
+        // through the decoder's own parsers: the candidate derivation the
+        // decision module calls reads decoder structures, and building
+        // them from the very bytes the stream carries is what keeps the
+        // encoder's idea of the geometry and the decoder's identical.
+        let sps_rbsp = syn::write_sps(&self.cfg, &g, LOG2_MAX_POC_LSB);
+        let pps_rbsp = syn::write_pps(qp, false);
+        let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&sps_rbsp))?;
+        let mut pps = crate::hevc::pps::Pps::parse(&crate::nal::unescape_rbsp(&pps_rbsp))?;
+        pps.resolve_tiles(&sps)?;
+
+        let refp = self
+            .refs
+            .last()
+            .ok_or_else(|| Error::bitstream("H.265 encode: a P picture with no reference"))?;
+        let ref_poc = refp.poc;
+
+        let cpu = Cpu::detect_honouring_env();
+        let mut dsp = HevcDsp::<u8>::SCALAR;
+        install_simd_u8(&mut dsp, cpu);
+        let enc = HevcEncDsp::new(cpu);
+        let dist = DistortionDsp::<u8>::new(cpu);
+        let mctx = IntraCtx {
+            dsp: &dsp,
+            enc: &enc,
+            dist: &dist,
+            qp: qp as i32,
+            bit_depth: 8,
+            strong_smoothing: false,
+            bypass: false,
+        };
+        let mut pic = InterPicture::<u8>::new(&sps, &pps, c.poc as i32);
+
+        let mut w = BitWriter::with_capacity(cw * ch / 4);
+        syn::write_slice_header(
+            &syn::SliceHeader {
+                kind: c.kind,
+                poc_lsb: (c.poc as u32) & ((1 << LOG2_MAX_POC_LSB) - 1),
+                qp,
+                log2_max_poc_lsb: LOG2_MAX_POC_LSB,
+                // One reference, in the past: the inline short term set
+                // this becomes is what builds RefPicList0.
+                ref_deltas: vec![ref_poc - c.poc as i32],
+            },
+            qp,
+            syn::NAL_TRAIL_R,
+            &mut w,
+        );
+        w.flag(true); // byte_alignment()
+        w.align_zero();
+
+        let (wc, hc) = (g.ctbs_wide as usize, g.ctbs_high as usize);
+        // Initialisation type 1 is what the decoder derives for a P slice
+        // when cabac_init_flag is absent, which the PPS guarantees.
+        let mut cx = Contexts::new(1, qp as i32);
+        // cu_skip_flag's context counts *skipped* available neighbours, so
+        // the walk carries what it decided, one entry per CTU.
+        let mut skipped = vec![false; wc * hc];
+        {
+            let mut e = CabacEncoder::new(&mut w);
+            for cy in 0..hc {
+                for cxu in 0..wc {
+                    let d = pic.code_ctu(&mctx, refp, cxu, cy, &py, cw, &pcb, &pcr, ccw);
+                    if matches!(d.kind, InterCuKind::UseIntra) {
+                        // Legal, and the decision module offers it, but
+                        // coding an intra CU inside a P slice needs the
+                        // intra decision working on this picture's own
+                        // reconstruction - one picture, two decision
+                        // modules - which is its own piece of wiring.
+                        return Err(Error::unsupported(
+                            "H.265 encode: intra coding units inside a P slice (encoder in progress)",
+                        ));
+                    }
+                    let left = (cxu > 0).then(|| skipped[cy * wc + cxu - 1]);
+                    let above = (cy > 0).then(|| skipped[(cy - 1) * wc + cxu]);
+                    write_cu_inter(&mut e, &mut cx, &d, left, above);
+                    skipped[cy * wc + cxu] = matches!(d.kind, InterCuKind::Skip { .. });
+                    e.encode_terminate(u32::from(cy == hc - 1 && cxu == wc - 1));
+                }
+            }
+        }
+        w.align_zero();
+        let mut out = Vec::new();
+        out.extend_from_slice(&syn::annexb(syn::NAL_TRAIL_R, &w.into_nal()));
+
+        let mut rec = Vec::with_capacity(self.frame_bytes);
+        let crop = |p: &crate::hevc::frame::Plane16<u8>, tw: usize, th: usize, out: &mut Vec<u8>| {
+            let o = p.origin();
+            for y in 0..th {
+                let row = o + y * p.stride;
+                out.extend_from_slice(&p.data[row..row + tw]);
+            }
+        };
+        crop(&pic.recon.y, dw, dh, &mut rec);
+        crop(&pic.recon.cb, cdw, cdh, &mut rec);
+        crop(&pic.recon.cr, cdw, cdh, &mut rec);
+        self.recon.push(rec);
+
+        // This picture becomes the reference for the next one. One slot:
+        // the decision searches exactly one reference, and the slice
+        // header it just wrote declares exactly one.
+        let mut frame = pic.recon;
+        frame.poc = c.poc as i32;
+        frame.extend_rows(0, frame.height);
+        self.refs.clear();
+        self.refs.push(frame);
+
+        Ok(Access { data: out, keyframe: false, poc: c.poc, encode_index: c.encode })
+    }
+}
+
+/// Serialise one inter coding unit - one whole-CTU `PART_2Nx2N` CU, in the
+/// reader's element order (`coding_unit` / `prediction_unit`).
+///
+/// Which elements exist depends on the shape, and two of them the decoder
+/// reads without anybody writing:
+///
+/// - A skipped CU codes `cu_skip_flag` and `merge_idx`, then stops:
+///   `rqt_root_cbf` is inferred 0 and no transform tree follows.
+/// - A non-skip 2Nx2N *merge* CU does not code `rqt_root_cbf` either - the
+///   reader infers it **true** - so its transform tree always follows, and
+///   a merge whose residual quantised away is unspellable. The decision
+///   module spells that case as a skip instead.
+/// - An AMVP CU codes `rqt_root_cbf` explicitly, and the tree follows only
+///   when it is set.
+///
+/// `ref_idx_l0` is absent because the slice declares one active reference,
+/// and `inter_pred_idc` is absent because a P slice forces list 0 - both
+/// reader-side conditions rather than simplifications.
+fn write_cu_inter(
+    e: &mut CabacEncoder,
+    cx: &mut Contexts,
+    d: &InterCuDecision,
+    left_skip: Option<bool>,
+    above_skip: Option<bool>,
+) {
+    let log2 = d.log2_cu;
+    // One CU per CTU, so the coding quadtree never splits and the flag is
+    // coded exactly once, false - the same shape the intra writer spells.
+    let nb = SplitCuNb {
+        left_depth: left_skip.map(|_| 0),
+        above_depth: above_skip.map(|_| 0),
+    };
+    write_split_cu_flag(e, cx, &nb, 0, false);
+
+    let skip = matches!(d.kind, InterCuKind::Skip { .. });
+    write_cu_skip_flag(e, cx, left_skip, above_skip, skip);
+    if let InterCuKind::Skip { merge_idx } = d.kind {
+        write_merge_idx(e, cx, MAX_MERGE_CAND as u32, u32::from(merge_idx));
+        return;
+    }
+
+    write_pred_mode_flag(e, cx, false);
+    write_part_mode_inter(e, cx, crate::hevc::ctu::PartMode::P2Nx2N);
+    match d.kind {
+        InterCuKind::Merge { merge_idx } => {
+            write_merge_flag(e, cx, true);
+            write_merge_idx(e, cx, MAX_MERGE_CAND as u32, u32::from(merge_idx));
+            // No rqt_root_cbf: the reader infers it true, so the tree
+            // below is not optional here.
+            debug_assert!(d.rqt_root_cbf, "a merge CU with no residual must be spelled as a skip");
+        }
+        InterCuKind::Amvp { mvp_flag, mvd } => {
+            write_merge_flag(e, cx, false);
+            write_mvd(e, cx, mvd);
+            write_mvp_flag(e, cx, mvp_flag != 0);
+            write_rqt_root_cbf(e, cx, d.rqt_root_cbf);
+            if !d.rqt_root_cbf {
+                return;
+            }
+        }
+        InterCuKind::Skip { .. } | InterCuKind::UseIntra => unreachable!("handled above"),
+    }
+
+    // The transform tree: one CU-sized TU, no split. cbf_luma is coded
+    // only because a chroma cbf is set or the depth is nonzero - for an
+    // inter leaf at depth 0 with both chroma cbfs clear the reader infers
+    // cbf_luma 1 and reads no bin, so writing one would desync.
+    write_split_transform_flag(e, cx, log2, false);
+    write_cbf_chroma(e, cx, 0, d.cbf_chroma[0]);
+    write_cbf_chroma(e, cx, 0, d.cbf_chroma[1]);
+    if d.cbf_chroma[0] || d.cbf_chroma[1] {
+        write_cbf_luma(e, cx, 0, d.cbf_luma);
+    } else {
+        debug_assert!(d.cbf_luma, "an inter leaf with no chroma cbf has cbf_luma inferred 1");
+    }
+
+    let n = 1usize << log2;
+    // Inter blocks always scan diagonally: the mode-dependent scans are an
+    // intra rule (7.4.9.11).
+    let params = |log2_size: u32, c_idx: usize| ResidualParams {
+        log2_size,
+        c_idx,
+        scan_idx: 0,
+        bypass: false,
+        transform_skip_allowed: false,
+        sign_hiding: false,
+        intra: false,
+        pred_mode_intra: 0,
+        ts_context: false,
+        implicit_rdpcm: false,
+        explicit_rdpcm: false,
+        persistent_rice: false,
+        trace: false,
+    };
+    if d.cbf_luma {
+        write_residual(e, cx, &params(log2, 0), &d.luma[..n * n]);
+    }
+    let nc = n / 2;
+    for comp in 0..2 {
+        if d.cbf_chroma[comp] {
+            write_residual(e, cx, &params(log2 - 1, comp + 1), &d.chroma[comp][..nc * nc]);
+        }
     }
 }
 
@@ -523,19 +808,59 @@ mod tests {
             assert_eq!(e.reconstructions()[0].len(), per, "{chroma:?} recon size");
         }
 
-        // The one remaining named hole.
+        // P pictures code: a GOP of 4:2:0 pictures produces one access
+        // unit each, the first a keyframe and the rest not.
         let mut e = H265Encoder::new(Config { gop: 8, ..cfg(64, 64, ChromaFormat::Yuv420) }).unwrap();
         let frame = vec![64u8; 64 * 64 * 3 / 2];
-        let mut named = false;
+        let mut units = Vec::new();
         for _ in 0..3 {
-            if let Err(err) = e.push(&frame) {
-                let s = format!("{err}");
-                assert!(s.contains("inter prediction"), "expected the inter hole in: {s}");
-                named = true;
-                break;
-            }
+            units.extend(e.push(&frame).expect("a P picture should code"));
         }
-        assert!(named, "never reached the inter-prediction hole");
+        units.extend(e.flush().unwrap());
+        assert_eq!(units.len(), 3, "one access unit per picture");
+        assert!(units[0].keyframe, "the first is an IDR");
+        assert!(!units[1].keyframe && !units[2].keyframe, "the rest are P");
+        assert!(units.iter().all(|u| !u.data.is_empty()));
+
+        // The named holes that remain, each reached by the configuration
+        // that asks for it.
+        let holes: [(Config, usize, &str); 3] = [
+            (
+                Config { gop: 8, bframes: 2, ..cfg(64, 64, ChromaFormat::Yuv420) },
+                64 * 64 * 3 / 2,
+                "B pictures",
+            ),
+            (Config { gop: 8, ..cfg(64, 64, ChromaFormat::Yuv422) }, 64 * 64 * 2, "outside 4:2:0"),
+            (
+                Config {
+                    gop: 8,
+                    rate: super::super::RateControl::Lossless,
+                    ..cfg(64, 64, ChromaFormat::Yuv420)
+                },
+                64 * 64 * 3 / 2,
+                "lossless inter",
+            ),
+        ];
+        for (config, per, want) in holes {
+            let mut e = H265Encoder::new(config).unwrap();
+            let frame = vec![64u8; per];
+            let mut named = false;
+            for _ in 0..6 {
+                if let Err(err) = e.push(&frame) {
+                    let s = format!("{err}");
+                    assert!(s.contains(want), "expected {want:?} in: {s}");
+                    named = true;
+                    break;
+                }
+            }
+            if !named {
+                if let Err(err) = e.flush() {
+                    assert!(format!("{err}").contains(want));
+                    named = true;
+                }
+            }
+            assert!(named, "never reached the {want:?} hole");
+        }
     }
 
     /// Lossless (transquant bypass) reconstructs the source exactly: the
