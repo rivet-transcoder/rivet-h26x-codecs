@@ -49,8 +49,12 @@
 //!   will make it reachable from production geometry — and brings the
 //!   chroma-at-the-parent rule (`transform_unit`'s `blk_idx == 3` case)
 //!   that one level never triggers.
-//! - **4:2:0 only** (`chroma_array_type` 1), one chroma TU per component
-//!   at half the CU size.
+//! - **Chroma formats: 4:0:0 and 4:2:0** ([`IntraPicture::new_with_chroma`];
+//!   plain `new` stays 4:2:0). Monochrome simply omits every chroma
+//!   element, mirroring the reader's `chroma_array_type == 0` gates; the
+//!   4:2:0 shape is one chroma TU per component at half the luma TU size.
+//!   4:2:2 and 4:4:4 are refused by name — next in line, not designed
+//!   around.
 //! - **One slice, one tile, raster CTU order.** Availability reduces to
 //!   picture geometry plus z-scan order, mirrored from the decoder.
 //! - **Flat scaling lists, no transform skip, no RDPCM, no rotation** —
@@ -140,7 +144,11 @@ pub struct CuDecision {
     pub luma_syntax: [LumaModeSyntax; 4],
     /// `intra_chroma_pred_mode` as coded: 0..=3 pick planar/26/10/1 (with
     /// 34 substituted where the pick equals the luma mode), 4 derives from
-    /// luma. One per CU — 4:4:4 `PART_NxN` would need four.
+    /// luma. One per CU — 4:4:4 `PART_NxN` would need four. For a
+    /// monochrome picture this and every other chroma field is
+    /// meaningless: the syntax element does not exist
+    /// (`coding_unit` reads it only when `chroma_array_type != 0`) and
+    /// the writer emits nothing chroma at all.
     pub chroma_syntax: u8,
     /// The derived `IntraPredModeC` — what `chroma_syntax` decodes to
     /// (8.4.3), stored so the writer's mode-dependent scan for 4x4 chroma
@@ -254,6 +262,10 @@ struct Geo {
     /// Luma picture width and height in samples.
     width: usize,
     height: usize,
+    /// `chroma_array_type`: 0 monochrome, 1 = 4:2:0 — the discriminator
+    /// the reader's chroma gates test, carried in its numeric form so the
+    /// mirrors read like the code they mirror.
+    cat: u32,
 }
 
 /// Per-picture state of the all-intra walk: the reconstruction the
@@ -287,23 +299,40 @@ pub struct IntraPicture<S: Sample> {
 }
 
 impl<S: Sample> IntraPicture<S> {
-    /// State for a picture of `width` by `height` luma samples, both
-    /// multiples of the CU size — the fixed-geometry simplification above.
+    /// State for a 4:2:0 picture of `width` by `height` luma samples,
+    /// both multiples of the CU size — the fixed-geometry simplification
+    /// above. Kept as-is so existing callers stay source- and
+    /// bit-identical; other chroma formats go through
+    /// [`IntraPicture::new_with_chroma`].
     pub fn new(width: usize, height: usize, log2_cu: u32, bit_depth: u32) -> Self {
+        Self::new_with_chroma(width, height, log2_cu, bit_depth, ChromaFormat::Yuv420)
+    }
+
+    /// [`IntraPicture::new`] with the chroma format spelled out.
+    /// Monochrome codes no chroma at all; formats this module does not
+    /// model yet are refused by name rather than mis-coded.
+    pub fn new_with_chroma(width: usize, height: usize, log2_cu: u32, bit_depth: u32, chroma: ChromaFormat) -> Self {
         assert!((3..=5).contains(&log2_cu), "log2_cu {log2_cu} outside 3..=5");
         let n = 1usize << log2_cu;
         assert!(width.is_multiple_of(n) && height.is_multiple_of(n), "{width}x{height} is not a whole number of {n}x{n} CTUs");
+        let cat = match chroma {
+            ChromaFormat::Monochrome => 0,
+            ChromaFormat::Yuv420 => 1,
+            ChromaFormat::Yuv422 | ChromaFormat::Yuv444 => {
+                unimplemented!("H.265 intra decision: {chroma:?} (4:2:2 and 4:4:4 in progress)")
+            }
+        };
         let w4 = width / 4;
         let h4 = height / 4;
         IntraPicture {
-            recon: Frame::new(width, height, ChromaFormat::Yuv420, bit_depth),
+            recon: Frame::new(width, height, chroma, bit_depth),
             log2_cu,
             try_split: false,
             // 1 (DC) everywhere, as the decoder initialises intra_mode; the
             // availability test keeps uncoded entries from ever being read.
             modes: vec![1; w4 * h4],
             scratch: IntraScratch::default(),
-            geo: Geo { log2_cu, wc: width >> log2_cu, w4, width, height },
+            geo: Geo { log2_cu, wc: width >> log2_cu, w4, width, height, cat },
         }
     }
 
@@ -328,7 +357,18 @@ impl<S: Sample> IntraPicture<S> {
         let try_split = self.try_split;
         let n = 1usize << geo.log2_cu;
         let (x0, y0) = (cu_x * n, cu_y * n);
-        let coff = (y0 / 2) * c_stride + x0 / 2;
+        // Monochrome codes no chroma at all — the reader's chroma work is
+        // uniformly gated on `chroma_array_type != 0` (the mode syntax in
+        // `coding_unit`, the cbfs in `transform_tree`, prediction and
+        // residual in `transform_unit`), and so is every chroma step
+        // below. The source slices are never indexed then, so callers may
+        // pass empty ones.
+        let (scb, scr) = if geo.cat != 0 {
+            let coff = (y0 / 2) * c_stride + x0 / 2;
+            (&src_cb[coff..], &src_cr[coff..])
+        } else {
+            (&src_cb[..0], &src_cr[..0])
+        };
         let mut out = CuDecision { log2_cu: geo.log2_cu, bypass: ctx.bypass, ..CuDecision::default() };
 
         let IntraPicture { recon, modes, scratch, .. } = self;
@@ -364,26 +404,28 @@ impl<S: Sample> IntraPicture<S> {
                 // the next PU's MPM list sees this one; mirror that.
                 PicInfo::fill4(modes, geo.w4, px, py, 4, 4, mode);
             }
-            let (csyn, cmode) = search_chroma_mode(
-                ctx,
-                geo,
-                &mut recon.cb,
-                &mut recon.cr,
-                scratch,
-                x0,
-                y0,
-                2,
-                out.luma_modes[0],
-                &src_cb[coff..],
-                &src_cr[coff..],
-                c_stride,
-            );
-            out.chroma_syntax = csyn;
-            out.chroma_mode = cmode;
-            for (comp, plane) in [&mut recon.cb, &mut recon.cr].into_iter().enumerate() {
-                let src = if comp == 0 { &src_cb[coff..] } else { &src_cr[coff..] };
-                let nz = code_chroma_tb(ctx, geo, plane, scratch, x0, y0, 2, 1 + comp, cmode, src, c_stride, &mut out.chroma[comp][..16]);
-                out.cbf_chroma[comp] = nz != 0;
+            if geo.cat != 0 {
+                let (csyn, cmode) = search_chroma_mode(
+                    ctx,
+                    geo,
+                    &mut recon.cb,
+                    &mut recon.cr,
+                    scratch,
+                    x0,
+                    y0,
+                    2,
+                    out.luma_modes[0],
+                    scb,
+                    scr,
+                    c_stride,
+                );
+                out.chroma_syntax = csyn;
+                out.chroma_mode = cmode;
+                for (comp, plane) in [&mut recon.cb, &mut recon.cr].into_iter().enumerate() {
+                    let src = if comp == 0 { scb } else { scr };
+                    let nz = code_chroma_tb(ctx, geo, plane, scratch, x0, y0, 2, 1 + comp, cmode, src, c_stride, &mut out.chroma[comp][..16]);
+                    out.cbf_chroma[comp] = nz != 0;
+                }
             }
         } else {
             // PART_2Nx2N. The luma mode is chosen once, by SATD on the
@@ -397,22 +439,25 @@ impl<S: Sample> IntraPicture<S> {
             out.luma_modes = [mode; 4];
             out.luma_syntax[0] = as_syntax(mode, cands);
             PicInfo::fill4(modes, geo.w4, x0, y0, n, n, mode);
-            let (csyn, cmode) = search_chroma_mode(
-                ctx,
-                geo,
-                &mut recon.cb,
-                &mut recon.cr,
-                scratch,
-                x0,
-                y0,
-                geo.log2_cu - 1,
-                mode,
-                &src_cb[coff..],
-                &src_cr[coff..],
-                c_stride,
-            );
-            out.chroma_syntax = csyn;
-            out.chroma_mode = cmode;
+            if geo.cat != 0 {
+                let (csyn, cmode) = search_chroma_mode(
+                    ctx,
+                    geo,
+                    &mut recon.cb,
+                    &mut recon.cr,
+                    scratch,
+                    x0,
+                    y0,
+                    geo.log2_cu - 1,
+                    mode,
+                    scb,
+                    scr,
+                    c_stride,
+                );
+                out.chroma_syntax = csyn;
+                out.chroma_mode = cmode;
+            }
+            let cmode = out.chroma_mode;
 
             // The transform structure: one CU-sized TU, or — when the
             // writer-side knob allows — four quarter TUs, judged by
@@ -423,17 +468,17 @@ impl<S: Sample> IntraPicture<S> {
             // simply recomputed, the way the H.264 side puts back the
             // I_4x4 coding its I_16x16 trials overwrote.
             let (ssd_u, nz_u) = code_cu_2nx2n(
-                ctx, geo, recon, scratch, x0, y0, mode, cmode, false, &src_y[soff..], y_stride, &src_cb[coff..], &src_cr[coff..], c_stride, &mut out,
+                ctx, geo, recon, scratch, x0, y0, mode, cmode, false, &src_y[soff..], y_stride, scb, scr, c_stride, &mut out,
             );
             if try_split {
                 let cost_u = ssd_u as f32 + tu_structure_cost(ctx.qp, &out, nz_u);
                 let (ssd_s, nz_s) = code_cu_2nx2n(
-                    ctx, geo, recon, scratch, x0, y0, mode, cmode, true, &src_y[soff..], y_stride, &src_cb[coff..], &src_cr[coff..], c_stride, &mut out,
+                    ctx, geo, recon, scratch, x0, y0, mode, cmode, true, &src_y[soff..], y_stride, scb, scr, c_stride, &mut out,
                 );
                 let cost_s = ssd_s as f32 + tu_structure_cost(ctx.qp, &out, nz_s);
                 if cost_u <= cost_s {
                     let _ = code_cu_2nx2n(
-                        ctx, geo, recon, scratch, x0, y0, mode, cmode, false, &src_y[soff..], y_stride, &src_cb[coff..], &src_cr[coff..], c_stride, &mut out,
+                        ctx, geo, recon, scratch, x0, y0, mode, cmode, false, &src_y[soff..], y_stride, scb, scr, c_stride, &mut out,
                     );
                 }
             }
@@ -901,54 +946,60 @@ fn code_cu_2nx2n<S: Sample>(
             out.cbf_luma[i] = nz != 0;
             nz_total += nz;
         }
-        let qc = (h / 2) * (h / 2);
-        for (comp, plane) in [&mut recon.cb, &mut recon.cr].into_iter().enumerate() {
-            for i in 0..4 {
-                let (tx, ty) = (x0 + (i & 1) * h, y0 + (i >> 1) * h);
-                let src = if comp == 0 { src_cb } else { src_cr };
-                let soff = (ty - y0) / 2 * c_stride + (tx - x0) / 2;
-                let nz = code_chroma_tb(
-                    ctx,
-                    geo,
-                    plane,
-                    sc,
-                    tx,
-                    ty,
-                    geo.log2_cu - 2,
-                    1 + comp,
-                    chroma_mode,
-                    &src[soff..],
-                    c_stride,
-                    &mut out.chroma[comp][i * qc..(i + 1) * qc],
-                );
-                out.cbf_chroma_tu[comp][i] = nz != 0;
-                nz_total += nz;
+        if geo.cat != 0 {
+            let qc = (h / 2) * (h / 2);
+            for (comp, plane) in [&mut recon.cb, &mut recon.cr].into_iter().enumerate() {
+                for i in 0..4 {
+                    let (tx, ty) = (x0 + (i & 1) * h, y0 + (i >> 1) * h);
+                    let src = if comp == 0 { src_cb } else { src_cr };
+                    let soff = (ty - y0) / 2 * c_stride + (tx - x0) / 2;
+                    let nz = code_chroma_tb(
+                        ctx,
+                        geo,
+                        plane,
+                        sc,
+                        tx,
+                        ty,
+                        geo.log2_cu - 2,
+                        1 + comp,
+                        chroma_mode,
+                        &src[soff..],
+                        c_stride,
+                        &mut out.chroma[comp][i * qc..(i + 1) * qc],
+                    );
+                    out.cbf_chroma_tu[comp][i] = nz != 0;
+                    nz_total += nz;
+                }
+                // The depth-0 bin is "any child coded", which is what gates
+                // the per-child bins in the reader.
+                out.cbf_chroma[comp] = out.cbf_chroma_tu[comp].iter().any(|&f| f);
             }
-            // The depth-0 bin is "any child coded", which is what gates
-            // the per-child bins in the reader.
-            out.cbf_chroma[comp] = out.cbf_chroma_tu[comp].iter().any(|&f| f);
         }
     } else {
         let nz = code_luma_tb(ctx, geo, &mut recon.y, sc, x0, y0, geo.log2_cu, mode, src_y, y_stride, &mut out.luma[..n * n]);
         out.cbf_luma[0] = nz != 0;
         nz_total += nz;
-        let nc = n / 2;
-        for (comp, plane) in [&mut recon.cb, &mut recon.cr].into_iter().enumerate() {
-            let src = if comp == 0 { src_cb } else { src_cr };
-            let nz = code_chroma_tb(ctx, geo, plane, sc, x0, y0, geo.log2_cu - 1, 1 + comp, chroma_mode, src, c_stride, &mut out.chroma[comp][..nc * nc]);
-            out.cbf_chroma[comp] = nz != 0;
-            nz_total += nz;
+        if geo.cat != 0 {
+            let nc = n / 2;
+            for (comp, plane) in [&mut recon.cb, &mut recon.cr].into_iter().enumerate() {
+                let src = if comp == 0 { src_cb } else { src_cr };
+                let nz = code_chroma_tb(ctx, geo, plane, sc, x0, y0, geo.log2_cu - 1, 1 + comp, chroma_mode, src, c_stride, &mut out.chroma[comp][..nc * nc]);
+                out.cbf_chroma[comp] = nz != 0;
+                nz_total += nz;
+            }
         }
     }
 
     // The trial's distortion: SSD of the reconstruction against the
-    // source over the whole CU, all three components.
+    // source over the whole CU, all components the format has.
     let yoff = recon.y.offset(x0 as isize, y0 as isize);
     let mut ssd = (ctx.dist.ssd)(src_y, y_stride, &recon.y.data[yoff..], recon.y.stride, n, n);
-    let nc = n / 2;
-    for (plane, src) in [(&recon.cb, src_cb), (&recon.cr, src_cr)] {
-        let off = plane.offset((x0 / 2) as isize, (y0 / 2) as isize);
-        ssd += (ctx.dist.ssd)(src, c_stride, &plane.data[off..], plane.stride, nc, nc);
+    if geo.cat != 0 {
+        let nc = n / 2;
+        for (plane, src) in [(&recon.cb, src_cb), (&recon.cr, src_cr)] {
+            let off = plane.offset((x0 / 2) as isize, (y0 / 2) as isize);
+            ssd += (ctx.dist.ssd)(src, c_stride, &plane.data[off..], plane.stride, nc, nc);
+        }
     }
     (ssd, nz_total)
 }
@@ -1035,11 +1086,12 @@ mod tests {
         h: usize,
         log2_cu: u32,
         try_split: bool,
+        chroma: ChromaFormat,
         src_y: &[u8],
         src_cb: &[u8],
         src_cr: &[u8],
     ) -> (IntraPicture<u8>, Vec<CuDecision>) {
-        let mut pic = IntraPicture::new(w, h, log2_cu, 8);
+        let mut pic = IntraPicture::new_with_chroma(w, h, log2_cu, 8, chroma);
         pic.try_split = try_split;
         let n = 1usize << log2_cu;
         let mut decisions = Vec::new();
@@ -1098,7 +1150,7 @@ mod tests {
     /// 8x8 CTUs (so the within-CTB z-order has two levels to get wrong).
     #[test]
     fn availability_follows_the_z_scan_order() {
-        let geo = Geo { log2_cu: 3, wc: 2, w4: 4, width: 16, height: 16 };
+        let geo = Geo { log2_cu: 3, wc: 2, w4: 4, width: 16, height: 16, cat: 1 };
         // TU1 of CTU (0,0), at (4,0): its left column is TU0, decoded.
         assert!(decoded_before(geo, 4, 0, 3, 0));
         // Its below-left samples are TU2's, which come later in z-order.
@@ -1166,6 +1218,7 @@ mod tests {
                 w4: pw.div_ceil(4),
                 width: pw,
                 height: ph,
+                cat: sps.chroma_array_type(),
             };
             for yc in (0..ph).step_by(4) {
                 for xc in (0..pw).step_by(4) {
@@ -1253,7 +1306,7 @@ mod tests {
 
             let y = vec![128u8; w * h];
             let c = vec![128u8; w * h / 4];
-            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, false, &y, &c, &c);
+            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, false, ChromaFormat::Yuv420, &y, &c, &c);
             for d in &decisions {
                 assert!(d.cbf_luma.iter().all(|&f| !f), "log2_cu={log2_cu}");
                 assert!(d.cbf_chroma.iter().all(|&f| !f));
@@ -1309,14 +1362,14 @@ mod tests {
             let y = mixed_source(w, h, n, 0x5eed ^ ((log2_cu as u64) << 8) ^ qp as u64);
             let cbs = noise(w / 2, h / 2, 0xcb);
             let crs = noise(w / 2, h / 2, 0xc7);
-            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, true, &y, &cbs, &crs);
+            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, true, ChromaFormat::Yuv420, &y, &cbs, &crs);
             if log2_cu > 3 {
                 assert!(
                     decisions.iter().any(|d| d.split_tu) && decisions.iter().any(|d| !d.split_tu),
                     "log2_cu={log2_cu} qp={qp}: only one structure occurred, the replay is not covering both"
                 );
             }
-            let replayed = replay(&ctx, w, h, log2_cu, &decisions);
+            let replayed = replay(&ctx, w, h, log2_cu, ChromaFormat::Yuv420, &decisions);
             assert_planes_equal(&pic.recon, &replayed, log2_cu, qp);
 
             let bd_off = 6 * (ctx.bit_depth as i32 - 8);
@@ -1358,7 +1411,7 @@ mod tests {
             // the extra signalling decides) — exactness must survive the
             // trial machinery either way. The split *shape* under bypass
             // is exercised by lossless_bypass_composes_with_the_split_shape.
-            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, true, &y, &cbs, &crs);
+            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, true, ChromaFormat::Yuv420, &y, &cbs, &crs);
             for (name, plane, src, pw, ph) in [
                 ("y", &pic.recon.y, &y, w, h),
                 ("cb", &pic.recon.cb, &cbs, w / 2, h / 2),
@@ -1377,7 +1430,7 @@ mod tests {
             }
             // And the replay agrees, which exercises the bypass path of
             // the reconstruction contract too.
-            let replayed = replay(&ctx, w, h, log2_cu, &decisions);
+            let replayed = replay(&ctx, w, h, log2_cu, ChromaFormat::Yuv420, &decisions);
             assert_planes_equal(&pic.recon, &replayed, log2_cu, 26);
         }
     }
@@ -1394,7 +1447,7 @@ mod tests {
             let y = mixed_source(w, h, n, 0xcbf ^ log2_cu as u64);
             let cbs = noise(w / 2, h / 2, 1);
             let crs = noise(w / 2, h / 2, 2);
-            let (_, decisions) = code_picture(&ctx, w, h, log2_cu, true, &y, &cbs, &crs);
+            let (_, decisions) = code_picture(&ctx, w, h, log2_cu, true, ChromaFormat::Yuv420, &y, &cbs, &crs);
             if log2_cu > 3 {
                 assert!(
                     decisions.iter().any(|d| d.split_tu) && decisions.iter().any(|d| !d.split_tu),
@@ -1456,6 +1509,70 @@ mod tests {
         }
     }
 
+    /// Monochrome end to end: no chroma elements exist, so the decision
+    /// codes luma alone (with the split trial live), the replay
+    /// reconstructs it from the decisions, and the distortion bound
+    /// holds. The chroma sources are empty slices — the contract is that
+    /// they are never indexed.
+    #[test]
+    fn monochrome_codes_luma_alone_and_replays() {
+        let kit = Kit::new();
+        for &(log2_cu, qp) in &[(3u32, 24i32), (4, 30), (5, 34)] {
+            let ctx = kit.ctx(qp, false);
+            let n = 1usize << log2_cu;
+            let (w, h) = (4 * n, 2 * n);
+            let y = mixed_source(w, h, n, 0x400 ^ ((log2_cu as u64) << 8) ^ qp as u64);
+            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, true, ChromaFormat::Monochrome, &y, &[], &[]);
+            if log2_cu > 3 {
+                assert!(
+                    decisions.iter().any(|d| d.split_tu) && decisions.iter().any(|d| !d.split_tu),
+                    "log2_cu={log2_cu} qp={qp}: only one structure occurred"
+                );
+            }
+            for d in &decisions {
+                assert_eq!(d.cbf_chroma, [false; 2], "monochrome coded chroma");
+                assert!(d.chroma.iter().all(|c| c.iter().all(|&v| v == 0)));
+            }
+            let replayed = replay(&ctx, w, h, log2_cu, ChromaFormat::Monochrome, &decisions);
+            // Luma-only comparison: the chroma planes are empty.
+            let (pa, pb) = (&pic.recon.y, &replayed.y);
+            let (oa, ob) = (pa.origin(), pb.origin());
+            let step = 1i32 << (qp / 6);
+            let mut worst = 0i32;
+            for yy in 0..h {
+                for xx in 0..w {
+                    assert_eq!(
+                        pa.data[oa + yy * pa.stride + xx],
+                        pb.data[ob + yy * pb.stride + xx],
+                        "y ({xx},{yy}) log2_cu={log2_cu} qp={qp}"
+                    );
+                    let dlt = pa.data[oa + yy * pa.stride + xx] as i32 - y[yy * w + xx] as i32;
+                    worst = worst.max(dlt.abs());
+                }
+            }
+            assert!(worst <= 8 * step + 16, "log2_cu={log2_cu} qp={qp} worst={worst}");
+        }
+    }
+
+    /// Monochrome bypass is exactly lossless, like every other format.
+    #[test]
+    fn monochrome_bypass_reconstructs_the_source_exactly() {
+        let kit = Kit::new();
+        let ctx = kit.ctx(26, true);
+        for log2_cu in 3..=5u32 {
+            let n = 1usize << log2_cu;
+            let (w, h) = (2 * n, 2 * n);
+            let y = noise(w, h, 0x400b + log2_cu as u64);
+            let (pic, _) = code_picture(&ctx, w, h, log2_cu, true, ChromaFormat::Monochrome, &y, &[], &[]);
+            let off = pic.recon.y.origin();
+            for yy in 0..h {
+                for xx in 0..w {
+                    assert_eq!(pic.recon.y.data[off + yy * pic.recon.y.stride + xx], y[yy * w + xx], "({xx},{yy}) log2_cu={log2_cu}");
+                }
+            }
+        }
+    }
+
     /// The construction the split exists for: three flat quadrants and a
     /// busy one. Unsplit, the big transform smears the busy quadrant's
     /// energy across the whole block's spectrum; split, three TUs code
@@ -1478,7 +1595,7 @@ mod tests {
                 }
             }
             let c = vec![128u8; w * h / 4];
-            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, true, &y, &c, &c);
+            let (pic, decisions) = code_picture(&ctx, w, h, log2_cu, true, ChromaFormat::Yuv420, &y, &c, &c);
             let d = &decisions[0];
             assert!(d.split_tu, "log2_cu={log2_cu}: the busy quadrant did not force a split");
             assert_eq!(d.cbf_luma, [false, false, false, true], "log2_cu={log2_cu}");
@@ -1487,7 +1604,7 @@ mod tests {
             assert!(d.luma[..3 * q].iter().all(|&v| v == 0));
             assert!(d.luma[3 * q..4 * q].iter().any(|&v| v != 0));
             // And the shape replays to the same picture, within the bound.
-            let replayed = replay(&ctx, w, h, log2_cu, &decisions);
+            let replayed = replay(&ctx, w, h, log2_cu, ChromaFormat::Yuv420, &decisions);
             assert_planes_equal(&pic.recon, &replayed, log2_cu, 30);
         }
     }
@@ -1505,7 +1622,7 @@ mod tests {
             let (w, h) = (n, n);
             let y = noise(w, h, 0x0451 + log2_cu as u64);
             let c = vec![128u8; w * h / 4];
-            let (_, decisions) = code_picture(&ctx, w, h, log2_cu, true, &y, &c, &c);
+            let (_, decisions) = code_picture(&ctx, w, h, log2_cu, true, ChromaFormat::Yuv420, &y, &c, &c);
             assert!(!decisions[0].split_tu, "log2_cu={log2_cu}: uniform noise split anyway");
         }
     }
@@ -1546,7 +1663,7 @@ mod tests {
             PicInfo::fill4(modes, geo.w4, 0, 0, n, n, mode);
             let _ = code_cu_2nx2n(&ctx, geo, recon, scratch, 0, 0, mode, d.chroma_mode, true, &y, w, &cbs, &crs, w / 2, &mut d);
             assert!(d.split_tu);
-            let replayed = replay(&ctx, w, h, log2_cu, &[d]);
+            let replayed = replay(&ctx, w, h, log2_cu, ChromaFormat::Yuv420, &[d]);
             assert_planes_equal(&pic.recon, &replayed, log2_cu, qp);
         }
     }
@@ -1582,7 +1699,7 @@ mod tests {
             let (ssd, _) = code_cu_2nx2n(&ctx, geo, recon, scratch, 0, 0, mode, d.chroma_mode, true, &y, w, &cbs, &crs, w / 2, &mut d);
             assert!(d.split_tu);
             assert_eq!(ssd, 0, "log2_cu={log2_cu}: bypass with a split is not exact");
-            let replayed = replay(&ctx, w, h, log2_cu, &[d]);
+            let replayed = replay(&ctx, w, h, log2_cu, ChromaFormat::Yuv420, &[d]);
             assert_planes_equal(&pic.recon, &replayed, log2_cu, 26);
         }
     }
@@ -1593,8 +1710,8 @@ mod tests {
     /// residuals from the stored levels through the decoder's inverse
     /// path. Deliberately does not touch the encoder's planes or call
     /// `code_residual`.
-    fn replay(ctx: &IntraCtx<'_, u8>, w: usize, h: usize, log2_cu: u32, decisions: &[CuDecision]) -> Frame<u8> {
-        let mut pic = IntraPicture::<u8>::new(w, h, log2_cu, 8);
+    fn replay(ctx: &IntraCtx<'_, u8>, w: usize, h: usize, log2_cu: u32, chroma: ChromaFormat, decisions: &[CuDecision]) -> Frame<u8> {
+        let mut pic = IntraPicture::<u8>::new_with_chroma(w, h, log2_cu, 8, chroma);
         let geo = pic.geo;
         let n = 1usize << log2_cu;
         let qp_y = ctx.qp + 6 * (ctx.bit_depth as i32 - 8);
@@ -1644,6 +1761,10 @@ mod tests {
                         predict(&mut recon.y, scratch, px, py, tn, mode, 0, true, true, ctx.bit_depth, ctx.strong_smoothing);
                         add_tu(ctx, &mut recon.y, px, py, lg, 0, qp_y, d.bypass, &d.luma[tu * q..(tu + 1) * q]);
                     }
+                }
+                if geo.cat == 0 {
+                    // Monochrome: no chroma elements exist to replay.
+                    continue;
                 }
                 let mode = chroma_mode_for(d.chroma_syntax, d.luma_modes[0]);
                 assert_eq!(mode, d.chroma_mode, "chroma syntax and mode disagree");
