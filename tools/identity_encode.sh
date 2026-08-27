@@ -49,12 +49,15 @@ one() {
   base=$(basename "$src" .yuv)
   geom=$(echo "$base" | sed -n 's/.*_\([0-9]\+x[0-9]\+\)_.*/\1/p')
   fmt=$(echo "$base" | sed -n 's/.*_[0-9]\+x[0-9]\+_\(.*\)/\1/p')
+  # `420p10` is chroma 420 at depth 10; a bare `420` is eight bits — the
+  # reading verify_encode.sh's chroma_of / depth_of make.
+  chroma=${fmt%%p*}; depth=${fmt##*p}; [ "$depth" = "$fmt" ] && depth=8
   tag="$base/$name"
   a="$OUT/$base.$name.a"; b="$OUT/$base.$name.b"
-  if ! env $ENV_A "$ENC" --input "$src" --size "$geom" --format "$fmt" $flags --output "$a" --recon "$a.yuv" > "$a.log" 2>&1; then
+  if ! env $ENV_A "$ENC" --input "$src" --size "$geom" --format "$chroma" --depth "$depth" $flags --output "$a" --recon "$a.yuv" > "$a.log" 2>&1; then
     echo "ENCODE-FAIL $tag (A): $(tail -1 "$a.log" | head -c 100)"; return 1
   fi
-  if ! env $ENV_B "$ENC_B" --input "$src" --size "$geom" --format "$fmt" $flags --output "$b" --recon "$b.yuv" > "$b.log" 2>&1; then
+  if ! env $ENV_B "$ENC_B" --input "$src" --size "$geom" --format "$chroma" --depth "$depth" $flags --output "$b" --recon "$b.yuv" > "$b.log" 2>&1; then
     echo "ENCODE-FAIL $tag (B): $(tail -1 "$b.log" | head -c 100)"; return 1
   fi
   if ! cmp -s "$a" "$b"; then
@@ -73,10 +76,14 @@ results="$OUT/results.txt"
 for src in $SOURCES; do
   echo "$CONFIGS" | while IFS='|' read -r name flags; do
     [ -z "$name" ] && continue
+    # As verify_encode.sh: a clip deeper than 8 bits is visited only by
+    # rows that name it with `@p10` / `@p12`; a row without `@` is 8-bit.
+    case "$src" in *_[0-9][0-9][0-9]p[0-9]*.yuv) deep=1 ;; *) deep=0 ;; esac
     case "$name" in
       *@*)
         pat=${name##*@}
         case "$src" in *"$pat"*) name=${name%@*} ;; *) continue ;; esac ;;
+      *) [ "$deep" = 1 ] && continue ;;
     esac
     echo "$src|$name|$flags"
   done
