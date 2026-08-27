@@ -24,6 +24,12 @@
 #      x86 rungs, and it is the check the kernels have to keep passing.
 #
 #   FIXTURES=dir  also sweep every stream named in dir/golden.txt
+#   ENC_CLIPS=dir also encode every src_*_420.yuv there (the 8-bit gate
+#                 corpus) in the encode round trip
+#
+#   3. Do the encode-side kernels (distortion, H.265 forward transforms and
+#      quantiser) have the same property, and does an encode inside wasm
+#      produce the bytes the scalar build produces? See the encode section.
 #
 # Exits nonzero on the first disagreement.
 set -u
@@ -132,6 +138,92 @@ if [ -n "${FIXTURES:-}" ]; then
   done < "$FIXTURES/golden.txt"
   echo "  $ok fixtures decode identically at both"
 fi
+
+# ----------------------------------------------------------------------
+# The encode side
+# ----------------------------------------------------------------------
+#
+# The encode-only kernel tables (distortion; H.265 forward transforms and
+# quantiser) have a simd128 tier of their own, and a rung of "SIMD128"
+# says nothing about whether *those* tables took it — they were scalar
+# for a long time while the rung said that. So: which entries each build
+# installed (all six groups on simd128, none on scalar), the randomised
+# sweep against the scalar reference inside the module, and then an
+# encode round trip on both builds — bitstream, decoded pictures and the
+# encoder's own reconstruction hashed inside the module — which must
+# agree byte for byte between the builds (the wasm form of
+# tools/identity_encode.sh) and, per build, between decoded and
+# reconstructed (the SELF property). Timings are best of three, clocked
+# from outside because the module has no clock.
+echo
+echo "== which encode-side kernels each build installed =="
+for w in scalar:0 simd128:63; do
+  b=${w%%:*}; want=${w##*:}
+  got=$(node tools/wasm_enc.mjs "$TMP/$b.wasm" --installed 2>&1)
+  printf "  %-8s mask %s
+" "$b" "$got"
+  [ "$got" = "$want" ] || { echo "    expected $want"; fail=1; }
+done
+
+echo
+echo "== encode-kernel self-test inside wasm (randomised, against scalar) =="
+for w in scalar simd128; do
+  got=$(node tools/wasm_enc.mjs "$TMP/$w.wasm" --selftest 2>&1)
+  printf "  %-8s %s
+" "$w" "$got"
+  [ "$got" = "OK" ] || fail=1
+done
+
+echo
+echo "== encode round trip inside wasm (scalar vs simd128; decoded vs recon) =="
+# Cells: codec x (intra, IP, IPB) at QP 26 and one QP 40 row, on the
+# synthesised clip; ENC_CLIPS=dir adds every src_*_420.yuv there (the
+# 8-bit gate corpus) at 64x64 — the name carries the geometry.
+cells="h264:26:0:0 h264:26:8:0 h264:26:8:2 h264:40:8:0 h265:26:0:0 h265:26:8:0 h265:26:8:2 h265:40:8:0"
+clips="synth:64x64:"
+if [ -n "${ENC_CLIPS:-}" ]; then
+  for f in "$ENC_CLIPS"/src_*_420.yuv; do
+    [ -f "$f" ] || continue
+    geom=$(basename "$f" | sed -n 's/.*_\([0-9]*x[0-9]*\)_420\.yuv$/\1/p')
+    [ -n "$geom" ] && clips="$clips $(basename "$f" .yuv):$geom:$f"
+  done
+fi
+cells_ok=0
+for clip in $clips; do
+  name=${clip%%:*}; r=${clip#*:}; geom=${r%%:*}; file=${r#*:}
+  for c in $cells; do
+    IFS=: read -r codec qp gop bf <<< "$c"
+    a=$(node tools/wasm_enc.mjs "$TMP/scalar.wasm" --encode "$geom" "$codec" "$qp" "$gop" "$bf" $file 2>&1) ||
+      { printf "  %-28s %-4s qp%s gop%s b%s  scalar: %s
+" "$name" "$codec" "$qp" "$gop" "$bf" "$a"; fail=1; continue; }
+    b=$(node tools/wasm_enc.mjs "$TMP/simd128.wasm" --encode "$geom" "$codec" "$qp" "$gop" "$bf" $file 2>&1) ||
+      { printf "  %-28s %-4s qp%s gop%s b%s  simd128: %s
+" "$name" "$codec" "$qp" "$gop" "$bf" "$b"; fail=1; continue; }
+    read -r af al ash adh arh ams <<< "$a"
+    read -r bf_ bl bsh bdh brh bms <<< "$b"
+    status=SAME
+    [ "$af $al $ash $adh" = "$bf_ $bl $bsh $bdh" ] || { status=MOVED; fail=1; }
+    [ "$adh" = "$arh" ] && [ "$bdh" = "$brh" ] || { status="$status SELF-FAIL"; fail=1; }
+    [ "$status" = SAME ] && cells_ok=$((cells_ok + 1))
+    printf "  %-28s %-4s qp%s gop%s b%s  %s frames %s bytes  scalar %sms  simd128 %sms  %s
+"       "$name" "$codec" "$qp" "$gop" "$bf" "$af" "$al" "$ams" "$bms" "$status"
+  done
+done
+echo "  $cells_ok cells identical across the builds and self-consistent"
+[ "$cells_ok" -gt 0 ] || { echo "  NO CELLS RAN"; fail=1; }
+
+echo
+echo "== encode kernels, ns per call group (best of 3, node) =="
+printf "  %-22s %10s %10s %8s
+" "kernel group" "scalar" "simd128" "ratio"
+for spec in "0:0:200000:sad+satd+ssd 4x4" "0:1:100000:sad+satd+ssd 8x8" "0:2:40000:sad+satd+ssd 16x16" "0:3:10000:sad+satd+ssd 32x32" "0:4:3000:sad+satd+ssd 64x64"             "1:0:200000:fdct+quant 4x4" "1:1:100000:fdct+quant 8x8" "1:2:20000:fdct+quant 16x16" "1:3:5000:fdct+quant 32x32"; do
+  IFS=: read -r g sh n label <<< "$spec"
+  a=$(node tools/wasm_enc.mjs "$TMP/scalar.wasm" --bench "$g" "$sh" "$n" 2>&1)
+  b=$(node tools/wasm_enc.mjs "$TMP/simd128.wasm" --bench "$g" "$sh" "$n" 2>&1)
+  ratio=$(awk -v a="$a" -v b="$b" 'BEGIN { if (b > 0) printf "%.2fx", a / b; else print "?" }')
+  printf "  %-22s %10s %10s %8s
+" "$label" "$a" "$b" "$ratio"
+done
 
 echo
 if [ "$fail" = 0 ]; then echo "wasm: OK"; else echo "wasm: FAILED"; fi
