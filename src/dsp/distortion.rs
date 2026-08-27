@@ -62,13 +62,30 @@ impl<S: Sample> DistortionDsp<S> {
         }
     }
 
-    /// The best table for `cpu`. No rung replaces anything yet: which of
-    /// these is worth hand-writing is a question for a profile of a real
-    /// encode, and the cumulative ladder lets them arrive one at a time.
+    /// The best table for `cpu`, built the way the decoders' tables are:
+    /// the scalar reference first, then each rung of the ladder replacing
+    /// the entries it has a kernel for.
     pub fn new(cpu: Cpu) -> Self {
         let mut d = Self::scalar();
         d.cpu = cpu;
+        install_simd(&mut d, cpu);
         d
+    }
+}
+
+/// The SIMD kernels exist for 8-bit samples, which is what both encoders
+/// work in today; a 16-bit table keeps the scalar reference. Dispatched on
+/// the sample type here rather than through a method on [`Sample`], so
+/// this table's ladder does not touch the trait the decoders share.
+#[allow(unused_variables)]
+fn install_simd<S: Sample>(d: &mut DistortionDsp<S>, cpu: Cpu) {
+    use std::any::Any;
+    if super::enc_simd_disabled("distortion") {
+        return;
+    }
+    if let Some(d) = (d as &mut dyn Any).downcast_mut::<DistortionDsp<u8>>() {
+        #[cfg(target_arch = "x86_64")]
+        super::distortion_x86::install(d, cpu);
     }
 }
 
@@ -78,7 +95,7 @@ impl<S: Sample> Default for DistortionDsp<S> {
     }
 }
 
-fn sad_scalar<S: Sample>(a: &[S], a_stride: usize, b: &[S], b_stride: usize, w: usize, h: usize) -> u32 {
+pub(crate) fn sad_scalar<S: Sample>(a: &[S], a_stride: usize, b: &[S], b_stride: usize, w: usize, h: usize) -> u32 {
     let mut sum = 0u32;
     for y in 0..h {
         let (ra, rb) = (&a[y * a_stride..], &b[y * b_stride..]);
@@ -89,7 +106,7 @@ fn sad_scalar<S: Sample>(a: &[S], a_stride: usize, b: &[S], b_stride: usize, w: 
     sum
 }
 
-fn ssd_scalar<S: Sample>(a: &[S], a_stride: usize, b: &[S], b_stride: usize, w: usize, h: usize) -> u64 {
+pub(crate) fn ssd_scalar<S: Sample>(a: &[S], a_stride: usize, b: &[S], b_stride: usize, w: usize, h: usize) -> u64 {
     let mut sum = 0u64;
     for y in 0..h {
         let (ra, rb) = (&a[y * a_stride..], &b[y * b_stride..]);
@@ -127,7 +144,7 @@ fn hadamard4x4(d: &mut [i32; 16]) {
 /// scale as the SAD of the same block and the two can share a Lagrangian
 /// constant; it matters only that it is consistent, and it is stated here
 /// so nobody has to infer it from a magic number later.
-fn satd_scalar<S: Sample>(a: &[S], a_stride: usize, b: &[S], b_stride: usize, w: usize, h: usize) -> u32 {
+pub(crate) fn satd_scalar<S: Sample>(a: &[S], a_stride: usize, b: &[S], b_stride: usize, w: usize, h: usize) -> u32 {
     debug_assert!(w % 4 == 0 && h % 4 == 0, "SATD wants a multiple of four");
     let mut total = 0u32;
     for by in (0..h).step_by(4) {

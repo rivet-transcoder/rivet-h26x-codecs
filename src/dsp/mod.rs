@@ -28,6 +28,9 @@ pub(crate) mod h264_x86_128;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_unsafe)]
 pub(crate) mod h264_avx2;
+#[cfg(target_arch = "x86_64")]
+#[allow(unused_unsafe)]
+pub(crate) mod distortion_x86;
 #[cfg(target_arch = "aarch64")]
 #[allow(unused_unsafe)]
 pub(crate) mod h264_neon;
@@ -59,6 +62,25 @@ pub(crate) mod hevc_wasm128;
 #[cfg(target_arch = "aarch64")]
 #[allow(unused_unsafe)]
 pub(crate) mod neon_dotprod;
+
+/// Whether `H26X_ENC_NO_SIMD` asks the encode-only kernel table `table`
+/// (`distortion`, `h264_enc` or `hevc_enc`) to keep its scalar references
+/// while the decoder-shared tables take the CPU's rungs as usual. `1`
+/// names all three; a comma-separated list names some.
+///
+/// This exists for one purpose — measuring what the encode-side kernels
+/// are worth, one binary, same run of everything else. `H26X_NO_SIMD`
+/// cannot answer that: it also strips the interpolation, inverse
+/// transforms and loop filters the encoders share with the decoders, so
+/// the difference it shows is mostly theirs. Naming one table isolates
+/// one step of the work. Read at table construction, which is once per
+/// encoder (or per picture in H.265), not per kernel.
+pub fn enc_simd_disabled(table: &str) -> bool {
+    match std::env::var("H26X_ENC_NO_SIMD") {
+        Ok(v) => v == "1" || v == "true" || v.split(',').any(|t| t.trim() == table),
+        Err(_) => false,
+    }
+}
 
 /// What the running CPU can do, detected once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
