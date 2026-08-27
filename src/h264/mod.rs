@@ -10,17 +10,20 @@
 //! long-term references and adaptive marking (MMCO 1–6), weighted prediction
 //! (explicit and implicit), the 8x8 transform and Intra_8x8, scaling
 //! matrices, I_PCM, constrained intra prediction, multiple slices per
-//! picture, frame_num gaps, POC types 0/1/2, cropping, and the deblocking
-//! filter.
+//! picture in any order (ASO), slice groups (FMO, all seven map types),
+//! SP and SI slices (the Extended profile's switching pictures), frame_num
+//! gaps, POC types 0/1/2, cropping, and the deblocking filter.
 //!
 //! What is refused with [`Error::Unsupported`](crate::Error::Unsupported)
-//! (a caller with another decoder should hand the stream over): slice
-//! groups (FMO/ASO), data partitioning, SP/SI slices, unequal luma / chroma
-//! bit depths and bit depths above 14.
+//! (a caller with another decoder should hand the stream over): data
+//! partitioning, SP/SI slices outside the Extended profile's shape (CABAC,
+//! 4:2:2 / 4:4:4, more than 8 bits, the 8x8 transform), unequal luma /
+//! chroma bit depths and bit depths above 14.
 //!
 //! Module map: `sps` / `pps` / `slice` parse the parameter sets and slice
-//! header; `cavlc` and `cabac_mb` parse a macroblock into an `mb::MbLayer`;
-//! `recon` turns it into samples (through `intra`, `inter`, `transform`);
+//! header; `fmo` maps macroblocks to slice groups; `cavlc` and `cabac_mb`
+//! parse a macroblock into an `mb::MbLayer`; `recon` turns it into samples
+//! (through `intra`, `inter`, `transform`, and `sp` for SP / SI slices);
 //! `deblock` filters the finished picture; `dpb` owns POC, reference marking,
 //! list construction and output order; `decoder` drives it all.
 
@@ -29,6 +32,7 @@ pub(crate) mod cavlc;
 pub(crate) mod deblock;
 pub(crate) mod decoder;
 pub(crate) mod dpb;
+pub(crate) mod fmo;
 pub(crate) mod frame;
 pub(crate) mod inter;
 pub(crate) mod intra;
@@ -36,6 +40,7 @@ pub(crate) mod mb;
 pub(crate) mod pps;
 pub(crate) mod recon;
 pub(crate) mod slice;
+pub(crate) mod sp;
 pub(crate) mod sps;
 pub(crate) mod tables;
 // Generated: the standard's tables in full, whether or not the decoder

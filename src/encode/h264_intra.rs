@@ -1400,6 +1400,10 @@ mod tests {
             x264_old_444: false,
             field_pic: false,
             mbaff: false,
+            sp: false,
+            sp_switch: false,
+            sp_qs: 0,
+            sp_qsc: [0; 2],
         };
         let mut seed = 0x51ded00du64;
         let mut lcg = move || -> i16 {

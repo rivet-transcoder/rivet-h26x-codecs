@@ -3172,6 +3172,10 @@ mod mb_round_trip {
             x264_old_444: false,
             field_pic,
             mbaff: false,
+            sp: false,
+            sp_switch: false,
+            sp_qs: 0,
+            sp_qsc: [0; 2],
         }
     }
 

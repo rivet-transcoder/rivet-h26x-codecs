@@ -171,6 +171,8 @@ pub struct SliceHeader {
     pub filter_offset_a: i32,
     /// `FilterOffsetB = slice_beta_offset_div2 << 1`.
     pub filter_offset_b: i32,
+    /// `slice_group_change_cycle` (slice group map types 3..=5; else 0).
+    pub slice_group_change_cycle: u32,
     /// Bit position in the RBSP where `slice_data()` starts (for CABAC, after
     /// `cabac_alignment_one_bit`s; for CAVLC, right after the header).
     pub data_bit_offset: u64,
@@ -426,8 +428,16 @@ impl SliceHeader {
                 filter_offset_b = b << 1;
             }
         }
-        // (slice_group_change_cycle would go here; slice groups are refused
-        // at the PPS.)
+        let mut slice_group_change_cycle = 0;
+        if let Some(sg) = &pps.slice_groups {
+            if (3..=5).contains(&sg.map_type) {
+                let bits = super::fmo::change_cycle_bits(
+                    sps.pic_width_in_mbs * sps.pic_height_in_map_units,
+                    sg.change_rate,
+                );
+                slice_group_change_cycle = r.bits(bits);
+            }
+        }
         r.finish("slice header")?;
 
         let mut data_bit_offset = r.position();
@@ -468,6 +478,7 @@ impl SliceHeader {
                 disable_deblocking_filter_idc,
                 filter_offset_a,
                 filter_offset_b,
+                slice_group_change_cycle,
                 data_bit_offset,
             },
             pps,

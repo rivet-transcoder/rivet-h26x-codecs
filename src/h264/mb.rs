@@ -19,6 +19,9 @@ pub enum MbKind {
     I16x16,
     /// Raw samples.
     IPcm,
+    /// SI (an SI slice's `mb_type` 0): Intra_4x4 prediction reconstructed
+    /// through the switching-picture path of 8.6.2.
+    Si,
     /// One 16x16 inter partition (P_L0_16x16 or a B 16x16 with any direction).
     Inter16x16,
     /// Two 16x8 partitions.
@@ -41,7 +44,7 @@ impl MbKind {
     pub fn is_intra(self) -> bool {
         matches!(
             self,
-            MbKind::I4x4 | MbKind::I8x8 | MbKind::I16x16 | MbKind::IPcm
+            MbKind::I4x4 | MbKind::I8x8 | MbKind::I16x16 | MbKind::IPcm | MbKind::Si
         )
     }
     /// Skipped (no residual, inferred motion)?
@@ -1320,6 +1323,10 @@ impl<'a> MbDequant<'a> {
         if ctx.transform_bypass && qps[0] == 0 {
             return None;
         }
+        // SP / SI reconstruction (8.6) scales the levels itself.
+        if ctx.sp && (kind == MbKind::Si || !kind.is_intra()) {
+            return None;
+        }
         let inter = !kind.is_intra();
         let mut q4 = [(&dq.scale4[0][0], 0u32); 3];
         let mut q8 = [(&dq.scale8[0][0], 0u32); 3];
@@ -1392,4 +1399,13 @@ pub struct SliceCtx {
     pub field_pic: bool,
     /// `MbaffFrameFlag`: macroblock pairs, each frame or field.
     pub mbaff: bool,
+    /// An SP or SI slice: its P macroblocks (SP) and SI macroblocks (SI)
+    /// are reconstructed through [`super::sp`] from their raw levels.
+    pub sp: bool,
+    /// The switching path of 8.6.2 (`sp_for_switch_flag`, or an SI slice).
+    pub sp_switch: bool,
+    /// `QSY` of an SP / SI slice.
+    pub sp_qs: i32,
+    /// `QSC` for Cb and Cr (from `QSY` and the PPS offsets).
+    pub sp_qsc: [i32; 2],
 }

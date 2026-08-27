@@ -873,6 +873,10 @@ mod tests {
             x264_old_444: false,
             field_pic: false,
             mbaff: false,
+            sp: false,
+            sp_switch: false,
+            sp_qs: 0,
+            sp_qsc: [0; 2],
         }
     }
 
@@ -1311,6 +1315,10 @@ mod tests {
             x264_old_444: false,
             field_pic: false,
             mbaff: false,
+            sp: false,
+            sp_switch: false,
+            sp_qs: 0,
+            sp_qsc: [0; 2],
         };
         let info = PicInfo::new(1, 1);
         let nb = MbNeighbours { mb_width: 1, ..MbNeighbours::default() };

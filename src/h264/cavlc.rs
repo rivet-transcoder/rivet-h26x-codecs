@@ -524,8 +524,12 @@ pub fn predicted_intra_mode(
             // intra prediction -> DC.
             return None;
         }
+        if m.kind == MbKind::Si && ctx.constrained_intra_pred && layer.kind != MbKind::Si {
+            // ... and an SI neighbour of a macroblock that is not SI.
+            return None;
+        }
         match m.kind {
-            MbKind::I4x4 => {
+            MbKind::I4x4 | MbKind::Si => {
                 if is_8x8 {
                     // 8.3.2.1: an I4x4 neighbour of an 8x8 block contributes
                     // the mode of the sub-block adjacent to the current
@@ -745,7 +749,15 @@ pub fn parse_mb_cavlc(
     layer.reset(MbKind::I4x4, false);
     let mut p8x8ref0 = false;
     match ctx.slice_type {
-        SliceType::I | SliceType::Si => intra_mb_type(mb_type_raw, layer)?,
+        SliceType::I => intra_mb_type(mb_type_raw, layer)?,
+        SliceType::Si => {
+            // Table 7-12: mb_type 0 is SI, the rest are the I types shifted.
+            if mb_type_raw == 0 {
+                layer.kind = MbKind::Si;
+            } else {
+                intra_mb_type(mb_type_raw - 1, layer)?;
+            }
+        }
         SliceType::P | SliceType::Sp => {
             if mb_type_raw < 5 {
                 p8x8ref0 = p_mb_type(mb_type_raw, layer)?;
@@ -835,7 +847,7 @@ pub fn parse_mb_cavlc(
         }
         // mb_pred()
         match layer.kind {
-            MbKind::I4x4 => {
+            MbKind::I4x4 | MbKind::Si => {
                 for blk in 0..16 {
                     let raster = super::mb::raster_of_blk(blk);
                     let (bx, by) = (raster % 4, raster / 4);
