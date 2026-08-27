@@ -222,6 +222,18 @@ fn main() {
         // Parsed by the gate. Same line, same shape, as the H.265 path.
         eprintln!("rate: achieved {achieved:.0} bps, target {target:.0} bps, ratio {:.3}", achieved / target);
     }
+    // The shape census: which macroblock kinds each picture type took.
+    // A row turns a shape on; only this line says whether the clip took
+    // it, which is the difference between a cell that proves a feature
+    // and one that proves its syntax.
+    for (pic, name) in ["I", "P", "B"].iter().enumerate() {
+        let taken = enc.shape_census().taken(pic);
+        if taken.is_empty() {
+            continue;
+        }
+        let list: Vec<String> = taken.iter().map(|(k, n)| format!("{k} {n}")).collect();
+        eprintln!("shapes {name}: {}", list.join(", "));
+    }
 }
 
 /// Write the reconstructions in *display* order — sorted by each coded

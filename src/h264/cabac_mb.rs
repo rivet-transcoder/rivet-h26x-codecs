@@ -474,22 +474,21 @@ pub(crate) fn write_sub_mb_type_p_cabac(e: &mut CabacEncoder, st: &mut CabacStat
 }
 
 /// Write a B-slice `mb_type`: the exact inverse of [`decode_mb_type`]'s B
-/// branch over the values this encoder spells — 0 `B_Direct_16x16`, 1
-/// `B_L0_16x16`, 2 `B_L1_16x16`, 3 `B_Bi_16x16`, and 23+ intra (the
-/// I-slice tree behind the B prefix, `23 + intra_mb_type_code(..)`).
+/// branch over Table 7-14's whole numbering — 0 `B_Direct_16x16`, 1..=3
+/// the explicit 16x16 directions, 4..=21 the 16x8 / 8x16 rows, 22
+/// `B_8x8`, and 23+ intra (the I-slice tree behind the B prefix,
+/// `23 + intra_mb_type_code(..)`).
 ///
 /// `inc` is the first bin's ctxIdxInc: how many of the two available
 /// neighbours are *neither* `B_Skip` nor `B_Direct_16x16` — read off
 /// [`WrittenMb::direct`] (a skipped B macroblock sets it too).
 ///
-/// 4..=22 — the 16x8 / 8x16 / 8x8 B partitions — are refused by name,
-/// exactly as `P_8x8` is on the P writer: spelling the type would promise
-/// partitions nothing can serialise.
+/// The binarisation (Table 9-37) after the two prefix bins is four fixed
+/// bins of a value `bits`, and the reader's arithmetic is the spec: below
+/// 8 the type is `bits + 3`; 13 escapes to intra, 14 is type 11, 15 is
+/// `B_8x8`; and 8..=12 take one more bin, the type then being the five
+/// bins as a number, minus 4. So 12..=21 spell `t + 4` over five bins.
 pub(crate) fn write_mb_type_b_cabac(e: &mut CabacEncoder, st: &mut CabacState, inc: usize, t: u32) {
-    debug_assert!(
-        t <= 3 || t >= 23,
-        "B mb_type {t}: two-partition and sub-8x8 B macroblocks have no writer yet"
-    );
     if t == 0 {
         e.encode_decision(&mut st.ctx[CTX_MB_TYPE_B_PREFIX + inc], 0);
         return;
@@ -501,15 +500,62 @@ pub(crate) fn write_mb_type_b_cabac(e: &mut CabacEncoder, st: &mut CabacState, i
         return;
     }
     e.encode_decision(&mut st.ctx[CTX_MB_TYPE_B_PREFIX + 3], 1);
-    // Four fixed bins carry `bits`: 0 for B_Bi_16x16 (t = 3 + 0), 13 for
-    // the intra escape.
-    let bits: u32 = if t == 3 { 0 } else { 13 };
+    // The four fixed bins, and whether a fifth follows.
+    let (bits, fifth): (u32, Option<u32>) = match t {
+        3..=10 => (t - 3, None),
+        11 => (14, None),
+        22 => (15, None),
+        12..=21 => ((t + 4) >> 1, Some((t + 4) & 1)),
+        _ => (13, None),
+    };
     e.encode_decision(&mut st.ctx[CTX_MB_TYPE_B_PREFIX + 4], (bits >> 3) & 1);
     e.encode_decision(&mut st.ctx[CTX_MB_TYPE_B_PREFIX + 5], (bits >> 2) & 1);
     e.encode_decision(&mut st.ctx[CTX_MB_TYPE_B_PREFIX + 5], (bits >> 1) & 1);
     e.encode_decision(&mut st.ctx[CTX_MB_TYPE_B_PREFIX + 5], bits & 1);
+    if let Some(b) = fifth {
+        e.encode_decision(&mut st.ctx[CTX_MB_TYPE_B_PREFIX + 5], b);
+    }
     if t >= 23 {
         write_intra_mb_type_cabac(e, st, CTX_MB_TYPE_B_SUFFIX, false, 0, t - 23);
+    }
+}
+
+/// Write a B-slice `sub_mb_type` (Table 7-18's 0..=12): the exact inverse
+/// of [`decode_sub_mb_type_b`], bin for bin — 0 `B_Direct_8x8` is a single
+/// zero; 1 and 2 (`B_L0_8x8`, `B_L1_8x8`) are `1 0 b`; 3..=6 are
+/// `1 1 0 b b`; 7..=10 are `1 1 1 0 b b`; 11 and 12 are `1 1 1 1 b`. The
+/// contexts are 36..=39 with the reader's own placement: the first three
+/// bins take 36, 37 and 38 in turn, everything after them 39.
+pub(crate) fn write_sub_mb_type_b_cabac(e: &mut CabacEncoder, st: &mut CabacState, t: u32) {
+    debug_assert!(t <= 12, "B sub_mb_type {t} out of range");
+    if t == 0 {
+        e.encode_decision(&mut st.ctx[CTX_SUB_MB_TYPE_B], 0);
+        return;
+    }
+    e.encode_decision(&mut st.ctx[CTX_SUB_MB_TYPE_B], 1);
+    if t <= 2 {
+        e.encode_decision(&mut st.ctx[CTX_SUB_MB_TYPE_B + 1], 0);
+        e.encode_decision(&mut st.ctx[CTX_SUB_MB_TYPE_B + 3], t - 1);
+        return;
+    }
+    e.encode_decision(&mut st.ctx[CTX_SUB_MB_TYPE_B + 1], 1);
+    match t {
+        3..=6 => {
+            e.encode_decision(&mut st.ctx[CTX_SUB_MB_TYPE_B + 2], 0);
+            e.encode_decision(&mut st.ctx[CTX_SUB_MB_TYPE_B + 3], (t - 3) >> 1);
+            e.encode_decision(&mut st.ctx[CTX_SUB_MB_TYPE_B + 3], (t - 3) & 1);
+        }
+        7..=10 => {
+            e.encode_decision(&mut st.ctx[CTX_SUB_MB_TYPE_B + 2], 1);
+            e.encode_decision(&mut st.ctx[CTX_SUB_MB_TYPE_B + 3], 0);
+            e.encode_decision(&mut st.ctx[CTX_SUB_MB_TYPE_B + 3], (t - 7) >> 1);
+            e.encode_decision(&mut st.ctx[CTX_SUB_MB_TYPE_B + 3], (t - 7) & 1);
+        }
+        _ => {
+            e.encode_decision(&mut st.ctx[CTX_SUB_MB_TYPE_B + 2], 1);
+            e.encode_decision(&mut st.ctx[CTX_SUB_MB_TYPE_B + 3], 1);
+            e.encode_decision(&mut st.ctx[CTX_SUB_MB_TYPE_B + 3], t - 11);
+        }
     }
 }
 
@@ -1445,12 +1491,20 @@ impl WrittenMb {
         }
     }
 
-    /// The state of a B macroblock written from `d`: the same gating as
-    /// the P constructor, per list. The direct kinds store no mvd and no
-    /// residual-bearing state beyond what their cbp says; `direct` marks
-    /// both `B_Skip` and `B_Direct_16x16`, which is what the B `mb_type`
-    /// first-bin context counts.
+    /// The state of a B macroblock written from `d`, of any coded shape:
+    /// the same gating as the P constructor, per list. The direct kinds
+    /// store no mvd and no residual-bearing state beyond what their cbp
+    /// says; `direct` marks both `B_Skip` and `B_Direct_16x16`, which is
+    /// what the B `mb_type` first-bin context counts — a `B_8x8` with
+    /// direct sub-macroblocks is *not* marked, exactly as the reader's
+    /// `decode_mb_type` counts it, and its direct blocks carry the zero
+    /// mvd the reader's `is_direct_block` reads for them.
     pub(crate) fn from_b_decision(d: &BDecision, c444: bool) -> Self {
+        // The list-0 reference index per 4x4, from its 8x8 partition's.
+        let mut ref_idx = [0i8; 16];
+        for (blk, r) in ref_idx.iter_mut().enumerate() {
+            *r = d.ref_idx[(blk / 8) * 2 + (blk % 4) / 2][0];
+        }
         match d.kind {
             BMbKind::UseIntra => {
                 unreachable!("UseIntra codes the intra decision; build from that")
@@ -1470,12 +1524,16 @@ impl WrittenMb {
                     nz_chroma: [[0; 16]; 2],
                     skip: true,
                     intra: false,
-                    ref_idx: [d.ref_idx[0]; 16],
+                    ref_idx,
                     mvd: [[Mv::ZERO; 16]; 2],
                     direct: true,
                 }
             }
-            BMbKind::BDirect16 | BMbKind::B16 => WrittenMb {
+            BMbKind::BDirect16
+            | BMbKind::B16
+            | BMbKind::B16x8
+            | BMbKind::B8x16
+            | BMbKind::B8x8 => WrittenMb {
                 pcm: false,
                 i16x16: false,
                 transform_8x8: d.transform_8x8,
@@ -1494,8 +1552,11 @@ impl WrittenMb {
                 },
                 skip: false,
                 intra: false,
-                ref_idx: [d.ref_idx[0]; 16],
-                mvd: [[d.mvd[0]; 16], [d.mvd[1]; 16]],
+                ref_idx,
+                // Each partition's mvd over its own 4x4 blocks per list,
+                // as the decoder's CABAC parser stores them; zero over
+                // direct-predicted blocks, which carry none.
+                mvd: d.mvd,
                 direct: d.kind == BMbKind::BDirect16,
             },
         }
@@ -4319,13 +4380,37 @@ mod mb_round_trip {
         );
     }
 
-    /// Every B `mb_type` this encoder spells, against every first-bin
+    /// Every B `sub_mb_type` of Table 7-18, written and decoded by
+    /// [`decode_sub_mb_type_b`] with the contexts compared afterwards —
+    /// the binarisation has four branches and a value on the wrong one
+    /// would still decode to *something*.
+    #[test]
+    fn b_sub_mb_type_round_trips() {
+        for t in 0..=12u32 {
+            let mut w = BitWriter::new();
+            let mut enc_st = CabacState::new(SliceType::B, 0, 30);
+            {
+                let mut e = CabacEncoder::new(&mut w);
+                write_sub_mb_type_b_cabac(&mut e, &mut enc_st, t);
+                e.encode_terminate(1);
+            }
+            w.align_zero();
+            let data = w.into_rbsp();
+            let mut dec_st = CabacState::new(SliceType::B, 0, 30);
+            let mut c = Cabac::new(&data);
+            assert_eq!(decode_sub_mb_type_b(&mut c, &mut dec_st), t);
+            assert_eq!(c.terminate(), 1, "t {t}");
+            assert!(!c.overrun());
+            assert_eq!(enc_st.ctx, dec_st.ctx, "t {t}: contexts diverged");
+        }
+    }
+
+    /// Every B `mb_type` — Table 7-14's whole numbering, 0..=22, plus the
+    /// intra tree behind the B prefix at 23+ — against every first-bin
     /// increment the neighbour rule can produce, decoded by
-    /// [`decode_mb_type`] over real neighbour configurations: 0 direct,
-    /// 1..=3 the explicit 16x16 directions, 23+ the intra tree behind the
-    /// B prefix. (I_PCM in a B slice has no producer — the intra fallback
-    /// never chooses PCM — and stays untested here like the other
-    /// unspelled types.)
+    /// [`decode_mb_type`] over real neighbour configurations. (I_PCM in a
+    /// B slice has no producer — the intra fallback never chooses PCM —
+    /// and stays untested here.)
     #[test]
     fn b_mb_type_round_trips() {
         for (inc, kinds) in [
@@ -4333,7 +4418,7 @@ mod mb_round_trip {
             (1, Some((MbKind::Inter16x16, MbKind::BSkip))),
             (2, Some((MbKind::Inter16x16, MbKind::I16x16))),
         ] {
-            for t in [0u32, 1, 2, 3, 23, 24, 30, 47] {
+            for t in (0u32..=22).chain([23, 24, 30, 47]) {
                 let mut w = BitWriter::new();
                 let mut enc_st = CabacState::new(SliceType::B, 0, 30);
                 {

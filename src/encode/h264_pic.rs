@@ -24,12 +24,11 @@ use crate::dsp::h264_enc::{H264EncDsp, Quant};
 use crate::encode::h264_deblock::{deblock_recon, nz_mask_of};
 use crate::encode::h264_intra::{IntraCtx, MbAvail, MbDecision, MbKind, code_macroblock};
 use crate::encode::h264_me::{
-    BDecision, BMbKind, InterDecision, InterMbKind, MbMotionState, code_macroblock_b16,
+    BDecision, BMbKind, InterDecision, InterMbKind, MbMotionState, code_macroblock_b,
     code_macroblock_p,
 };
 use crate::encode::h264_syntax::{Geometry, Plane, Recon};
 use crate::h264::frame::{BlockMotion, Frame, Mv};
-use crate::h264::cavlc::mb_partitions;
 use crate::h264::mb::{MbInfo, MbKind as DecKind, MbMotion, MbNeighbours, PicInfo, chroma_qp};
 use crate::h264::sps::ScalingLists;
 use crate::h264::transform::Dequant;
@@ -570,8 +569,9 @@ pub enum BMb<'a> {
     Skip(&'a BDecision),
     /// `B_Direct_16x16` with a residual (`mb_type` 0, no motion syntax).
     Direct(&'a BDecision),
-    /// An explicit 16x16 — L0, L1 or bi by [`BDecision::used`] — with its
-    /// mvds, cbp and coefficients.
+    /// An explicitly partitioned macroblock — 16x16, 16x8, 8x16 or the
+    /// `B_8x8` tree, directions per partition by [`BDecision::dir`] —
+    /// with its mvds, cbp and coefficients.
     Explicit(&'a BDecision),
     /// The intra fallback, coded as intra-in-B (the `mb_type` offset of
     /// 23 is the serialiser's).
@@ -614,7 +614,7 @@ pub(crate) fn code_b_picture(
         for mb_x in 0..mbs_wide {
             let addr = mb_y * mbs_wide + mb_x;
             st.start(&pm.frame, &pm.info, addr, &mut dnb);
-            let dec = code_macroblock_b16(
+            let dec = code_macroblock_b(
                 ctx,
                 rec,
                 refs,
@@ -670,41 +670,46 @@ pub(crate) fn code_b_picture(
                 match dec.kind {
                     BMbKind::BSkip => BMb::Skip(&dec),
                     BMbKind::BDirect16 => BMb::Direct(&dec),
-                    BMbKind::B16 => BMb::Explicit(&dec),
+                    BMbKind::B16 | BMbKind::B16x8 | BMbKind::B8x16 | BMbKind::B8x8 => {
+                        BMb::Explicit(&dec)
+                    }
                     BMbKind::UseIntra => unreachable!(),
                 },
             );
+            // The rectangles the decoder's motion jobs cover, whose left
+            // and top edges are where the loop filter compares motion.
+            // A direct macroblock is *four 8x8 partitions*, not one:
+            // `direct_partitions` pushes a job per 8x8 under
+            // `direct_8x8_inference` (src/h264/recon.rs), so a decoder
+            // records the 8x8 cross as partition edges — and
+            // `BDecision::rects` says so. Passing [0, 0] for direct was
+            // harmless while all four had the same vector, and became a
+            // real desync the moment colZeroFlag started varying per
+            // 8x8. It cost six cells of `--subparts --t8x8 --bframes 2`.
+            let mut rects = [(0usize, 0usize, 0usize, 0usize); 16];
+            let n = dec.rects(&mut rects);
+            // Which 8x8s of a `B_8x8` are direct: what the reader's
+            // `is_direct_block` asks of a neighbouring macroblock for
+            // its ref_idx and mvd contexts (src/h264/cabac_mb.rs), and
+            // what `derive` stores (src/h264/recon.rs).
+            let sub_direct = if dec.kind == BMbKind::B8x8 {
+                (0..4).map(|p| (dec.is_direct_part(p) as u8) << p).sum()
+            } else {
+                0
+            };
             pm.commit(
                 addr,
-                coded_info(
-                    match dec.kind {
-                        BMbKind::BSkip => DecKind::BSkip,
-                        BMbKind::BDirect16 => DecKind::BDirect16x16,
-                        _ => DecKind::Inter16x16,
-                    },
-                    nz_mask_of(&dec.nz_luma, dec.transform_8x8),
-                    dec.transform_8x8,
-                    ctx.qp,
-                    ctx.qpc,
-                    // A direct macroblock is *four 8x8 partitions*, not
-                    // one: `direct_partitions` pushes a job per 8x8 under
-                    // `direct_8x8_inference` (src/h264/recon.rs), so a
-                    // decoder records the 8x8 cross as partition edges
-                    // and compares motion across them. An explicit 16x16
-                    // has no internal edge.
-                    //
-                    // Passing [0, 0] here was harmless while direct gave
-                    // all four the same vector — the comparison it
-                    // skipped would have come out bS 0 anyway — and
-                    // became a real desync the moment colZeroFlag started
-                    // varying per 8x8. It cost six cells of
-                    // `--subparts --t8x8 --bframes 2`.
-                    if dec.kind == BMbKind::B16 {
-                        [0; 2]
-                    } else {
-                        part_edges_of(mb_partitions(DecKind::Inter8x8))
-                    },
-                ),
+                MbInfo {
+                    sub_direct,
+                    ..coded_info(
+                        dec.kind.dec_kind(),
+                        nz_mask_of(&dec.nz_luma, dec.transform_8x8),
+                        dec.transform_8x8,
+                        ctx.qp,
+                        ctx.qpc,
+                        part_edges_of(&rects[..n]),
+                    )
+                },
                 st.motion(),
             );
             left_modes = [Some(2); 4];

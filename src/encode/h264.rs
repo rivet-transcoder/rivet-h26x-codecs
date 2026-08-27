@@ -81,6 +81,57 @@ pub struct H264Encoder {
     /// carries its own as a delta against it — see `code_picture` for why
     /// the PPS must not follow the picture.
     pps_qp: u8,
+    /// What shapes the pictures took — see [`ShapeCensus`].
+    census: ShapeCensus,
+}
+
+/// How many macroblocks of each kind the stream's pictures took, per
+/// picture type — read off each coded picture's own `MbInfo` record
+/// (what the loop filter and the next picture's direct derivation read),
+/// so it counts what was committed and nothing the decision walks
+/// tried.
+///
+/// A configuration row can switch a shape *on*; only the content decides
+/// whether anything *takes* it, and a gate cell whose new shape was never
+/// chosen proves the syntax and nothing else. This is how that is told
+/// apart from a cell that exercised the shape.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShapeCensus {
+    /// `[picture type][macroblock kind]`: picture types 0 intra, 1 P, 2 B;
+    /// kinds in [`ShapeCensus::KINDS`]' order.
+    pub counts: [[u64; 11]; 3],
+}
+
+impl ShapeCensus {
+    /// Every macroblock kind, in the order `counts` is indexed.
+    pub const KINDS: [crate::h264::mb::MbKind; 11] = {
+        use crate::h264::mb::MbKind::*;
+        [I4x4, I8x8, I16x16, IPcm, Inter16x16, Inter16x8, Inter8x16, Inter8x8, PSkip, BSkip, BDirect16x16]
+    };
+
+    /// Count one coded picture's macroblocks.
+    fn add(&mut self, kind: Kind, mbs: &[crate::h264::mb::MbInfo]) {
+        let pic = match kind {
+            Kind::Idr | Kind::I => 0,
+            Kind::P => 1,
+            Kind::B => 2,
+        };
+        for m in mbs {
+            let k = Self::KINDS.iter().position(|&k| k == m.kind).expect("every kind is listed");
+            self.counts[pic][k] += 1;
+        }
+    }
+
+    /// The kinds that occurred in pictures of type `pic` (0 intra, 1 P,
+    /// 2 B), as `(name, count)`, for reporting.
+    pub fn taken(&self, pic: usize) -> Vec<(String, u64)> {
+        Self::KINDS
+            .iter()
+            .zip(&self.counts[pic])
+            .filter(|&(_, &n)| n != 0)
+            .map(|(k, &n)| (format!("{k:?}"), n))
+            .collect()
+    }
 }
 
 /// The exponents the SPS declares. Fixed rather than derived: 16 bits of
@@ -174,12 +225,19 @@ impl H264Encoder {
             idr_pic_id: 0,
             plane_dims,
             tools,
+            census: ShapeCensus::default(),
         })
     }
 
     /// How many bytes one source picture must be.
     pub fn frame_bytes(&self) -> usize {
         self.frame_bytes
+    }
+
+    /// Which macroblock kinds the pictures coded so far took, per picture
+    /// type.
+    pub fn shape_census(&self) -> &ShapeCensus {
+        &self.census
     }
 
     /// The reconstructions produced so far, in coding order. The SELF property
@@ -592,6 +650,7 @@ impl H264Encoder {
         }
         self.recon.push(cropped);
 
+        self.census.add(c.kind, &motion.info.mbs);
         if c.reference {
             self.frame_num = (self.frame_num + 1) & ((1 << LOG2_MAX_FRAME_NUM) - 1);
         }
