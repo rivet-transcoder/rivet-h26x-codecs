@@ -89,7 +89,12 @@
 # copies and a private scratch directory per run, for the reason recorded in
 # tools/README.md — a shared copy produces a green run that tested somebody
 # else's build.
-cd "${H26X_WORK:-$(dirname "$0")}"
+# Where this script lives, resolved BEFORE the cd below: a relative
+# invocation (`bash tools/verify_encode.sh`) resolves to nothing afterwards,
+# and MSYS turned that nothing into `C:\Program Files\Git\param_sets.py` —
+# every cell red on the BOX check with a message that named the wrong bug.
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+cd "${H26X_WORK:-$SCRIPT_DIR}"
 ENC=${1:-../release/examples/h26xenc.exe}
 DEC=${2:-../release/examples/h26xdec.exe}
 [ -f "$ENC" ] || ENC=${ENC%.exe}
@@ -99,7 +104,7 @@ HRD=${HRD:-$(dirname "$ENC")/h26xhrd.exe}
 [ -f "$HRD" ] || HRD=${HRD%.exe}
 FFMPEG=${FFMPEG:-ffmpeg}
 # The BOX checker (property 6) lives in the repo, beside this script.
-PARAM_SETS=${PARAM_SETS:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/param_sets.py}
+PARAM_SETS=${PARAM_SETS:-$SCRIPT_DIR/param_sets.py}
 TAG=$$
 OUT=enc_out_$TAG
 JOBS=${JOBS:-4}
