@@ -232,8 +232,18 @@ pub struct Access {
     pub data: Vec<u8>,
     /// Whether a decoder may begin here.
     pub keyframe: bool,
-    /// Display order.
+    /// Display order *within the GOP*: picture order count, reset to zero
+    /// at every IDR. Two per picture (see `gop.rs`).
     pub poc: i32,
     /// Coding order.
     pub encode_index: u64,
+    /// Display order across the whole stream: the index, counted from the
+    /// first picture ever pushed, of the picture this access unit codes.
+    ///
+    /// With B pictures coding order is not display order, and `poc` cannot
+    /// recover it because it restarts at each IDR. A caller that hands out
+    /// timestamps needs exactly this: the packet for the picture pushed
+    /// `display`-th carries that picture's timestamp, whatever position it
+    /// was coded at.
+    pub display: u64,
 }

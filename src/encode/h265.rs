@@ -710,7 +710,13 @@ impl<S: Sample> Core<S> {
         // before it is discarded, which is what makes it a random access
         // point — and not before.
         Ok(Attempt {
-            access: Access { data: out, keyframe: true, poc: c.poc, encode_index: c.encode },
+            access: Access {
+                data: out,
+                keyframe: true,
+                poc: c.poc,
+                encode_index: c.encode,
+                display: c.display,
+            },
             rec,
             frame: pic.recon,
             clears_refs: true,
@@ -972,7 +978,13 @@ impl<S: Sample> Core<S> {
         }
         // Handed back rather than kept — see the intra path.
         Ok(Attempt {
-            access: Access { data: out, keyframe: false, poc: c.poc, encode_index: c.encode },
+            access: Access {
+                data: out,
+                keyframe: false,
+                poc: c.poc,
+                encode_index: c.encode,
+                display: c.display,
+            },
             rec,
             frame: pic.recon,
             clears_refs: false,
@@ -1639,6 +1651,14 @@ mod tests {
                     );
                 }
                 for u in &units {
+                    // `display` is the stream-wide display index, which in
+                    // this single GOP is poc / 2 as well; the two must agree
+                    // or a caller's timestamp table is read at the wrong row.
+                    assert_eq!(
+                        u.display,
+                        (u.poc / 2) as u64,
+                        "{chroma:?} bframes={bframes}: display index disagrees with poc"
+                    );
                     let rec = &e.reconstructions()[u.encode_index as usize];
                     assert_eq!(
                         rec, &frames[(u.poc / 2) as usize],
