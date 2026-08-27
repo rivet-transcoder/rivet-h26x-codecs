@@ -98,7 +98,10 @@ unsafe fn sad_impl(a: *const u8, sa: usize, b: *const u8, sb: usize, w: usize, h
             let mut row = i16x8_splat(0);
             let mut x = 0;
             while x + 16 <= w {
-                let d = absdiff8(v128_load(ra.add(x) as *const v128), v128_load(rb.add(x) as *const v128));
+                let d = absdiff8(
+                    v128_load(ra.add(x) as *const v128),
+                    v128_load(rb.add(x) as *const v128),
+                );
                 row = i16x8_add(row, u16x8_extadd_pairwise_u8x16(d));
                 x += 16;
             }
@@ -126,7 +129,10 @@ fn sad(a: &[u8], a_stride: usize, b: &[u8], b_stride: usize, w: usize, h: usize)
     }
     // The scalar reference indexes and would panic; this reads through
     // pointers, so the bound is checked once here.
-    assert!(a.len() >= (h - 1) * a_stride + w && b.len() >= (h - 1) * b_stride + w, "block out of range");
+    assert!(
+        a.len() >= (h - 1) * a_stride + w && b.len() >= (h - 1) * b_stride + w,
+        "block out of range"
+    );
     unsafe { sad_impl(a.as_ptr(), a_stride, b.as_ptr(), b_stride, w, h) }
 }
 
@@ -179,7 +185,10 @@ fn ssd(a: &[u8], a_stride: usize, b: &[u8], b_stride: usize, w: usize, h: usize)
     if w % 4 != 0 || h == 0 {
         return ssd_scalar(a, a_stride, b, b_stride, w, h);
     }
-    assert!(a.len() >= (h - 1) * a_stride + w && b.len() >= (h - 1) * b_stride + w, "block out of range");
+    assert!(
+        a.len() >= (h - 1) * a_stride + w && b.len() >= (h - 1) * b_stride + w,
+        "block out of range"
+    );
     unsafe { ssd_impl(a.as_ptr(), a_stride, b.as_ptr(), b_stride, w, h) }
 }
 
@@ -194,7 +203,12 @@ fn butterfly(r0: v128, r1: v128, r2: v128, r3: v128) -> [v128; 4] {
     let s1 = i16x8_add(r1, r2);
     let s2 = i16x8_sub(r1, r2);
     let s3 = i16x8_sub(r0, r3);
-    [i16x8_add(s0, s1), i16x8_add(s3, s2), i16x8_sub(s0, s1), i16x8_sub(s3, s2)]
+    [
+        i16x8_add(s0, s1),
+        i16x8_add(s3, s2),
+        i16x8_sub(s0, s1),
+        i16x8_sub(s3, s2),
+    ]
 }
 
 /// SATD of the two 4x4 tiles held in `r0..r3` (one row each, tile A in
@@ -217,7 +231,10 @@ fn satd_pair(r0: v128, r1: v128, r2: v128, r3: v128) -> v128 {
     let c2 = zip_lo64(v1, v3);
     let c3 = zip_hi64(v1, v3);
     let [w0, w1, w2, w3] = butterfly(c0, c1, c2, c3);
-    let s = i16x8_add(i16x8_add(i16x8_abs(w0), i16x8_abs(w1)), i16x8_add(i16x8_abs(w2), i16x8_abs(w3)));
+    let s = i16x8_add(
+        i16x8_add(i16x8_abs(w0), i16x8_abs(w1)),
+        i16x8_add(i16x8_abs(w2), i16x8_abs(w3)),
+    );
     // [A01, A23, B01, B23] -> [A, A, B, B], then the tile rounding.
     let p = i32x4_extadd_pairwise_i16x8(s);
     let q = i32x4_add(p, i32x4_shuffle::<1, 0, 3, 2>(p, p));
@@ -227,13 +244,23 @@ fn satd_pair(r0: v128, r1: v128, r2: v128, r3: v128) -> v128 {
 /// A row of eight bytes from each side, as eight i16 differences.
 #[inline]
 unsafe fn diff8(a: *const u8, b: *const u8) -> v128 {
-    unsafe { i16x8_sub(u16x8_extend_low_u8x16(load8(a)), u16x8_extend_low_u8x16(load8(b))) }
+    unsafe {
+        i16x8_sub(
+            u16x8_extend_low_u8x16(load8(a)),
+            u16x8_extend_low_u8x16(load8(b)),
+        )
+    }
 }
 
 /// A row of four bytes from each side in the low half, zeros above.
 #[inline]
 unsafe fn diff4(a: *const u8, b: *const u8) -> v128 {
-    unsafe { i16x8_sub(u16x8_extend_low_u8x16(load4(a)), u16x8_extend_low_u8x16(load4(b))) }
+    unsafe {
+        i16x8_sub(
+            u16x8_extend_low_u8x16(load4(a)),
+            u16x8_extend_low_u8x16(load4(b)),
+        )
+    }
 }
 
 /// Rows `y` and `y + 4` of a four-wide block, four bytes each, in the two
@@ -288,6 +315,9 @@ fn satd(a: &[u8], a_stride: usize, b: &[u8], b_stride: usize, w: usize, h: usize
     if w % 4 != 0 || h % 4 != 0 || h == 0 {
         return satd_scalar(a, a_stride, b, b_stride, w, h);
     }
-    assert!(a.len() >= (h - 1) * a_stride + w && b.len() >= (h - 1) * b_stride + w, "block out of range");
+    assert!(
+        a.len() >= (h - 1) * a_stride + w && b.len() >= (h - 1) * b_stride + w,
+        "block out of range"
+    );
     unsafe { satd_impl(a.as_ptr(), a_stride, b.as_ptr(), b_stride, w, h) }
 }

@@ -52,7 +52,13 @@ pub fn install(d: &mut HevcEncDsp, cpu: Cpu) {
 /// i16 at `base + l * stride`: the low four outputs in `lo`, the high
 /// four in `hi`.
 #[inline(always)]
-unsafe fn mla8(mut lo: int32x4_t, mut hi: int32x4_t, base: *const i16, stride: usize, lanes: int16x8_t) -> (int32x4_t, int32x4_t) {
+unsafe fn mla8(
+    mut lo: int32x4_t,
+    mut hi: int32x4_t,
+    base: *const i16,
+    stride: usize,
+    lanes: int16x8_t,
+) -> (int32x4_t, int32x4_t) {
     unsafe {
         macro_rules! lane {
             ($l:literal) => {{
@@ -102,7 +108,13 @@ unsafe fn narrow(acc: int32x4_t, neg_shift: int32x4_t) -> int16x4_t {
 /// in place), `N >= 8`. `col` is the transposed matrix (`CT[k][j]`), `row`
 /// the matrix itself (`MT[j][k]`). `s1 >= 1`.
 #[target_feature(enable = "neon")]
-unsafe fn fwd_impl<const N: usize>(block: *mut i16, s1: i32, s2: i32, col: *const i16, row: *const i16) {
+unsafe fn fwd_impl<const N: usize>(
+    block: *mut i16,
+    s1: i32,
+    s2: i32,
+    col: *const i16,
+    row: *const i16,
+) {
     unsafe {
         let mut tmp = [0i16; 32 * 32];
         let r1 = vdupq_n_s32(1 << (s1 - 1));
@@ -120,7 +132,10 @@ unsafe fn fwd_impl<const N: usize>(block: *mut i16, s1: i32, s2: i32, col: *cons
                     let lanes = vld1q_s16(x.add(8 * m));
                     (lo, hi) = mla8(lo, hi, col.add(8 * m * N + j), N, lanes);
                 }
-                vst1q_s16(tmp.as_mut_ptr().add(y * N + j), vcombine_s16(narrow(lo, n1), narrow(hi, n1)));
+                vst1q_s16(
+                    tmp.as_mut_ptr().add(y * N + j),
+                    vcombine_s16(narrow(lo, n1), narrow(hi, n1)),
+                );
                 j += 8;
             }
         }
@@ -134,7 +149,10 @@ unsafe fn fwd_impl<const N: usize>(block: *mut i16, s1: i32, s2: i32, col: *cons
                     let lanes = vld1q_s16(row.add(j * N + 8 * m));
                     (lo, hi) = mla8(lo, hi, tmp.as_ptr().add(8 * m * N + x), N, lanes);
                 }
-                vst1q_s16(block.add(j * N + x), vcombine_s16(narrow(lo, n2), narrow(hi, n2)));
+                vst1q_s16(
+                    block.add(j * N + x),
+                    vcombine_s16(narrow(lo, n2), narrow(hi, n2)),
+                );
                 x += 8;
             }
         }
@@ -175,9 +193,21 @@ fn fdct<const N: usize>(block: &mut [i16], log2: u32, bit_depth: u32) {
     assert!(block.len() >= N * N, "block too small");
     unsafe {
         if N == 4 {
-            fwd4_impl(block.as_mut_ptr(), s1, s2, ct::<4>().as_ptr(), mt::<4>().as_ptr())
+            fwd4_impl(
+                block.as_mut_ptr(),
+                s1,
+                s2,
+                ct::<4>().as_ptr(),
+                mt::<4>().as_ptr(),
+            )
         } else {
-            fwd_impl::<N>(block.as_mut_ptr(), s1, s2, ct::<N>().as_ptr(), mt::<N>().as_ptr())
+            fwd_impl::<N>(
+                block.as_mut_ptr(),
+                s1,
+                s2,
+                ct::<N>().as_ptr(),
+                mt::<N>().as_ptr(),
+            )
         }
     }
 }
@@ -192,7 +222,14 @@ fn fdst4(block: &mut [i16], bit_depth: u32) {
 }
 
 #[target_feature(enable = "neon")]
-unsafe fn quant_impl(coeffs: *const i16, levels: *mut i16, n2: usize, scale: i32, qbits: u32, offset: i32) -> u32 {
+unsafe fn quant_impl(
+    coeffs: *const i16,
+    levels: *mut i16,
+    n2: usize,
+    scale: i32,
+    qbits: u32,
+    offset: i32,
+) -> u32 {
     unsafe {
         let vs = vdup_n_u16(scale as u16);
         let vo = vdupq_n_u32(offset as u32);
@@ -228,7 +265,16 @@ fn quant(coeffs: &[i16], levels: &mut [i16], n: usize, scale: i32, qbits: u32, o
         return quant_scalar(coeffs, levels, n, scale, qbits, offset);
     }
     assert!(coeffs.len() >= n2 && levels.len() >= n2, "block too small");
-    unsafe { quant_impl(coeffs.as_ptr(), levels.as_mut_ptr(), n2, scale, qbits, offset) }
+    unsafe {
+        quant_impl(
+            coeffs.as_ptr(),
+            levels.as_mut_ptr(),
+            n2,
+            scale,
+            qbits,
+            offset,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -237,7 +283,9 @@ mod tests {
     use crate::dsp::hevc_enc::{qbits, quant_offset, quant_scale};
 
     fn lcg(seed: &mut u64) -> u32 {
-        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (*seed >> 33) as u32
     }
 
@@ -246,10 +294,22 @@ mod tests {
     /// the architecture it compiles for.
     fn neon() -> HevcEncDsp {
         let mut d = HevcEncDsp::scalar();
-        install(&mut d, Cpu { neon: true, ..Cpu::SCALAR });
+        install(
+            &mut d,
+            Cpu {
+                neon: true,
+                ..Cpu::SCALAR
+            },
+        );
         let s = HevcEncDsp::scalar();
-        assert!(d.quant as usize != s.quant as usize, "the NEON quantiser did not install");
-        assert!(d.fdct[3] as usize != s.fdct[3] as usize, "the NEON transform did not install");
+        assert!(
+            d.quant as usize != s.quant as usize,
+            "the NEON quantiser did not install"
+        );
+        assert!(
+            d.fdct[3] as usize != s.fdct[3] as usize,
+            "the NEON transform did not install"
+        );
         d
     }
 
@@ -318,7 +378,10 @@ mod tests {
                         let mut got = vec![0i16; n * n];
                         let nw = (s.quant)(&coeffs, &mut want, n, scale, qb, off);
                         let ng = (d.quant)(&coeffs, &mut got, n, scale, qb, off);
-                        assert_eq!(got, want, "neon quant {n}x{n} qp={qp} bd={bit_depth} intra={intra}");
+                        assert_eq!(
+                            got, want,
+                            "neon quant {n}x{n} qp={qp} bd={bit_depth} intra={intra}"
+                        );
                         assert_eq!(ng, nw, "neon quant nz {n}x{n} qp={qp}");
                     }
                 }

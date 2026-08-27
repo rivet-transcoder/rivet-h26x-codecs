@@ -100,7 +100,8 @@ unsafe fn fwd_impl<const N: usize>(block: *mut i16, s1: u32, s2: u32, table: *co
                     let src = inter.as_ptr().add(q * 2 * N + 2 * x);
                     a0 = i32x4_add(a0, i32x4_dot_i16x8(v128_load(src as *const v128), c));
                     if N > 4 {
-                        a1 = i32x4_add(a1, i32x4_dot_i16x8(v128_load(src.add(8) as *const v128), c));
+                        a1 =
+                            i32x4_add(a1, i32x4_dot_i16x8(v128_load(src.add(8) as *const v128), c));
                     }
                 }
                 let v = i16x8_narrow_i32x4(i32x4_shr(a0, s2), i32x4_shr(a1, s2));
@@ -138,7 +139,14 @@ fn fdst4(block: &mut [i16], bit_depth: u32) {
     unsafe { fwd_impl::<4>(block.as_mut_ptr(), s1 as u32, 8, FDST.as_ptr()) }
 }
 
-unsafe fn quant_impl(coeffs: *const i16, levels: *mut i16, n2: usize, scale: i32, qbits: u32, offset: i32) -> u32 {
+unsafe fn quant_impl(
+    coeffs: *const i16,
+    levels: *mut i16,
+    n2: usize,
+    scale: i32,
+    qbits: u32,
+    offset: i32,
+) -> u32 {
     unsafe {
         let vs = i32x4_splat(scale);
         let vo = i32x4_splat(offset);
@@ -148,8 +156,14 @@ unsafe fn quant_impl(coeffs: *const i16, levels: *mut i16, n2: usize, scale: i32
         while i < n2 {
             let c = v128_load(coeffs.add(i) as *const v128);
             let a = i16x8_abs(c);
-            let m0 = u32x4_shr(i32x4_add(i32x4_mul(u32x4_extend_low_u16x8(a), vs), vo), qbits);
-            let m1 = u32x4_shr(i32x4_add(i32x4_mul(u32x4_extend_high_u16x8(a), vs), vo), qbits);
+            let m0 = u32x4_shr(
+                i32x4_add(i32x4_mul(u32x4_extend_low_u16x8(a), vs), vo),
+                qbits,
+            );
+            let m1 = u32x4_shr(
+                i32x4_add(i32x4_mul(u32x4_extend_high_u16x8(a), vs), vo),
+                qbits,
+            );
             let s = i16x8_shr(c, 15);
             let s0 = i32x4_extend_low_i16x8(s);
             let s1 = i32x4_extend_high_i16x8(s);
@@ -174,5 +188,14 @@ fn quant(coeffs: &[i16], levels: &mut [i16], n: usize, scale: i32, qbits: u32, o
         return quant_scalar(coeffs, levels, n, scale, qbits, offset);
     }
     assert!(coeffs.len() >= n2 && levels.len() >= n2, "block too small");
-    unsafe { quant_impl(coeffs.as_ptr(), levels.as_mut_ptr(), n2, scale, qbits, offset) }
+    unsafe {
+        quant_impl(
+            coeffs.as_ptr(),
+            levels.as_mut_ptr(),
+            n2,
+            scale,
+            qbits,
+            offset,
+        )
+    }
 }
