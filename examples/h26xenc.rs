@@ -10,10 +10,11 @@
 //!   h26xenc --input src.yuv --size 64x64 --format 420 --output out.264 \
 //!           --recon out.rec.yuv [--codec h264|h265] [--qp N | --lossless]
 //!           [--gop N] [--bframes N] [--cavlc] [--threads N]
+//!           [--color PRIMARIES:TRANSFER:MATRIX [--full-range]]
 
 
 use h26x::ChromaFormat;
-use h26x::encode::{Config, Entropy, RateControl};
+use h26x::encode::{ColourDescription, Config, Entropy, RateControl};
 
 fn die(msg: &str) -> ! {
     eprintln!("h26xenc: {msg}");
@@ -22,7 +23,9 @@ fn die(msg: &str) -> ! {
          \x20      [--recon F] [--codec h264|h265] [--qp N | --lossless | --bitrate BPS]\n\
          \x20      [--fps N] [--cpb-ms N]\n\
          \x20      [--gop N] [--bframes N] [--cavlc] [--t8x8] [--subparts] [--sao]\n\
-         \x20      [--depth N] [--threads N]"
+         \x20      [--depth N] [--threads N]\n\
+         \x20      [--color PRIMARIES:TRANSFER:MATRIX (H.273 codes, e.g. 9:16:9 for HDR10)]\n\
+         \x20      [--full-range]"
     );
     std::process::exit(2);
 }
@@ -35,6 +38,7 @@ fn main() {
     let mut codec = "h264".to_string();
     let mut cfg = Config::default();
     let mut fmt = "420".to_string();
+    let mut full_range = false;
 
     let mut i = 1;
     let val = |i: &mut usize, args: &Vec<String>, what: &str| -> String {
@@ -84,6 +88,20 @@ fn main() {
             "--sao" => cfg.sao = true,
             // H.264 only: offer inter partitions below 16x16.
             "--subparts" => cfg.subparts = true,
+            // The VUI colour description, as the three H.273 code points
+            // (colour_primaries:transfer_characteristics:matrix_coefficients).
+            // Absent, the stream says nothing about colour.
+            "--color" => {
+                let s = val(&mut i, &args, "--color");
+                let mut it = s.split(':').map(|x| x.parse::<u8>());
+                let (Some(Ok(p)), Some(Ok(t)), Some(Ok(m)), None) = (it.next(), it.next(), it.next(), it.next())
+                else {
+                    die("--color wants PRIMARIES:TRANSFER:MATRIX, three H.273 codes 0..=255")
+                };
+                cfg.colour = Some(ColourDescription { primaries: p, transfer: t, matrix: m, full_range: false });
+            }
+            // `video_full_range_flag`, beside a --color.
+            "--full-range" => full_range = true,
             other => die(&format!("unknown argument {other}")),
         }
         i += 1;
@@ -100,6 +118,12 @@ fn main() {
     };
     if codec != "h264" && codec != "h265" {
         die("--codec must be h264 or h265");
+    }
+    if full_range {
+        match cfg.colour.as_mut() {
+            Some(c) => c.full_range = true,
+            None => die("--full-range needs a --color to sit beside"),
+        }
     }
 
     let raw = std::fs::read(&input).unwrap_or_else(|e| die(&format!("read {input}: {e}")));

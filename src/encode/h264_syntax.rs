@@ -22,7 +22,7 @@ use crate::cabac_enc::CabacEncoder;
 use crate::encode::gop::Kind;
 use crate::h264::SliceType;
 use crate::h264::cabac_mb::{CabacState, MB_TYPE_I_PCM, write_mb_type_i_cabac};
-use crate::encode::{Config, Entropy};
+use crate::encode::{ColourDescription, Config, Entropy};
 use crate::picture::ChromaFormat;
 
 pub use crate::encode::h265_syntax::Cpb;
@@ -73,25 +73,63 @@ fn write_hrd(w: &mut BitWriter, cpb: &Cpb) {
     w.bits(5, 0); // time_offset_length — no pic_struct, so no time_offset
 }
 
-/// `vui_parameters()` (E.1.1) carrying only what the buffer model needs:
-/// the clock the removal delays are counted in, and the NAL HRD.
+/// `vui_parameters()` (E.1.1) carrying only what was asked for: the
+/// colour description when the caller gave one, and the clock the removal
+/// delays are counted in plus the NAL HRD when a buffer was declared.
 /// Everything else is absent by its own flag — a VUI is optional and this
-/// encoder wrote none until a buffer needed one.
-fn write_vui(w: &mut BitWriter, cpb: &Cpb, fps: u32) {
+/// encoder wrote none until a buffer needed one — and each of the two
+/// halves is present only under its own condition, so a stream with a
+/// buffer and no colour is byte-identical to one from before colour
+/// existed. The inverse of `h264::sps::parse_vui`, which keeps every
+/// field written here.
+fn write_vui(w: &mut BitWriter, colour: Option<&ColourDescription>, cpb: Option<&Cpb>, fps: u32) {
     w.flag(false); // aspect_ratio_info_present_flag
     w.flag(false); // overscan_info_present_flag
-    w.flag(false); // video_signal_type_present_flag
+    write_video_signal_type(w, colour);
     w.flag(false); // chroma_loc_info_present_flag
-    w.flag(true); // timing_info_present_flag
-    w.bits(32, 1); // num_units_in_tick
-    w.bits(32, TICKS_PER_FRAME * fps.max(1)); // time_scale
-    w.flag(true); // fixed_frame_rate_flag
-    w.flag(true); // nal_hrd_parameters_present_flag
-    write_hrd(w, cpb);
-    w.flag(false); // vcl_hrd_parameters_present_flag
-    w.flag(false); // low_delay_hrd_flag (present: a NAL HRD is)
+    match cpb {
+        Some(cpb) => {
+            w.flag(true); // timing_info_present_flag
+            w.bits(32, 1); // num_units_in_tick
+            w.bits(32, TICKS_PER_FRAME * fps.max(1)); // time_scale
+            w.flag(true); // fixed_frame_rate_flag
+            w.flag(true); // nal_hrd_parameters_present_flag
+            write_hrd(w, cpb);
+            w.flag(false); // vcl_hrd_parameters_present_flag
+            w.flag(false); // low_delay_hrd_flag (present: a NAL HRD is)
+        }
+        None => {
+            w.flag(false); // timing_info_present_flag
+            w.flag(false); // nal_hrd_parameters_present_flag
+            w.flag(false); // vcl_hrd_parameters_present_flag
+            // low_delay_hrd_flag is absent: neither HRD is present.
+        }
+    }
     w.flag(false); // pic_struct_present_flag
     w.flag(false); // bitstream_restriction_flag
+}
+
+/// The `video_signal_type_present_flag` group of a VUI (E.1.1): the
+/// three H.273 code points and the range flag, or the one zero flag that
+/// says nothing about colour. `video_format` is 5, "unspecified" — the
+/// value for content that is not a broadcast standard's — which is what
+/// every encoder that writes this group writes.
+///
+/// Identical in H.264 and H.265 (E.2.1 copies E.1.1 field for field), so
+/// the H.265 writer calls this one.
+pub(crate) fn write_video_signal_type(w: &mut BitWriter, colour: Option<&ColourDescription>) {
+    match colour {
+        Some(c) => {
+            w.flag(true); // video_signal_type_present_flag
+            w.bits(3, 5); // video_format: unspecified
+            w.flag(c.full_range); // video_full_range_flag
+            w.flag(true); // colour_description_present_flag
+            w.bits(8, u32::from(c.primaries)); // colour_primaries
+            w.bits(8, u32::from(c.transfer)); // transfer_characteristics
+            w.bits(8, u32::from(c.matrix)); // matrix_coefficients
+        }
+        None => w.flag(false), // video_signal_type_present_flag
+    }
 }
 
 /// One SEI message wrapped as an SEI NAL payload: `payloadType`,
@@ -239,9 +277,10 @@ fn has_chroma_extension(profile: u8) -> bool {
 }
 
 /// Sequence parameter set. With a coded picture buffer declared it
-/// carries a VUI — the frame clock and the NAL HRD — and without one no
-/// VUI at all, so a stream that declares no buffer is byte-identical to
-/// one from before the buffer model existed.
+/// carries a VUI — the frame clock and the NAL HRD — and with a colour
+/// description the VUI carries that; with neither, no VUI at all, so a
+/// stream that declares no buffer and no colour is byte-identical to one
+/// from before either existed.
 pub fn write_sps(
     cfg: &Config,
     g: &Geometry,
@@ -304,12 +343,11 @@ pub fn write_sps(
     } else {
         w.flag(false);
     }
-    match cpb {
-        Some(cpb) => {
-            w.flag(true); // vui_parameters_present_flag
-            write_vui(&mut w, cpb, cfg.fps);
-        }
-        None => w.flag(false), // vui_parameters_present_flag
+    if cpb.is_some() || cfg.colour.is_some() {
+        w.flag(true); // vui_parameters_present_flag
+        write_vui(&mut w, cfg.colour.as_ref(), cpb, cfg.fps);
+    } else {
+        w.flag(false); // vui_parameters_present_flag
     }
     w.rbsp_trailing_bits();
     w.into_nal()
@@ -739,6 +777,68 @@ mod tests {
         )))
         .unwrap();
         assert!(sps.vui.is_none(), "no buffer, no VUI");
+    }
+
+    /// The colour description round-trips through the decoder's own SPS
+    /// parser, field for field, on its own and beside a buffer; with a
+    /// buffer and no colour the VUI says nothing about colour, and with
+    /// neither there is no VUI at all — the flag, not a VUI of zeros —
+    /// so every stream from before colour existed is byte-identical.
+    ///
+    /// Three code points are asserted separately rather than as one
+    /// tuple so that writing one of them into another's field — the
+    /// mutation this test exists to catch — names the field it lost.
+    #[test]
+    fn the_colour_description_survives_the_decoders_own_sps_parser() {
+        use crate::encode::ColourDescription;
+        let colours = [
+            ColourDescription { primaries: 9, transfer: 16, matrix: 9, full_range: false }, // HDR10
+            ColourDescription { primaries: 9, transfer: 18, matrix: 9, full_range: false }, // HLG
+            ColourDescription { primaries: 1, transfer: 1, matrix: 1, full_range: true }, // BT.709 full
+            ColourDescription { primaries: 12, transfer: 17, matrix: 6, full_range: false }, // P3 / SMPTE 428 / 601
+        ];
+        let (base, g) = geom(64, 64, ChromaFormat::Yuv420);
+        for c in colours {
+            let cfg = Config { colour: Some(c), ..base.clone() };
+            let sps = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 16, 16, None)))
+                .unwrap_or_else(|e| panic!("{c:?}: SPS rejected: {e}"));
+            let vui = sps.vui.as_ref().unwrap_or_else(|| panic!("{c:?}: no VUI"));
+            let (p, t, m) = vui.colour_description.unwrap_or_else(|| panic!("{c:?}: no colour description"));
+            assert_eq!(p, c.primaries, "{c:?}: primaries");
+            assert_eq!(t, c.transfer, "{c:?}: transfer");
+            assert_eq!(m, c.matrix, "{c:?}: matrix");
+            assert_eq!(vui.full_range, c.full_range, "{c:?}: range");
+            assert_eq!(vui.timing, None, "{c:?}: no buffer, no clock");
+            assert_eq!(vui.nal_hrd, None, "{c:?}: no buffer, no HRD");
+            assert!(!vui.bitstream_restriction);
+        }
+        // Beside a buffer: both halves present, neither disturbing the other.
+        let cpb = Cpb::new(64_000, 125).expect("representable");
+        let cfg = Config {
+            colour: Some(colours[0]),
+            rate: crate::encode::RateControl::Bitrate { bps: 64_000 },
+            cpb_ms: 125,
+            ..base.clone()
+        };
+        let sps = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 16, 16, Some(&cpb))))
+            .expect("SPS");
+        let vui = sps.vui.as_ref().expect("VUI");
+        assert_eq!(vui.colour_description, Some((9, 16, 9)));
+        assert_eq!(vui.timing, Some((1, 60)));
+        assert_eq!(vui.nal_hrd.map(|h| h.bit_rate), Some(cpb.bit_rate));
+        // A buffer alone says nothing about colour.
+        let cfg = Config { colour: None, ..cfg };
+        let sps = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 16, 16, Some(&cpb))))
+            .expect("SPS");
+        let vui = sps.vui.as_ref().expect("VUI");
+        assert_eq!(vui.colour_description, None, "a buffer alone must not invent a colour");
+        assert!(!vui.full_range);
+        assert_eq!(vui.timing, Some((1, 60)));
+        // Neither: the bytes from before either existed.
+        let plain = write_sps(&base, &g, 16, 16, None);
+        let sps = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&plain)).expect("SPS");
+        assert!(sps.vui.is_none(), "no buffer and no colour, no VUI");
+        assert_ne!(plain, write_sps(&Config { colour: Some(colours[0]), ..base }, &g, 16, 16, None));
     }
 
     #[test]

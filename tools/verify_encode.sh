@@ -93,6 +93,22 @@
 #               (clip, configuration, bytes, PSNR, seconds, frames/s), so
 #               two runs can be set side by side.
 #
+#   8. VUI      Only for --color rows. The colour description is three
+#               H.273 code points and a range flag in the SPS VUI, and
+#               nothing above can see whether they are there: SELF and
+#               CROSS compare samples, which do not change when the VUI
+#               says BT.2020 PQ instead of nothing, and the crate's own
+#               parser is the inverse of its own writer, so a shared
+#               misreading of E.1.1 / E.2.1 round-trips cleanly. What
+#               settles it is a third reader: tools/vui_probe.py asks
+#               ffprobe, which reports the VUI as names, and the row is
+#               green only when all four fields name exactly the codes
+#               the encoder was handed. A player that shows BT.2020 PQ as
+#               BT.709 is what this row exists to prevent.
+#
+#               Its mutation: write the transfer code into the primaries
+#               field, and every --color row must go red naming the field.
+#
 # Usage: verify_encode.sh [encoder] [decoder]
 #   H26X_WORK=dir   scratch directory holding the source clips (default: here)
 #   JOBS=n          configurations in parallel (default 4)
@@ -118,6 +134,14 @@ HRD=${HRD:-$(dirname "$ENC")/h26xhrd.exe}
 FFMPEG=${FFMPEG:-ffmpeg}
 # The BOX checker (property 6) lives in the repo, beside this script.
 PARAM_SETS=${PARAM_SETS:-$SCRIPT_DIR/param_sets.py}
+# The VUI probe (property 8) too; it asks ffprobe, which lives beside the
+# ffmpeg named above (the same suffix, `.exe` or none), or is on the PATH
+# when ffmpeg is.
+VUI_PROBE=${VUI_PROBE:-$SCRIPT_DIR/vui_probe.py}
+case "$FFMPEG" in
+  */*) FFPROBE=${FFPROBE:-$(dirname "$FFMPEG")/ffprobe${FFMPEG##*/ffmpeg}} ;;
+  *) FFPROBE=${FFPROBE:-ffprobe} ;;
+esac
 TAG=$$
 OUT=enc_out_$TAG
 JOBS=${JOBS:-4}
@@ -278,6 +302,11 @@ hevc12-cqp40-sao-ip@p12|--codec h265 --qp 40 --gop 8 --sao
 hevc12-lossless-ip@p12|--codec h265 --lossless --gop 8
 abr-64k-cpb@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8
 abr-64k-cavlc-cpb@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8 --cavlc
+cqp-ip-bt709pc|--codec h264 --qp 26 --gop 8 --color 1:1:1 --full-range
+abr-64k-cpb-bt709@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8 --color 1:1:1
+hevc-vbv-125-hdr10@src_cut|--codec h265 --bitrate 64000 --cpb-ms 125 --gop 8 --color 9:16:9
+hevc10-hdr10-ip@p10|--codec h265 --qp 26 --gop 8 --color 9:16:9
+hevc10-hlg-ipb@p10|--codec h265 --qp 26 --gop 8 --bframes 2 --color 9:18:9
 "}
 
 # Split a clip's format token into its chroma format and sample depth:
@@ -393,6 +422,21 @@ one() {
       ;;
   esac
 
+  # 8. VUI. Only where a colour was given. The probe is told the codes the
+  # encoder was handed and the range flag beside them, and asks ffprobe
+  # whether the stream says so — the one reader here that is neither the
+  # writer nor its own inverse.
+  case "$flags" in
+    *--color*)
+      colour=$(echo "$flags" | sed -n 's/.*--color \([0-9:]*\).*/\1/p')
+      range=tv; case "$flags" in *--full-range*) range=pc ;; esac
+      if ! out=$(FFPROBE="$FFPROBE" python "$VUI_PROBE" "$bs" "$colour" "$range" 2>&1); then
+        echo "VUI-FAIL    $tag: $(echo "$out" | tail -1 | head -c 120)"
+        return 1
+      fi
+      ;;
+  esac
+
   # 3. QUALITY. Gated only when the configuration claims to be lossless.
   psnr=$(psnr_of "$src" "$rec" "$depth")
   size=$(stat -c %s "$bs")
@@ -475,7 +519,7 @@ print("inf" if mse == 0 else f"{10 * math.log10(peak * peak / mse):.2f}")
 PY
 }
 export -f one ffpix psnr_of chroma_of depth_of frame_bytes
-export ENC DEC HRD FFMPEG OUT PARAM_SETS H26X_SPEED_TABLE JOBS
+export ENC DEC HRD FFMPEG FFPROBE OUT PARAM_SETS VUI_PROBE H26X_SPEED_TABLE JOBS
 
 echo "== encode verification =="
 results="$OUT/results.txt"
@@ -520,7 +564,7 @@ pass=$(grep -c '^PASS' "$results")
 # failure prefix is missing from this pattern reports its failure and is
 # then counted as green - which is how the RATE rows first shipped, caught
 # only by running the mutation they exist to catch.
-bad=$(grep -cE '^(ENCODE|SELF|CROSS|LOSSLESS|RATE|HRD|PS)-FAIL' "$results")
+bad=$(grep -cE '^(ENCODE|SELF|CROSS|LOSSLESS|RATE|HRD|PS|VUI)-FAIL' "$results")
 echo
 echo "encode: $pass passed, $bad failed"
 [ "$bad" = 0 ] || fail=1

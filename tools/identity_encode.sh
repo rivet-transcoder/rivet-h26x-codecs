@@ -41,8 +41,11 @@ SOURCES=${SOURCES:-$(ls src_*.yuv 2>/dev/null)}
 [ -n "$SOURCES" ] || { echo "no source clips (src_*.yuv)" >&2; exit 2; }
 # The configuration list is verify_encode.sh's own, read out of it so the
 # two cannot drift: everything between CONFIGS=${CONFIGS:-" and the closing
-# quote.
-CONFIGS=$(sed -n '/^CONFIGS=\${CONFIGS:-"/,/^"}/p' "$VERIFY" | sed '1d;$d')
+# quote. CONFIGS in the environment overrides it, as it does there — for a
+# side B that predates a flag (a develop binary against a branch that
+# added one), where the rows using the flag cannot run on B and prove
+# nothing about the rows that can.
+CONFIGS=${CONFIGS:-$(sed -n '/^CONFIGS=\${CONFIGS:-"/,/^"}/p' "$VERIFY" | sed '1d;$d')}
 
 one() {
   src=$1; name=$2; flags=$3
