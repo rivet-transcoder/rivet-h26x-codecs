@@ -108,6 +108,14 @@
 #
 #               Its mutation: write the transfer code into the primaries
 #               field, and every --color row must go red naming the field.
+#               Which is why the H.264 rows carry three DIFFERENT codes
+#               (sRGB-on-709 full range, 1:13:6; P3 / ST 428 / 601,
+#               12:17:6) rather than the BT.709 triple 1:1:1 they first
+#               had: under that mutation 1:1:1 writes 1 where 1 belonged
+#               and stayed green in ten cells at once. The HDR rows have
+#               primaries equal to matrix (9:16:9, 9:18:9) because that
+#               is what HDR10 and HLG are; the H.264 rows are where a
+#               primaries/matrix swap shows.
 #
 # Usage: verify_encode.sh [encoder] [decoder]
 #   H26X_WORK=dir   scratch directory holding the source clips (default: here)
@@ -319,8 +327,8 @@ h264-10-abr-128k@p10|--codec h264 --bitrate 128000 --gop 8
 h264-12-cqp-ip@p12|--codec h264 --qp 26 --gop 8
 h264-12-cavlc40-ipb-t8x8-subparts@p12|--codec h264 --qp 40 --gop 8 --bframes 2 --cavlc --t8x8 --subparts
 h264-12-lossless-intra@p12|--codec h264 --lossless --gop 0
-cqp-ip-bt709pc|--codec h264 --qp 26 --gop 8 --color 1:1:1 --full-range
-abr-64k-cpb-bt709@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8 --color 1:1:1
+cqp-ip-srgb-pc|--codec h264 --qp 26 --gop 8 --color 1:13:6 --full-range
+abr-64k-cpb-p3@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8 --color 12:17:6
 hevc-vbv-125-hdr10@src_cut|--codec h265 --bitrate 64000 --cpb-ms 125 --gop 8 --color 9:16:9
 hevc10-hdr10-ip@p10|--codec h265 --qp 26 --gop 8 --color 9:16:9
 hevc10-hlg-ipb@p10|--codec h265 --qp 26 --gop 8 --bframes 2 --color 9:18:9
