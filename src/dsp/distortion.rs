@@ -86,6 +86,8 @@ fn install_simd<S: Sample>(d: &mut DistortionDsp<S>, cpu: Cpu) {
     if let Some(d) = (d as &mut dyn Any).downcast_mut::<DistortionDsp<u8>>() {
         #[cfg(target_arch = "x86_64")]
         super::distortion_x86::install(d, cpu);
+        #[cfg(target_arch = "aarch64")]
+        super::distortion_neon::install(d, cpu);
     }
 }
 
