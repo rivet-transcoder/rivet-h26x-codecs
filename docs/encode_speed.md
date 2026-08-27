@@ -197,3 +197,120 @@ Three names recur in every table and are not pixel kernels:
 | 1.31% | `dsp::h264_avx2::qpel_impl<2,0>` |
 | 1.19% | `dsp::h264_avx2::qpel_impl<0,2>` |
 | 1.09% | `dsp::h264_avx2::qpel_impl<3,3>` |
+
+## What was built, and what it measured (2026-08-27)
+
+Every number below is from one binary under two environments (or, where
+a change has no switch, two builds of the same tree one commit apart),
+interleaved, pinned to the quietest physical core, median of nine paired
+CPU-second ratios (`tools/ab_enc.py`). Every group ran a same-binary
+control; the control's spread is the smallest difference the machine
+could resolve at the time, and it is quoted beside the result it bounds.
+Clip: 640x360 4:2:0 `testsrc2`, 30 frames (90 for the whole-track row),
+QP 26. The machine was shared with two other gate sweeps throughout.
+
+### Inventory after this work
+
+| table | kernel | SSE2 | SSSE3 | AVX | AVX2 | NEON | simd128 |
+|---|---|---|---|---|---|---|---|
+| `distortion` | `sad` / `satd` / `ssd` (u8) | yes | satd (`pabsw`) | yes (VEX) | yes, widths ≥16 | written, compile-checked only | — |
+| `hevc_enc` | `fdct` 4/8/16/32, `fdst4` | yes | — | yes (VEX) | 16 and 32 | — | — |
+| `hevc_enc` | `quant` | yes | `pabsw` | yes (VEX) | yes | — | — |
+| `hevc_enc` | `fskip` | — | — | — | — | — | — |
+| `h264_enc` | all seven | — | — | — | — | — | — |
+
+SSE4.1 is not a rung for any of these: nothing in them has a better
+SSE4.1 instruction. `H264EncDsp` stays scalar on purpose — see below.
+`DistortionDsp<u16>` keeps the scalar reference.
+
+### Per-kernel (microbench in each module's `kernel_bench`, ns per call group, release)
+
+Scalar is listed twice: the pair is the control.
+
+| distortion (sad+satd+ssd) | scalar | scalar again | SSE2 | AVX | AVX2 |
+|---|---:|---:|---:|---:|---:|
+| 4x4 | 60.9 | 59.5 | 21.7 | 17.3 | 17.2 |
+| 8x8 | 174 | 167 | 35.8 | 29.1 | 30.5 |
+| 16x16 | 644 | 633 | 90.0 | 78.6 | 36.6 |
+| 32x32 | 1947 | 1867 | 230 | 249 | 130 |
+| 64x64 | 8161 | 8484 | 1109 | 892 | 472 |
+
+| hevc_enc (fdct+quant) | scalar | scalar again | SSE2 | AVX | AVX2 |
+|---|---:|---:|---:|---:|---:|
+| 4x4 | 58.5 | 60.2 | 24.0 | 22.3 | 24.9 |
+| 8x8 | 238 | 247 | 58.2 | 65.1 | 52.9 |
+| 16x16 | 2173 | 2149 | 317 | 251 | 177 |
+| 32x32 | 17087 | 16602 | 1905 | 1678 | 1173 |
+
+H.264 `fdct4` and `quant4` were written the same way (i32-lane 4x4
+transform, `pmuludq` quantiser reproducing the i64 product and the two
+truncating casts), bit-exact, and measured: `fdct4` scalar 8.4 ns against
+8.8–9.5 ns SIMD, `quant4` 10.1 against 9.0–11.6. The compiler already
+vectorises those fixed-size loops and the 64-bit product costs the SIMD
+form what it gains, so the module was not kept. Recorded so nobody writes
+it a third time; the remaining scalar hot spot in H.264 (`quant4` at 3–5%)
+wants a different idea — a 32-bit product under a proven bound — not
+wider lanes.
+
+### End-to-end, one step at a time
+
+`B/A` is the encode's CPU time after over before; the range is the nine
+paired ratios.
+
+| step | switch | H.265 intra | H.265 IP | H.265 IPB | H.264 intra | H.264 IP | H.264 IPB | H.264 t8x8+subparts |
+|---|---|---|---|---|---|---|---|---|
+| distortion SIMD | `H26X_ENC_NO_SIMD=distortion` | 0.823 (0.78–0.98) | 0.705 (0.67–1.05) | — | 0.727 (0.71–0.76) | — | 0.458 (0.42–0.48) | 0.456 (0.44–0.47) |
+| HEVC forward SIMD | `H26X_ENC_NO_SIMD=hevc_enc` | 0.878 (0.87–0.89) | 0.815 (0.78–0.89) | 0.857 (0.79–0.89) | — | — | — | — |
+| CABAC cost table | two builds | 0.897 (0.89–0.93) | 0.955 (0.91–1.00) | — | 0.938 (0.88–1.07) | 1.000 (0.90–1.00) | 0.909 (0.91–1.00) | — |
+| RDOQ early-out | two builds | 0.967 (0.95–1.00) at QP 26; 0.941 (0.91–1.29) at QP 22; 1.000 (0.85–1.02) at QP 34 | n/a (intra only) | | | | | |
+| controls (same binary, same env) | | 1.026 (0.93–1.03), 1.000 (0.96–1.04), 1.000 (0.92–1.05), 1.000 (0.95–1.05) | | | 1.000 (0.91–1.10), 1.000 (0.90–1.10), 1.000 (1.00–1.11) | | | |
+
+The H.264 rows for the CABAC table are at the resolution of the CPU-time
+tick (0.15 s runs, 15.6 ms ticks — the controls span ±10%); the
+whole-track row below, on three times the frames, is the one to read.
+
+### The whole track, 5cb468c against 1905e57 (640x360, 90 frames)
+
+| | H.264 intra | H.264 IP | H.264 IPB | H.264 t8x8+subparts | H.264 CAVLC IP | H.265 intra | H.265 IP | H.265 IPB |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| after / before | **0.689** | **0.490** | **0.420** | **0.446** | **0.477** | **0.653** | **0.527** | **0.485** |
+| paired range | 0.667–0.694 | 0.469–0.521 | 0.406–0.441 | 0.445–0.452 | 0.455–0.488 | 0.646–0.660 | 0.513–0.549 | 0.481–0.492 |
+
+Controls in the same session: 1.000 (0.931–1.037) and 1.000 (0.991–1.009).
+
+### Identity
+
+`tools/identity_encode.sh` — all 280 cells of the eight-bit corpus
+(9 clips x the configuration list, `@src_cut` row on one), bitstream and
+reconstruction compared byte for byte:
+
+- encode-side SIMD off vs on, binary at 7695ece: **280 identical, 0 moved**
+- 7695ece vs 7b547c0 (CABAC table): 280 identical, 0 moved
+- 7b547c0 vs 9644eac (RDOQ early-out): 280 identical, 0 moved
+- `tools/bd_rate.py`, RDOQ early-out, all-intra H.265 at QP 22/27/32/37:
+  +0.000% on encspeed_320x240, src_detail, src_cut (byte-identical streams;
+  the only divergence the count found is two blocks in 544 at QP 40).
+
+### Threading
+
+`--threads` is parsed into `Config::threads` and read by nothing: neither
+encoder has a thread. `--threads 1` vs `0` on 640x360: H.264 IPB 255 vs
+246 ms, H.265 IP 398 vs 452 ms — noise. Making an encoder scale is a
+design, not a serialisation fix, and was not attempted.
+
+### Not done
+
+- **NEON** kernels are compile-checked against `aarch64-unknown-linux-gnu`
+  (`--tests` too) and carry the x86 module's bit-exactness test, which no
+  machine here can run. They need the CI runners (a PR against develop);
+  nothing was pushed.
+- **wasm simd128** tier: not written.
+- **`DistortionDsp<u16>`**: scalar. The u8 kernels' shapes carry over
+  (`psadbw` does not; a u16 SAD is `pabsw` of a difference and `pmaddwd`
+  against ones), an afternoon's work once the u16 encoder path has a
+  profile to point at.
+- **H.264 `quant4`** stays scalar for the reason above.
+- **`fskip`, `hadamard*`, `fdct8`**: not in any profile's top ten.
+- **A README benchmark table per rung** for the encoders was not
+  generated; the method (`tools/ab_enc.py`, `H26X_MAX_SIMD`) and this
+  note's tables are what exist.
