@@ -19,9 +19,10 @@
 //!   the halves.
 //!
 //! Written on x86 and checked for compilation against
-//! `aarch64-unknown-linux-gnu`; the bit-exactness test below is the
-//! same one the x86 module runs and needs an ARM machine (the CI runners)
-//! to execute. Not installed on any table until it has.
+//! `aarch64-unknown-linux-gnu`; the bit-exactness test below is the same
+//! one the x86 module runs and executes on the CI arm64 runners (a PR
+//! against develop runs it on Linux and macOS arm64). `install` takes
+//! the table for every `cpu.neon`, which on AArch64 is every CPU.
 
 #![cfg(target_arch = "aarch64")]
 

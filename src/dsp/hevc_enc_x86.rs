@@ -37,59 +37,10 @@
 #![cfg(target_arch = "x86_64")]
 
 use super::Cpu;
-use super::hevc_enc::{DST4, HevcEncDsp};
-use crate::hevc::tables::TRANSFORM32;
-
-/// `FP[q * 2N + 2j + t] = M[j][2q + t]` for the `N`-point matrix `M`
-/// (`TRANSFORM32` every `32 / N`th row), flattened so a generic kernel can
-/// index it. `L` is `N * N`.
-const fn build_fp<const L: usize>(n: usize) -> [i16; L] {
-    let mut t = [0i16; L];
-    let step = 32 / n;
-    let mut q = 0;
-    while q < n / 2 {
-        let mut j = 0;
-        while j < n {
-            t[q * 2 * n + 2 * j] = TRANSFORM32[j * step][2 * q] as i16;
-            t[q * 2 * n + 2 * j + 1] = TRANSFORM32[j * step][2 * q + 1] as i16;
-            j += 1;
-        }
-        q += 1;
-    }
-    t
-}
-
-/// The DST's table, from the same matrix the scalar kernel reads.
-const fn build_fdst() -> [i16; 16] {
-    let mut t = [0i16; 16];
-    let mut q = 0;
-    while q < 2 {
-        let mut j = 0;
-        while j < 4 {
-            t[q * 8 + 2 * j] = DST4[j][2 * q] as i16;
-            t[q * 8 + 2 * j + 1] = DST4[j][2 * q + 1] as i16;
-            j += 1;
-        }
-        q += 1;
-    }
-    t
-}
-
-static FP4: [i16; 16] = build_fp::<16>(4);
-static FP8: [i16; 64] = build_fp::<64>(8);
-static FP16: [i16; 256] = build_fp::<256>(16);
-static FP32: [i16; 1024] = build_fp::<1024>(32);
-static FDST: [i16; 16] = build_fdst();
-
-#[inline(always)]
-fn fp<const N: usize>() -> &'static [i16] {
-    match N {
-        32 => &FP32,
-        16 => &FP16,
-        8 => &FP8,
-        _ => &FP4,
-    }
-}
+// The pair tables are `hevc_enc`'s, built from the decoder's matrix and
+// shared with the NEON and wasm tiers; `fp::<N>()` selects one by size.
+use super::hevc_enc::HevcEncDsp;
+use super::hevc_enc::layouts::{FDST, fp};
 
 macro_rules! kernels {
     ($feat:literal, $lvl:tt) => {
@@ -634,41 +585,6 @@ mod tests {
                         }
                     }
                 }
-            }
-        }
-    }
-
-    /// The pair table really is the matrix: every entry against
-    /// `TRANSFORM32` directly, so a transposed build cannot pass by being
-    /// consistently wrong in both stages.
-    #[test]
-    fn pair_table_is_the_matrix() {
-        for &(n, t) in &[
-            (4usize, &FP4[..]),
-            (8, &FP8[..]),
-            (16, &FP16[..]),
-            (32, &FP32[..]),
-        ] {
-            let step = 32 / n;
-            for q in 0..n / 2 {
-                for j in 0..n {
-                    assert_eq!(
-                        t[q * 2 * n + 2 * j],
-                        TRANSFORM32[j * step][2 * q] as i16,
-                        "n={n} q={q} j={j}"
-                    );
-                    assert_eq!(
-                        t[q * 2 * n + 2 * j + 1],
-                        TRANSFORM32[j * step][2 * q + 1] as i16,
-                        "n={n} q={q} j={j}"
-                    );
-                }
-            }
-        }
-        for q in 0..2 {
-            for j in 0..4 {
-                assert_eq!(FDST[q * 8 + 2 * j], DST4[j][2 * q] as i16);
-                assert_eq!(FDST[q * 8 + 2 * j + 1], DST4[j][2 * q + 1] as i16);
             }
         }
     }
