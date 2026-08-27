@@ -29,12 +29,12 @@
 
 use crate::bitwriter::BitWriter;
 use crate::encode::h264_intra::{MbDecision, MbKind};
-use crate::encode::h264_me::{BDecision, InterDecision, InterMbKind};
+use crate::encode::h264_me::{BDecision, BMbKind, InterDecision, InterMbKind};
 use crate::encode::h264_pic::{
     BMb, IntraTools, PMb, PicMotion, code_b_picture, code_intra_picture, code_p_picture,
 };
 use crate::encode::h264_syntax::{Geometry, Plane, Recon};
-use crate::h264::cavlc::{SCAN8_SUB, SCAN_CHROMA_DC, write_residual_block_cavlc};
+use crate::h264::cavlc::{SCAN8_SUB, SCAN_CHROMA_DC, part_index_of, write_residual_block_cavlc};
 use crate::h264::mb::SubMbShape;
 use crate::h264::mb::raster_of_blk;
 use crate::h264::tables::{
@@ -661,39 +661,57 @@ pub fn write_p_picture(
     fmbs
 }
 
-/// Write one coded B macroblock — `mb_type` (Table 7-14's 16x16 rows)
+/// Write one coded B macroblock of any shape — `mb_type` (Table 7-14)
 /// through the residual. The skip run belongs to the caller; no `ref_idx`
 /// is written because exactly one reference is active per list, and the
-/// mvds come in list order for the lists the direction uses (7.3.5.1's
-/// prediction loops). `B_Direct_16x16` carries no motion syntax at all —
-/// `mb_type` 0, then straight to the coded block pattern.
+/// mvds come **list-major**: every partition's `mvd_l0` in partition
+/// order, then every partition's `mvd_l1` (7.3.5.1's and 7.3.5.2's
+/// prediction loops, which the reader's `parse_mb_cavlc` walks the same
+/// way). `B_Direct_16x16` carries no motion syntax at all — `mb_type` 0,
+/// then straight to the coded block pattern — and neither does a
+/// `B_Direct_8x8` sub-macroblock, whose `sub_mb_type` of 0 is all it
+/// spells.
 #[allow(clippy::too_many_arguments)]
-fn write_b16_macroblock(
+fn write_b_macroblock(
     w: &mut BitWriter,
     dec: &BDecision,
     st: &mut NzState,
     mb_x: usize,
     left: bool,
     top: bool,
-    direct: bool,
     t8x8_mode: bool,
 ) {
-    debug_assert!(dec.ref_idx.iter().all(|&r| r <= 0), "multi-reference lists need te(v) ref_idx");
-    if direct {
-        w.ue(0); // B_Direct_16x16
-    } else {
-        // B_L0_16x16 (1), B_L1_16x16 (2), B_Bi_16x16 (3).
-        let t = match dec.used {
-            [true, false] => 1,
-            [false, true] => 2,
-            [true, true] => 3,
-            [false, false] => unreachable!("an explicit B macroblock uses a list"),
-        };
-        w.ue(t);
-        for l in 0..2 {
-            if dec.used[l] {
-                w.se(dec.mvd[l].x as i32);
-                w.se(dec.mvd[l].y as i32);
+    debug_assert!(
+        !matches!(dec.kind, BMbKind::BSkip | BMbKind::UseIntra),
+        "only a coded B macroblock carries this syntax"
+    );
+    debug_assert!(
+        dec.ref_idx.iter().flatten().all(|&r| r <= 0),
+        "multi-reference lists need te(v) ref_idx"
+    );
+    w.ue(dec.mb_type());
+    if dec.kind == BMbKind::B8x8 {
+        // `sub_mb_pred()`: the four `sub_mb_type`s first, all of them
+        // before any motion.
+        for part in 0..4 {
+            w.ue(dec.sub_mb_type(part));
+        }
+    }
+    if dec.kind != BMbKind::BDirect16 {
+        // `ref_idx_lX` is absent throughout (one active reference per
+        // list). Then the mvds, list-major, one per explicit rectangle in
+        // syntax order, x then y.
+        let mut rects = [(0usize, 0usize, 0usize, 0usize); 16];
+        let n = dec.rects(&mut rects);
+        for list in 0..2 {
+            for &(x, y, _, _) in rects.iter().take(n) {
+                let part = part_index_of(x, y);
+                if dec.is_direct_part(part) || !dec.used(part)[list] {
+                    continue;
+                }
+                let mvd = dec.mvd[list][(y / 4) * 4 + x / 4];
+                w.se(mvd.x as i32);
+                w.se(mvd.y as i32);
             }
         }
     }
@@ -704,12 +722,18 @@ fn write_b16_macroblock(
         INTER_CBP_TO_GOLOMB_GRAY[cbp]
     };
     w.ue(code as u32);
-    // `B_Direct_16x16` carries the flag too, because the SPS this encoder
-    // writes sets `direct_8x8_inference_flag`.
-    if t8x8_mode && dec.cbp_luma != 0 {
+    // The flag comes after the coded block pattern, only when some luma
+    // block is coded, and only when every sub-macroblock partition is at
+    // least 8x8. `B_Direct_16x16` and a direct sub-macroblock count as
+    // 8x8, because the SPS this encoder writes sets
+    // `direct_8x8_inference_flag`.
+    if t8x8_mode && dec.cbp_luma != 0 && dec.no_sub_mb_part_less_than_8x8() {
         w.flag(dec.transform_8x8);
     }
-    debug_assert!(!dec.transform_8x8 || (t8x8_mode && dec.cbp_luma != 0));
+    debug_assert!(
+        !dec.transform_8x8
+            || (t8x8_mode && dec.cbp_luma != 0 && dec.no_sub_mb_part_less_than_8x8())
+    );
     if cbp != 0 {
         w.se(dec.qp_delta as i32);
     }
@@ -756,15 +780,10 @@ pub fn write_b_picture(
             skip_run += 1;
             skip_nz(&mut st, mb_x);
         }
-        BMb::Direct(dec) => {
+        BMb::Direct(dec) | BMb::Explicit(dec) => {
             w.ue(skip_run);
             skip_run = 0;
-            write_b16_macroblock(w, dec, &mut st, mb_x, mb_x > 0, mb_y > 0, true, t8x8);
-        }
-        BMb::Explicit(dec) => {
-            w.ue(skip_run);
-            skip_run = 0;
-            write_b16_macroblock(w, dec, &mut st, mb_x, mb_x > 0, mb_y > 0, false, t8x8);
+            write_b_macroblock(w, dec, &mut st, mb_x, mb_x > 0, mb_y > 0, t8x8);
         }
         BMb::Intra(idec) => {
             w.ue(skip_run);
@@ -785,6 +804,7 @@ mod tests {
     use super::*;
     use crate::bitreader::BitReader;
     use crate::encode::h264_intra::{IntraCtx, MbAvail, PredMode, code_macroblock, quad_rasters};
+    use crate::encode::h264_me::test_b_decision as b_decision;
     use crate::h264::tables::ZIGZAG8X8;
     use crate::encode::h264_syntax::recon_plane;
     use crate::h264::SliceType;
@@ -921,35 +941,58 @@ mod tests {
         }
     }
 
-    /// Write one B macroblock of each 16x16 shape and hand the bits to
-    /// the production reader: the direction, the per-list mvds in list
-    /// order, the absent ref_idx, the INTER coded-block-pattern column
-    /// and the nonzero counts must all come back as written — and
-    /// `B_Direct_16x16` must come back as exactly `mb_type` 0 with no
-    /// motion syntax consumed.
+    /// Write one B macroblock of every shape and hand the bits to the
+    /// production reader: the kind, each partition's direction, the
+    /// sub-macroblock types, the mvds list-major, the absent ref_idx, the
+    /// INTER coded-block-pattern column and the nonzero counts must all
+    /// come back as written — and `B_Direct_16x16` must come back as
+    /// exactly `mb_type` 0 with no motion syntax consumed, a
+    /// `B_Direct_8x8` as a sub-macroblock with none.
+    ///
+    /// Every direction pair of Table 7-14's two-partition rows is
+    /// written, and `B_8x8` trees mixing direct with every shape and
+    /// direction, because the mvd order (every partition's list 0, then
+    /// every partition's list 1, skipping the direct ones and the unused
+    /// lists) is exactly the kind of thing a single case cannot pin.
     #[test]
-    fn a_b16_macroblock_round_trips_through_the_reader() {
-        use crate::h264::mb::PRED_L0;
-        let cases: [(bool, [bool; 2], [crate::h264::frame::Mv; 2]); 5] = [
-            (true, [true, true], [crate::h264::frame::Mv::ZERO; 2]),
-            (false, [true, false], [crate::h264::frame::Mv::new(7, -3), crate::h264::frame::Mv::ZERO]),
-            (false, [false, true], [crate::h264::frame::Mv::ZERO, crate::h264::frame::Mv::new(-13, 21)]),
-            (false, [true, true], [crate::h264::frame::Mv::new(2, 2), crate::h264::frame::Mv::new(-1, 5)]),
-            (false, [true, true], [crate::h264::frame::Mv::ZERO, crate::h264::frame::Mv::ZERO]),
-        ];
-        for (direct, used, mvd) in cases {
-            let mut dec = BDecision { used, mvd, ..BDecision::default() };
-            dec.ref_idx = [if used[0] { 0 } else { -1 }, if used[1] { 0 } else { -1 }];
-            dec.luma[0][0] = 4;
-            dec.luma[0][5] = -1;
-            dec.nz_luma[0] = 2;
-            dec.cbp_luma = 0b0001;
-            dec.chroma_dc[0][1] = 2;
-            dec.cbp_chroma = 1;
+    fn every_b_shape_round_trips_through_the_reader() {
+        use crate::h264::mb::{PRED_BI, PRED_L0, PRED_L1};
+        use crate::h264::frame::Mv;
+        let mut cases: Vec<BDecision> = Vec::new();
+        cases.push(b_decision(BMbKind::BDirect16, [PRED_BI; 4], [SubMbShape::S8x8; 4], 1));
+        for dir in [PRED_L0, PRED_L1, PRED_BI] {
+            cases.push(b_decision(BMbKind::B16, [dir; 4], [SubMbShape::S8x8; 4], 2));
+        }
+        for d0 in [PRED_L0, PRED_L1, PRED_BI] {
+            for d1 in [PRED_L0, PRED_L1, PRED_BI] {
+                cases.push(b_decision(BMbKind::B16x8, [d0, d0, d1, d1], [SubMbShape::S8x8; 4], 3));
+                cases.push(b_decision(BMbKind::B8x16, [d0, d1, d0, d1], [SubMbShape::S8x8; 4], 4));
+            }
+        }
+        cases.push(b_decision(
+            BMbKind::B8x8,
+            [PRED_BI, PRED_L0, PRED_L1, PRED_BI],
+            [SubMbShape::Direct, SubMbShape::S8x8, SubMbShape::S8x4, SubMbShape::S4x4],
+            5,
+        ));
+        cases.push(b_decision(
+            BMbKind::B8x8,
+            [PRED_BI, PRED_L0, PRED_L0, PRED_L1],
+            [SubMbShape::S4x8, SubMbShape::Direct, SubMbShape::Direct, SubMbShape::S8x8],
+            6,
+        ));
+        cases.push(b_decision(
+            BMbKind::B8x8,
+            [PRED_L0, PRED_L0, PRED_L1, PRED_BI],
+            [SubMbShape::S8x4, SubMbShape::S4x8, SubMbShape::S4x4, SubMbShape::S8x8],
+            7,
+        ));
+        cases.push(b_decision(BMbKind::B8x8, [PRED_L0; 4], [SubMbShape::Direct; 4], 8));
 
+        for dec in &cases {
             let mut st = NzState::new(1, 2, false);
             let mut w = BitWriter::new();
-            write_b16_macroblock(&mut w, &dec, &mut st, 0, false, false, direct, false);
+            write_b_macroblock(&mut w, dec, &mut st, 0, false, false, false);
             w.rbsp_trailing_bits();
             let rbsp = w.into_rbsp();
 
@@ -969,26 +1012,103 @@ mod tests {
             parse_mb_cavlc(&mut r, &ctx, &info, &nb, t, &mut layer, &dq, &mut qps)
                 .expect("the reader rejected what the writer produced");
             assert!(!r.overrun());
+            let tag = format!("{:?} dir {:?} sub {:?}", dec.kind, dec.dir, dec.sub_shape);
 
-            if direct {
-                assert_eq!(t, 0);
-                assert_eq!(layer.kind, DecKind::BDirect16x16);
-            } else {
-                assert_eq!(layer.kind, DecKind::Inter16x16, "used {used:?}");
-                let want_dir = (used[0] as u8) * PRED_L0 + (used[1] as u8) * 2;
-                assert_eq!(layer.pred_dir[0], want_dir, "used {used:?}");
+            assert_eq!(t, dec.mb_type(), "{tag}: mb_type");
+            assert_eq!(layer.kind, dec.kind.dec_kind(), "{tag}: kind");
+            for part in 0..4 {
+                if dec.is_direct_part(part) {
+                    if dec.kind == BMbKind::B8x8 {
+                        assert_eq!(layer.sub_shape[part], SubMbShape::Direct, "{tag}: part {part}");
+                    }
+                    continue;
+                }
+                assert_eq!(layer.pred_dir[part], dec.dir[part], "{tag}: part {part} direction");
+                if dec.kind == BMbKind::B8x8 {
+                    assert_eq!(layer.sub_shape[part], dec.sub_shape[part], "{tag}: part {part} shape");
+                }
                 for l in 0..2 {
-                    if used[l] {
-                        assert_eq!(layer.mvd[0].mvd[l], mvd[l], "list {l}");
-                        assert_eq!(layer.ref_idx[l][0], 0, "list {l}");
+                    if dec.used(part)[l] {
+                        assert_eq!(layer.ref_idx[l][part], 0, "{tag}: part {part} list {l}");
                     }
                 }
             }
-            assert_eq!(layer.cbp, dec.cbp_luma | (dec.cbp_chroma << 4));
+            // The reader keeps each mvd on its partition's top-left 4x4;
+            // the decision replicates it over the rectangle, so the
+            // top-left of every explicit rectangle is where they meet.
+            let mut rects = [(0usize, 0usize, 0usize, 0usize); 16];
+            let n = dec.rects(&mut rects);
+            for &(x, y, _, _) in rects.iter().take(n) {
+                let part = part_index_of(x, y);
+                let blk = (y / 4) * 4 + x / 4;
+                for l in 0..2 {
+                    let want = if !dec.is_direct_part(part) && dec.used(part)[l] {
+                        dec.mvd[l][blk]
+                    } else {
+                        Mv::ZERO
+                    };
+                    assert_eq!(layer.mvd[blk].mvd[l], want, "{tag}: block {blk} list {l} mvd");
+                }
+            }
+            assert_eq!(layer.cbp, dec.cbp_luma | (dec.cbp_chroma << 4), "{tag}: cbp");
             for blk in 0..16 {
-                assert_eq!(layer.nz[0][blk], dec.nz_luma[blk], "luma nz {blk}");
+                assert_eq!(layer.nz[0][blk], dec.nz_luma[blk], "{tag}: luma nz {blk}");
             }
         }
+    }
+
+    /// The encoder's `mb_type` and `sub_mb_type` numbering inverts the
+    /// reader's tables exactly: every direction pair of both two-partition
+    /// shapes unmaps to its own kind and directions through `b_mb_type`,
+    /// and every (shape, direction) of a sub-macroblock through
+    /// `b_sub_mb_type` — with the thirteen codes of Table 7-18 all
+    /// produced, so no row is a number nothing spells.
+    #[test]
+    fn b_mb_type_numbering_inverts_the_readers_tables() {
+        use crate::h264::cavlc::{b_mb_type, b_sub_mb_type};
+        use crate::h264::mb::{PRED_BI, PRED_L0, PRED_L1};
+        use crate::encode::h264_me::b_sub_mb_type_code;
+        let dirs = [PRED_L0, PRED_L1, PRED_BI];
+        let mut seen = std::collections::BTreeSet::new();
+        for d0 in dirs {
+            for d1 in dirs {
+                for kind in [BMbKind::B16x8, BMbKind::B8x16] {
+                    let dir = if kind == BMbKind::B16x8 { [d0, d0, d1, d1] } else { [d0, d1, d0, d1] };
+                    let dec = BDecision { kind, dir, ..BDecision::default() };
+                    let t = dec.mb_type();
+                    assert!((4..=21).contains(&t), "{kind:?} {d0} {d1}: {t}");
+                    assert!(seen.insert(t), "{kind:?} {d0} {d1}: mb_type {t} spelled twice");
+                    let mut layer = MbLayer::new(DecKind::I4x4);
+                    b_mb_type(t, &mut layer).unwrap();
+                    assert_eq!(layer.kind, kind.dec_kind(), "{kind:?} {d0} {d1}");
+                    assert_eq!(layer.pred_dir, dir, "{kind:?} {d0} {d1}");
+                }
+            }
+            let dec = BDecision { kind: BMbKind::B16, dir: [d0; 4], ..BDecision::default() };
+            let mut layer = MbLayer::new(DecKind::I4x4);
+            b_mb_type(dec.mb_type(), &mut layer).unwrap();
+            assert_eq!(layer.kind, DecKind::Inter16x16);
+            assert_eq!(layer.pred_dir, [d0; 4]);
+        }
+        assert_eq!(seen.len(), 18, "the eighteen two-partition rows");
+        let mut layer = MbLayer::new(DecKind::I4x4);
+        b_mb_type(BDecision { kind: BMbKind::B8x8, ..BDecision::default() }.mb_type(), &mut layer)
+            .unwrap();
+        assert_eq!(layer.kind, DecKind::Inter8x8);
+
+        let mut codes = std::collections::BTreeSet::new();
+        for shape in [SubMbShape::S8x8, SubMbShape::S8x4, SubMbShape::S4x8, SubMbShape::S4x4] {
+            for dir in dirs {
+                let t = b_sub_mb_type_code(shape, dir);
+                assert!(codes.insert(t), "{shape:?} {dir}: sub_mb_type {t} spelled twice");
+                assert_eq!(b_sub_mb_type(t).unwrap(), (shape, dir), "{shape:?} {dir}");
+            }
+        }
+        let t = b_sub_mb_type_code(SubMbShape::Direct, PRED_BI);
+        assert_eq!(t, 0);
+        assert_eq!(b_sub_mb_type(0).unwrap().0, SubMbShape::Direct);
+        codes.insert(t);
+        assert_eq!(codes.into_iter().collect::<Vec<_>>(), (0..=12).collect::<Vec<_>>());
     }
 
     /// A 4:4:4 intra macroblock — decided by the real mode decision,

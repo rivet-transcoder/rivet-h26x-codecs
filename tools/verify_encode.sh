@@ -234,6 +234,9 @@ cqp-subparts|--codec h264 --qp 26 --gop 8 --subparts
 cqp40-subparts|--codec h264 --qp 40 --gop 8 --subparts
 cavlc-subparts|--codec h264 --qp 26 --gop 8 --cavlc --subparts
 cavlc40-subparts|--codec h264 --qp 40 --gop 8 --cavlc --subparts
+cqp-ipb-subparts|--codec h264 --qp 26 --gop 8 --bframes 2 --subparts
+cavlc-ipb-subparts|--codec h264 --qp 26 --gop 8 --bframes 2 --cavlc --subparts
+cqp-ipb-t8x8-subparts|--codec h264 --qp 26 --gop 8 --bframes 2 --t8x8 --subparts
 hevc-lossless-intra|--codec h265 --lossless --gop 0
 hevc-lossless-ip|--codec h265 --lossless --gop 8
 hevc-lossless-ipb|--codec h265 --lossless --gop 8 --bframes 2
@@ -260,6 +263,8 @@ hevc10-abr-96k@p10|--codec h265 --bitrate 96000 --gop 8
 hevc12-cqp-ip@p12|--codec h265 --qp 26 --gop 8
 hevc12-cqp40-sao-ip@p12|--codec h265 --qp 40 --gop 8 --sao
 hevc12-lossless-ip@p12|--codec h265 --lossless --gop 8
+abr-64k-cpb@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8
+abr-64k-cavlc-cpb@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8 --cavlc
 "}
 
 # Split a clip's format token into its chroma format and sample depth:

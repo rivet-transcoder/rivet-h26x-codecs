@@ -36,7 +36,7 @@ use crate::bitwriter::BitWriter;
 use crate::cabac_enc::CabacEncoder;
 use crate::encode::h264_intra::{MbDecision, MbKind};
 use crate::encode::h264_cavlc_mb::sub_mb_type_p;
-use crate::encode::h264_me::{InterDecision, InterMbKind};
+use crate::encode::h264_me::{BDecision, BMbKind, InterDecision, InterMbKind};
 use crate::encode::h264_pic::{
     BMb, IntraTools, PMb, PicMotion, code_b_picture, code_intra_picture, code_p_picture,
 };
@@ -46,9 +46,10 @@ use crate::h264::cabac_mb::{
     CabacState, WrittenMb, intra_mb_type_code, write_cbp_cabac, write_intra_pred_modes_cabac,
     write_intra_residual_cabac, write_inter_residual_cabac, write_inter_residual_fields_cabac,
     CurMbMvd, write_mb_qp_delta_cabac, write_mb_skip_cabac, write_mb_type_b_cabac,
-    write_mb_type_i_cabac, write_mb_type_p_cabac, write_mvd_16x16_cabac, write_mvd_cabac,
-    write_sub_mb_type_p_cabac, write_transform_8x8_cabac,
+    write_mb_type_i_cabac, write_mb_type_p_cabac, write_mvd_cabac,
+    write_sub_mb_type_b_cabac, write_sub_mb_type_p_cabac, write_transform_8x8_cabac,
 };
+use crate::h264::cavlc::part_index_of;
 use crate::picture::ChromaFormat;
 
 /// What one written macroblock leaves for its neighbours' contexts: the
@@ -172,6 +173,78 @@ fn write_p16_body(
         write_mb_qp_delta_cabac(e, st, d.qp_delta as i32);
         st.prev_qp_delta_nonzero = d.qp_delta != 0;
         write_inter_residual_cabac(e, st, false, cfi, d, lnb, anb);
+    } else {
+        st.prev_qp_delta_nonzero = false;
+    }
+}
+
+/// One coded B macroblock of any shape after its skip flag: `mb_type`
+/// (with `inc` its first-bin increment), `B_8x8`'s four `sub_mb_type`s,
+/// the mvds **list-major** — every explicit rectangle's `mvd_l0` in
+/// syntax order, then every one's `mvd_l1`, each recorded as it is
+/// written so a later rectangle's context can read it, exactly as the
+/// reader stores `layer.mvd` — then cbp, the transform flag where 7.3.5
+/// allows one, and qp_delta plus residual when any block coded. No
+/// `ref_idx`: one reference per list. `B_Direct_16x16` and a
+/// `B_Direct_8x8` sub-macroblock carry no motion syntax.
+#[allow(clippy::too_many_arguments)]
+fn write_b_body(
+    e: &mut CabacEncoder,
+    st: &mut CabacState,
+    d: &BDecision,
+    inc: usize,
+    left: Option<&Coded>,
+    above: Option<&Coded>,
+    cfi: u32,
+    t8x8_mode: bool,
+) {
+    debug_assert!(
+        !matches!(d.kind, BMbKind::BSkip | BMbKind::UseIntra),
+        "only a coded B macroblock carries this syntax"
+    );
+    debug_assert!(d.ref_idx.iter().flatten().all(|&r| r <= 0), "more than one reference needs ref_idx writing");
+    let lnb = left.map(|m| &m.nb);
+    let anb = above.map(|m| &m.nb);
+    write_mb_type_b_cabac(e, st, inc, d.mb_type());
+    if d.kind == BMbKind::B8x8 {
+        for part in 0..4 {
+            write_sub_mb_type_b_cabac(e, st, d.sub_mb_type(part));
+        }
+    }
+    if d.kind != BMbKind::BDirect16 {
+        let mut cur = CurMbMvd::default();
+        let mut rects = [(0usize, 0usize, 0usize, 0usize); 16];
+        let n = d.rects(&mut rects);
+        for list in 0..2 {
+            for &(x, y, w, h) in rects.iter().take(n) {
+                let part = part_index_of(x, y);
+                if d.is_direct_part(part) || !d.used(part)[list] {
+                    continue;
+                }
+                let mvd = d.mvd[list][(y / 4) * 4 + x / 4];
+                write_mvd_cabac(e, st, &cur, lnb, anb, list, x / 4, y / 4, mvd);
+                cur.set(list, x, y, w, h, mvd);
+            }
+        }
+    }
+    write_cbp_cabac(e, st, lnb, anb, d.cbp_luma | (d.cbp_chroma << 4), cfi == 1 || cfi == 2);
+    // After the coded block pattern, only when some luma block is coded
+    // and every sub-macroblock partition is at least 8x8 —
+    // `B_Direct_16x16` and a direct sub-macroblock count as 8x8, because
+    // the SPS this encoder writes sets `direct_8x8_inference_flag`.
+    if t8x8_mode && d.cbp_luma != 0 && d.no_sub_mb_part_less_than_8x8() {
+        write_transform_8x8_cabac(e, st, lnb, anb, d.transform_8x8);
+    }
+    debug_assert!(
+        !d.transform_8x8 || (t8x8_mode && d.cbp_luma != 0 && d.no_sub_mb_part_less_than_8x8())
+    );
+    if d.cbp_luma != 0 || d.cbp_chroma != 0 {
+        write_mb_qp_delta_cabac(e, st, d.qp_delta as i32);
+        st.prev_qp_delta_nonzero = d.qp_delta != 0;
+        write_inter_residual_fields_cabac(
+            e, st, false, cfi, d.transform_8x8, d.cbp_luma, &d.nz_luma, &d.luma, d.cbp_chroma,
+            &d.chroma_dc, &d.chroma_ac, &d.nz_chroma, lnb, anb,
+        );
     } else {
         st.prev_qp_delta_nonzero = false;
     }
@@ -338,53 +411,7 @@ pub fn write_b_picture_cabac(
                 }
             }
             BMb::Direct(dec) | BMb::Explicit(dec) => {
-                let direct = matches!(mb, BMb::Direct(_));
-                let t = if direct {
-                    0
-                } else {
-                    match dec.used {
-                        [true, false] => 1,
-                        [false, true] => 2,
-                        [true, true] => 3,
-                        [false, false] => unreachable!("an explicit B macroblock uses a list"),
-                    }
-                };
-                write_mb_type_b_cabac(&mut e, &mut st, inc, t);
-                if !direct {
-                    // One reference per list, so no ref_idx; the mvds in
-                    // list order for the lists the direction uses.
-                    debug_assert!(dec.ref_idx.iter().all(|&r| r <= 0));
-                    for l in 0..2 {
-                        if dec.used[l] {
-                            write_mvd_16x16_cabac(&mut e, &mut st, lnb, anb, l, dec.mvd[l]);
-                        }
-                    }
-                }
-                write_cbp_cabac(
-                    &mut e,
-                    &mut st,
-                    lnb,
-                    anb,
-                    dec.cbp_luma | (dec.cbp_chroma << 4),
-                    cfi == 1 || cfi == 2,
-                );
-                // `B_Direct_16x16` carries the flag too, because the SPS
-                // this encoder writes sets `direct_8x8_inference_flag`.
-                if t8x8 && dec.cbp_luma != 0 {
-                    write_transform_8x8_cabac(&mut e, &mut st, lnb, anb, dec.transform_8x8);
-                }
-                debug_assert!(!dec.transform_8x8 || (t8x8 && dec.cbp_luma != 0));
-                if dec.cbp_luma != 0 || dec.cbp_chroma != 0 {
-                    write_mb_qp_delta_cabac(&mut e, &mut st, dec.qp_delta as i32);
-                    st.prev_qp_delta_nonzero = dec.qp_delta != 0;
-                    write_inter_residual_fields_cabac(
-                        &mut e, &mut st, false, cfi, dec.transform_8x8, dec.cbp_luma,
-                        &dec.nz_luma, &dec.luma, dec.cbp_chroma, &dec.chroma_dc, &dec.chroma_ac,
-                        &dec.nz_chroma, lnb, anb,
-                    );
-                } else {
-                    st.prev_qp_delta_nonzero = false;
-                }
+                write_b_body(&mut e, &mut st, dec, inc, left, above, cfi, t8x8);
                 Coded {
                     nb: WrittenMb::from_b_decision(dec, cfi == 3),
                     not_nxn: true,
@@ -442,4 +469,224 @@ pub fn write_skip_picture_cabac(w: &mut BitWriter, g: &Geometry, qp: u8, is_b: b
     }
     drop(e);
     w.align_zero();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cabac::Cabac;
+    use crate::encode::h264_me::test_b_decision;
+    use crate::h264::cabac_mb::{decode_end_of_slice, decode_mb_skip, parse_mb_cabac};
+    use crate::h264::frame::BlockMotion;
+    use crate::h264::mb::{
+        MbKind as DecKind, MbLayer, MbNeighbours, PRED_BI, PRED_L0, PRED_L1, PicInfo, SliceCtx,
+        SubMbShape,
+    };
+    use crate::h264::recon::QpState;
+    use crate::h264::sps::ScalingLists;
+    use crate::h264::transform::Dequant;
+
+    /// The decoder's per-macroblock bookkeeping (`derive`, src/h264/recon.rs)
+    /// for everything the B contexts read back from a neighbour: the
+    /// kind, which 8x8s of a `B_8x8` are direct, the cbp and counts, and
+    /// the per-list mvds.
+    fn commit(info: &mut PicInfo, addr: usize, layer: &MbLayer) {
+        let m = &mut info.mbs[addr];
+        m.kind = layer.kind;
+        m.slice = 0;
+        m.decoded = true;
+        m.cbp = layer.cbp;
+        m.transform_8x8 = layer.transform_8x8;
+        m.qp_delta_nonzero = layer.has_residual() && layer.qp_delta != 0;
+        m.dc_cbf = layer.dc_cbf;
+        m.sub_direct = if layer.kind == DecKind::Inter8x8 {
+            (0..4).map(|p| ((layer.sub_shape[p] == SubMbShape::Direct) as u8) << p).sum()
+        } else {
+            0
+        };
+        let base = addr * 16;
+        info.luma_nz[base..base + 16].copy_from_slice(&layer.nz[0]);
+        for comp in 0..2 {
+            info.chroma_nz[addr * 32 + comp * 16..addr * 32 + comp * 16 + 8]
+                .copy_from_slice(&layer.chroma_nz[comp]);
+        }
+        info.intra_modes[base..base + 16].fill(2);
+        for l in 0..2 {
+            for (dst, ent) in info.mvd[l][base..base + 16].iter_mut().zip(&layer.mvd) {
+                *dst = ent.mvd[l];
+            }
+        }
+    }
+
+    /// A 2x2 B slice of four differently partitioned macroblocks — a
+    /// 16x8, a `B_8x8` mixing direct with every direction, a
+    /// `B_Direct_16x16`, an 8x16 — written by [`write_b_body`] over the
+    /// `WrittenMb` chain and read back by the production `parse_mb_cabac`
+    /// over the decoder's own neighbour machinery, with the whole context
+    /// array compared at the end.
+    ///
+    /// Four macroblocks rather than one because the mvd contexts of a
+    /// partition read the blocks left of and above it, and for every
+    /// shape below 16x16 at least one of those is *inside* the
+    /// macroblock — the `CurMbMvd` half of the writer — while the others
+    /// are across an edge from a neighbour whose blocks are direct,
+    /// list-0 only, or bi. A single macroblock exercises neither.
+    #[test]
+    fn b_partition_shapes_round_trip_through_the_cabac_reader() {
+        let mbs = [
+            test_b_decision(
+                BMbKind::B16x8,
+                [PRED_L0, PRED_L0, PRED_BI, PRED_BI],
+                [SubMbShape::S8x8; 4],
+                3,
+            ),
+            test_b_decision(
+                BMbKind::B8x8,
+                [PRED_BI, PRED_L1, PRED_BI, PRED_L0],
+                [SubMbShape::Direct, SubMbShape::S8x8, SubMbShape::S4x4, SubMbShape::S8x4],
+                5,
+            ),
+            test_b_decision(BMbKind::BDirect16, [PRED_BI; 4], [SubMbShape::S8x8; 4], 1),
+            test_b_decision(
+                BMbKind::B8x16,
+                [PRED_BI, PRED_L1, PRED_BI, PRED_L1],
+                [SubMbShape::S8x8; 4],
+                4,
+            ),
+        ];
+        let (mbw, total) = (2usize, 4usize);
+        let cfi = 1;
+
+        // ---- write ----
+        let mut w = BitWriter::new();
+        w.align_one();
+        let mut enc_st = CabacState::new(SliceType::B, 0, 30);
+        let mut coded: Vec<Coded> = Vec::new();
+        {
+            let mut e = CabacEncoder::new(&mut w);
+            for (i, d) in mbs.iter().enumerate() {
+                let left = (i % mbw > 0).then(|| &coded[i - 1]);
+                let above = (i >= mbw).then(|| &coded[i - mbw]);
+                write_mb_skip_cabac(
+                    &mut e,
+                    &mut enc_st,
+                    left.map(|m| &m.nb),
+                    above.map(|m| &m.nb),
+                    true,
+                    false,
+                );
+                let cond =
+                    |m: Option<&Coded>| m.map_or(0, |m| !(m.nb.skip || m.nb.direct) as usize);
+                let inc = cond(left) + cond(above);
+                write_b_body(&mut e, &mut enc_st, d, inc, left, above, cfi, false);
+                coded.push(Coded {
+                    nb: WrittenMb::from_b_decision(d, false),
+                    not_nxn: true,
+                    chroma_nonzero: false,
+                });
+                e.encode_terminate((i + 1 == total) as u32);
+            }
+        }
+        w.align_zero();
+        let data = w.into_rbsp();
+
+        // ---- read back ----
+        let ctx = SliceCtx {
+            slice_type: SliceType::B,
+            slice_num: 0,
+            num_ref_idx: [1, 1],
+            direct_spatial: true,
+            transform_8x8_mode: false,
+            constrained_intra_pred: false,
+            direct_8x8_inference: true,
+            chroma_format_idc: cfi,
+            cabac: true,
+            bit_depth: 8,
+            transform_bypass: false,
+            scaling_plane: 0,
+            x264_old_444: false,
+            field_pic: false,
+            mbaff: false,
+        };
+        let lists = ScalingLists { list4x4: [[16; 16]; 6], list8x8: [[16; 64]; 6] };
+        let dq = Dequant::new(&lists);
+        let mut qps = QpState { prev_qp: 30, chroma_offset: [0, 0] };
+        let mut dec_st = CabacState::new(SliceType::B, 0, 30);
+        let mut c = Cabac::new(&data);
+        let mut info = PicInfo::new(mbw, total / mbw);
+        let mut layer = MbLayer::new(DecKind::I4x4);
+        let mut nb = MbNeighbours::default();
+        let frame_motion: [Vec<BlockMotion>; 2] = [
+            vec![BlockMotion::default(); total * 16],
+            vec![BlockMotion::default(); total * 16],
+        ];
+        for (addr, d) in mbs.iter().enumerate() {
+            nb.derive_into(&info, addr, 0);
+            nb.gather_nz(&info, 1, 2);
+            assert!(!decode_mb_skip(&mut c, &mut dec_st, &info, &nb, true), "mb {addr} skip");
+            parse_mb_cabac(
+                &mut c,
+                &mut dec_st,
+                &ctx,
+                &info,
+                &nb,
+                &frame_motion,
+                &mut layer,
+                &dq,
+                &mut qps,
+            )
+            .unwrap_or_else(|e| panic!("mb {addr}: the reader rejected the writer's bins: {e}"));
+            assert_eq!(layer.kind, d.kind.dec_kind(), "mb {addr} kind");
+            for part in 0..4 {
+                if d.is_direct_part(part) {
+                    if d.kind == BMbKind::B8x8 {
+                        assert_eq!(
+                            layer.sub_shape[part],
+                            SubMbShape::Direct,
+                            "mb {addr} part {part}"
+                        );
+                    }
+                    continue;
+                }
+                assert_eq!(layer.pred_dir[part], d.dir[part], "mb {addr} part {part} direction");
+                if d.kind == BMbKind::B8x8 {
+                    assert_eq!(
+                        layer.sub_shape[part],
+                        d.sub_shape[part],
+                        "mb {addr} part {part} shape"
+                    );
+                }
+            }
+            // The CABAC reader stores every mvd over its whole
+            // rectangle, exactly as the decision does.
+            for blk in 0..16 {
+                for l in 0..2 {
+                    assert_eq!(
+                        layer.mvd[blk].mvd[l],
+                        d.mvd[l][blk],
+                        "mb {addr} block {blk} list {l} mvd"
+                    );
+                }
+            }
+            assert_eq!(layer.cbp, d.cbp_luma | (d.cbp_chroma << 4), "mb {addr} cbp");
+            for blk in 0..16 {
+                assert_eq!(layer.nz[0][blk], d.nz_luma[blk], "mb {addr} luma nz {blk}");
+            }
+            // The writer's own record of this macroblock against what
+            // the decoder stores of it.
+            let wm = &coded[addr].nb;
+            for blk in 0..16 {
+                assert_eq!(wm.mvd[0][blk], layer.mvd[blk].mvd[0], "mb {addr} WrittenMb l0 {blk}");
+                assert_eq!(wm.mvd[1][blk], layer.mvd[blk].mvd[1], "mb {addr} WrittenMb l1 {blk}");
+            }
+            commit(&mut info, addr, &layer);
+            assert_eq!(
+                decode_end_of_slice(&mut c),
+                addr + 1 == total,
+                "end_of_slice after mb {addr}"
+            );
+        }
+        assert!(!c.overrun(), "the reader ran past what the writer produced");
+        assert_eq!(enc_st.ctx, dec_st.ctx, "context states diverged");
+    }
 }

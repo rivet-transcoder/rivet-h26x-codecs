@@ -73,11 +73,11 @@ use crate::encode::h264_intra::{IntraCtx, code_block_8x8, lambda, quad_rasters, 
 use crate::h264::cavlc::sub_block_counts_8x8;
 use crate::encode::h264_syntax::Recon;
 use crate::h264::frame::{BlockMotion, Frame, Mv, PARITY_FRAME};
-use crate::h264::cavlc::{mb_partitions, sub_partition_rect};
+use crate::h264::cavlc::{mb_partitions, part_index_of, sub_partition_rect};
 use crate::h264::mb::SubMbShape;
 use crate::h264::mb::{
-    MbKind as DecMbKind, MbMotion, MbNeighbours, MotionCache, PicInfo, colocated_block,
-    fill_motion, p_skip_mv, predict_mv,
+    MbKind as DecMbKind, MbMotion, MbNeighbours, MotionCache, PRED_BI, PRED_L0, PRED_L1,
+    PicInfo, colocated_block, fill_motion, p_skip_mv, predict_mv,
 };
 use crate::h264::transform::{chroma_dc_transform_420, chroma_dc_transform_422};
 
@@ -1511,11 +1511,53 @@ pub enum BMbKind {
     /// `B_Direct_16x16`: direct motion with a residual (`mb_type` 0).
     BDirect16,
     /// One explicit 16x16 partition — `B_L0_16x16`, `B_L1_16x16` or
-    /// `B_Bi_16x16` by [`BDecision::used`].
+    /// `B_Bi_16x16` by [`BDecision::dir`].
     B16,
+    /// Two 16x8 partitions, each with its own direction — Table 7-14's
+    /// even rows 4..=20.
+    B16x8,
+    /// Two 8x16 partitions, each with its own direction — the odd rows
+    /// 5..=21.
+    B8x16,
+    /// `B_8x8`: four 8x8 partitions, each a sub-macroblock of Table 7-18
+    /// — `B_Direct_8x8`, or a shape with one direction for all its
+    /// sub-partitions ([`BDecision::sub_shape`], [`BDecision::dir`]).
+    B8x8,
     /// Inter lost: code this macroblock with the intra decision instead.
     UseIntra,
 }
+
+impl BMbKind {
+    /// The decoder's own name for this macroblock.
+    pub fn dec_kind(self) -> DecMbKind {
+        match self {
+            BMbKind::BSkip => DecMbKind::BSkip,
+            BMbKind::BDirect16 => DecMbKind::BDirect16x16,
+            BMbKind::B16 => DecMbKind::Inter16x16,
+            BMbKind::B16x8 => DecMbKind::Inter16x8,
+            BMbKind::B8x16 => DecMbKind::Inter8x16,
+            BMbKind::B8x8 => DecMbKind::Inter8x8,
+            BMbKind::UseIntra => DecMbKind::I16x16,
+        }
+    }
+}
+
+/// Table 7-14's two-partition rows, as `(direction of partition 0,
+/// direction of partition 1)` for `(mb_type - 4) / 2` — the same table
+/// the reader's `b_mb_type` (src/h264/cavlc.rs) unmaps by, spelled here
+/// so that [`BDecision::mb_type`] can invert it; the round-trip test in
+/// `h264_cavlc_mb` holds the two to each other.
+const B_TWO_PART_DIRS: [(u8, u8); 9] = [
+    (PRED_L0, PRED_L0),
+    (PRED_L1, PRED_L1),
+    (PRED_L0, PRED_L1),
+    (PRED_L1, PRED_L0),
+    (PRED_L0, PRED_BI),
+    (PRED_L1, PRED_BI),
+    (PRED_BI, PRED_L0),
+    (PRED_BI, PRED_L1),
+    (PRED_BI, PRED_BI),
+];
 
 /// How a B macroblock was coded, in the form an entropy coder needs — the
 /// two-list sibling of [`InterDecision`], with the same residual layout.
@@ -1529,30 +1571,41 @@ pub struct BDecision {
     /// [`InterDecision::transform_8x8`]: present in the syntax only when
     /// some luma block is coded, and therefore false whenever `cbp_luma`
     /// is. `B_Direct_16x16` may carry it because the SPS this encoder
-    /// writes sets `direct_8x8_inference_flag` (7.3.5).
+    /// writes sets `direct_8x8_inference_flag`, and so may a `B_8x8`
+    /// whose sub-macroblocks are all 8x8 or direct.
     pub transform_8x8: bool,
-    /// Which lists predict. `B16`: the searched direction (`[true,false]`
-    /// L0, `[false,true]` L1, `[true,true]` bi). `BSkip` / `BDirect16`:
-    /// the derived direct references — which is `[true,true]` whenever any
-    /// neighbour predicts from a list, and *always* both when no
-    /// neighbour does (8.4.1.2.2's both-negative rule).
-    pub used: [bool; 2],
-    /// The vector per 8x8 partition per list, quarter luma samples,
-    /// meaningful where `used`. Filled for every kind including the
-    /// skips, because later macroblocks' prediction and the loop filter
-    /// need it.
+    /// The prediction direction per 8x8 partition, in the decoder's own
+    /// `pred_dir` encoding (`PRED_L0`, `PRED_L1`, `PRED_BI`). A 16x16 has
+    /// the same value in all four; a 16x8 in pairs `[d0, d0, d1, d1]`, an
+    /// 8x16 `[d0, d1, d0, d1]`.
     ///
-    /// Per 8x8 and not per macroblock because spatial direct derives
-    /// colZeroFlag from each 8x8's own colocated corner (8.4.1.2.1), and
-    /// those four answers differ the moment the colocated macroblock has
-    /// more than one partition. An explicit `B16` fills all four alike.
-    pub mv: [[Mv; 2]; 4],
-    /// `mv` minus that list's median predictor: what `mvd_lX` carries for
-    /// `B16`. Zero for the direct kinds (their syntax carries none).
-    pub mvd: [Mv; 2],
-    /// Reference index per list: 0 where `used`, -1 where not — the
-    /// values a decoder stores.
-    pub ref_idx: [i8; 2],
+    /// For the direct kinds, and for a `Direct` sub-macroblock of `B8x8`,
+    /// this is the set of lists the spatial direct derivation *used* —
+    /// at least one, and both under 8.4.1.2.2's both-negative rule. That
+    /// is what the walk commits and predicts from; no writer spells it,
+    /// because direct carries no direction syntax.
+    pub dir: [u8; 4],
+    /// For `B8x8`: each 8x8 partition's sub-macroblock shape, `Direct`
+    /// included. Meaningless for every other kind.
+    pub sub_shape: [SubMbShape; 4],
+    /// The vector per 4x4 block (raster) per list, quarter luma samples,
+    /// meaningful where the block's partition uses the list. Filled for
+    /// every kind including the skips, because later macroblocks'
+    /// prediction and the loop filter need it.
+    ///
+    /// Per 4x4 rather than per partition because `B_8x8` can carry
+    /// sixteen, and because spatial direct derives colZeroFlag from each
+    /// 8x8's own colocated corner (8.4.1.2.1), so even a direct
+    /// macroblock's four 8x8s can differ.
+    pub mv: [[Mv; 2]; 16],
+    /// `mvd_lX` per list per 4x4 block (raster), each explicit
+    /// partition's difference replicated over the blocks it covers — the
+    /// decoder's own layout, and what the CABAC contexts read. Zero over
+    /// direct-predicted blocks, whose syntax carries none.
+    pub mvd: [[Mv; 16]; 2],
+    /// Reference index per 8x8 partition per list: 0 where that partition
+    /// uses the list, -1 where not — the values a decoder stores.
+    pub ref_idx: [[i8; 2]; 4],
     /// `CodedBlockPatternLuma`, as in [`InterDecision::cbp_luma`].
     pub cbp_luma: u8,
     /// `CodedBlockPatternChroma`.
@@ -1577,10 +1630,11 @@ impl Default for BDecision {
         BDecision {
             kind: BMbKind::B16,
             transform_8x8: false,
-            used: [true, false],
-            mv: [[Mv::ZERO; 2]; 4],
-            mvd: [Mv::ZERO; 2],
-            ref_idx: [0, -1],
+            dir: [PRED_L0; 4],
+            sub_shape: [SubMbShape::S8x8; 4],
+            mv: [[Mv::ZERO; 2]; 16],
+            mvd: [[Mv::ZERO; 16]; 2],
+            ref_idx: [[0, -1]; 4],
             cbp_luma: 0,
             cbp_chroma: 0,
             qp_delta: 0,
@@ -1593,6 +1647,118 @@ impl Default for BDecision {
     }
 }
 
+impl BDecision {
+    /// Which lists 8x8 partition `part` predicts from, off [`Self::dir`].
+    pub fn used(&self, part: usize) -> [bool; 2] {
+        let d = self.dir[part];
+        [d & PRED_L0 != 0, d & PRED_L1 != 0]
+    }
+
+    /// Whether 8x8 partition `part` is direct-predicted — the whole
+    /// macroblock for the direct kinds, a `Direct` sub-macroblock of
+    /// `B8x8` — and therefore carries no motion syntax.
+    pub fn is_direct_part(&self, part: usize) -> bool {
+        match self.kind {
+            BMbKind::BSkip | BMbKind::BDirect16 => true,
+            BMbKind::B8x8 => self.sub_shape[part] == SubMbShape::Direct,
+            _ => false,
+        }
+    }
+
+    /// The prediction rectangles this macroblock's motion covers, in the
+    /// order the syntax carries them, written into `out`; returns how
+    /// many there are.
+    ///
+    /// The direct kinds are *four 8x8s*: `direct_partitions` pushes a job
+    /// per 8x8 under `direct_8x8_inference` (src/h264/recon.rs), which is
+    /// what the loop filter's partition edges and the motion commit both
+    /// walk. `B8x8` is each partition's sub-rectangles — one 8x8 for a
+    /// direct sub-macroblock — which is where the count can reach
+    /// sixteen.
+    pub fn rects(&self, out: &mut [(usize, usize, usize, usize); 16]) -> usize {
+        if self.kind != BMbKind::B8x8 {
+            let parts = match self.kind {
+                BMbKind::BSkip | BMbKind::BDirect16 => mb_partitions(DecMbKind::Inter8x8),
+                k => mb_partitions(k.dec_kind()),
+            };
+            out[..parts.len()].copy_from_slice(parts);
+            return parts.len();
+        }
+        let mut n = 0;
+        for part in 0..4 {
+            let shape = self.sub_shape[part];
+            for sub in 0..shape.count() {
+                out[n] = sub_partition_rect(part, shape, sub);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// `noSubMbPartSizeLessThan8x8Flag` (7.3.5): whether every
+    /// sub-macroblock partition is at least 8x8 — a direct one counts,
+    /// because the SPS sets `direct_8x8_inference_flag`. One of the
+    /// conditions under which `transform_size_8x8_flag` is present at all.
+    pub fn no_sub_mb_part_less_than_8x8(&self) -> bool {
+        self.kind != BMbKind::B8x8 || self.sub_shape.iter().all(|s| s.count() == 1)
+    }
+
+    /// `mb_type` in Table 7-14's numbering — the value the reader's
+    /// `b_mb_type` (src/h264/cavlc.rs) unmaps: 0 direct, 1..=3 the 16x16
+    /// directions, `4 + 2 * i` (16x8) or `5 + 2 * i` (8x16) for the
+    /// direction pair at row `i` of `B_TWO_PART_DIRS`, 22 for `B_8x8`.
+    pub fn mb_type(&self) -> u32 {
+        match self.kind {
+            BMbKind::BDirect16 => 0,
+            BMbKind::B16 => self.dir[0] as u32,
+            BMbKind::B16x8 | BMbKind::B8x16 => {
+                let (d0, d1) = if self.kind == BMbKind::B16x8 {
+                    (self.dir[0], self.dir[2])
+                } else {
+                    (self.dir[0], self.dir[1])
+                };
+                let i = B_TWO_PART_DIRS
+                    .iter()
+                    .position(|&p| p == (d0, d1))
+                    .expect("every direction pair has a row");
+                4 + 2 * i as u32 + (self.kind == BMbKind::B8x16) as u32
+            }
+            BMbKind::B8x8 => 22,
+            BMbKind::BSkip | BMbKind::UseIntra => {
+                unreachable!("only a coded B macroblock has an mb_type")
+            }
+        }
+    }
+
+    /// `sub_mb_type` of 8x8 partition `part` in Table 7-18's numbering —
+    /// the value the reader's `b_sub_mb_type` unmaps. `B8x8` only.
+    pub fn sub_mb_type(&self, part: usize) -> u32 {
+        debug_assert_eq!(self.kind, BMbKind::B8x8);
+        b_sub_mb_type_code(self.sub_shape[part], self.dir[part])
+    }
+}
+
+/// Table 7-18: the `sub_mb_type` of a B sub-macroblock of `shape`
+/// predicting from `dir` — the inverse of the reader's `b_sub_mb_type`.
+pub fn b_sub_mb_type_code(shape: SubMbShape, dir: u8) -> u32 {
+    // The direction's rank within a shape's three rows: L0, L1, Bi.
+    let d = match dir {
+        PRED_L0 => 0,
+        PRED_L1 => 1,
+        PRED_BI => 2,
+        _ => unreachable!("a sub-macroblock predicts from a list"),
+    };
+    match shape {
+        SubMbShape::Direct => 0,
+        SubMbShape::S8x8 => 1 + d,
+        // 8x4 and 4x8 interleave: 4 8x4 L0, 5 4x8 L0, 6 8x4 L1, 7 4x8 L1,
+        // 8 8x4 Bi, 9 4x8 Bi.
+        SubMbShape::S8x4 => 4 + 2 * d,
+        SubMbShape::S4x8 => 5 + 2 * d,
+        SubMbShape::S4x4 => 10 + d,
+    }
+}
+
 /// The spatial direct motion of a B macroblock (8.4.1.2.2), returning
 /// the reference index per list and the vector per 8x8 partition per
 /// list.
@@ -1600,7 +1766,10 @@ impl Default for BDecision {
 /// The reference indices and the median predictions are derived once for
 /// the whole macroblock — the decoder does the same, at the 16x16
 /// position with an empty `done` (`direct_partitions`, src/h264/recon.rs)
-/// — and only colZeroFlag varies per 8x8.
+/// — and only colZeroFlag varies per 8x8. That the derivation reads only
+/// blocks *outside* the macroblock is what lets a `B_Direct_8x8`
+/// sub-macroblock take the same answer whatever its neighbours inside the
+/// macroblock have already committed.
 ///
 /// Mirrors the decoder's derivation in `src/h264/recon.rs`
 /// (`derive_motion`'s `direct_spatial` branch): the reference indices are
@@ -1663,9 +1832,42 @@ pub fn spatial_direct(
     (ref_idx, mv)
 }
 
+/// SATD of the `w` by `h` luma rectangle at picture position `(x, y)`
+/// against its prediction from `used` lists at per-list vectors `mv` —
+/// through the decoder's kernels and, for both lists, its default
+/// bi-predictive average — without touching `rec`. How every B candidate
+/// is priced before one of them is committed. `src` is the source at the
+/// rectangle's own corner.
+#[allow(clippy::too_many_arguments)]
+fn rect_satd(
+    ctx: &MeCtx,
+    refs: [&[Recon]; 2],
+    x: i32,
+    y: i32,
+    w: usize,
+    h: usize,
+    src: &[u8],
+    src_stride: usize,
+    used: [bool; 2],
+    mv: [Mv; 2],
+) -> u32 {
+    let mut a = [0u8; 16 * PRED_STRIDE];
+    if used[0] && used[1] {
+        let mut b = [0u8; 16 * PRED_STRIDE];
+        let mut c = [0u8; 16 * PRED_STRIDE];
+        luma_pred_into(ctx, &refs[0][0], x, y, mv[0], w, h, &mut a);
+        luma_pred_into(ctx, &refs[1][0], x, y, mv[1], w, h, &mut b);
+        (ctx.dsp.avg)(&mut c, PRED_STRIDE, &a, &b, w, h);
+        (ctx.dist.satd)(src, src_stride, &c, PRED_STRIDE, w, h)
+    } else {
+        let l = if used[0] { 0 } else { 1 };
+        luma_pred_into(ctx, &refs[l][0], x, y, mv[l], w, h, &mut a);
+        (ctx.dist.satd)(src, src_stride, &a, PRED_STRIDE, w, h)
+    }
+}
+
 /// SATD of the source against the luma prediction for the given lists
-/// and per-8x8 vectors, without touching `rec` — how the B candidates are
-/// priced before one of them is committed.
+/// and per-8x8 vectors, without touching `rec`.
 ///
 /// Scored one 8x8 at a time because direct prediction can give the four
 /// partitions different vectors. For a candidate whose four are equal the
@@ -1682,43 +1884,353 @@ fn b_luma_satd(
     used: [bool; 2],
     mv: &[[Mv; 2]; 4],
 ) -> u32 {
-    let mut a = [0u8; 16 * PRED_STRIDE];
     let mut total = 0u32;
     for part in 0..4 {
         let (ox, oy) = (((part & 1) * 8) as i32, ((part >> 1) * 8) as i32);
         let s = &src[oy as usize * src_stride + ox as usize..];
-        if used[0] && used[1] {
-            let mut b = [0u8; 16 * PRED_STRIDE];
-            let mut c = [0u8; 16 * PRED_STRIDE];
-            luma_pred_into(ctx, &refs[0][0], px + ox, py + oy, mv[part][0], 8, 8, &mut a);
-            luma_pred_into(ctx, &refs[1][0], px + ox, py + oy, mv[part][1], 8, 8, &mut b);
-            (ctx.dsp.avg)(&mut c, PRED_STRIDE, &a, &b, 8, 8);
-            total += (ctx.dist.satd)(s, src_stride, &c, PRED_STRIDE, 8, 8);
-        } else {
-            let l = if used[0] { 0 } else { 1 };
-            luma_pred_into(ctx, &refs[l][0], px + ox, py + oy, mv[part][l], 8, 8, &mut a);
-            total += (ctx.dist.satd)(s, src_stride, &a, PRED_STRIDE, 8, 8);
-        }
+        total += rect_satd(ctx, refs, px + ox, py + oy, 8, 8, s, src_stride, used, mv[part]);
     }
     total
+}
+
+/// The direction encoding's three values, in the order ties are broken:
+/// the cheaper syntax first.
+const B_DIRS: [u8; 3] = [PRED_L0, PRED_L1, PRED_BI];
+
+/// The bins a B `mb_type` costs (Table 9-37): one for direct, three for
+/// an L0 or L1 16x16, six for a bi 16x16 and for the two-partition rows
+/// up to 11 and for `B_8x8`, seven for rows 12..=21. The same kind of
+/// constant the P decision charges its shapes.
+fn b_mb_type_bins(t: u32) -> f32 {
+    match t {
+        0 => 1.0,
+        1 | 2 => 3.0,
+        3..=11 | 22 => 6.0,
+        _ => 7.0,
+    }
+}
+
+/// The bins a B `sub_mb_type` costs (its binarisation in
+/// `write_sub_mb_type_b_cabac`, src/h264/cabac_mb.rs): one for direct,
+/// three for an L0 or L1 8x8, five or six for everything else.
+fn b_sub_mb_type_bins(t: u32) -> f32 {
+    match t {
+        0 => 1.0,
+        1 | 2 => 3.0,
+        7..=10 => 6.0,
+        _ => 5.0,
+    }
+}
+
+/// One searched B candidate: its shape, the direction of each 8x8
+/// partition, the vector and vector difference of every 4x4 per list,
+/// and its price. The motion state after the trial is not kept: the
+/// winner is replayed into it, exactly as the P path replays.
+struct BTrial {
+    kind: BMbKind,
+    dir: [u8; 4],
+    sub_shape: [SubMbShape; 4],
+    mvs: [[Mv; 2]; 16],
+    mvds: [[Mv; 16]; 2],
+    satd: u32,
+    cost: f32,
+}
+
+impl BTrial {
+    fn new(kind: BMbKind) -> Self {
+        BTrial {
+            kind,
+            dir: [PRED_L0; 4],
+            sub_shape: [SubMbShape::S8x8; 4],
+            mvs: [[Mv::ZERO; 2]; 16],
+            mvds: [[Mv::ZERO; 16]; 2],
+            satd: 0,
+            cost: 0.0,
+        }
+    }
+
+    /// Record a rectangle's motion over the blocks it covers: the vectors
+    /// per list, and the differences for the lists it uses.
+    fn fill(&mut self, rect: (usize, usize, usize, usize), used: [bool; 2], mv: [Mv; 2], mvd: [Mv; 2]) {
+        let (x, y, w, h) = rect;
+        for by in y / 4..(y + h) / 4 {
+            for bx in x / 4..(x + w) / 4 {
+                self.mvs[by * 4 + bx] = mv;
+                for l in 0..2 {
+                    self.mvds[l][by * 4 + bx] = if used[l] { mvd[l] } else { Mv::ZERO };
+                }
+            }
+        }
+    }
+}
+
+/// What every B search reads: the context, the two reference pictures,
+/// the macroblock's position and the source plane. Bundled because the
+/// trials below are a tree of small functions that would otherwise each
+/// take these seven arguments.
+struct BSearch<'a, 'b> {
+    ctx: &'b MeCtx<'a>,
+    refs: [&'b [Recon]; 2],
+    px: usize,
+    py: usize,
+    src_luma: &'b [u8],
+    luma_stride: usize,
+}
+
+impl BSearch<'_, '_> {
+    /// The source at macroblock offset `(x, y)`.
+    fn src_at(&self, x: usize, y: usize) -> &[u8] {
+        &self.src_luma[(self.py + y) * self.luma_stride + self.px + x..]
+    }
+
+    /// Search one list for `rect`, seeded at that list's predictor over
+    /// the state as it stands: `(predictor, vector)`.
+    fn search(&self, st: &MbMotionState, list: usize, rect: (usize, usize, usize, usize)) -> (Mv, Mv) {
+        let (x, y, w, h) = rect;
+        let pred = st.predict(list, 0, x, y, w, h);
+        let (mv, _) = search_rect(
+            self.ctx,
+            &self.refs[list][0],
+            (self.px + x) as i32,
+            (self.py + y) as i32,
+            w,
+            h,
+            self.src_at(x, y),
+            self.luma_stride,
+            pred,
+        );
+        (pred, mv)
+    }
+
+    /// SATD of `rect` predicted from `used` lists at `mv`.
+    fn satd(&self, rect: (usize, usize, usize, usize), used: [bool; 2], mv: [Mv; 2]) -> u32 {
+        let (x, y, w, h) = rect;
+        rect_satd(
+            self.ctx,
+            self.refs,
+            (self.px + x) as i32,
+            (self.py + y) as i32,
+            w,
+            h,
+            self.src_at(x, y),
+            self.luma_stride,
+            used,
+            mv,
+        )
+    }
+}
+
+/// The lists a direction predicts from.
+fn lists_of(dir: u8) -> [bool; 2] {
+    [dir & PRED_L0 != 0, dir & PRED_L1 != 0]
+}
+
+/// The bits the used lists' differences cost, through [`se_bits`].
+fn mvd_bits(used: [bool; 2], mvd: [Mv; 2]) -> f32 {
+    let mut bits = 0.0;
+    for l in 0..2 {
+        if used[l] {
+            bits += se_bits(mvd[l].x) + se_bits(mvd[l].y);
+        }
+    }
+    bits
+}
+
+/// Search one of the fixed B shapes — 16x16, 16x8, 8x16 — partition by
+/// partition, each choosing its own direction.
+///
+/// Every partition is searched over the state a decoder would hold at
+/// that point: both lists are searched from that state's own predictors,
+/// the direction is chosen by SATD plus the priced differences, and the
+/// partition is committed with exactly the lists it uses before the next
+/// one is searched. Nothing is approximated: the differences recorded
+/// are against the predictors the replay will derive.
+fn trial_b_fixed(s: &BSearch, st: &mut MbMotionState, kind: BMbKind) -> BTrial {
+    st.reset_mb();
+    let mut t = BTrial::new(kind);
+    let qp = s.ctx.qp;
+    let mut bits = 0.0f32;
+    for &rect in mb_partitions(kind.dec_kind()) {
+        let (x, y, w, h) = rect;
+        let (p0, m0) = s.search(st, 0, rect);
+        let (p1, m1) = s.search(st, 1, rect);
+        let mv = [m0, m1];
+        let mvd = [Mv::new(m0.x - p0.x, m0.y - p0.y), Mv::new(m1.x - p1.x, m1.y - p1.y)];
+        let mut best: Option<(u8, u32, f32, f32)> = None;
+        for dir in B_DIRS {
+            let used = lists_of(dir);
+            let satd = s.satd(rect, used, mv);
+            let b = mvd_bits(used, mvd);
+            let cost = satd as f32 + lambda(qp) * b;
+            if best.is_none_or(|bst| cost < bst.2) {
+                best = Some((dir, satd, cost, b));
+            }
+        }
+        let (dir, satd, _, b) = best.expect("three directions were tried");
+        let used = lists_of(dir);
+        t.satd += satd;
+        bits += b;
+        // The direction over every 8x8 the partition covers.
+        for by in y / 8..(y + h) / 8 {
+            for bx in x / 8..(x + w) / 8 {
+                t.dir[by * 2 + bx] = dir;
+            }
+        }
+        t.fill(rect, used, mv, mvd);
+        st.commit_part(x, y, w, h, [used[0].then_some(m0), used[1].then_some(m1)]);
+    }
+    let decision = BDecision { kind, dir: t.dir, ..BDecision::default() };
+    t.cost = t.satd as f32 + lambda(qp) * (b_mb_type_bins(decision.mb_type()) + bits);
+    t
+}
+
+/// Search `B_8x8`, choosing each 8x8's sub-macroblock type as it goes:
+/// direct, or one of the four shapes with one direction.
+///
+/// The four partitions are decided in order and each committed before
+/// the next is searched, as the P tree does. Within a partition the
+/// direction is shared by its sub-partitions (Table 7-18), so it cannot
+/// be chosen per sub-rectangle: each shape is searched with both lists
+/// committed provisionally, and then each direction is *replayed* from
+/// the partition's starting state — predictors, differences and commits
+/// exactly as a decoder would derive them — and priced. The provisional
+/// commit only seeds the second and later sub-rectangles' searches; the
+/// differences recorded are the replay's.
+///
+/// `direct` is the macroblock's spatial direct motion, per 8x8, which a
+/// `B_Direct_8x8` sub-macroblock takes unchanged: the derivation reads no
+/// block inside the macroblock (see [`spatial_direct`]).
+fn trial_b_8x8(
+    s: &BSearch,
+    st: &mut MbMotionState,
+    direct: &([i8; 2], [[Mv; 2]; 4]),
+) -> BTrial {
+    st.reset_mb();
+    let mut t = BTrial::new(BMbKind::B8x8);
+    let qp = s.ctx.qp;
+    let (dref, dmv) = direct;
+    let dused = [dref[0] >= 0, dref[1] >= 0];
+    let ddir = (dused[0] as u8) * PRED_L0 + (dused[1] as u8) * PRED_L1;
+    let mut bits = 0.0f32;
+    for part in 0..4 {
+        let before = *st;
+        // The direct candidate first: it wins ties, costing one bin and
+        // no differences.
+        let rect8 = sub_partition_rect(part, SubMbShape::Direct, 0);
+        let dsatd = s.satd(rect8, dused, dmv[part]);
+        let mut after = before;
+        after.commit_part(
+            rect8.0,
+            rect8.1,
+            8,
+            8,
+            [dused[0].then_some(dmv[part][0]), dused[1].then_some(dmv[part][1])],
+        );
+        let mut cand = BTrial::new(BMbKind::B8x8);
+        cand.fill(rect8, dused, dmv[part], [Mv::ZERO; 2]);
+        let mut best: (SubMbShape, u8, u32, f32, f32, BTrial, MbMotionState) = (
+            SubMbShape::Direct,
+            ddir,
+            dsatd,
+            dsatd as f32 + lambda(qp) * b_sub_mb_type_bins(0),
+            b_sub_mb_type_bins(0),
+            cand,
+            after,
+        );
+        for shape in [SubMbShape::S8x8, SubMbShape::S8x4, SubMbShape::S4x8, SubMbShape::S4x4] {
+            // Provisional: both lists searched and committed per
+            // sub-rectangle, so the later ones are seeded from something.
+            *st = before;
+            let mut mvs = [[Mv::ZERO; 2]; 4];
+            for sub in 0..shape.count() {
+                let rect = sub_partition_rect(part, shape, sub);
+                let (_, m0) = s.search(st, 0, rect);
+                let (_, m1) = s.search(st, 1, rect);
+                mvs[sub] = [m0, m1];
+                st.commit_part(rect.0, rect.1, rect.2, rect.3, [Some(m0), Some(m1)]);
+            }
+            // Each direction replayed exactly.
+            for dir in B_DIRS {
+                let used = lists_of(dir);
+                *st = before;
+                let mut cand = BTrial::new(BMbKind::B8x8);
+                let mut satd = 0u32;
+                let mut b = b_sub_mb_type_bins(b_sub_mb_type_code(shape, dir));
+                for sub in 0..shape.count() {
+                    let rect = sub_partition_rect(part, shape, sub);
+                    let mv = mvs[sub];
+                    let mut mvd = [Mv::ZERO; 2];
+                    for l in 0..2 {
+                        if used[l] {
+                            let p = st.predict(l, 0, rect.0, rect.1, rect.2, rect.3);
+                            mvd[l] = Mv::new(mv[l].x - p.x, mv[l].y - p.y);
+                        }
+                    }
+                    satd += s.satd(rect, used, mv);
+                    b += mvd_bits(used, mvd);
+                    cand.fill(rect, used, mv, mvd);
+                    st.commit_part(
+                        rect.0,
+                        rect.1,
+                        rect.2,
+                        rect.3,
+                        [used[0].then_some(mv[0]), used[1].then_some(mv[1])],
+                    );
+                }
+                let cost = satd as f32 + lambda(qp) * b;
+                if cost < best.3 {
+                    best = (shape, dir, satd, cost, b, cand, *st);
+                }
+            }
+        }
+        let (shape, dir, satd, _, b, cand, after) = best;
+        *st = after;
+        t.sub_shape[part] = shape;
+        t.dir[part] = dir;
+        t.satd += satd;
+        bits += b;
+        // The winner's blocks into the trial: exactly this partition's.
+        let (x, y) = ((part & 1) * 8, (part >> 1) * 8);
+        for by in y / 4..(y + 8) / 4 {
+            for bx in x / 4..(x + 8) / 4 {
+                let blk = by * 4 + bx;
+                t.mvs[blk] = cand.mvs[blk];
+                t.mvds[0][blk] = cand.mvds[0][blk];
+                t.mvds[1][blk] = cand.mvds[1][blk];
+            }
+        }
+    }
+    t.cost = t.satd as f32 + lambda(qp) * (b_mb_type_bins(22) + bits);
+    t
 }
 
 /// Decide and code one B macroblock, leaving its reconstruction in `rec`.
 ///
 /// `refs` are the list-0 (past) and list-1 (future) reference pictures'
-/// planes, borders replicated; `nb` the neighbouring motion per list;
-/// `col` the list-1 reference's motion and `addr` this macroblock's
-/// address in it (see [`spatial_direct`]). The candidates are direct, L0, L1 and
-/// bi-predictive 16x16 — direct keeps ties, because its syntax is
-/// cheapest — with the intra fallback consulted last, exactly as in the
-/// P path. `B_Skip` is chosen when direct won and no residual survived;
-/// unlike `P_Skip` there is no vector-equality leg, because direct motion
-/// *is* the derived motion.
+/// planes, borders replicated; `st` the motion state gathered from the
+/// picture coded so far; `col` the list-1 reference's motion and `addr`
+/// this macroblock's address in it (see [`spatial_direct`]).
+///
+/// Without `subparts` the candidates are direct, L0, L1 and bi-predictive
+/// 16x16, compared by SATD alone — direct keeps ties, because its syntax
+/// is cheapest — exactly as they always were, so a stream that does not
+/// ask for the partitions is byte-identical to one from before they
+/// existed. With `subparts` the two-partition shapes and the `B_8x8`
+/// tree join, and every candidate — the 16x16 ones and direct included —
+/// is priced the way the P decision prices its shapes: SATD plus
+/// `lambda` times the `mb_type` / `sub_mb_type` bins and each
+/// difference's `se(v)` length (`placeholder_partition_cost`'s style,
+/// and its limits: no rate term for the residual).
+///
+/// The intra fallback is consulted last, exactly as in the P path.
+/// `B_Skip` is chosen when direct won and no residual survived; unlike
+/// `P_Skip` there is no vector-equality leg, because direct motion *is*
+/// the derived motion.
 ///
 /// On [`BMbKind::UseIntra`] the reconstruction planes are untouched: the
 /// caller runs the intra decision, which writes them itself.
 #[allow(clippy::too_many_arguments)]
-pub fn code_macroblock_b16(
+pub fn code_macroblock_b(
     ctx: &MeCtx,
     rec: &mut [Recon],
     refs: [&[Recon]; 2],
@@ -1737,74 +2249,102 @@ pub fn code_macroblock_b16(
     let src = &src_luma[soff..];
     let mut out = BDecision::default();
 
-    // Direct first: it wins ties, because it costs no motion syntax.
-    let (dref, dmv) = spatial_direct(st, col, addr);
+    // Direct: derived once, a candidate in itself and the motion any
+    // `B_Direct_8x8` sub-macroblock takes.
+    let direct = spatial_direct(st, col, addr);
+    let (dref, dmv) = direct;
     let dused = [dref[0] >= 0, dref[1] >= 0];
-    let mut best_cost = b_luma_satd(ctx, refs, px as i32, py as i32, src, luma_stride, dused, &dmv);
-    out.kind = BMbKind::BDirect16;
-    out.used = dused;
-    out.mv = dmv;
-    out.ref_idx = dref;
-
-    // Explicit candidates: one search per list around that list's median
-    // predictor, then the bi combination of the two winners.
-    let pred = [st.predict(0, 0, 0, 0, 16, 16), st.predict(1, 0, 0, 0, 16, 16)];
-    let (mv0, _) = search_rect(ctx, &refs[0][0], px as i32, py as i32, 16, 16, src, luma_stride, pred[0]);
-    let (mv1, _) = search_rect(ctx, &refs[1][0], px as i32, py as i32, 16, 16, src, luma_stride, pred[1]);
-    for (used, label_mv) in [
-        ([true, false], [mv0, Mv::ZERO]),
-        ([false, true], [Mv::ZERO, mv1]),
-        ([true, true], [mv0, mv1]),
-    ] {
-        // One vector per list over the whole macroblock: the same four
-        // 8x8 entries, which is what an explicit 16x16 partition means.
-        let uniform = [label_mv; 4];
-        let cost =
-            b_luma_satd(ctx, refs, px as i32, py as i32, src, luma_stride, used, &uniform);
-        if cost < best_cost {
-            best_cost = cost;
-            out.kind = BMbKind::B16;
-            out.used = used;
-            out.mv = uniform;
-            out.ref_idx = [if used[0] { 0 } else { -1 }, if used[1] { 0 } else { -1 }];
-        }
+    let ddir = (dused[0] as u8) * PRED_L0 + (dused[1] as u8) * PRED_L1;
+    let dsatd = b_luma_satd(ctx, refs, px as i32, py as i32, src, luma_stride, dused, &dmv);
+    let mut dtrial = BTrial::new(BMbKind::BDirect16);
+    dtrial.dir = [ddir; 4];
+    for part in 0..4 {
+        dtrial.fill(sub_partition_rect(part, SubMbShape::S8x8, 0), dused, dmv[part], [Mv::ZERO; 2]);
     }
-    if out.kind == BMbKind::B16 {
-        for l in 0..2 {
-            if out.used[l] {
-                out.mvd[l] = Mv::new(out.mv[0][l].x - pred[l].x, out.mv[0][l].y - pred[l].y);
+    dtrial.satd = dsatd;
+    dtrial.cost = dsatd as f32 + lambda(ctx.qp) * b_mb_type_bins(0);
+
+    let s = BSearch { ctx, refs, px, py, src_luma, luma_stride };
+    let best: BTrial = if !ctx.subparts {
+        // The 16x16-only decision, exactly as it has always been: one
+        // search per list around that list's median predictor, then the
+        // three directions against direct by SATD alone, direct keeping
+        // ties.
+        let pred = [st.predict(0, 0, 0, 0, 16, 16), st.predict(1, 0, 0, 0, 16, 16)];
+        let (mv0, _) = search_rect(ctx, &refs[0][0], px as i32, py as i32, 16, 16, src, luma_stride, pred[0]);
+        let (mv1, _) = search_rect(ctx, &refs[1][0], px as i32, py as i32, 16, 16, src, luma_stride, pred[1]);
+        let mut best = dtrial;
+        for (dir, mv) in [
+            (PRED_L0, [mv0, Mv::ZERO]),
+            (PRED_L1, [Mv::ZERO, mv1]),
+            (PRED_BI, [mv0, mv1]),
+        ] {
+            let used = lists_of(dir);
+            let satd = b_luma_satd(ctx, refs, px as i32, py as i32, src, luma_stride, used, &[mv; 4]);
+            if satd < best.satd {
+                let mut t = BTrial::new(BMbKind::B16);
+                t.dir = [dir; 4];
+                let mvd = [
+                    Mv::new(mv0.x - pred[0].x, mv0.y - pred[0].y),
+                    Mv::new(mv1.x - pred[1].x, mv1.y - pred[1].y),
+                ];
+                t.fill((0, 0, 16, 16), used, mv, mvd);
+                t.satd = satd;
+                t.cost = satd as f32;
+                best = t;
             }
         }
+        best
+    } else {
+        let mut best = dtrial;
+        for t in [
+            trial_b_fixed(&s, st, BMbKind::B16),
+            trial_b_fixed(&s, st, BMbKind::B16x8),
+            trial_b_fixed(&s, st, BMbKind::B8x16),
+            trial_b_8x8(&s, st, &direct),
+        ] {
+            if t.cost < best.cost {
+                best = t;
+            }
+        }
+        best
+    };
+
+    out.kind = best.kind;
+    out.dir = best.dir;
+    out.sub_shape = best.sub_shape;
+    out.mv = best.mvs;
+    out.mvd = best.mvds;
+    for part in 0..4 {
+        let used = out.used(part);
+        out.ref_idx[part] = [if used[0] { 0 } else { -1 }, if used[1] { 0 } else { -1 }];
     }
 
-    if placeholder_inter_or_intra(ctx.dist, best_cost, src, luma_stride) {
+    if placeholder_inter_or_intra(ctx.dist, best.satd, src, luma_stride) {
         out.kind = BMbKind::UseIntra;
         return out;
     }
 
-    // Commit: the winner's motion into the state and its prediction into
-    // the reconstruction planes, one 8x8 at a time — direct's four can
-    // differ, and an explicit macroblock's four agree, so the same loop
-    // serves both.
+    // Replay the winner into the state — the losing trials overwrote it
+    // — and predict each rectangle into the reconstruction planes through
+    // the decoder's kernels, then code the residual over the whole
+    // macroblock and reconstruct in place.
     st.reset_mb();
-    for part in 0..4 {
-        let (ox, oy) = ((part & 1) * 8, (part >> 1) * 8);
-        st.commit_part(
-            ox,
-            oy,
-            8,
-            8,
-            [
-                out.used[0].then_some(out.mv[part][0]),
-                out.used[1].then_some(out.mv[part][1]),
-            ],
-        );
-        predict_inter_rect(ctx, rec, refs, px + ox, py + oy, 8, 8, out.used, out.mv[part]);
+    let mut rects = [(0usize, 0usize, 0usize, 0usize); 16];
+    let n = out.rects(&mut rects);
+    for &(x, y, w, h) in rects.iter().take(n) {
+        let used = out.used(part_index_of(x, y));
+        let mv = out.mv[(y / 4) * 4 + x / 4];
+        st.commit_part(x, y, w, h, [used[0].then_some(mv[0]), used[1].then_some(mv[1])]);
+        predict_inter_rect(ctx, rec, refs, px + x, py + y, w, h, used, mv);
     }
-    // A B macroblock this encoder writes has no sub-macroblock
-    // partitions, so `noSubMbPartSizeLessThan8x8Flag` holds.
+    // `transform_size_8x8_flag` is absent when any sub-macroblock
+    // partition is smaller than 8x8 (a direct one is not, under
+    // `direct_8x8_inference`), so the residual must not use the 8x8
+    // transform there.
     let r = code_inter_mb_residual(
-        ctx, rec, mb_x, mb_y, src_luma, luma_stride, src_chroma, chroma_stride, true,
+        ctx, rec, mb_x, mb_y, src_luma, luma_stride, src_chroma, chroma_stride,
+        out.no_sub_mb_part_less_than_8x8(),
     );
     out.transform_8x8 = r.transform_8x8;
     out.cbp_luma = r.cbp_luma;
@@ -1820,6 +2360,54 @@ pub fn code_macroblock_b16(
         out.kind = BMbKind::BSkip;
     }
     out
+}
+
+/// A B decision of the given shape for the writers' round-trip tests:
+/// a distinct mvd on every explicit rectangle and list (so a rectangle
+/// written in the wrong place reads back as the wrong value), reference
+/// indices from the directions, and a little residual. Shared by the
+/// CAVLC and CABAC tests so the two spell the same macroblocks.
+#[cfg(test)]
+pub(crate) fn test_b_decision(
+    kind: BMbKind,
+    dir: [u8; 4],
+    sub_shape: [SubMbShape; 4],
+    seed: i16,
+) -> BDecision {
+    let mut dec = BDecision { kind, dir, sub_shape, ..BDecision::default() };
+    let mut rects = [(0usize, 0usize, 0usize, 0usize); 16];
+    let n = dec.rects(&mut rects);
+    for (k, &(x, y, w, h)) in rects.iter().take(n).enumerate() {
+        let part = part_index_of(x, y);
+        for l in 0..2 {
+            if dec.is_direct_part(part) || !dec.used(part)[l] {
+                continue;
+            }
+            let k = k as i16;
+            let mvd = Mv::new(
+                (seed * 5 + k * 3 - 7) * if l == 0 { 1 } else { -1 },
+                seed - k * 2 + l as i16 * 11,
+            );
+            for by in y / 4..(y + h) / 4 {
+                for bx in x / 4..(x + w) / 4 {
+                    dec.mvd[l][by * 4 + bx] = mvd;
+                }
+            }
+        }
+    }
+    for part in 0..4 {
+        let used = dec.used(part);
+        dec.ref_idx[part] = [if used[0] { 0 } else { -1 }, if used[1] { 0 } else { -1 }];
+    }
+    dec.luma[0][0] = 4;
+    dec.luma[0][5] = -1;
+    dec.nz_luma[0] = 2;
+    dec.luma[10][3] = 1;
+    dec.nz_luma[10] = 1;
+    dec.cbp_luma = 0b1001;
+    dec.chroma_dc[0][1] = 2;
+    dec.cbp_chroma = 1;
+    dec
 }
 
 #[cfg(test)]
