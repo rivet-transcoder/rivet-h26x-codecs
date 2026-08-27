@@ -53,6 +53,35 @@ pub struct Vui {
     pub timing: Option<(u32, u32)>,
     /// `fixed_frame_rate_flag`.
     pub fixed_frame_rate: bool,
+    /// The NAL HRD parameters, when `nal_hrd_parameters_present_flag`.
+    /// The decoder itself never reads them — a decoder is not required to
+    /// check the hypothetical reference decoder — but `encode::hrd` does,
+    /// and it must read the declaration out of the stream rather than be
+    /// told it. The VCL HRD is still parsed and skipped: nothing here
+    /// writes or checks one.
+    pub nal_hrd: Option<Hrd>,
+}
+
+/// The first coded picture buffer of an `hrd_parameters()` (E.1.2) — what
+/// a buffer checker needs: the rate and size the stream promises, and
+/// the widths of the delays its SEI messages carry, without which those
+/// messages cannot be parsed at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hrd {
+    /// `BitRate[0]`: `(bit_rate_value_minus1 + 1) << (6 + bit_rate_scale)`.
+    pub bit_rate: u64,
+    /// `CpbSize[0]`: `(cpb_size_value_minus1 + 1) << (4 + cpb_size_scale)`.
+    pub cpb_size: u64,
+    /// `cbr_flag[0]`.
+    pub cbr: bool,
+    /// `initial_cpb_removal_delay_length_minus1 + 1`.
+    pub initial_delay_length: u32,
+    /// `cpb_removal_delay_length_minus1 + 1`.
+    pub removal_delay_length: u32,
+    /// `dpb_output_delay_length_minus1 + 1`.
+    pub output_delay_length: u32,
+    /// `time_offset_length`.
+    pub time_offset_length: u32,
 }
 
 /// A parsed SPS.
@@ -261,19 +290,30 @@ pub(crate) fn parse_scaling_matrix(
     lists
 }
 
-fn parse_hrd(r: &mut BitReader) {
+/// `hrd_parameters()` (E.1.2), returning its first CPB.
+fn parse_hrd(r: &mut BitReader) -> Hrd {
     let cpb_cnt = r.ue() + 1;
-    r.bits(4); // bit_rate_scale
-    r.bits(4); // cpb_size_scale
+    let bit_rate_scale = r.bits(4);
+    let cpb_size_scale = r.bits(4);
+    let mut first: Option<(u32, u32, bool)> = None;
     for _ in 0..cpb_cnt.min(32) {
-        r.ue(); // bit_rate_value_minus1
-        r.ue(); // cpb_size_value_minus1
-        r.flag(); // cbr_flag
+        let br = r.ue(); // bit_rate_value_minus1
+        let cs = r.ue(); // cpb_size_value_minus1
+        let cbr = r.flag(); // cbr_flag
+        if first.is_none() {
+            first = Some((br, cs, cbr));
+        }
     }
-    r.bits(5); // initial_cpb_removal_delay_length_minus1
-    r.bits(5); // cpb_removal_delay_length_minus1
-    r.bits(5); // dpb_output_delay_length_minus1
-    r.bits(5); // time_offset_length
+    let (br, cs, cbr) = first.unwrap_or((0, 0, false));
+    Hrd {
+        bit_rate: (br as u64 + 1) << (6 + bit_rate_scale),
+        cpb_size: (cs as u64 + 1) << (4 + cpb_size_scale),
+        cbr,
+        initial_delay_length: r.bits(5) + 1,
+        removal_delay_length: r.bits(5) + 1,
+        output_delay_length: r.bits(5) + 1,
+        time_offset_length: r.bits(5),
+    }
 }
 
 fn parse_vui(r: &mut BitReader) -> Vui {
@@ -315,11 +355,11 @@ fn parse_vui(r: &mut BitReader) -> Vui {
     }
     let nal_hrd = r.flag();
     if nal_hrd {
-        parse_hrd(r);
+        vui.nal_hrd = Some(parse_hrd(r));
     }
     let vcl_hrd = r.flag();
     if vcl_hrd {
-        parse_hrd(r);
+        let _ = parse_hrd(r);
     }
     if nal_hrd || vcl_hrd {
         r.flag(); // low_delay_hrd_flag

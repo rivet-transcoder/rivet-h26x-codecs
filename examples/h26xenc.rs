@@ -222,6 +222,9 @@ fn main() {
         // Parsed by the gate. Same line, same shape, as the H.265 path.
         eprintln!("rate: achieved {achieved:.0} bps, target {target:.0} bps, ratio {:.3}", achieved / target);
     }
+    if enc.recodes() != 0 {
+        eprintln!("rate: {} extra codings to fit the declared buffer", enc.recodes());
+    }
     // The shape census: which macroblock kinds each picture type took.
     // A row turns a shape on; only this line says whether the clip took
     // it, which is the difference between a cell that proves a feature

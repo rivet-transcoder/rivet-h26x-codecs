@@ -263,6 +263,8 @@ hevc10-abr-96k@p10|--codec h265 --bitrate 96000 --gop 8
 hevc12-cqp-ip@p12|--codec h265 --qp 26 --gop 8
 hevc12-cqp40-sao-ip@p12|--codec h265 --qp 40 --gop 8 --sao
 hevc12-lossless-ip@p12|--codec h265 --lossless --gop 8
+abr-64k-cpb@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8
+abr-64k-cavlc-cpb@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8 --cavlc
 "}
 
 # Split a clip's format token into its chroma format and sample depth:

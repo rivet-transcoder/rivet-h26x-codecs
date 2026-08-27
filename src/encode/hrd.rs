@@ -104,13 +104,25 @@ pub struct Schedule {
 }
 
 /// Walk the buffer over `sizes` (access unit sizes in **bits**, in coding
-/// order) against `s`.
+/// order) against `s`, at a fixed picture rate: unit `n` is removed at
+/// `initial_delay + n * tick`.
 ///
 /// Separated from any parsing so it can be tested against sequences chosen
 /// to underflow and to overflow — which is the only way to know the check
 /// can fail at all. A conformance checker that has never rejected anything
 /// is indistinguishable from one that cannot.
 pub fn simulate(sizes: &[u64], s: &Schedule) -> Report {
+    let removal: Vec<u64> =
+        (0..sizes.len()).map(|n| s.initial_delay_90k + (n as u64) * s.tick_90k).collect();
+    simulate_at(sizes, &removal, s)
+}
+
+/// [`simulate`] with each unit's removal time given outright, in 90 kHz
+/// ticks — how an H.264 stream is walked, whose removal times come from
+/// the `cpb_removal_delay` of each picture's own timing SEI rather than
+/// from a fixed-rate inference.
+pub fn simulate_at(sizes: &[u64], removal_90k: &[u64], s: &Schedule) -> Report {
+    debug_assert_eq!(sizes.len(), removal_90k.len());
     let mut occupancy = Vec::with_capacity(sizes.len());
     let mut underflow: Option<(usize, u64)> = None;
     let mut overflow: Option<(usize, u64)> = None;
@@ -123,7 +135,7 @@ pub fn simulate(sizes: &[u64], s: &Schedule) -> Report {
     for (n, &size) in sizes.iter().enumerate() {
         // Bits that have arrived by this removal time, and bits already
         // removed by the units before it.
-        let t = s.initial_delay_90k + (n as u64) * s.tick_90k;
+        let t = removal_90k[n];
         let total_in = arrived(t);
         let removed: u64 = sizes[..n].iter().sum();
 
@@ -297,13 +309,222 @@ fn buffering_period_delay(rbsp: &[u8], sps: &Sps) -> Option<u64> {
     Some(r.bits(hrd.initial_delay_length) as u64)
 }
 
-/// Verify an Annex B stream against the buffer **it declares**.
+/// Whether an Annex B stream is H.264 rather than H.265, read off its
+/// first NAL unit: an H.265 stream opens with a parameter set whose
+/// two-byte header has type 32..=34; an H.264 header is one byte whose
+/// low five bits name the type, and no H.264 type read as an H.265 one
+/// lands in that range (an SPS's `0x67` reads as 51).
+fn is_h264(annexb: &[u8]) -> bool {
+    match crate::nal::annexb_nals(annexb).next() {
+        Some(nal) if !nal.is_empty() => !matches!((nal[0] >> 1) & 0x3f, 32..=34),
+        _ => false,
+    }
+}
+
+/// The H.264 messages of one SEI NAL that the buffer model reads:
+/// `initial_cpb_removal_delay` from a buffering period, and
+/// `(cpb_removal_delay, dpb_output_delay)` from a picture timing.
+#[derive(Default)]
+struct H264Sei {
+    buffering_period: Option<u64>,
+    pic_timing: Option<(u64, u64)>,
+}
+
+/// Parse the SEI messages of one H.264 SEI RBSP — `payloadType` and
+/// `payloadSize` each a run of 0xff bytes plus one below 255 — at the
+/// field widths the SPS's HRD declared, which is why the SPS must have
+/// been seen first.
+fn h264_sei(rbsp: &[u8], hrd: &crate::h264::sps::Hrd) -> H264Sei {
+    let mut out = H264Sei::default();
+    let mut i = 0usize;
+    while i < rbsp.len() && rbsp[i] != 0x80 {
+        let mut ty = 0usize;
+        while i < rbsp.len() && rbsp[i] == 0xff {
+            ty += 255;
+            i += 1;
+        }
+        if i >= rbsp.len() {
+            break;
+        }
+        ty += rbsp[i] as usize;
+        i += 1;
+        let mut size = 0usize;
+        while i < rbsp.len() && rbsp[i] == 0xff {
+            size += 255;
+            i += 1;
+        }
+        if i >= rbsp.len() {
+            break;
+        }
+        size += rbsp[i] as usize;
+        i += 1;
+        let end = (i + size).min(rbsp.len());
+        let mut r = crate::bitreader::BitReader::new(&rbsp[i..end]);
+        match ty {
+            0 => {
+                r.ue(); // seq_parameter_set_id
+                // NalHrdBpPresentFlag: the first (only) SchedSelIdx.
+                out.buffering_period = Some(r.bits(hrd.initial_delay_length) as u64);
+            }
+            1 => {
+                // CpbDpbDelaysPresentFlag, set by the NAL HRD.
+                let removal = r.bits(hrd.removal_delay_length) as u64;
+                let output = r.bits(hrd.output_delay_length) as u64;
+                out.pic_timing = Some((removal, output));
+            }
+            _ => {}
+        }
+        i = end;
+    }
+    out
+}
+
+/// Walk an H.264 stream: access unit sizes and removal times, with the
+/// schedule, all read off the bytes.
+///
+/// An H.264 access unit is a run of non-VCL NAL units — SEI, parameter
+/// sets — followed by its slices (types 1..=5); the next begins at the
+/// first NAL after a slice. Each unit's removal time is
+/// `t_r(n_b) + t_c * cpb_removal_delay(n)` (C.1.2): its own timing SEI's
+/// delay in clock ticks after the removal of the last access unit that
+/// carried a buffering period — and the first unit's is the initial
+/// delay the buffering period itself carries. A stream with a NAL HRD
+/// that leaves a picture without a timing SEI has no removal time for
+/// it, and is refused rather than guessed at.
+fn h264_units(annexb: &[u8]) -> Result<(Vec<u64>, Vec<u64>, Schedule)> {
+    use crate::h264::sps::Sps;
+    let mut sps: Option<Sps> = None;
+    let mut schedule: Option<Schedule> = None;
+    let mut sizes: Vec<u64> = Vec::new();
+    let mut removal: Vec<u64> = Vec::new();
+    // The unit being accumulated: its bytes so far, and what its SEI said.
+    let mut cur_bytes = 0u64;
+    let mut cur_sei = H264Sei::default();
+    let mut in_slices = false;
+    // Removal time of the last buffering-period unit, the base every
+    // `cpb_removal_delay` counts from.
+    let mut base_90k: Option<u64> = None;
+    let mut close = |bytes: u64, sei: &H264Sei, schedule: &Schedule, sizes: &mut Vec<u64>, removal: &mut Vec<u64>| -> Result<()> {
+        let n = sizes.len();
+        let t = match (base_90k, sei.buffering_period, sei.pic_timing) {
+            (None, Some(initial), Some((delay, _))) => initial + delay * schedule.tick_90k,
+            (None, Some(initial), None) if n == 0 => initial,
+            (None, None, _) => {
+                return Err(Error::bitstream(
+                    "HRD: the first access unit carries no buffering period SEI, so the initial removal delay is unknown",
+                ));
+            }
+            (Some(base), _, Some((delay, _))) => base + delay * schedule.tick_90k,
+            (_, _, None) => {
+                return Err(Error::bitstream(format!(
+                    "HRD: access unit {n} carries no picture timing SEI, so its removal time is undefined"
+                )));
+            }
+        };
+        if sei.buffering_period.is_some() {
+            base_90k = Some(t);
+        }
+        sizes.push(bytes * 8);
+        removal.push(t);
+        Ok(())
+    };
+    // Start codes are four bytes throughout what this encoder writes; the
+    // size counted is the whole unit including them and the NAL headers,
+    // because that is what arrives at a decoder.
+    let mut i = 0usize;
+    let mut starts: Vec<usize> = Vec::new();
+    while i + 4 <= annexb.len() {
+        if annexb[i] == 0 && annexb[i + 1] == 0 && annexb[i + 2] == 0 && annexb[i + 3] == 1 {
+            if i + 4 < annexb.len() {
+                starts.push(i);
+            }
+            i += 4;
+        } else {
+            i += 1;
+        }
+    }
+    for k in 0..starts.len() {
+        let end = starts.get(k + 1).copied().unwrap_or(annexb.len());
+        let nal = &annexb[starts[k] + 4..end];
+        let t = nal[0] & 0x1f;
+        let vcl = (1..=5).contains(&t);
+        if !vcl && in_slices {
+            // A new unit begins.
+            let Some(s) = schedule.as_ref() else {
+                return Err(Error::bitstream("HRD: slices before any sequence parameter set"));
+            };
+            close(cur_bytes, &cur_sei, s, &mut sizes, &mut removal)?;
+            cur_bytes = 0;
+            cur_sei = H264Sei::default();
+            in_slices = false;
+        }
+        cur_bytes += (end - starts[k]) as u64;
+        in_slices |= vcl;
+        match t {
+            7 if sps.is_none() => {
+                let parsed = Sps::parse(&crate::nal::unescape_rbsp(&nal[1..]))?;
+                let vui = parsed.vui.as_ref().ok_or_else(|| {
+                    Error::bitstream("HRD: the sequence parameter set declares no VUI, so no buffer")
+                })?;
+                let hrd = vui.nal_hrd.ok_or_else(|| {
+                    Error::bitstream("HRD: the VUI declares no hypothetical reference decoder")
+                })?;
+                let (num_units, time_scale) = vui.timing.ok_or_else(|| {
+                    Error::bitstream("HRD: the VUI declares no clock, so removal times are undefined")
+                })?;
+                if time_scale == 0 {
+                    return Err(Error::bitstream("HRD: time_scale is zero"));
+                }
+                schedule = Some(Schedule {
+                    bit_rate: hrd.bit_rate,
+                    cpb_size: hrd.cpb_size,
+                    cbr: hrd.cbr,
+                    tick_90k: 90_000u64 * num_units as u64 / time_scale as u64,
+                    initial_delay_90k: 0,
+                });
+                sps = Some(parsed);
+            }
+            6 => {
+                if let Some(hrd) = sps.as_ref().and_then(|s| s.vui.as_ref()).and_then(|v| v.nal_hrd) {
+                    let sei = h264_sei(&crate::nal::unescape_rbsp(&nal[1..]), &hrd);
+                    if sei.buffering_period.is_some() {
+                        cur_sei.buffering_period = sei.buffering_period;
+                    }
+                    if sei.pic_timing.is_some() {
+                        cur_sei.pic_timing = sei.pic_timing;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(mut s) = schedule else {
+        return Err(Error::bitstream("HRD: the stream carries no sequence parameter set"));
+    };
+    if cur_bytes != 0 {
+        close(cur_bytes, &cur_sei, &s, &mut sizes, &mut removal)?;
+    }
+    // The report quotes the initial delay through the schedule; it is
+    // the first unit's removal time.
+    s.initial_delay_90k = removal.first().copied().unwrap_or(0);
+    Ok((sizes, removal, s))
+}
+
+/// Verify an Annex B stream — H.264 or H.265, told apart by its first
+/// NAL — against the buffer **it declares**.
 ///
 /// Every number comes from the bytes: the rate and buffer size from the
-/// SPS's VUI, the removal interval from the frame rate beside it, and the
-/// initial delay from the buffering period SEI. Nothing is passed in, so
-/// nothing can be assumed.
+/// SPS's VUI, the clock beside it, the initial delay from the buffering
+/// period SEI — and, for H.264, each picture's removal time from its own
+/// timing SEI. Nothing is passed in, so nothing can be assumed.
 pub fn verify(annexb: &[u8]) -> Result<Report> {
+    if is_h264(annexb) {
+        let (sizes, removal, schedule) = h264_units(annexb)?;
+        if sizes.is_empty() {
+            return Err(Error::bitstream("HRD: the stream carries no access units"));
+        }
+        return Ok(simulate_at(&sizes, &removal, &schedule));
+    }
     let schedule = schedule_from_stream(annexb)?;
     let sizes = access_unit_bits(annexb);
     if sizes.is_empty() {
@@ -395,7 +616,7 @@ mod tests {
 
     /// A stream with no VUI, or a VUI with no HRD, is not a stream that
     /// failed the buffer — it is one that declared no buffer, and saying so
-    /// is different from saying it conformed.
+    /// is different from saying it conformed. Both codecs.
     #[test]
     fn a_stream_that_declares_no_buffer_is_refused_rather_than_passed() {
         use crate::encode::h265_syntax::{Geometry, write_sps};
@@ -406,5 +627,86 @@ mod tests {
         let err = verify(&sps).expect_err("no VUI means no verdict");
         let s = format!("{err}");
         assert!(s.contains("no VUI") || s.contains("no buffer"), "{s}");
+
+        let g = crate::encode::h264_syntax::Geometry::new(&cfg);
+        let sps = crate::encode::h264_syntax::annexb(
+            crate::encode::h264_syntax::NAL_SPS,
+            3,
+            &crate::encode::h264_syntax::write_sps(&cfg, &g, 16, 16, None),
+        );
+        assert!(is_h264(&sps));
+        let err = verify(&sps).expect_err("H.264: no VUI means no verdict");
+        let s = format!("{err}");
+        assert!(s.contains("no VUI") || s.contains("no buffer"), "{s}");
+    }
+
+    /// An H.264 stream's schedule is read off its own SEI: the initial
+    /// delay from the buffering period, each unit's removal time from its
+    /// timing SEI's `cpb_removal_delay` — with a second buffering period
+    /// rebasing the count — and the units split at the slices. Built from
+    /// the encoder's own writers, then walked, and checked against the
+    /// same walk done by hand.
+    #[test]
+    fn an_h264_schedule_is_read_off_the_stream() {
+        use crate::encode::h264_syntax::{
+            Cpb, Geometry, NAL_IDR, NAL_PPS, NAL_SEI, NAL_SLICE, NAL_SPS, annexb, write_pps,
+            write_buffering_period_sei, write_pic_timing_sei, write_sps,
+        };
+        use crate::encode::{Config, RateControl};
+        let cfg = Config {
+            width: 64,
+            height: 64,
+            fps: 30,
+            rate: RateControl::Bitrate { bps: 90_000 },
+            cpb_ms: 500,
+            ..Config::default()
+        };
+        let g = Geometry::new(&cfg);
+        let cpb = Cpb::new(90_000, 500).unwrap();
+        // Five pictures: an IDR, two P, an IDR (a new buffering period,
+        // its delay counted from the first), one P — two clock ticks per
+        // frame, slices padded to known sizes.
+        let slice = |bytes: usize| -> Vec<u8> { vec![0x55u8; bytes] };
+        let mut stream = Vec::new();
+        let unit = |idr: bool, delay: u32, bytes: usize, out: &mut Vec<u8>| {
+            if idr {
+                out.extend_from_slice(&annexb(NAL_SPS, 3, &write_sps(&cfg, &g, 16, 16, Some(&cpb))));
+                out.extend_from_slice(&annexb(NAL_PPS, 3, &write_pps(&cfg, 26)));
+                out.extend_from_slice(&annexb(NAL_SEI, 0, &write_buffering_period_sei(&cpb)));
+            }
+            out.extend_from_slice(&annexb(NAL_SEI, 0, &write_pic_timing_sei(&cpb, delay, 0)));
+            out.extend_from_slice(&annexb(if idr { NAL_IDR } else { NAL_SLICE }, 3, &slice(bytes)));
+        };
+        unit(true, 0, 3000, &mut stream);
+        unit(false, 2, 200, &mut stream);
+        unit(false, 4, 200, &mut stream);
+        unit(true, 6, 2500, &mut stream);
+        unit(false, 2, 200, &mut stream);
+
+        let (sizes, removal, s) = h264_units(&stream).expect("a readable schedule");
+        assert_eq!(sizes.len(), 5, "five access units");
+        assert_eq!(s.bit_rate, cpb.bit_rate);
+        assert_eq!(s.cpb_size, cpb.size);
+        // 60 ticks a second: one clock tick is 1500 of the 90 kHz.
+        assert_eq!(s.tick_90k, 1500);
+        let t0 = cpb.initial_removal_delay_90k() as u64;
+        assert_eq!(removal, vec![t0, t0 + 3000, t0 + 6000, t0 + 9000, t0 + 9000 + 3000]);
+        // The unit sizes are the whole units: for an IDR, SPS + PPS + two
+        // SEI + slice, start codes and headers included.
+        assert!(sizes[0] > 3000 * 8 && sizes[1] > 200 * 8 && sizes[1] < 300 * 8, "{sizes:?}");
+        let r = verify(&stream).unwrap();
+        assert_eq!(r, simulate_at(&sizes, &removal, &s));
+        assert!(r.conforms(), "{r:?}");
+
+        // Drop a picture's timing SEI and the stream has no removal time
+        // for it: refused, not guessed. (The PPS is what makes the second
+        // slice a unit of its own: a unit begins at the first non-slice
+        // NAL after a slice.)
+        let mut broken = Vec::new();
+        unit(true, 0, 300, &mut broken);
+        broken.extend_from_slice(&annexb(NAL_PPS, 3, &write_pps(&cfg, 26)));
+        broken.extend_from_slice(&annexb(NAL_SLICE, 3, &slice(300)));
+        let err = verify(&broken).expect_err("no timing SEI, no removal time");
+        assert!(format!("{err}").contains("timing"), "{err}");
     }
 }

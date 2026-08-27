@@ -25,14 +25,131 @@ use crate::h264::cabac_mb::{CabacState, MB_TYPE_I_PCM, write_mb_type_i_cabac};
 use crate::encode::{Config, Entropy};
 use crate::picture::ChromaFormat;
 
+pub use crate::encode::h265_syntax::Cpb;
+
 /// Coded slice of a non-IDR picture.
 pub const NAL_SLICE: u8 = 1;
 /// Coded slice of an IDR picture.
 pub const NAL_IDR: u8 = 5;
+/// Supplemental enhancement information.
+pub const NAL_SEI: u8 = 6;
 /// Sequence parameter set.
 pub const NAL_SPS: u8 = 7;
 /// Picture parameter set.
 pub const NAL_PPS: u8 = 8;
+
+/// Width of `dpb_output_delay`, in bits — the same 24 the other two
+/// delays have (`Cpb`'s lengths), because there is no reason for the
+/// three to differ.
+const OUTPUT_DELAY_LENGTH: u32 = 24;
+
+/// The clock ticks one frame lasts. `time_scale` is written as twice the
+/// frame rate with `fixed_frame_rate_flag` set, because that flag's
+/// definition counts a *frame* as `DeltaTfiDivisor` ticks and the divisor
+/// is 2 for a frame picture without `pic_struct` (E.2.1) — the field-rate
+/// clock every H.264 encoder writes, so that `cpb_removal_delay` steps by
+/// two per frame.
+pub const TICKS_PER_FRAME: u32 = 2;
+
+/// `hrd_parameters()` (E.1.2) — one CPB, NAL HRD only. The inverse of
+/// `h264::sps::parse_hrd`, which retains exactly the fields written here.
+///
+/// `BitRate` and `CpbSize` are `(value + 1) << (6 + scale)` and
+/// `(value + 1) << (4 + scale)` exactly as in H.265, so the one [`Cpb`]
+/// — already snapped to what those can carry — serves both codecs.
+fn write_hrd(w: &mut BitWriter, cpb: &Cpb) {
+    w.ue(0); // cpb_cnt_minus1 — one buffer
+    w.bits(4, 0); // bit_rate_scale
+    w.bits(4, 0); // cpb_size_scale
+    w.ue((cpb.bit_rate >> 6) as u32 - 1); // bit_rate_value_minus1[0]
+    w.ue((cpb.size >> 4) as u32 - 1); // cpb_size_value_minus1[0]
+    // cbr_flag 0: a variable rate, for the reason the H.265 side gives —
+    // the controller targets an average and stuffs nothing, so a constant
+    // rate would declare something it does not do.
+    w.flag(false); // cbr_flag[0]
+    w.bits(5, cpb.initial_delay_length - 1); // initial_cpb_removal_delay_length_minus1
+    w.bits(5, cpb.removal_delay_length - 1); // cpb_removal_delay_length_minus1
+    w.bits(5, OUTPUT_DELAY_LENGTH - 1); // dpb_output_delay_length_minus1
+    w.bits(5, 0); // time_offset_length — no pic_struct, so no time_offset
+}
+
+/// `vui_parameters()` (E.1.1) carrying only what the buffer model needs:
+/// the clock the removal delays are counted in, and the NAL HRD.
+/// Everything else is absent by its own flag — a VUI is optional and this
+/// encoder wrote none until a buffer needed one.
+fn write_vui(w: &mut BitWriter, cpb: &Cpb, fps: u32) {
+    w.flag(false); // aspect_ratio_info_present_flag
+    w.flag(false); // overscan_info_present_flag
+    w.flag(false); // video_signal_type_present_flag
+    w.flag(false); // chroma_loc_info_present_flag
+    w.flag(true); // timing_info_present_flag
+    w.bits(32, 1); // num_units_in_tick
+    w.bits(32, TICKS_PER_FRAME * fps.max(1)); // time_scale
+    w.flag(true); // fixed_frame_rate_flag
+    w.flag(true); // nal_hrd_parameters_present_flag
+    write_hrd(w, cpb);
+    w.flag(false); // vcl_hrd_parameters_present_flag
+    w.flag(false); // low_delay_hrd_flag (present: a NAL HRD is)
+    w.flag(false); // pic_struct_present_flag
+    w.flag(false); // bitstream_restriction_flag
+}
+
+/// One SEI message wrapped as an SEI NAL payload: `payloadType`,
+/// `payloadSize` in the standard's 255-at-a-time form, the payload bytes
+/// (already byte-aligned by their own trailing bits), then the RBSP's.
+///
+/// The payload arrives as *raw* RBSP bytes and the emulation prevention
+/// is applied once, here, to the whole NAL. A payload that had already
+/// been escaped would be escaped again — a timing SEI is mostly zero
+/// bytes, exactly the pattern the escape targets — and a reader would
+/// find `0x03` where a delay's bits should be.
+fn sei_nal(payload_type: u32, payload: &[u8]) -> Vec<u8> {
+    let mut w = BitWriter::with_capacity(payload.len() + 8);
+    let mut t = payload_type;
+    while t >= 255 {
+        w.bits(8, 255);
+        t -= 255;
+    }
+    w.bits(8, t);
+    let mut n = payload.len();
+    while n >= 255 {
+        w.bits(8, 255);
+        n -= 255;
+    }
+    w.bits(8, n as u32);
+    for b in payload {
+        w.bits(8, *b as u32);
+    }
+    w.rbsp_trailing_bits();
+    w.into_nal()
+}
+
+/// A `buffering_period` SEI (D.1.2), for every IDR access unit: the
+/// initial removal delay — the one number the schedule cannot derive —
+/// and its offset, at the widths the SPS declared. `cpb` is what that SPS
+/// wrote.
+pub fn write_buffering_period_sei(cpb: &Cpb) -> Vec<u8> {
+    let mut p = BitWriter::with_capacity(16);
+    p.ue(0); // seq_parameter_set_id
+    // NalHrdBpPresentFlag: one SchedSelIdx.
+    p.bits(cpb.initial_delay_length, cpb.initial_removal_delay_90k()); // initial_cpb_removal_delay
+    p.bits(cpb.initial_delay_length, 0); // initial_cpb_removal_delay_offset
+    p.rbsp_trailing_bits();
+    sei_nal(0, &p.into_rbsp())
+}
+
+/// A `pic_timing` SEI (D.1.3), for every access unit of a stream with a
+/// NAL HRD: `cpb_removal_delay` — clock ticks since the removal of the
+/// last buffering-period access unit, which is what fixes this picture's
+/// removal time (C.1.2) — and `dpb_output_delay`, ticks from removal to
+/// output. No `pic_struct`: the VUI does not present one.
+pub fn write_pic_timing_sei(cpb: &Cpb, cpb_removal_delay: u32, dpb_output_delay: u32) -> Vec<u8> {
+    let mut p = BitWriter::with_capacity(8);
+    p.bits(cpb.removal_delay_length, cpb_removal_delay);
+    p.bits(OUTPUT_DELAY_LENGTH, dpb_output_delay);
+    p.rbsp_trailing_bits();
+    sei_nal(1, &p.into_rbsp())
+}
 
 /// Prefix a NAL payload with its header byte and an Annex B start code.
 ///
@@ -121,8 +238,17 @@ fn has_chroma_extension(profile: u8) -> bool {
     matches!(profile, 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135)
 }
 
-/// Sequence parameter set.
-pub fn write_sps(cfg: &Config, g: &Geometry, log2_max_frame_num: u32, log2_max_poc_lsb: u32) -> Vec<u8> {
+/// Sequence parameter set. With a coded picture buffer declared it
+/// carries a VUI — the frame clock and the NAL HRD — and without one no
+/// VUI at all, so a stream that declares no buffer is byte-identical to
+/// one from before the buffer model existed.
+pub fn write_sps(
+    cfg: &Config,
+    g: &Geometry,
+    log2_max_frame_num: u32,
+    log2_max_poc_lsb: u32,
+    cpb: Option<&Cpb>,
+) -> Vec<u8> {
     let mut w = BitWriter::with_capacity(64);
     let profile = profile_idc(g);
     w.bits(8, profile as u32);
@@ -178,7 +304,13 @@ pub fn write_sps(cfg: &Config, g: &Geometry, log2_max_frame_num: u32, log2_max_p
     } else {
         w.flag(false);
     }
-    w.flag(false); // vui_parameters_present_flag
+    match cpb {
+        Some(cpb) => {
+            w.flag(true); // vui_parameters_present_flag
+            write_vui(&mut w, cpb, cfg.fps);
+        }
+        None => w.flag(false), // vui_parameters_present_flag
+    }
     w.rbsp_trailing_bits();
     w.into_nal()
 }
@@ -504,7 +636,7 @@ mod tests {
             (64, 64, ChromaFormat::Monochrome),
         ] {
             let (cfg, g) = geom(w, h, c);
-            let sps = write_sps(&cfg, &g, 4, 4);
+            let sps = write_sps(&cfg, &g, 4, 4, None);
             let parsed = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&sps))
                 .unwrap_or_else(|e| panic!("{w}x{h} {c:?}: SPS rejected: {e}"));
             assert_eq!(parsed.pic_width_in_mbs * 16, g.coded_width, "{w}x{h} {c:?}");
@@ -521,7 +653,7 @@ mod tests {
     fn cropping_is_written_when_the_size_is_not_a_whole_macroblock() {
         let (cfg, g) = geom(50, 34, ChromaFormat::Yuv420);
         assert_eq!((g.coded_width, g.coded_height), (64, 48));
-        let sps = write_sps(&cfg, &g, 4, 4);
+        let sps = write_sps(&cfg, &g, 4, 4, None);
         let parsed = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&sps)).unwrap();
         // The property that matters is not the field values but what a
         // decoder ends up displaying: the size the caller asked for.
@@ -543,6 +675,7 @@ mod tests {
             &Geometry::new(&cfg),
             4,
             4,
+            None,
         )))
         .expect("SPS");
         for t8x8 in [false, true] {
@@ -562,6 +695,50 @@ mod tests {
         let on = write_pps(&Config { transform_8x8: true, ..cfg }, 26);
         assert_ne!(off, on, "the flag has to reach the bitstream");
         assert_eq!(off.len(), 3, "no extension means the historical three-byte PPS");
+    }
+
+    /// The HRD the SPS declares must survive the parser that, until this
+    /// change, read the fields only to stay bit-aligned: the rate and
+    /// size as `Cpb` snapped them, the clock as twice the frame rate, and
+    /// the delay widths the SEI messages will be written at. And an SPS
+    /// that declares no buffer must carry no VUI — the flag, not a VUI
+    /// full of zeros — so every stream without one is byte-identical to
+    /// what it was.
+    #[test]
+    fn the_hrd_survives_the_decoders_own_sps_parser() {
+        for (bps, ms) in [(64_000u32, 125u32), (128_000, 500), (1_000_000, 1000)] {
+            let cfg = Config {
+                width: 64,
+                height: 64,
+                rate: crate::encode::RateControl::Bitrate { bps },
+                cpb_ms: ms,
+                fps: 30,
+                ..Config::default()
+            };
+            let g = Geometry::new(&cfg);
+            let Some(cpb) = Cpb::new(bps, ms) else { panic!("{bps}bps/{ms}ms: representable") };
+            let sps = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&write_sps(
+                &cfg, &g, 16, 16, Some(&cpb),
+            )))
+            .unwrap_or_else(|e| panic!("{bps}bps/{ms}ms: SPS rejected: {e}"));
+            let vui = sps.vui.as_ref().unwrap_or_else(|| panic!("{bps}bps/{ms}ms: no VUI"));
+            assert_eq!(vui.timing, Some((1, 60)), "{bps}bps/{ms}ms: clock");
+            assert!(vui.fixed_frame_rate);
+            let hrd = vui.nal_hrd.unwrap_or_else(|| panic!("{bps}bps/{ms}ms: no NAL HRD"));
+            assert_eq!(hrd.bit_rate, cpb.bit_rate, "{bps}bps/{ms}ms: bit rate");
+            assert_eq!(hrd.cpb_size, cpb.size, "{bps}bps/{ms}ms: buffer size");
+            assert!(!hrd.cbr);
+            assert_eq!(hrd.initial_delay_length, cpb.initial_delay_length);
+            assert_eq!(hrd.removal_delay_length, cpb.removal_delay_length);
+            assert_eq!(hrd.output_delay_length, OUTPUT_DELAY_LENGTH);
+            assert_eq!(hrd.time_offset_length, 0);
+        }
+        let (cfg, g) = geom(64, 64, ChromaFormat::Yuv420);
+        let sps = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&write_sps(
+            &cfg, &g, 16, 16, None,
+        )))
+        .unwrap();
+        assert!(sps.vui.is_none(), "no buffer, no VUI");
     }
 
     #[test]

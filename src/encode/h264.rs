@@ -83,6 +83,39 @@ pub struct H264Encoder {
     pps_qp: u8,
     /// What shapes the pictures took — see [`ShapeCensus`].
     census: ShapeCensus,
+    /// The coded picture buffer this stream declares, when it declares
+    /// one: the *declared* values, snapped to what the syntax carries, so
+    /// what the controller aims at and what the stream promises are one
+    /// number. `None` writes no VUI and no SEI at all.
+    cpb: Option<syn::Cpb>,
+    /// Coding index of the last access unit that carried a buffering
+    /// period — every `cpb_removal_delay` counts clock ticks from its
+    /// removal.
+    last_bp_encode: u64,
+    /// How many extra codings the declared buffer cost — pictures that
+    /// came out too large for it and were coded again at a higher
+    /// quantiser. Reported rather than hidden, as on the H.265 side.
+    recoded: u64,
+}
+
+/// One coded picture, before anything about it has been kept — the
+/// H.265 side's own pattern, for the same reason: a picture that will
+/// not fit the declared buffer is coded again, and the attempt that lost
+/// must leave no trace — not in the reconstructions the SELF check reads,
+/// and above all not as the reference the next picture predicts from.
+///
+/// `code_attempt` takes `&self` and so *cannot* write: every per-picture
+/// write lives in [`H264Encoder::commit`], which runs only for an attempt
+/// that is kept. That is the claim the byte-identity of every non-buffer
+/// stream rests on, enforced by the borrow checker rather than by care.
+struct Attempt {
+    access: Access,
+    /// The reconstruction, cropped to display size.
+    rec: Vec<u8>,
+    /// The reconstruction at coded size, borders not yet replicated.
+    recon: Vec<syn::Recon>,
+    /// The picture's motion in the decoder's layout.
+    motion: super::h264_pic::PicMotion,
 }
 
 /// How many macroblocks of each kind the stream's pictures took, per
@@ -197,8 +230,33 @@ impl H264Encoder {
             plane_dims.push((cw, chh));
         }
         let tools = super::h264_pic::IntraTools::new(cfg.transform_8x8, cfg.subparts);
+        // The buffer to declare, snapped to what the syntax can carry —
+        // the same rules, and the same refusals, as the H.265 side.
+        let cpb = match (cfg.cpb_ms, cfg.rate) {
+            (0, _) => None,
+            (ms, RateControl::Bitrate { bps }) => match syn::Cpb::new(bps, ms) {
+                Some(c) => Some(c),
+                None => {
+                    return Err(Error::unsupported(
+                        "H.264 encode: a coded picture buffer this size needs a bit-rate or buffer scale (encoder writes both as 0)",
+                    ));
+                }
+            },
+            _ => {
+                return Err(Error::unsupported(
+                    "H.264 encode: a coded picture buffer without a bitrate target (a buffer constrains a rate; a fixed quantiser has none)",
+                ));
+            }
+        };
         let rc = match cfg.rate {
-            RateControl::Bitrate { bps } => Some(RateController::new(bps, cfg.fps, cfg.width, cfg.height, cfg.gop, cfg.bframes)),
+            // The controller aims at the *declared* rate where a buffer
+            // was declared, so the two cannot disagree by the rounding.
+            RateControl::Bitrate { bps } => Some(match cpb {
+                Some(c) => RateController::with_cpb(
+                    c.bit_rate as u32, cfg.fps, cfg.width, cfg.height, cfg.gop, cfg.bframes, Some(c.size),
+                ),
+                None => RateController::new(bps, cfg.fps, cfg.width, cfg.height, cfg.gop, cfg.bframes),
+            }),
             _ => None,
         };
         // The PPS quantiser: the constant one where there is one, and the
@@ -226,7 +284,16 @@ impl H264Encoder {
             plane_dims,
             tools,
             census: ShapeCensus::default(),
+            cpb,
+            last_bp_encode: 0,
+            recoded: 0,
         })
+    }
+
+    /// How many extra codings the declared buffer cost. Zero when no
+    /// buffer was declared, because then nothing can fail to fit.
+    pub fn recodes(&self) -> u64 {
+        self.recoded
     }
 
     /// How many bytes one source picture must be.
@@ -308,11 +375,105 @@ impl H264Encoder {
         Ok(out)
     }
 
-    /// Code one picture: parameter sets, slice header, then the slice data
-    /// of whichever path the configuration selects — the transform writers
-    /// (either entropy coder), PCM where exactness or 4:4:4 demands it, or
-    /// the all-skip inter fallback.
+    /// Code one picture, re-coding it at a higher quantiser if it will not
+    /// fit the buffer this stream declares — the same loop, the same
+    /// escalation law and the same refusal as the H.265 side.
+    ///
+    /// The quantiser is chosen **once**; the loop escalates from it and
+    /// tells the controller afterwards which quantiser the picture was
+    /// actually coded at. Without a declared buffer there is nothing to
+    /// fit and the loop runs exactly once, which is why every stream that
+    /// does not ask for a buffer is byte-identical to what it was before
+    /// this existed.
     fn code_picture(&mut self, c: Coded, src: &[u8]) -> Result<Access> {
+        let mut qp = self.pick_picture_qp(&c);
+        for attempt in 0..super::rc::MAX_ATTEMPTS {
+            let a = self.code_attempt(&c, src, qp)?;
+            let bits = a.access.data.len() as u64 * 8;
+            // What the buffer can hand over at this picture's removal time;
+            // `None` means no buffer was declared and nothing can fail.
+            let affordable = self.rc.as_ref().and_then(|rc| rc.affordable_bits());
+            let Some(afford) = affordable else {
+                return Ok(self.commit(&c, a));
+            };
+            if bits <= afford {
+                if let Some(rc) = self.rc.as_mut() {
+                    rc.note_recode(qp);
+                }
+                return Ok(self.commit(&c, a));
+            }
+            if attempt + 1 == super::rc::MAX_ATTEMPTS || qp >= 51 {
+                // The declared buffer is smaller than this content can be
+                // coded into: a configuration error, refused by name rather
+                // than shipped as a stream that violates what it declares.
+                return Err(Error::unsupported(format!(
+                    "H.264 encode: picture {} needs {bits} bits and the declared buffer affords {afford} even at quantiser {qp} (the coded picture buffer is too small for this content)",
+                    c.poc
+                )));
+            }
+            self.recoded += 1;
+            qp = RateController::escalate(qp, bits, afford);
+        }
+        unreachable!("the loop returns or errors on its last attempt")
+    }
+
+    /// The quantiser this picture starts at, before any buffer escalation:
+    /// the controller's choice under a bitrate, the configured one
+    /// otherwise.
+    fn pick_picture_qp(&mut self, c: &Coded) -> u8 {
+        match self.cfg.rate {
+            RateControl::Bitrate { .. } => {
+                let kind = match c.kind {
+                    Kind::Idr | Kind::I => PicKind::Intra,
+                    Kind::P => PicKind::Inter,
+                    Kind::B => PicKind::B,
+                };
+                self.rc.as_mut().expect("a bitrate configuration builds a controller").pick_qp(kind)
+            }
+            _ => self.picture_qp(c.kind),
+        }
+    }
+
+    /// Keep what an attempt made: the reconstruction the SELF check reads,
+    /// the reference the next pictures predict from, and the counters the
+    /// headers run on. Every write this encoder makes per picture is here
+    /// — `code_attempt` makes none — so a re-coded attempt leaves no
+    /// trace.
+    fn commit(&mut self, c: &Coded, a: Attempt) -> Access {
+        let idr = c.kind == Kind::Idr;
+        self.recon.push(a.rec);
+        self.census.add(c.kind, &a.motion.info.mbs);
+        if idr {
+            // The attempt wrote `frame_num` 0 for an IDR; the count
+            // restarts from there.
+            self.frame_num = 0;
+            self.idr_pic_id ^= 1;
+            self.last_bp_encode = c.encode;
+        }
+        if c.reference {
+            self.frame_num = (self.frame_num + 1) & ((1 << LOG2_MAX_FRAME_NUM) - 1);
+            let mut recon = a.recon;
+            // Replicate the borders motion compensation reads — once, here,
+            // so every stored reference is search-ready and the P path never
+            // has to wonder whether a plane's border is stale.
+            crate::encode::h264_me::prepare_reference(&mut recon);
+            self.refs.push((c.poc, recon, a.motion));
+            // The DPB the SPS declares. Dropping the oldest keeps the encoder
+            // inside what it told the decoder to allocate.
+            let cap = (self.cfg.max_refs.max(1) as usize) + 1;
+            while self.refs.len() > cap {
+                self.refs.remove(0);
+            }
+        }
+        a.access
+    }
+
+    /// Code one picture at a given quantiser, keeping nothing: parameter
+    /// sets, the buffer SEI where a buffer is declared, slice header, then
+    /// the slice data of whichever path the configuration selects — the
+    /// transform writers (either entropy coder), PCM where exactness or
+    /// 4:4:4 demands it, or the all-skip inter fallback.
+    fn code_attempt(&self, c: &Coded, src: &[u8], qp: u8) -> Result<Attempt> {
         let g = self.geom;
         let idr = c.kind == Kind::Idr;
         // Reference lists, by picture order count: list0 runs backwards from
@@ -366,11 +527,8 @@ impl H264Encoder {
         }
 
         // An IDR restarts the count, and the header below carries the reset
-        // value. Doing this after writing would send the *previous* GOP's
-        // frame_num in the one picture that must not carry it.
-        if idr {
-            self.frame_num = 0;
-        }
+        // value; `commit` restarts the stored count to match.
+        let frame_num = if idr { 0 } else { self.frame_num };
         // H.264 repeats its parameter sets with *every* access unit — see
         // the SPS/PPS emitted below — and this side once put each picture's
         // own quantiser straight into `pic_init_qp` with a zero
@@ -394,19 +552,10 @@ impl H264Encoder {
         // and reverted for no gain" was true of the quantiser alone; the
         // gain is that the stream can be put in a box.)
         //
-        // The controller chooses per picture, in coding order; everything
-        // else is a function of the configuration alone.
-        let qp = match self.cfg.rate {
-            RateControl::Bitrate { .. } => {
-                let kind = match c.kind {
-                    Kind::Idr | Kind::I => PicKind::Intra,
-                    Kind::P => PicKind::Inter,
-                    Kind::B => PicKind::B,
-                };
-                self.rc.as_mut().expect("a bitrate configuration builds a controller").pick_qp(kind)
-            }
-            _ => self.picture_qp(c.kind),
-        };
+        // The quantiser arrives as an argument: chosen once by the caller
+        // and escalated by it, so an attempt cannot quietly pick a
+        // different one than the buffer arithmetic is reasoning about.
+        //
         // Whether this picture takes the transform intra path rather than
         // I_PCM. Lossless stays PCM because PCM is the exactly-lossless mode
         // and the transform path quantises; 4:4:4 stays PCM because
@@ -446,16 +595,43 @@ impl H264Encoder {
         out.extend_from_slice(&syn::annexb(
             syn::NAL_SPS,
             3,
-            &syn::write_sps(&self.cfg, &g, LOG2_MAX_FRAME_NUM, LOG2_MAX_POC_LSB),
+            &syn::write_sps(&self.cfg, &g, LOG2_MAX_FRAME_NUM, LOG2_MAX_POC_LSB, self.cpb.as_ref()),
         ));
         out.extend_from_slice(&syn::annexb(syn::NAL_PPS, 3, &syn::write_pps(&self.cfg, self.pps_qp)));
+        if let Some(cpb) = self.cpb.as_ref() {
+            // A buffering period begins at every IDR, carrying the initial
+            // removal delay; and every access unit of a stream with a NAL
+            // HRD carries its timing — `cpb_removal_delay`, clock ticks
+            // since the last buffering period's removal, which is what
+            // fixes this picture's removal time (C.1.2; H.265 infers it
+            // from a fixed picture rate, H.264 has no such inference), and
+            // `dpb_output_delay`, ticks from removal to output: the
+            // reorder depth plus this picture's own displacement, never
+            // negative because a picture is never displayed more than
+            // `bframes` positions before it is coded.
+            if idr {
+                out.extend_from_slice(&syn::annexb(
+                    syn::NAL_SEI,
+                    0,
+                    &syn::write_buffering_period_sei(cpb),
+                ));
+            }
+            let removal = syn::TICKS_PER_FRAME as u64 * (c.encode - self.last_bp_encode);
+            let output = syn::TICKS_PER_FRAME as i64
+                * (c.display as i64 + self.cfg.bframes as i64 - c.encode as i64);
+            out.extend_from_slice(&syn::annexb(
+                syn::NAL_SEI,
+                0,
+                &syn::write_pic_timing_sei(cpb, removal as u32, output.max(0) as u32),
+            ));
+        }
 
         let cabac = self.cfg.entropy == Entropy::Cabac;
         let mut w = BitWriter::with_capacity(self.frame_bytes + 256);
         syn::write_slice_header(
             &syn::SliceHeader {
                 kind: c.kind,
-                frame_num: self.frame_num,
+                frame_num,
                 idr_pic_id: self.idr_pic_id,
                 poc_lsb: (c.poc as u32) & ((1 << LOG2_MAX_POC_LSB) - 1),
                 qp,
@@ -648,33 +824,17 @@ impl H264Encoder {
             let (dw, dh) = self.plane_dims[i];
             syn::crop_into(p, dw, dh, &mut cropped);
         }
-        self.recon.push(cropped);
 
-        self.census.add(c.kind, &motion.info.mbs);
-        if c.reference {
-            self.frame_num = (self.frame_num + 1) & ((1 << LOG2_MAX_FRAME_NUM) - 1);
-        }
-        if idr {
-            self.idr_pic_id ^= 1;
-        }
-        if c.reference {
-            // Replicate the borders motion compensation reads — once, here,
-            // so every stored reference is search-ready and the P path never
-            // has to wonder whether a plane's border is stale.
-            crate::encode::h264_me::prepare_reference(&mut recon);
-            self.refs.push((c.poc, recon, motion));
-            // The DPB the SPS declares. Dropping the oldest keeps the encoder
-            // inside what it told the decoder to allocate.
-            let cap = (self.cfg.max_refs.max(1) as usize) + 1;
-            while self.refs.len() > cap {
-                self.refs.remove(0);
-            }
-        }
-        Ok(Access {
-            data: out,
-            keyframe: idr,
-            poc: c.poc,
-            encode_index: c.encode,
+        Ok(Attempt {
+            access: Access {
+                data: out,
+                keyframe: idr,
+                poc: c.poc,
+                encode_index: c.encode,
+            },
+            rec: cropped,
+            recon,
+            motion,
         })
     }
 
