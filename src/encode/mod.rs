@@ -142,6 +142,43 @@ pub struct ColourDescription {
     pub full_range: bool,
 }
 
+/// HDR10 static metadata, first half: the colour volume of the display
+/// the content was mastered on (SMPTE ST 2086), carried as the
+/// `mastering_display_colour_volume` SEI — payloadType 137, H.264 D.1.29
+/// and H.265 D.2.28, the same twelve fields in the same order. A player
+/// tone-maps against these; without them Apple's fall back to BT.709 even
+/// when the VUI says BT.2020 PQ.
+///
+/// Chromaticities are CIE 1931 (x, y) in units of 0.00002 (so BT.2020's
+/// red is `(34000, 16000)`), luminances in units of 0.0001 cd/m² (so 1000
+/// nits is `10_000_000`) — the SEI's own units, copied into it unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MasteringDisplay {
+    /// Red primary (x, y) — `display_primaries_x/y[2]` in the SEI's order.
+    pub red: (u16, u16),
+    /// Green primary (x, y) — `display_primaries_x/y[0]`.
+    pub green: (u16, u16),
+    /// Blue primary (x, y) — `display_primaries_x/y[1]`.
+    pub blue: (u16, u16),
+    /// White point (x, y).
+    pub white_point: (u16, u16),
+    /// `max_display_mastering_luminance`, 0.0001 cd/m².
+    pub max_luminance: u32,
+    /// `min_display_mastering_luminance`, 0.0001 cd/m².
+    pub min_luminance: u32,
+}
+
+/// HDR10 static metadata, second half: how bright the content itself gets
+/// (CTA-861.3), carried as the `content_light_level_info` SEI —
+/// payloadType 144, H.264 D.1.31 and H.265 D.2.35. Both in cd/m².
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentLightLevel {
+    /// `max_content_light_level`: the brightest pixel in the stream.
+    pub max_cll: u16,
+    /// `max_pic_average_light_level`: the brightest picture average.
+    pub max_fall: u16,
+}
+
 /// Everything the encoder needs that is not a picture.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -215,6 +252,14 @@ pub struct Config {
     /// displayed as BT.709 by every player that does not read the
     /// container's colour box, and some that do.
     pub colour: Option<ColourDescription>,
+    /// HDR10 mastering display colour volume, written as an SEI in every
+    /// IDR / IRAP access unit — or `None` for no such SEI, which is what
+    /// every stream before the field existed had. Meaningful beside a
+    /// BT.2020 PQ [`colour`](Self::colour); the encoder does not insist.
+    pub mastering_display: Option<MasteringDisplay>,
+    /// HDR10 content light level, likewise an SEI in every IDR / IRAP
+    /// access unit, or `None` for none.
+    pub content_light: Option<ContentLightLevel>,
 }
 
 impl Default for Config {
@@ -236,6 +281,8 @@ impl Default for Config {
             fps: 30,
             cpb_ms: 0,
             colour: None,
+            mastering_display: None,
+            content_light: None,
         }
     }
 }

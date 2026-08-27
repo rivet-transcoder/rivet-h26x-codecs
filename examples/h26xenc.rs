@@ -11,10 +11,42 @@
 //!           --recon out.rec.yuv [--codec h264|h265] [--qp N | --lossless]
 //!           [--gop N] [--bframes N] [--cavlc] [--threads N]
 //!           [--color PRIMARIES:TRANSFER:MATRIX [--full-range]]
+//!           [--mastering-display G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)]
+//!           [--content-light MAXCLL,MAXFALL]
 
 
 use h26x::ChromaFormat;
-use h26x::encode::{ColourDescription, Config, Entropy, RateControl};
+use h26x::encode::{ColourDescription, Config, ContentLightLevel, Entropy, MasteringDisplay, RateControl};
+
+/// `G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)` — x265's `master-display`
+/// syntax, in the SEI's units — or `None` for anything else.
+fn parse_mastering_display(s: &str) -> Option<MasteringDisplay> {
+    let mut rest = s;
+    let mut pair = |label: &str| -> Option<(u64, u64)> {
+        rest = rest.strip_prefix(label)?.strip_prefix('(')?;
+        let end = rest.find(')')?;
+        let (a, b) = rest[..end].split_once(',')?;
+        rest = &rest[end + 1..];
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    };
+    let g = pair("G")?;
+    let b = pair("B")?;
+    let r = pair("R")?;
+    let wp = pair("WP")?;
+    let l = pair("L")?;
+    if !rest.is_empty() {
+        return None;
+    }
+    let xy = |(x, y): (u64, u64)| Some((u16::try_from(x).ok()?, u16::try_from(y).ok()?));
+    Some(MasteringDisplay {
+        red: xy(r)?,
+        green: xy(g)?,
+        blue: xy(b)?,
+        white_point: xy(wp)?,
+        max_luminance: u32::try_from(l.0).ok()?,
+        min_luminance: u32::try_from(l.1).ok()?,
+    })
+}
 
 fn die(msg: &str) -> ! {
     eprintln!("h26xenc: {msg}");
@@ -25,7 +57,9 @@ fn die(msg: &str) -> ! {
          \x20      [--gop N] [--bframes N] [--cavlc] [--t8x8] [--subparts] [--sao]\n\
          \x20      [--depth N] [--threads N]\n\
          \x20      [--color PRIMARIES:TRANSFER:MATRIX (H.273 codes, e.g. 9:16:9 for HDR10)]\n\
-         \x20      [--full-range]"
+         \x20      [--full-range]\n\
+         \x20      [--mastering-display G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)] (ST 2086, SEI units)\n\
+         \x20      [--content-light MAXCLL,MAXFALL] (cd/m2)"
     );
     std::process::exit(2);
 }
@@ -102,6 +136,21 @@ fn main() {
             }
             // `video_full_range_flag`, beside a --color.
             "--full-range" => full_range = true,
+            // HDR10 static metadata: an SEI each, in every IDR access unit.
+            "--mastering-display" => {
+                let s = val(&mut i, &args, "--mastering-display");
+                cfg.mastering_display = Some(parse_mastering_display(&s).unwrap_or_else(|| {
+                    die("--mastering-display wants G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min), integers in the SEI's units")
+                }));
+            }
+            "--content-light" => {
+                let s = val(&mut i, &args, "--content-light");
+                let Some((Ok(max_cll), Ok(max_fall))) = s.split_once(',').map(|(a, b)| (a.parse::<u16>(), b.parse::<u16>()))
+                else {
+                    die("--content-light wants MAXCLL,MAXFALL in cd/m2, each 0..=65535")
+                };
+                cfg.content_light = Some(ContentLightLevel { max_cll, max_fall });
+            }
             other => die(&format!("unknown argument {other}")),
         }
         i += 1;
