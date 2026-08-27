@@ -78,9 +78,16 @@ impl HevcEncDsp {
     pub fn new(cpu: Cpu) -> Self {
         let mut d = Self::scalar();
         d.cpu = cpu;
+        #[allow(unused_variables)]
         if !super::enc_simd_disabled("hevc_enc") {
             #[cfg(target_arch = "x86_64")]
             super::hevc_enc_x86::install(&mut d, cpu);
+            #[cfg(target_arch = "aarch64")]
+            super::hevc_enc_neon::install(&mut d, cpu);
+            #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+            if cpu.simd128 {
+                super::hevc_enc_wasm128::install(&mut d);
+            }
         }
         d
     }
@@ -168,6 +175,176 @@ pub(crate) fn fdct_scalar<const N: usize>(block: &mut [i16], log2: u32, bit_dept
 /// The DST matrix of 8.6.4.2, read the way a forward transform reads it.
 pub(crate) const DST4: [[i32; 4]; 4] = [[29, 55, 74, 84], [74, 74, 0, -74], [84, -29, -74, 55], [55, -84, 74, -29]];
 
+/// The matrices laid out for the SIMD tiers.
+///
+/// Built at compile time from the decoder's `TRANSFORM32` (and `DST4`) so
+/// no tier can disagree with the reference about a coefficient — the tests
+/// below read every layout back against the matrix. Shared here rather than
+/// kept in one tier's file because the x86, NEON and wasm kernels read them
+/// and none of them is compiled on the others' targets; which layouts a
+/// target uses varies, hence the `dead_code` allowance on the module.
+pub(crate) mod layouts {
+    #![allow(dead_code)]
+
+    use super::DST4;
+    use crate::hevc::tables::TRANSFORM32;
+
+    /// The pair table the `pmaddwd`-shaped kernels (x86, wasm `i32x4_dot_i16x8`)
+    /// read: `FP[q * 2N + 2j + t] = M[j][2q + t]` for the `N`-point matrix
+    /// `M` (`TRANSFORM32` every `32 / N`th row), flattened so a generic kernel
+    /// can index it. `L` is `N * N`.
+    pub(crate) const fn build_fp<const L: usize>(n: usize) -> [i16; L] {
+        let mut t = [0i16; L];
+        let step = 32 / n;
+        let mut q = 0;
+        while q < n / 2 {
+            let mut j = 0;
+            while j < n {
+                t[q * 2 * n + 2 * j] = TRANSFORM32[j * step][2 * q] as i16;
+                t[q * 2 * n + 2 * j + 1] = TRANSFORM32[j * step][2 * q + 1] as i16;
+                j += 1;
+            }
+            q += 1;
+        }
+        t
+    }
+
+    /// The DST's pair table, from the same matrix the scalar kernel reads.
+    pub(crate) const fn build_fdst() -> [i16; 16] {
+        let mut t = [0i16; 16];
+        let mut q = 0;
+        while q < 2 {
+            let mut j = 0;
+            while j < 4 {
+                t[q * 8 + 2 * j] = DST4[j][2 * q] as i16;
+                t[q * 8 + 2 * j + 1] = DST4[j][2 * q + 1] as i16;
+                j += 1;
+            }
+            q += 1;
+        }
+        t
+    }
+
+    /// The column table the multiply-accumulate-shaped kernels (NEON `smlal`
+    /// by lane) read: `CT[k * N + j] = M[j][k]` — the matrix transposed, so
+    /// that for one input sample `x[k]` the eight outputs `j..j+8` it feeds
+    /// are one contiguous vector of weights.
+    pub(crate) const fn build_ct<const L: usize>(n: usize) -> [i16; L] {
+        let mut t = [0i16; L];
+        let step = 32 / n;
+        let mut k = 0;
+        while k < n {
+            let mut j = 0;
+            while j < n {
+                t[k * n + j] = TRANSFORM32[j * step][k] as i16;
+                j += 1;
+            }
+            k += 1;
+        }
+        t
+    }
+
+    /// The DST's column table.
+    pub(crate) const fn build_cdst() -> [i16; 16] {
+        let mut t = [0i16; 16];
+        let mut k = 0;
+        while k < 4 {
+            let mut j = 0;
+            while j < 4 {
+                t[k * 4 + j] = DST4[j][k] as i16;
+                j += 1;
+            }
+            k += 1;
+        }
+        t
+    }
+
+    /// The matrix itself as i16, rows contiguous: `MT[j * N + k] = M[j][k]`.
+    /// What the column table is the transpose of; the same kernels read this
+    /// one in their second stage, where the weights of one output row are
+    /// the vector and the data rows are what gets strided through.
+    pub(crate) const fn build_mt<const L: usize>(n: usize) -> [i16; L] {
+        let mut t = [0i16; L];
+        let step = 32 / n;
+        let mut j = 0;
+        while j < n {
+            let mut k = 0;
+            while k < n {
+                t[j * n + k] = TRANSFORM32[j * step][k] as i16;
+                k += 1;
+            }
+            j += 1;
+        }
+        t
+    }
+
+    /// The DST matrix as i16, rows contiguous.
+    pub(crate) const fn build_mdst() -> [i16; 16] {
+        let mut t = [0i16; 16];
+        let mut j = 0;
+        while j < 4 {
+            let mut k = 0;
+            while k < 4 {
+                t[j * 4 + k] = DST4[j][k] as i16;
+                k += 1;
+            }
+            j += 1;
+        }
+        t
+    }
+
+    pub(crate) static FP4: [i16; 16] = build_fp::<16>(4);
+    pub(crate) static FP8: [i16; 64] = build_fp::<64>(8);
+    pub(crate) static FP16: [i16; 256] = build_fp::<256>(16);
+    pub(crate) static FP32: [i16; 1024] = build_fp::<1024>(32);
+    pub(crate) static FDST: [i16; 16] = build_fdst();
+
+    pub(crate) static CT4: [i16; 16] = build_ct::<16>(4);
+    pub(crate) static CT8: [i16; 64] = build_ct::<64>(8);
+    pub(crate) static CT16: [i16; 256] = build_ct::<256>(16);
+    pub(crate) static CT32: [i16; 1024] = build_ct::<1024>(32);
+    pub(crate) static CDST: [i16; 16] = build_cdst();
+
+    pub(crate) static MT4: [i16; 16] = build_mt::<16>(4);
+    pub(crate) static MT8: [i16; 64] = build_mt::<64>(8);
+    pub(crate) static MT16: [i16; 256] = build_mt::<256>(16);
+    pub(crate) static MT32: [i16; 1024] = build_mt::<1024>(32);
+    pub(crate) static MDST: [i16; 16] = build_mdst();
+
+    /// The `N`-point matrix, rows contiguous.
+    #[inline(always)]
+    pub(crate) fn mt<const N: usize>() -> &'static [i16] {
+        match N {
+            32 => &MT32,
+            16 => &MT16,
+            8 => &MT8,
+            _ => &MT4,
+        }
+    }
+
+    /// The `N`-point pair table.
+    #[inline(always)]
+    pub(crate) fn fp<const N: usize>() -> &'static [i16] {
+        match N {
+            32 => &FP32,
+            16 => &FP16,
+            8 => &FP8,
+            _ => &FP4,
+        }
+    }
+
+    /// The `N`-point column table.
+    #[inline(always)]
+    pub(crate) fn ct<const N: usize>() -> &'static [i16] {
+        match N {
+            32 => &CT32,
+            16 => &CT16,
+            8 => &CT8,
+            _ => &CT4,
+        }
+    }
+}
+
 pub(crate) fn fdst4_scalar(block: &mut [i16], bit_depth: u32) {
     let s1 = 2 + bit_depth as i32 - 9;
     let s2 = 2 + 6;
@@ -246,6 +423,7 @@ pub fn rdpcm_forward(block: &mut [i16], log2: u32, vertical: bool) {
 
 #[cfg(test)]
 mod tests {
+    use super::layouts::*;
     use super::*;
     use crate::hevc::residual::{ScalingSource, rdpcm_residual, scale_coefficients, transform_skip_residual};
 
@@ -377,6 +555,61 @@ mod tests {
                 assert_eq!(block, res, "log2={log2} vertical={vertical}");
             }
         }
+    }
+
+    /// The pair table really is the matrix: every entry against
+    /// `TRANSFORM32` directly, so a transposed build cannot pass by being
+    /// consistently wrong in both stages of every tier that reads it.
+    #[test]
+    fn pair_table_is_the_matrix() {
+        for &(n, t) in &[(4usize, &FP4[..]), (8, &FP8[..]), (16, &FP16[..]), (32, &FP32[..])] {
+            let step = 32 / n;
+            assert_eq!(t.len(), n * n, "n={n}");
+            for q in 0..n / 2 {
+                for j in 0..n {
+                    assert_eq!(t[q * 2 * n + 2 * j], TRANSFORM32[j * step][2 * q] as i16, "n={n} q={q} j={j}");
+                    assert_eq!(t[q * 2 * n + 2 * j + 1], TRANSFORM32[j * step][2 * q + 1] as i16, "n={n} q={q} j={j}");
+                }
+            }
+        }
+        for q in 0..2 {
+            for j in 0..4 {
+                assert_eq!(FDST[q * 8 + 2 * j], DST4[j][2 * q] as i16);
+                assert_eq!(FDST[q * 8 + 2 * j + 1], DST4[j][2 * q + 1] as i16);
+            }
+        }
+    }
+
+    /// And the column table is its transpose, entry for entry.
+    #[test]
+    fn column_table_is_the_matrix_transposed() {
+        for &(n, t) in &[(4usize, &CT4[..]), (8, &CT8[..]), (16, &CT16[..]), (32, &CT32[..])] {
+            let step = 32 / n;
+            assert_eq!(t.len(), n * n, "n={n}");
+            for k in 0..n {
+                for j in 0..n {
+                    assert_eq!(t[k * n + j], TRANSFORM32[j * step][k] as i16, "n={n} k={k} j={j}");
+                }
+            }
+        }
+        for k in 0..4 {
+            for j in 0..4 {
+                assert_eq!(CDST[k * 4 + j], DST4[j][k] as i16);
+                assert_eq!(MDST[j * 4 + k], DST4[j][k] as i16);
+            }
+        }
+        // And the row-major copy is the matrix, entry for entry.
+        for &(n, t) in &[(4usize, &MT4[..]), (8, &MT8[..]), (16, &MT16[..]), (32, &MT32[..])] {
+            let step = 32 / n;
+            for j in 0..n {
+                for k in 0..n {
+                    assert_eq!(t[j * n + k], TRANSFORM32[j * step][k] as i16, "n={n} j={j} k={k}");
+                }
+            }
+        }
+        assert_eq!(fp::<16>().len(), 256);
+        assert_eq!(ct::<32>().len(), 1024);
+        assert_eq!(mt::<8>().len(), 64);
     }
 
     /// A flat block is DC-only whichever size runs, which catches a

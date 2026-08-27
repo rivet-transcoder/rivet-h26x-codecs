@@ -88,6 +88,10 @@ fn install_simd<S: Sample>(d: &mut DistortionDsp<S>, cpu: Cpu) {
         super::distortion_x86::install(d, cpu);
         #[cfg(target_arch = "aarch64")]
         super::distortion_neon::install(d, cpu);
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        if cpu.simd128 {
+            super::distortion_wasm128::install(d);
+        }
     }
 }
 
