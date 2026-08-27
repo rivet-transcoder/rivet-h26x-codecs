@@ -28,3 +28,6 @@ pub(crate) mod tables;
 pub(crate) mod tables_gen;
 
 pub use decoder::HevcDecoder;
+// The parsed SPS (with its VUI) is public so a container demuxer can read
+// the colour description straight off a parameter set it already holds.
+pub use sps::{Sps, Vui};
