@@ -66,6 +66,21 @@
 #               cap alone lands 632 bits short, so the row is carried by
 #               the re-code and not merely by the aim.
 #
+#   6. BOX      Every stream: exactly one VPS / SPS / PPS, byte for byte.
+#               SELF and CROSS both read Annex-B, where a parameter set
+#               re-sent under the same id replaces the previous one, so an
+#               encoder writing a DIFFERENT PPS for its I and P pictures
+#               passes both. An MP4 avc1/hvc1 sample entry cannot carry that:
+#               the sets are stored once, out of band, and stripped from the
+#               samples, so a decoder reading the box holds two under one id
+#               and decodes the pictures written under the other one to
+#               garbage from their first macroblock. That is how rivet's first
+#               H.264 file failed (2026-08-27) with this whole gate green.
+#
+#               Checked by tools/param_sets.py. Its mutation: put the picture
+#               quantiser back into pic_init_qp, and every H.264 row with an
+#               I and a P picture must go red.
+#
 # Usage: verify_encode.sh [encoder] [decoder]
 #   H26X_WORK=dir   scratch directory holding the source clips (default: here)
 #   JOBS=n          configurations in parallel (default 4)
@@ -83,6 +98,8 @@ DEC=${2:-../release/examples/h26xdec.exe}
 HRD=${HRD:-$(dirname "$ENC")/h26xhrd.exe}
 [ -f "$HRD" ] || HRD=${HRD%.exe}
 FFMPEG=${FFMPEG:-ffmpeg}
+# The BOX checker (property 6) lives in the repo, beside this script.
+PARAM_SETS=${PARAM_SETS:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/param_sets.py}
 TAG=$$
 OUT=enc_out_$TAG
 JOBS=${JOBS:-4}
@@ -281,6 +298,15 @@ one() {
     return 1
   fi
 
+  # 6. BOX. One parameter set of each kind for the whole stream, so the
+  # stream can be put in an MP4 with the sets out of band. Neither decoder
+  # above can see this: both read Annex-B, where a re-sent set replaces
+  # the old one.
+  if ! python "$PARAM_SETS" "$bs" > "$OUT/$base.$name.ps.log" 2>&1; then
+    echo "PS-FAIL     $tag: $(tail -1 "$OUT/$base.$name.ps.log" | head -c 100)"
+    return 1
+  fi
+
   # 4. RATE. Only where a target was given. The encoder reports what it
   # achieved rather than this script recomputing it: it knows the frame
   # count, the frame rate and the exact bytes emitted, and a second
@@ -361,7 +387,7 @@ print("inf" if mse == 0 else f"{10 * math.log10(255 * 255 / mse):.2f}")
 PY
 }
 export -f one ffpix psnr_of
-export ENC DEC HRD FFMPEG OUT
+export ENC DEC HRD FFMPEG OUT PARAM_SETS
 
 echo "== encode verification =="
 results="$OUT/results.txt"
@@ -397,7 +423,7 @@ pass=$(grep -c '^PASS' "$results")
 # failure prefix is missing from this pattern reports its failure and is
 # then counted as green - which is how the RATE rows first shipped, caught
 # only by running the mutation they exist to catch.
-bad=$(grep -cE '^(ENCODE|SELF|CROSS|LOSSLESS|RATE|HRD)-FAIL' "$results")
+bad=$(grep -cE '^(ENCODE|SELF|CROSS|LOSSLESS|RATE|HRD|PS)-FAIL' "$results")
 echo
 echo "encode: $pass passed, $bad failed"
 [ "$bad" = 0 ] || fail=1

@@ -36,7 +36,14 @@
 //!    at a stated bitrate. Lossless mode makes it exact and therefore checkable
 //!    like the other two.
 //!
-//! `tools/verify_encode.sh` gates 1 and 2 and reports 3.
+//! `tools/verify_encode.sh` gates 1 and 2 and reports 3. It also gates a
+//! fourth exact property the first three structurally cannot see, because
+//! both decoders read Annex-B: **one parameter set of each kind per
+//! stream**, byte for byte. A re-sent PPS replaces the old one in Annex-B
+//! and passes SELF and CROSS; in an MP4 `avc1` box the sets live out of
+//! band, so a PPS that changed between the I and P pictures decodes the
+//! pictures under the other one to garbage — which is how rivet's first
+//! H.264 file failed with the whole gate green. See `tools/param_sets.py`.
 //!
 //! # Shape
 //!

@@ -77,6 +77,10 @@ pub struct H264Encoder {
     plane_dims: Vec<(u32, u32)>,
     /// Kernels and derived tables for the transform intra path, built once.
     tools: super::h264_pic::IntraTools,
+    /// The quantiser the PPS declares, for the whole stream. Every slice
+    /// carries its own as a delta against it — see `code_picture` for why
+    /// the PPS must not follow the picture.
+    pps_qp: u8,
 }
 
 /// The exponents the SPS declares. Fixed rather than derived: 16 bits of
@@ -146,11 +150,20 @@ impl H264Encoder {
             RateControl::Bitrate { bps } => Some(RateController::new(bps, cfg.fps, cfg.width, cfg.height, cfg.gop, cfg.bframes)),
             _ => None,
         };
+        // The PPS quantiser: the constant one where there is one, and the
+        // middle of the road where the controller varies it per picture or
+        // no quantiser applies. Its only effect on the stream is the size of
+        // each `slice_qp_delta`. The same rule as the H.265 side.
+        let pps_qp = match cfg.rate {
+            RateControl::ConstantQp(q) => q.min(51),
+            RateControl::Lossless | RateControl::Bitrate { .. } => 26,
+        };
         Ok(Self {
             rc,
             emitted: 0,
             cfg,
             sched,
+            pps_qp,
             held: std::collections::BTreeMap::new(),
             recon: Vec::new(),
             frame_bytes: (luma + chroma) * bps,
@@ -301,17 +314,27 @@ impl H264Encoder {
             self.frame_num = 0;
         }
         // H.264 repeats its parameter sets with *every* access unit — see
-        // the SPS/PPS emitted below — so each picture's own quantiser can
-        // go straight into `pic_init_qp` with a zero `slice_qp_delta`, and
-        // varying it per picture needs no stream-wide nominal at all.
+        // the SPS/PPS emitted below — and this side once put each picture's
+        // own quantiser straight into `pic_init_qp` with a zero
+        // `slice_qp_delta`, on the grounds that a re-sent PPS replaces the
+        // old one and the decoded quantiser is identical either way. Every
+        // Annex-B check agreed: SELF, CROSS, the whole gate.
         //
-        // That is a real difference from the H.265 side rather than a
-        // stylistic one: there the parameter sets are written once, in the
-        // IDR access unit, so every later picture refers back to a fixed
-        // quantiser and must carry its own as a delta against it. Making
-        // this side match that shape was tried and reverted: it changed
-        // every existing H.264 stream's bytes for no gain, because the
-        // decoded quantiser was identical either way.
+        // What none of them could see is a container. An MP4 `avc1` sample
+        // entry carries the parameter sets OUT OF BAND in `avcC` and strips
+        // them from the samples, so a PPS that differs between the I and P
+        // pictures leaves the box holding two under one id; a decoder keeps
+        // whichever it parses last and reads the pictures written under the
+        // other one as garbage from their first macroblock. libavcodec did
+        // exactly that on rivet's first H.264 file (2026-08-27) — MB 0 0 of
+        // the IDR, "top block unavailable for requested intra mode" —
+        // while the same bytes as an Annex-B stream decoded clean.
+        //
+        // So the PPS is now the stream's, fixed at construction, and each
+        // slice carries its own quantiser as a delta against it — the shape
+        // the H.265 side has always had. (The note that this was "tried
+        // and reverted for no gain" was true of the quantiser alone; the
+        // gain is that the stream can be put in a box.)
         //
         // The controller chooses per picture, in coding order; everything
         // else is a function of the configuration alone.
@@ -367,7 +390,7 @@ impl H264Encoder {
             3,
             &syn::write_sps(&self.cfg, &g, LOG2_MAX_FRAME_NUM, LOG2_MAX_POC_LSB),
         ));
-        out.extend_from_slice(&syn::annexb(syn::NAL_PPS, 3, &syn::write_pps(&self.cfg, qp)));
+        out.extend_from_slice(&syn::annexb(syn::NAL_PPS, 3, &syn::write_pps(&self.cfg, self.pps_qp)));
 
         let cabac = self.cfg.entropy == Entropy::Cabac;
         let mut w = BitWriter::with_capacity(self.frame_bytes + 256);
@@ -392,7 +415,7 @@ impl H264Encoder {
                 cabac,
                 direct_spatial: transform_b,
             },
-            qp,
+            self.pps_qp,
             &mut w,
         );
         // Every coded picture leaves its motion in the decoder's layout:
