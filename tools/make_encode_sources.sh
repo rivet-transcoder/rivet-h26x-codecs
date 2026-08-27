@@ -94,3 +94,26 @@ gen static "testsrc2=size=64x64:rate=25,loop=loop=-1:size=1:start=0" 8 64x64_420
 # unrelated one, spliced with no transition. `trim` takes the head of each
 # and `setpts` restarts the timestamps so `concat` joins them cleanly.
 gen cut    "testsrc2=size=64x64:rate=25,trim=end_frame=51,setpts=PTS-STARTPTS[a];mandelbrot=size=64x64:rate=25,trim=end_frame=45,setpts=PTS-STARTPTS[b];[a][b]concat=n=2:v=1:a=0" 96 64x64_420 yuv420p
+
+# Deep samples. The format token grows a depth suffix — `420p10` — which
+# verify_encode.sh splits into `--format 420 --depth 10` and maps to
+# ffmpeg's `yuv420p10le` for the CROSS decode; a token without a suffix is
+# 8-bit, as every clip above is. Little-endian 16-bit planar throughout,
+# the layout the decoders emit and the encoders take.
+#
+# The content is NOT an 8-bit picture shifted up. `testsrc2` is drawn at
+# 8 bits and `-pix_fmt yuv420p10le` alone would scale it, leaving the low
+# two bits of every sample zero — and a depth bug that only touched those
+# bits (a quantiser shift short by two, a clip at 255 << 2) would then be
+# invisible to the whole gate. So a `geq` stage adds two bits of noise per
+# sample AFTER the conversion, at the deep format, and a probe of the
+# result shows every low-bit pattern present. Four bits at 12.
+deep() { # name source frames geom fmt depth
+  noise=$(( 1 << ($6 - 8) ))
+  gen "$1" "$2,format=yuv${5}p${6}le,geq=lum='p(X,Y)+floor(random(0)*$noise)':cb='p(X,Y)+floor(random(1)*$noise)':cr='p(X,Y)+floor(random(2)*$noise)'" "$3" "${4}_${5}p${6}" "yuv${5}p${6}le"
+}
+deep detail10 "testsrc2=size=64x64:rate=25"  8 64x64 420 10
+deep motion10 "testsrc=size=64x64:rate=25"  12 64x64 420 10
+deep detail10 "testsrc2=size=64x64:rate=25"  8 64x64 422 10
+deep detail10 "testsrc2=size=64x64:rate=25"  8 64x64 444 10
+deep detail12 "testsrc2=size=64x64:rate=25"  8 64x64 420 12

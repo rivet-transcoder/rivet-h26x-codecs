@@ -74,7 +74,7 @@
 //! from both loop filters, and SAO would therefore be a no-op declared in
 //! every slice header. Shipping that is worse than refusing it.
 
-use crate::encode::h265_intra::IntraCtx;
+use crate::encode::h265_intra::{IntraCtx, ssd_lambda_scale};
 use crate::hevc::ctu::SaoMerge;
 use crate::hevc::frame::{Frame, Plane16};
 use crate::hevc::pic::{PicInfo, SaoParams};
@@ -407,8 +407,12 @@ pub fn sao_picture<S: Sample>(
     let cat = sps.chroma_array_type();
     let ncomp = if cat != 0 { 3 } else { 1 };
     let (sw, sh) = if cat != 0 { sps.sub_wh() } else { (1, 1) };
+    // `cMax` of `sao_offset_abs`: 7 at 8 bits, 31 from 10 up, the same
+    // derivation `write_sao_for` spells and the reader applies. Luma's
+    // depth serves chroma too: this encoder writes one depth for both.
     let cmax = ((1i64 << (sps.bit_depth_luma.min(10) - 5)) - 1) as i64;
-    let lam = lambda(ctx.qp);
+    // Priced against SSD, so the deep-sample scale is the squared one.
+    let lam = lambda(ctx.qp) * ssd_lambda_scale(ctx.bit_depth);
 
     let mut params = vec![[SaoParams::default(); 3]; wc * hc];
     let mut merges: Vec<Option<SaoMerge>> = vec![None; wc * hc];

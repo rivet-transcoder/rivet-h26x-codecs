@@ -164,7 +164,7 @@
 //! Lagrangian constant for the same reason.
 
 use crate::dsp::hevc_enc::{qbits, quant_offset, quant_scale};
-use crate::encode::h265_intra::{CuDecision, Geo, IntraCtx, chroma_tbs, code_cu_2nx2n_intra, sub_wh};
+use crate::encode::h265_intra::{CuDecision, Geo, IntraCtx, chroma_tbs, code_cu_2nx2n_intra, satd_lambda_scale, sub_wh};
 use crate::cabac_enc::CabacEncoder;
 use crate::hevc::ctu::{
     PartMode, SplitCuNb, chroma_qp, write_cu_skip_flag, write_inter_pred_idc, write_merge_flag,
@@ -606,7 +606,7 @@ impl<S: Sample> InterPicture<S> {
         // Cost the shapes. Merge candidates are scored at their exact
         // vectors; only the first occurrence of a vector matters (a later
         // duplicate signals strictly more bins for the same prediction).
-        let lam = lambda(ctx.qp);
+        let lam = lambda(ctx.qp) * satd_lambda_scale(ctx.bit_depth);
         let rate = Rate::new(ctx.qp, false, self.log2_cu);
         let mut best_merge: Option<(usize, u32)> = None; // (idx, satd)
         let mut best_merge_cost = f32::INFINITY;
@@ -767,7 +767,7 @@ impl<S: Sample> InterPicture<S> {
             uni[list] = self.refine_subpel(ctx, plane, x0, y0, n, src, y_stride, full);
         }
 
-        let lam = lambda(ctx.qp);
+        let lam = lambda(ctx.qp) * satd_lambda_scale(ctx.bit_depth);
         let rate = Rate::new(ctx.qp, true, self.log2_cu);
 
         // The three AMVP shapes. `inter_pred_idc` costs two bins for a uni
@@ -1218,8 +1218,9 @@ fn predict14<S: Sample>(
     }
 }
 
-/// The conventional Lagrangian `0.85 * 2^((QP − 12) / 3)`, in SATD units —
-/// the intra module's constant, duplicated (see the module header).
+/// The conventional Lagrangian `0.85 * 2^((QP − 12) / 3)`, in 8-bit SATD
+/// units — the intra module's constant, duplicated (see the module
+/// header). Callers multiply by `satd_lambda_scale` for deeper samples.
 fn lambda(qp: i32) -> f32 {
     0.85f32 * ((qp - 12) as f32 / 3.0).exp2()
 }
