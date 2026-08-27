@@ -17,7 +17,9 @@
 # decoder-shared kernels keep their rungs, which is what isolates the
 # encode-side SIMD; `H26X_NO_SIMD=1` would measure both at once. An empty
 # side is the binary as it runs in the field. Several assignments may be
-# space-separated in one side.
+# space-separated in one side. `EXE=path` in a side replaces the binary for
+# that side instead of setting a variable — for a change that has no
+# switch, where the honest comparison is two builds.
 #
 # Before believing any number: run this with the same environment on both
 # sides. That spread is the smallest difference this machine can resolve.
@@ -102,9 +104,10 @@ print(f"pinned to {where}")
 
 def run(extra):
     e = dict(os.environ)
-    e.update(extra)
+    e.update({k: v for k, v in extra.items() if k != "EXE"})
+    argv = [extra.get("EXE", cmd[0])] + cmd[1:]
     t = time.perf_counter()
-    p = subprocess.Popen(cmd, env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    p = subprocess.Popen(argv, env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          creationflags=HIGH_PRIORITY_CLASS)
     kernel32.SetProcessAffinityMask(wintypes.HANDLE(p._handle), ctypes.c_size_t(MASK))
     p.wait()
