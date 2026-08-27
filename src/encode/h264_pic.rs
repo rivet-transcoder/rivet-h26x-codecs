@@ -33,16 +33,24 @@ use crate::h264::mb::{MbInfo, MbKind as DecKind, MbMotion, MbNeighbours, PicInfo
 use crate::h264::sps::ScalingLists;
 use crate::h264::transform::Dequant;
 use crate::picture::ChromaFormat;
+use crate::sample::Sample;
 
 /// The kernels and derived tables the transform paths run on, built once
 /// per encoder and shared by both entropy coders — and, beside them, the
 /// one coding-tool switch that has to reach every decision walk.
-pub struct IntraTools {
-    pub(crate) dsp: H264Dsp<u8>,
+///
+/// Generic over the sample type, so an 8-bit encoder holds the 8-bit
+/// kernel tables (the SIMD tiers) and a deeper one the 16-bit tables —
+/// the decoder's own split, made once at construction.
+pub struct IntraTools<S: Sample> {
+    pub(crate) dsp: H264Dsp<S>,
     pub(crate) enc: H264EncDsp,
-    pub(crate) dist: DistortionDsp<u8>,
+    pub(crate) dist: DistortionDsp<S>,
     pub(crate) quant: Quant,
     pub(crate) dequant: Dequant,
+    /// Bits per sample, 8 to 14 — what every `IntraCtx` built from these
+    /// tools carries to the predictors and the quantiser offsets.
+    pub(crate) bit_depth: u32,
     /// `transform_8x8_mode_flag`, as the PPS writes it. A decision may
     /// only produce `transform_size_8x8_flag` when this is true, because
     /// otherwise the element is not in the bitstream at all. It rides
@@ -54,14 +62,14 @@ pub struct IntraTools {
     pub(crate) subparts: bool,
 }
 
-impl IntraTools {
-    /// Build for the running CPU, offering the 8x8 transform or not. The
-    /// scaling lists are flat sixteens because the parameter sets this
-    /// encoder writes carry no scaling matrices, which makes flat the
-    /// lists a decoder will derive — and that is as true of the 8x8 lists
-    /// as of the 4x4 ones, since the PPS declares
-    /// `pic_scaling_matrix_present_flag` zero either way.
-    pub fn new(transform_8x8: bool, subparts: bool) -> Self {
+impl<S: Sample> IntraTools<S> {
+    /// Build for the running CPU, offering the 8x8 transform or not, at
+    /// `bit_depth` bits per sample. The scaling lists are flat sixteens
+    /// because the parameter sets this encoder writes carry no scaling
+    /// matrices, which makes flat the lists a decoder will derive — and
+    /// that is as true of the 8x8 lists as of the 4x4 ones, since the
+    /// PPS declares `pic_scaling_matrix_present_flag` zero either way.
+    pub fn new(transform_8x8: bool, subparts: bool, bit_depth: u32) -> Self {
         let lists = ScalingLists { list4x4: [[16; 16]; 6], list8x8: [[16; 64]; 6] };
         let cpu = Cpu::detect_honouring_env();
         IntraTools {
@@ -70,15 +78,10 @@ impl IntraTools {
             dist: DistortionDsp::new(cpu),
             quant: Quant::new(&lists),
             dequant: Dequant::new(&lists),
+            bit_depth,
             transform_8x8,
             subparts,
         }
-    }
-}
-
-impl Default for IntraTools {
-    fn default() -> Self {
-        Self::new(false, false)
     }
 }
 
@@ -251,8 +254,8 @@ fn edge_modes(kind: MbKind, modes: &[u8; 16]) -> ([Option<u8>; 4], [Option<u8>; 
 /// fill the PCM path uses, and for the same reason: the cropping
 /// rectangle hides these samples, and repeating the edge keeps the coded
 /// picture free of an artificial boundary that would cost bits.
-fn pad_to(src: &Plane<'_>, w: usize, h: usize) -> Vec<u8> {
-    let mut out = vec![0u8; w * h];
+fn pad_to<S: Sample>(src: &Plane<'_, S>, w: usize, h: usize) -> Vec<S> {
+    let mut out = vec![S::default(); w * h];
     let sw = (src.width as usize).min(w);
     for y in 0..h {
         let sy = y.min(src.height as usize - 1);
@@ -269,9 +272,9 @@ fn pad_to(src: &Plane<'_>, w: usize, h: usize) -> Vec<u8> {
 /// The coding context and padded sources a picture walk works from —
 /// built one way for intra and inter pictures alike, so the two cannot
 /// disagree about geometry or quantisation.
-struct PicCoding<'a> {
+struct PicCoding<'a, S: Sample> {
     /// The per-picture context both mode-decision modules take.
-    ctx: IntraCtx<'a>,
+    ctx: IntraCtx<'a, S>,
     /// Picture size in macroblocks.
     mbs_wide: usize,
     /// See `mbs_wide`.
@@ -281,20 +284,25 @@ struct PicCoding<'a> {
     /// Stride of `src_cb` / `src_cr`; 0 for monochrome.
     chroma_stride: usize,
     /// The source planes at coded size, edge-replicated.
-    src_y: Vec<u8>,
+    src_y: Vec<S>,
     /// See `src_y` (empty for monochrome).
-    src_cb: Vec<u8>,
+    src_cb: Vec<S>,
     /// See `src_y`.
-    src_cr: Vec<u8>,
+    src_cr: Vec<S>,
 }
 
-impl<'a> PicCoding<'a> {
-    fn new(g: &Geometry, tools: &'a IntraTools, qp: u8, planes: &[Plane<'_>]) -> Self {
+impl<'a, S: Sample> PicCoding<'a, S> {
+    fn new(g: &Geometry, tools: &'a IntraTools<S>, qp: u8, planes: &[Plane<'_, S>]) -> Self {
         let (cw, ch) = g.chroma_mb();
         let chroma_h = ch as usize;
-        // 8-bit only (the encoder refuses deeper at construction), and the
-        // PPS writes both chroma QP offsets as zero.
-        let qpc = chroma_qp(qp as i32, 0, 0);
+        debug_assert_eq!(tools.bit_depth, g.bit_depth, "one depth per encoder");
+        // The quantisers, in the two forms the reader keeps them
+        // (`MbDequant::for_mb`, src/h264/mb.rs): `QP_Y` as the slice
+        // header carries it, and `QP'_Y = QP_Y + QpBdOffset_Y` for the
+        // scaling tables. The PPS writes both chroma QP offsets as zero,
+        // and the chroma map clips at `-QpBdOffset_C` below (8.5.8).
+        let bd_off = 6 * (g.bit_depth as i32 - 8);
+        let qpc = chroma_qp(qp as i32, 0, bd_off);
         let ctx = IntraCtx {
             dsp: &tools.dsp,
             enc: &tools.enc,
@@ -303,6 +311,10 @@ impl<'a> PicCoding<'a> {
             dequant: &tools.dequant,
             qp: qp as i32,
             qpc: [qpc; 2],
+            qp_prime: qp as i32 + bd_off,
+            qpc_prime: [qpc + bd_off; 2],
+            bit_depth: g.bit_depth,
+            max: (1i32 << g.bit_depth) - 1,
             chroma_h,
             c444: g.chroma == ChromaFormat::Yuv444,
             t8x8: tools.transform_8x8,
@@ -359,12 +371,12 @@ pub enum PMb<'a> {
 /// derives for those), the reconstruction the next macroblock predicts
 /// from, and the loop filter, run after the last macroblock so what
 /// leaves `rec` is the filtered picture a decoder emits.
-pub(crate) fn code_intra_picture(
+pub(crate) fn code_intra_picture<S: Sample>(
     g: &Geometry,
-    tools: &IntraTools,
+    tools: &IntraTools<S>,
     qp: u8,
-    planes: &[Plane<'_>],
-    rec: &mut [Recon],
+    planes: &[Plane<'_, S>],
+    rec: &mut [Recon<S>],
     mut emit: impl FnMut(usize, usize, &MbDecision),
 ) -> PicMotion {
     let pc = PicCoding::new(g, tools, qp, planes);
@@ -447,13 +459,13 @@ pub(crate) fn code_intra_picture(
 ///   decoder would store, committed as each macroblock is coded and
 ///   applied after the last one, before the reconstruction becomes a
 ///   reference.
-pub(crate) fn code_p_picture(
+pub(crate) fn code_p_picture<S: Sample>(
     g: &Geometry,
-    tools: &IntraTools,
+    tools: &IntraTools<S>,
     qp: u8,
-    planes: &[Plane<'_>],
-    rec: &mut [Recon],
-    refp: &[Recon],
+    planes: &[Plane<'_, S>],
+    rec: &mut [Recon<S>],
+    refp: &[Recon<S>],
     mut emit: impl FnMut(usize, usize, PMb<'_>),
 ) -> PicMotion {
     let pc = PicCoding::new(g, tools, qp, planes);
@@ -585,13 +597,13 @@ pub enum BMb<'a> {
 /// direct derivation reads as colocated motion. `refs` are the list-0
 /// (past) and list-1 (future) reference planes, borders replicated.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn code_b_picture(
+pub(crate) fn code_b_picture<S: Sample>(
     g: &Geometry,
-    tools: &IntraTools,
+    tools: &IntraTools<S>,
     qp: u8,
-    planes: &[Plane<'_>],
-    rec: &mut [Recon],
-    refs: [&[Recon]; 2],
+    planes: &[Plane<'_, S>],
+    rec: &mut [Recon<S>],
+    refs: [&[Recon<S>]; 2],
     col: &PicMotion,
     mut emit: impl FnMut(usize, usize, BMb<'_>),
 ) -> PicMotion {

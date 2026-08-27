@@ -69,9 +69,12 @@ use crate::dsp::distortion::DistortionDsp;
 use crate::dsp::h264::{NO_DC, PRED_STRIDE};
 use crate::dsp::h264_enc::{qbits4, quant_offset};
 use crate::encode::h264_pic::PicMotion;
-use crate::encode::h264_intra::{IntraCtx, code_block_8x8, lambda, quad_rasters, reconstruct_8x8};
+use crate::encode::h264_intra::{
+    IntraCtx, code_block_8x8, quad_rasters, reconstruct_8x8, satd_lambda, ssd_lambda,
+};
 use crate::h264::cavlc::sub_block_counts_8x8;
 use crate::encode::h264_syntax::Recon;
+use crate::sample::Sample;
 use crate::h264::frame::{BlockMotion, Frame, Mv, PARITY_FRAME};
 use crate::h264::cavlc::{mb_partitions, part_index_of, sub_partition_rect};
 use crate::h264::mb::SubMbShape;
@@ -86,7 +89,7 @@ use crate::h264::transform::{chroma_dc_transform_420, chroma_dc_transform_422};
 /// the quantisation tables already carry the inter lists (3..6), and one
 /// context serving both modules means the picture loop cannot hand the two
 /// halves of a macroblock decision different QPs.
-pub type MeCtx<'a> = IntraCtx<'a>;
+pub type MeCtx<'a, S> = IntraCtx<'a, S>;
 
 /// How a P macroblock was coded, in the form an entropy coder needs.
 ///
@@ -396,7 +399,7 @@ impl MbMotionState {
 /// reference picture, after its last macroblock is reconstructed and
 /// before anything searches against it — the decoder does the same as its
 /// rows complete (`Frame::extend_rows`, src/h264/frame.rs).
-pub fn prepare_reference(planes: &mut [Recon]) {
+pub fn prepare_reference<S: Sample>(planes: &mut [Recon<S>]) {
     for p in planes.iter_mut() {
         p.extend_edges(false);
     }
@@ -409,7 +412,7 @@ pub fn prepare_reference(planes: &mut [Recon]) {
 /// Whether a `ww x hh` read at `(x0, y0)` stays inside the padded plane.
 /// The direct-read condition of `interp` in `src/h264/inter.rs`, for a
 /// progressive frame (full border trusted on all four sides).
-fn window_ok(r: &Recon, x0: i32, y0: i32, ww: i32, hh: i32) -> bool {
+fn window_ok<S: Sample>(r: &Recon<S>, x0: i32, y0: i32, ww: i32, hh: i32) -> bool {
     let pad = r.pad as i32;
     x0 >= -pad && y0 >= -pad && x0 + ww <= r.width as i32 + pad && y0 + hh <= r.height as i32 + pad
 }
@@ -419,12 +422,12 @@ fn window_ok(r: &Recon, x0: i32, y0: i32, ww: i32, hh: i32) -> bool {
 /// else a sample-by-sample clamp to the picture. Mirrors `interp` in
 /// `src/h264/inter.rs` exactly, so a far-out vector reads the same samples
 /// a decoder would.
-fn interp(r: &Recon, x0: i32, y0: i32, ww: usize, hh: usize, out: &mut [u8], kernel: impl FnOnce(&mut [u8], &[u8], usize)) {
+fn interp<S: Sample>(r: &Recon<S>, x0: i32, y0: i32, ww: usize, hh: usize, out: &mut [S], kernel: impl FnOnce(&mut [S], &[S], usize)) {
     if window_ok(r, x0, y0, ww as i32, hh as i32) {
         kernel(out, &r.data[r.offset(x0 as isize, y0 as isize)..], r.stride);
     } else {
         let (pw, ph) = (r.width as i32, r.height as i32);
-        let mut window = [0u8; 32 * 32];
+        let mut window = [S::default(); 32 * 32];
         for y in 0..hh {
             let yy = (y0 + y as i32).clamp(0, ph - 1) as isize;
             for x in 0..ww {
@@ -447,21 +450,21 @@ fn interp(r: &Recon, x0: i32, y0: i32, ww: usize, hh: usize, out: &mut [u8], ker
 /// macroblock's: a partition interpolates from its own corner, so a 16x8
 /// lower half reads eight rows further down and its window moves with it.
 #[allow(clippy::too_many_arguments)]
-fn luma_pred_into(
-    ctx: &MeCtx,
-    r: &Recon,
+fn luma_pred_into<S: Sample>(
+    ctx: &MeCtx<S>,
+    r: &Recon<S>,
     x: i32,
     y: i32,
     mv: Mv,
     w: usize,
     h: usize,
-    dst: &mut [u8; 16 * PRED_STRIDE],
+    dst: &mut [S; 16 * PRED_STRIDE],
 ) {
     let xi = x + (mv.x as i32 >> 2);
     let yi = y + (mv.y as i32 >> 2);
     let pos = ((mv.y & 3) as usize) * 4 + (mv.x & 3) as usize;
     let k = ctx.dsp.qpel[pos];
-    interp(r, xi - 2, yi - 2, w + 5, h + 5, dst, |o, s, st| k(o, s, st, w, h, 255));
+    interp(r, xi - 2, yi - 2, w + 5, h + 5, dst, |o, s, st| k(o, s, st, w, h, ctx.max));
 }
 
 /// Interpolate one chroma component's prediction (8 wide, `ch` high) for
@@ -471,16 +474,16 @@ fn luma_pred_into(
 /// only: eighth-sample fractions in 4:2:0; in 4:2:2 the vertical component
 /// is in quarter *chroma* samples, so the fraction doubles.
 #[allow(clippy::too_many_arguments)]
-fn chroma_pred_into(
-    ctx: &MeCtx,
-    r: &Recon,
+fn chroma_pred_into<S: Sample>(
+    ctx: &MeCtx<S>,
+    r: &Recon<S>,
     cx: i32,
     cy: i32,
     mv: Mv,
     cw: usize,
     ch_h: usize,
     ch: usize,
-    dst: &mut [u8; 16 * PRED_STRIDE],
+    dst: &mut [S; 16 * PRED_STRIDE],
 ) {
     let xci = cx + (mv.x as i32 >> 3);
     let (yci, yf) = if ch == 8 {
@@ -508,14 +511,14 @@ const RANGE: i32 = 16;
 /// searches from its own corner over its own eight rows, which is what
 /// makes two halves able to find different motion.
 #[allow(clippy::too_many_arguments)]
-fn search_rect(
-    ctx: &MeCtx,
-    r: &Recon,
+fn search_rect<S: Sample>(
+    ctx: &MeCtx<S>,
+    r: &Recon<S>,
     x: i32,
     y: i32,
     w: usize,
     h: usize,
-    src: &[u8],
+    src: &[S],
     src_stride: usize,
     pred: Mv,
 ) -> (Mv, u32) {
@@ -586,7 +589,7 @@ fn search_rect(
     // Refinement: half- then quarter-sample rings, scored by SATD through
     // the decoder's own interpolation. The full-sample winner is rescored
     // with SATD first, because SAD and SATD are not on the same scale.
-    let mut scratch = [0u8; 16 * PRED_STRIDE];
+    let mut scratch = [S::default(); 16 * PRED_STRIDE];
     let mut satd_of = |mv: Mv| -> u32 {
         luma_pred_into(ctx, r, x, y, mv, w, h, &mut scratch);
         (ctx.dist.satd)(src, src_stride, &scratch, PRED_STRIDE, w, h)
@@ -625,11 +628,11 @@ fn search_rect(
 /// dead zone). Returns the levels and their nonzero count. The shape of
 /// `code_block_4x4` in `src/encode/h264_intra.rs` (private there), minus
 /// the Intra_16x16 DC split: an inter block keeps its own DC.
-fn code_inter_4x4(ctx: &MeCtx, rec: &Recon, off: usize, src: &[u8], src_stride: usize, list: usize, qp: i32, keep_dc: bool) -> ([i16; 16], u32, i32) {
+fn code_inter_4x4<S: Sample>(ctx: &MeCtx<S>, rec: &Recon<S>, off: usize, src: &[S], src_stride: usize, list: usize, qp: i32, keep_dc: bool) -> ([i16; 16], u32, i32) {
     let mut residual = [0i16; 16];
     for y in 0..4 {
         for x in 0..4 {
-            residual[y * 4 + x] = src[y * src_stride + x] as i16 - rec.data[off + y * rec.stride + x] as i16;
+            residual[y * 4 + x] = (src[y * src_stride + x].to_i32() - rec.data[off + y * rec.stride + x].to_i32()) as i16;
         }
     }
     let mut coeffs = [0i32; 16];
@@ -654,7 +657,7 @@ fn code_inter_4x4(ctx: &MeCtx, rec: &Recon, off: usize, src: &[u8], src_stride: 
 /// ([`crate::dsp::h264::H264Dsp::residual4`], 8.5.12), so the two cannot
 /// disagree. The shape of `reconstruct_4x4` in
 /// `src/encode/h264_intra.rs` (private there).
-fn add_residual_4x4(ctx: &MeCtx, rec: &mut Recon, off: usize, levels: &[i16; 16], list: usize, qp: i32, dc: Option<i32>) {
+fn add_residual_4x4<S: Sample>(ctx: &MeCtx<S>, rec: &mut Recon<S>, off: usize, levels: &[i16; 16], list: usize, qp: i32, dc: Option<i32>) {
     let m = (qp % 6) as usize;
     let scale = &ctx.dequant.scale4[list][m];
     let q6 = qp / 6;
@@ -667,7 +670,7 @@ fn add_residual_4x4(ctx: &MeCtx, rec: &mut Recon, off: usize, levels: &[i16; 16]
             (c + (1 << (3 - q6))) >> (4 - q6)
         };
     }
-    (ctx.dsp.residual4)(&mut rec.data[off..], rec.stride, &coefs, dc.unwrap_or(NO_DC), 255);
+    (ctx.dsp.residual4)(&mut rec.data[off..], rec.stride, &coefs, dc.unwrap_or(NO_DC), ctx.max);
 }
 
 /// Write one partition's inter prediction for one or two references into
@@ -677,10 +680,10 @@ fn add_residual_4x4(ctx: &MeCtx, rec: &mut Recon, off: usize, levels: &[i16; 16]
 /// `Weighting::Default`). What stands in `rec` afterwards is bit-identical
 /// to what a decoder derives for the same vectors.
 #[allow(clippy::too_many_arguments)]
-fn predict_inter_rect(
-    ctx: &MeCtx,
-    rec: &mut [Recon],
-    refs: [&[Recon]; 2],
+fn predict_inter_rect<S: Sample>(
+    ctx: &MeCtx<S>,
+    rec: &mut [Recon<S>],
+    refs: [&[Recon<S>]; 2],
     px: usize,
     py: usize,
     pw: usize,
@@ -689,8 +692,8 @@ fn predict_inter_rect(
     mv: [Mv; 2],
 ) {
     debug_assert!(used[0] || used[1]);
-    let mut a = [0u8; 16 * PRED_STRIDE];
-    let mut b = [0u8; 16 * PRED_STRIDE];
+    let mut a = [S::default(); 16 * PRED_STRIDE];
+    let mut b = [S::default(); 16 * PRED_STRIDE];
     // Luma.
     let off = rec[0].offset(px as isize, py as isize);
     let stride = rec[0].stride;
@@ -776,14 +779,14 @@ struct InterResidual {
 }
 
 /// A macroblock's worth of luma out of a plane, packed 16 by 16.
-fn gather16(p: &Recon, off: usize, out: &mut [u8; 256]) {
+fn gather16<S: Sample>(p: &Recon<S>, off: usize, out: &mut [S; 256]) {
     for y in 0..16 {
         out[y * 16..y * 16 + 16].copy_from_slice(&p.data[off + y * p.stride..off + y * p.stride + 16]);
     }
 }
 
 /// The inverse of [`gather16`]: put a saved macroblock back.
-fn scatter16(p: &mut Recon, off: usize, src: &[u8; 256]) {
+fn scatter16<S: Sample>(p: &mut Recon<S>, off: usize, src: &[S; 256]) {
     for y in 0..16 {
         p.data[off + y * p.stride..off + y * p.stride + 16]
             .copy_from_slice(&src[y * 16..y * 16 + 16]);
@@ -792,11 +795,11 @@ fn scatter16(p: &mut Recon, off: usize, src: &[u8; 256]) {
 
 /// Code an inter macroblock's luma as sixteen 4x4 blocks, reconstructing
 /// in place, and fill the levels, counts and coded block pattern.
-fn code_luma_4x4(
-    ctx: &MeCtx,
-    rec: &mut Recon,
+fn code_luma_4x4<S: Sample>(
+    ctx: &MeCtx<S>,
+    rec: &mut Recon<S>,
     off: usize,
-    src: &[u8],
+    src: &[S],
     src_stride: usize,
     out: &mut InterResidual,
 ) {
@@ -804,10 +807,10 @@ fn code_luma_4x4(
         let (bx, by) = (blk % 4, blk / 4);
         let boff = off + by * 4 * rec.stride + bx * 4;
         let bsoff = by * 4 * src_stride + bx * 4;
-        let (lv, n, _) = code_inter_4x4(ctx, rec, boff, &src[bsoff..], src_stride, 3, ctx.qp, true);
+        let (lv, n, _) = code_inter_4x4(ctx, rec, boff, &src[bsoff..], src_stride, 3, ctx.qp_prime, true);
         out.luma[blk] = lv;
         out.nz_luma[blk] = n as u8;
-        add_residual_4x4(ctx, rec, boff, &lv, 3, ctx.qp, None);
+        add_residual_4x4(ctx, rec, boff, &lv, 3, ctx.qp_prime, None);
     }
     for blk8 in 0..4 {
         if quad_rasters(blk8).iter().any(|&r| out.nz_luma[r] != 0) {
@@ -820,11 +823,11 @@ fn code_luma_4x4(
 /// dead zone and 8x8 scaling list 1 (`2 * plane + inter`, so luma inter
 /// is 1 — not the 4x4 order's 3), and the counts kept per CAVLC sub-scan
 /// as [`InterDecision::nz_luma`] promises.
-fn code_luma_8x8(
-    ctx: &MeCtx,
-    rec: &mut Recon,
+fn code_luma_8x8<S: Sample>(
+    ctx: &MeCtx<S>,
+    rec: &mut Recon<S>,
     off: usize,
-    src: &[u8],
+    src: &[S],
     src_stride: usize,
     out: &mut InterResidual,
 ) {
@@ -833,8 +836,8 @@ fn code_luma_8x8(
         let boff = off + by * 4 * rec.stride + bx * 4;
         let bsoff = by * 4 * src_stride + bx * 4;
         let (lv, counts) =
-            code_block_8x8(ctx, rec, boff, &src[bsoff..], src_stride, 1, ctx.qp, false);
-        reconstruct_8x8(ctx, rec, boff, &lv, 1, ctx.qp);
+            code_block_8x8(ctx, rec, boff, &src[bsoff..], src_stride, 1, ctx.qp_prime, false);
+        reconstruct_8x8(ctx, rec, boff, &lv, 1, ctx.qp_prime);
         out.luma.as_flattened_mut()[blk8 * 64..blk8 * 64 + 64].copy_from_slice(&lv);
         for (sub, &raster) in quad_rasters(blk8).iter().enumerate() {
             out.nz_luma[raster] = counts[sub];
@@ -872,8 +875,10 @@ fn code_luma_8x8(
 /// It still has no rate term for the residual, which is where the 8x8
 /// transform mostly earns its keep, so it takes 8x8 less often than a
 /// real rate-distortion decision would. One function, one comparison.
-fn placeholder_inter_transform_size(ssd_4x4: u64, ssd_8x8: u64, qp: i32) -> bool {
-    ssd_8x8 as f32 + lambda(qp) < ssd_4x4 as f32
+/// `lam` is the multiplier in squared-error units at the picture's
+/// depth ([`ssd_lambda`]).
+fn placeholder_inter_transform_size(ssd_4x4: u64, ssd_8x8: u64, lam: f32) -> bool {
+    ssd_8x8 as f32 + lam < ssd_4x4 as f32
 }
 
 /// Code the residual of a 16x16 inter macroblock whose *prediction*
@@ -883,14 +888,14 @@ fn placeholder_inter_transform_size(ssd_4x4: u64, ssd_8x8: u64, qp: i32) -> bool
 /// by the P and B paths — the prediction differs between them, the
 /// residual machinery must not.
 #[allow(clippy::too_many_arguments)]
-fn code_inter_mb_residual(
-    ctx: &MeCtx,
-    rec: &mut [Recon],
+fn code_inter_mb_residual<S: Sample>(
+    ctx: &MeCtx<S>,
+    rec: &mut [Recon<S>],
     mb_x: usize,
     mb_y: usize,
-    src_luma: &[u8],
+    src_luma: &[S],
     luma_stride: usize,
-    src_chroma: [&[u8]; 2],
+    src_chroma: [&[S]; 2],
     chroma_stride: usize,
     allow_8x8: bool,
 ) -> InterResidual {
@@ -915,14 +920,14 @@ fn code_inter_mb_residual(
     // The prediction, before any residual is added to it: the 8x8
     // candidate has to start from the same samples, and whichever loses
     // has to be undone.
-    let mut pred = [0u8; 256];
+    let mut pred = [S::default(); 256];
     gather16(&rec[0], off, &mut pred);
     code_luma_4x4(ctx, &mut rec[0], off, &src_luma[soff..], luma_stride, &mut out);
 
     if ctx.t8x8 && allow_8x8 {
         // Score what the 4x4 reconstructed, keep it, and try the 8x8 from
         // the same prediction.
-        let mut recon4 = [0u8; 256];
+        let mut recon4 = [S::default(); 256];
         gather16(&rec[0], off, &mut recon4);
         let cost4 = (ctx.dist.ssd)(&src_luma[soff..], luma_stride, &recon4, 16, 16, 16);
         let r4 = (out.cbp_luma, out.luma, out.nz_luma);
@@ -932,7 +937,7 @@ fn code_inter_mb_residual(
         out.luma = [[0; 16]; 16];
         out.nz_luma = [0; 16];
         code_luma_8x8(ctx, &mut rec[0], off, &src_luma[soff..], luma_stride, &mut out);
-        let mut recon8 = [0u8; 256];
+        let mut recon8 = [S::default(); 256];
         gather16(&rec[0], off, &mut recon8);
         let cost8 = (ctx.dist.ssd)(&src_luma[soff..], luma_stride, &recon8, 16, 16, 16);
 
@@ -940,7 +945,7 @@ fn code_inter_mb_residual(
         // so the 8x8 candidate cannot be *recorded* even when it wins:
         // both spell the same empty residual, and 4x4 is what a decoder
         // will infer.
-        if placeholder_inter_transform_size(cost4, cost8, ctx.qp) {
+        if placeholder_inter_transform_size(cost4, cost8, ssd_lambda(ctx)) {
             out.transform_8x8 = true;
         } else {
             scatter16(&mut rec[0], off, &recon4);
@@ -962,7 +967,7 @@ fn code_inter_mb_residual(
             let src = &src_chroma[comp][soff..];
             let plane = &mut rec[comp + 1];
             let off = plane.offset(px as isize, py as isize);
-            let qp = ctx.qpc[comp];
+            let qp = ctx.qpc_prime[comp];
             if out.transform_8x8 {
                 // The transform size is the macroblock's, not the plane's:
                 // one `transform_size_8x8_flag` governs all three
@@ -1017,7 +1022,7 @@ fn code_inter_mb_residual(
         let src = &src_chroma[comp][coff..];
         let plane = &mut rec[comp + 1];
         let off = plane.offset(cx as isize, cy as isize);
-        let qp = ctx.qpc[comp];
+        let qp = ctx.qpc_prime[comp];
         let list = 4 + comp; // Cb inter, Cr inter
         let mut dcs = [0i32; 8];
         let mut levels = [[0i16; 16]; 16];
@@ -1126,14 +1131,14 @@ impl InterResidual {
 /// can afford to run the real intra decision and compare rate-distortion
 /// costs; it lives in this one named function so that replacement touches
 /// nothing else.
-pub fn placeholder_inter_or_intra(dist: &DistortionDsp<u8>, inter_satd: u32, src: &[u8], src_stride: usize) -> bool {
-    let mut sum = 0u32;
+pub fn placeholder_inter_or_intra<S: Sample>(dist: &DistortionDsp<S>, inter_satd: u32, src: &[S], src_stride: usize) -> bool {
+    let mut sum = 0i32;
     for y in 0..16 {
         for x in 0..16 {
-            sum += src[y * src_stride + x] as u32;
+            sum += src[y * src_stride + x].to_i32();
         }
     }
-    let flat = [((sum + 128) >> 8) as u8; 16 * PRED_STRIDE];
+    let flat = [S::from_i32((sum + 128) >> 8); 16 * PRED_STRIDE];
     let intra_proxy = (dist.satd)(src, src_stride, &flat, PRED_STRIDE, 16, 16);
     intra_proxy < inter_satd
 }
@@ -1150,15 +1155,15 @@ pub fn placeholder_inter_or_intra(dist: &DistortionDsp<u8>, inter_satd: u32, src
 /// On [`InterMbKind::UseIntra`] the reconstruction planes are untouched:
 /// the caller runs the intra decision, which writes them itself.
 #[allow(clippy::too_many_arguments)]
-pub fn code_macroblock_p(
-    ctx: &MeCtx,
-    rec: &mut [Recon],
-    refp: &[Recon],
+pub fn code_macroblock_p<S: Sample>(
+    ctx: &MeCtx<S>,
+    rec: &mut [Recon<S>],
+    refp: &[Recon<S>],
     mb_x: usize,
     mb_y: usize,
-    src_luma: &[u8],
+    src_luma: &[S],
     luma_stride: usize,
-    src_chroma: [&[u8]; 2],
+    src_chroma: [&[S]; 2],
     chroma_stride: usize,
     st: &mut MbMotionState,
 ) -> InterDecision {
@@ -1265,14 +1270,14 @@ struct Trial {
 /// committed into `st` before returning, so the *next* rectangle predicts
 /// from it exactly as a decoder would.
 #[allow(clippy::too_many_arguments)]
-fn search_and_commit(
-    ctx: &MeCtx,
-    refp: &[Recon],
+fn search_and_commit<S: Sample>(
+    ctx: &MeCtx<S>,
+    refp: &[Recon<S>],
     st: &mut MbMotionState,
     px: usize,
     py: usize,
     rect: (usize, usize, usize, usize),
-    src_luma: &[u8],
+    src_luma: &[S],
     luma_stride: usize,
     mvs: &mut [Mv; 16],
     mvds: &mut [Mv; 16],
@@ -1307,14 +1312,14 @@ fn search_and_commit(
 
 /// Search one of the fixed shapes — 16x16, 16x8, 8x16.
 #[allow(clippy::too_many_arguments)]
-fn trial_fixed(
-    ctx: &MeCtx,
-    refp: &[Recon],
+fn trial_fixed<S: Sample>(
+    ctx: &MeCtx<S>,
+    refp: &[Recon<S>],
     st: &mut MbMotionState,
     kind: InterMbKind,
     px: usize,
     py: usize,
-    src_luma: &[u8],
+    src_luma: &[S],
     luma_stride: usize,
 ) -> Trial {
     st.reset_mb();
@@ -1335,7 +1340,7 @@ fn trial_fixed(
         t.rects[t.n_rects] = rect;
         t.n_rects += 1;
     }
-    t.cost = placeholder_partition_cost(kind, &t.sub_shape, t.satd, &t.mvds, &t.rects, t.n_rects, ctx.qp);
+    t.cost = placeholder_partition_cost(kind, &t.sub_shape, t.satd, &t.mvds, &t.rects, t.n_rects, satd_lambda(ctx));
     t
 }
 
@@ -1348,13 +1353,13 @@ fn trial_fixed(
 /// shapes are tried against each other and the cheapest kept, which means
 /// re-deriving that partition's rectangles once the winner is known.
 #[allow(clippy::too_many_arguments)]
-fn trial_8x8(
-    ctx: &MeCtx,
-    refp: &[Recon],
+fn trial_8x8<S: Sample>(
+    ctx: &MeCtx<S>,
+    refp: &[Recon<S>],
     st: &mut MbMotionState,
     px: usize,
     py: usize,
-    src_luma: &[u8],
+    src_luma: &[S],
     luma_stride: usize,
 ) -> Trial {
     st.reset_mb();
@@ -1388,7 +1393,7 @@ fn trial_8x8(
                     ctx, refp, st, px, py, rect, src_luma, luma_stride, &mut mvs, &mut mvds,
                 );
             }
-            let cost = placeholder_sub_shape_cost(shape, satd, &mvds, part, ctx.qp);
+            let cost = placeholder_sub_shape_cost(shape, satd, &mvds, part, satd_lambda(ctx));
             if best.as_ref().is_none_or(|b| cost < b.2) {
                 best = Some((shape, satd, cost, mvs, mvds, *st));
             }
@@ -1405,7 +1410,7 @@ fn trial_8x8(
         }
     }
     t.cost = placeholder_partition_cost(
-        InterMbKind::P8x8, &t.sub_shape, t.satd, &t.mvds, &t.rects, t.n_rects, ctx.qp,
+        InterMbKind::P8x8, &t.sub_shape, t.satd, &t.mvds, &t.rects, t.n_rects, satd_lambda(ctx),
     );
     t
 }
@@ -1423,7 +1428,7 @@ fn placeholder_sub_shape_cost(
     satd: u32,
     mvds: &[Mv; 16],
     part: usize,
-    qp: i32,
+    lam: f32,
 ) -> f32 {
     let mut bits = match shape {
         SubMbShape::S8x8 => 1.0,
@@ -1436,7 +1441,7 @@ fn placeholder_sub_shape_cost(
         let m = mvds[(y / 4) * 4 + x / 4];
         bits += se_bits(m.x) + se_bits(m.y);
     }
-    satd as f32 + lambda(qp) * bits
+    satd as f32 + lam * bits
 }
 
 /// The bits an `se(v)` of this value costs — the exact CAVLC length, and
@@ -1465,6 +1470,11 @@ fn se_bits(v: i16) -> f32 {
 /// What it still does not have — as with every other decision here — is a
 /// rate term for the *residual*, which is the other half of what
 /// splitting buys. One function, one comparison.
+///
+/// `lam` is the multiplier in SATD units at the picture's depth
+/// ([`satd_lambda`]), which is what makes the bit prices here hold at
+/// 10 bits — a SATD there is four times the 8-bit one for the same
+/// content, a bit is not.
 #[allow(clippy::too_many_arguments)]
 fn placeholder_partition_cost(
     kind: InterMbKind,
@@ -1473,7 +1483,7 @@ fn placeholder_partition_cost(
     mvds: &[Mv; 16],
     rects: &[(usize, usize, usize, usize); 16],
     n_rects: usize,
-    qp: i32,
+    lam: f32,
 ) -> f32 {
     // `mb_type`: two bins for 16x16 and for P_8x8, three for the
     // two-partition shapes; plus P_8x8's four `sub_mb_type`s.
@@ -1496,7 +1506,7 @@ fn placeholder_partition_cost(
         let m = mvds[(y / 4) * 4 + x / 4];
         bits += se_bits(m.x) + se_bits(m.y);
     }
-    satd as f32 + lambda(qp) * bits
+    satd as f32 + lam * bits
 }
 
 // ---------------------------------------------------------------------------
@@ -1839,22 +1849,22 @@ pub fn spatial_direct(
 /// is priced before one of them is committed. `src` is the source at the
 /// rectangle's own corner.
 #[allow(clippy::too_many_arguments)]
-fn rect_satd(
-    ctx: &MeCtx,
-    refs: [&[Recon]; 2],
+fn rect_satd<S: Sample>(
+    ctx: &MeCtx<S>,
+    refs: [&[Recon<S>]; 2],
     x: i32,
     y: i32,
     w: usize,
     h: usize,
-    src: &[u8],
+    src: &[S],
     src_stride: usize,
     used: [bool; 2],
     mv: [Mv; 2],
 ) -> u32 {
-    let mut a = [0u8; 16 * PRED_STRIDE];
+    let mut a = [S::default(); 16 * PRED_STRIDE];
     if used[0] && used[1] {
-        let mut b = [0u8; 16 * PRED_STRIDE];
-        let mut c = [0u8; 16 * PRED_STRIDE];
+        let mut b = [S::default(); 16 * PRED_STRIDE];
+        let mut c = [S::default(); 16 * PRED_STRIDE];
         luma_pred_into(ctx, &refs[0][0], x, y, mv[0], w, h, &mut a);
         luma_pred_into(ctx, &refs[1][0], x, y, mv[1], w, h, &mut b);
         (ctx.dsp.avg)(&mut c, PRED_STRIDE, &a, &b, w, h);
@@ -1874,12 +1884,12 @@ fn rect_satd(
 /// sum is the same number the whole-macroblock SATD gave: the metric
 /// tiles by 4x4, so a 16x16 SATD *is* the sum of its four 8x8 SATDs.
 #[allow(clippy::too_many_arguments)]
-fn b_luma_satd(
-    ctx: &MeCtx,
-    refs: [&[Recon]; 2],
+fn b_luma_satd<S: Sample>(
+    ctx: &MeCtx<S>,
+    refs: [&[Recon<S>]; 2],
     px: i32,
     py: i32,
-    src: &[u8],
+    src: &[S],
     src_stride: usize,
     used: [bool; 2],
     mv: &[[Mv; 2]; 4],
@@ -1968,18 +1978,18 @@ impl BTrial {
 /// the macroblock's position and the source plane. Bundled because the
 /// trials below are a tree of small functions that would otherwise each
 /// take these seven arguments.
-struct BSearch<'a, 'b> {
-    ctx: &'b MeCtx<'a>,
-    refs: [&'b [Recon]; 2],
+struct BSearch<'a, 'b, S: Sample> {
+    ctx: &'b MeCtx<'a, S>,
+    refs: [&'b [Recon<S>]; 2],
     px: usize,
     py: usize,
-    src_luma: &'b [u8],
+    src_luma: &'b [S],
     luma_stride: usize,
 }
 
-impl BSearch<'_, '_> {
+impl<S: Sample> BSearch<'_, '_, S> {
     /// The source at macroblock offset `(x, y)`.
-    fn src_at(&self, x: usize, y: usize) -> &[u8] {
+    fn src_at(&self, x: usize, y: usize) -> &[S] {
         &self.src_luma[(self.py + y) * self.luma_stride + self.px + x..]
     }
 
@@ -2045,10 +2055,10 @@ fn mvd_bits(used: [bool; 2], mvd: [Mv; 2]) -> f32 {
 /// partition is committed with exactly the lists it uses before the next
 /// one is searched. Nothing is approximated: the differences recorded
 /// are against the predictors the replay will derive.
-fn trial_b_fixed(s: &BSearch, st: &mut MbMotionState, kind: BMbKind) -> BTrial {
+fn trial_b_fixed<S: Sample>(s: &BSearch<S>, st: &mut MbMotionState, kind: BMbKind) -> BTrial {
     st.reset_mb();
     let mut t = BTrial::new(kind);
-    let qp = s.ctx.qp;
+    let lam = satd_lambda(s.ctx);
     let mut bits = 0.0f32;
     for &rect in mb_partitions(kind.dec_kind()) {
         let (x, y, w, h) = rect;
@@ -2061,7 +2071,7 @@ fn trial_b_fixed(s: &BSearch, st: &mut MbMotionState, kind: BMbKind) -> BTrial {
             let used = lists_of(dir);
             let satd = s.satd(rect, used, mv);
             let b = mvd_bits(used, mvd);
-            let cost = satd as f32 + lambda(qp) * b;
+            let cost = satd as f32 + lam * b;
             if best.is_none_or(|bst| cost < bst.2) {
                 best = Some((dir, satd, cost, b));
             }
@@ -2080,7 +2090,7 @@ fn trial_b_fixed(s: &BSearch, st: &mut MbMotionState, kind: BMbKind) -> BTrial {
         st.commit_part(x, y, w, h, [used[0].then_some(m0), used[1].then_some(m1)]);
     }
     let decision = BDecision { kind, dir: t.dir, ..BDecision::default() };
-    t.cost = t.satd as f32 + lambda(qp) * (b_mb_type_bins(decision.mb_type()) + bits);
+    t.cost = t.satd as f32 + lam * (b_mb_type_bins(decision.mb_type()) + bits);
     t
 }
 
@@ -2100,14 +2110,14 @@ fn trial_b_fixed(s: &BSearch, st: &mut MbMotionState, kind: BMbKind) -> BTrial {
 /// `direct` is the macroblock's spatial direct motion, per 8x8, which a
 /// `B_Direct_8x8` sub-macroblock takes unchanged: the derivation reads no
 /// block inside the macroblock (see [`spatial_direct`]).
-fn trial_b_8x8(
-    s: &BSearch,
+fn trial_b_8x8<S: Sample>(
+    s: &BSearch<S>,
     st: &mut MbMotionState,
     direct: &([i8; 2], [[Mv; 2]; 4]),
 ) -> BTrial {
     st.reset_mb();
     let mut t = BTrial::new(BMbKind::B8x8);
-    let qp = s.ctx.qp;
+    let lam = satd_lambda(s.ctx);
     let (dref, dmv) = direct;
     let dused = [dref[0] >= 0, dref[1] >= 0];
     let ddir = (dused[0] as u8) * PRED_L0 + (dused[1] as u8) * PRED_L1;
@@ -2132,7 +2142,7 @@ fn trial_b_8x8(
             SubMbShape::Direct,
             ddir,
             dsatd,
-            dsatd as f32 + lambda(qp) * b_sub_mb_type_bins(0),
+            dsatd as f32 + lam * b_sub_mb_type_bins(0),
             b_sub_mb_type_bins(0),
             cand,
             after,
@@ -2177,7 +2187,7 @@ fn trial_b_8x8(
                         [used[0].then_some(mv[0]), used[1].then_some(mv[1])],
                     );
                 }
-                let cost = satd as f32 + lambda(qp) * b;
+                let cost = satd as f32 + lam * b;
                 if cost < best.3 {
                     best = (shape, dir, satd, cost, b, cand, *st);
                 }
@@ -2200,7 +2210,7 @@ fn trial_b_8x8(
             }
         }
     }
-    t.cost = t.satd as f32 + lambda(qp) * (b_mb_type_bins(22) + bits);
+    t.cost = t.satd as f32 + lam * (b_mb_type_bins(22) + bits);
     t
 }
 
@@ -2230,15 +2240,15 @@ fn trial_b_8x8(
 /// On [`BMbKind::UseIntra`] the reconstruction planes are untouched: the
 /// caller runs the intra decision, which writes them itself.
 #[allow(clippy::too_many_arguments)]
-pub fn code_macroblock_b(
-    ctx: &MeCtx,
-    rec: &mut [Recon],
-    refs: [&[Recon]; 2],
+pub fn code_macroblock_b<S: Sample>(
+    ctx: &MeCtx<S>,
+    rec: &mut [Recon<S>],
+    refs: [&[Recon<S>]; 2],
     mb_x: usize,
     mb_y: usize,
-    src_luma: &[u8],
+    src_luma: &[S],
     luma_stride: usize,
-    src_chroma: [&[u8]; 2],
+    src_chroma: [&[S]; 2],
     chroma_stride: usize,
     st: &mut MbMotionState,
     col: &PicMotion,
@@ -2262,7 +2272,7 @@ pub fn code_macroblock_b(
         dtrial.fill(sub_partition_rect(part, SubMbShape::S8x8, 0), dused, dmv[part], [Mv::ZERO; 2]);
     }
     dtrial.satd = dsatd;
-    dtrial.cost = dsatd as f32 + lambda(ctx.qp) * b_mb_type_bins(0);
+    dtrial.cost = dsatd as f32 + satd_lambda(ctx) * b_mb_type_bins(0);
 
     let s = BSearch { ctx, refs, px, py, src_luma, luma_stride };
     let best: BTrial = if !ctx.subparts {
@@ -2445,7 +2455,7 @@ mod tests {
                 dequant: Dequant::new(&flat()),
             }
         }
-        fn ctx(&self, qp: i32) -> MeCtx<'_> {
+        fn ctx(&self, qp: i32) -> MeCtx<'_, u8> {
             MeCtx {
                 dsp: &self.dsp,
                 enc: &self.enc,
@@ -2454,6 +2464,10 @@ mod tests {
                 dequant: &self.dequant,
                 qp,
                 qpc: [qp, qp],
+                qp_prime: qp,
+                qpc_prime: [qp, qp],
+                bit_depth: 8,
+                max: 255,
                 chroma_h: 8,
                 c444: false,
                 t8x8: false,
@@ -2488,7 +2502,7 @@ mod tests {
     /// is asserted with the predictor seeded at the truth, which is how
     /// large motion is actually found in a picture walk — by neighbour
     /// propagation, not by heroic walks from zero.
-    fn grating_plane(w: usize, h: usize, pad: usize) -> Recon {
+    fn grating_plane(w: usize, h: usize, pad: usize) -> Recon<u8> {
         let mut p = recon_plane(w as u32, h as u32, pad);
         let o = p.origin();
         for y in 0..h {
@@ -2505,7 +2519,7 @@ mod tests {
     /// Reference planes (luma + 2 chroma) for a 3x3-macroblock picture.
     /// Chroma is never scored by the search, so any structured content
     /// does; only the luma needs [`grating_plane`]'s convergence property.
-    fn reference() -> Vec<Recon> {
+    fn reference() -> Vec<Recon<u8>> {
         let y = grating_plane(48, 48, LUMA_PAD);
         let mut cb = recon_plane(24, 24, CHROMA_PAD);
         let mut cr = recon_plane(24, 24, CHROMA_PAD);
@@ -2525,7 +2539,7 @@ mod tests {
     /// The luma source picture that is `refp` translated by `mv` (quarter
     /// samples), generated through the decoder's own kernels so that the
     /// prediction at `mv` is bit-identical to the source by construction.
-    fn translated_luma(refp: &Recon, mv: Mv) -> Vec<u8> {
+    fn translated_luma(refp: &Recon<u8>, mv: Mv) -> Vec<u8> {
         let (w, h) = (refp.width, refp.height);
         let mut src = vec![0u8; w * h];
         let dsp = H264Dsp::<u8>::new(Cpu::SCALAR);
@@ -2549,7 +2563,7 @@ mod tests {
     /// `mv`, generated straight from clause 8.4.2.2.2's position formula
     /// and the decoder's bilinear kernel — independently of
     /// `chroma_pred_into`, whose derivation it therefore checks.
-    fn translated_chroma(refp: &Recon, mv: Mv) -> Vec<u8> {
+    fn translated_chroma(refp: &Recon<u8>, mv: Mv) -> Vec<u8> {
         let (w, h) = (refp.width, refp.height);
         let mut src = vec![0u8; w * h];
         let dsp = H264Dsp::<u8>::new(Cpu::SCALAR);
@@ -2569,7 +2583,7 @@ mod tests {
     }
 
     /// Fresh (zeroed) reconstruction planes matching [`reference`].
-    fn fresh_rec() -> Vec<Recon> {
+    fn fresh_rec() -> Vec<Recon<u8>> {
         vec![
             recon_plane(48, 48, LUMA_PAD),
             recon_plane(24, 24, CHROMA_PAD),
@@ -2639,9 +2653,9 @@ mod tests {
     /// motion state rather than on the decision, because a macroblock
     /// no longer has just the one.
     fn code_centre(
-        ctx: &MeCtx,
-        rec: &mut [Recon],
-        refp: &[Recon],
+        ctx: &MeCtx<u8>,
+        rec: &mut [Recon<u8>],
+        refp: &[Recon<u8>],
         srcy: &[u8],
         srcc: [&[u8]; 2],
         st: &mut MbMotionState,

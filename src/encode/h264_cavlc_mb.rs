@@ -37,6 +37,7 @@ use crate::encode::h264_syntax::{Geometry, Plane, Recon};
 use crate::h264::cavlc::{SCAN8_SUB, SCAN_CHROMA_DC, part_index_of, write_residual_block_cavlc};
 use crate::h264::mb::SubMbShape;
 use crate::h264::mb::raster_of_blk;
+use crate::sample::Sample;
 use crate::h264::tables::{
     GOLOMB_TO_INTER_CBP, GOLOMB_TO_INTER_CBP_GRAY, GOLOMB_TO_INTRA4X4_CBP,
     GOLOMB_TO_INTRA4X4_CBP_GRAY, SCAN_CHROMA_DC_422, ZIGZAG4X4,
@@ -592,13 +593,13 @@ fn write_mb_residual(
 /// until something adapts the quantiser. Refuses nothing at run time: the
 /// caller keeps 4:4:4 and lossless on the PCM path, and a `debug_assert`
 /// holds the door.
-pub fn write_intra_picture(
+pub fn write_intra_picture<S: Sample>(
     w: &mut BitWriter,
     g: &Geometry,
-    tools: &IntraTools,
+    tools: &IntraTools<S>,
     qp: u8,
-    planes: &[Plane<'_>],
-    rec: &mut [Recon],
+    planes: &[Plane<'_, S>],
+    rec: &mut [Recon<S>],
 ) -> PicMotion {
     let mbs_wide = g.mbs_wide as usize;
     let rows = if g.chroma == crate::picture::ChromaFormat::Yuv444 { 0 } else { g.chroma_mb().1 as usize / 4 };
@@ -619,14 +620,14 @@ pub fn write_intra_picture(
 /// `refp` is the reference picture's reconstruction, borders already
 /// replicated ([`crate::encode::h264_me::prepare_reference`]); exactly one
 /// reference is active, which is why no `ref_idx` is ever written.
-pub fn write_p_picture(
+pub fn write_p_picture<S: Sample>(
     w: &mut BitWriter,
     g: &Geometry,
-    tools: &IntraTools,
+    tools: &IntraTools<S>,
     qp: u8,
-    planes: &[Plane<'_>],
-    rec: &mut [Recon],
-    refp: &[Recon],
+    planes: &[Plane<'_, S>],
+    rec: &mut [Recon<S>],
+    refp: &[Recon<S>],
 ) -> PicMotion {
     let mbs_wide = g.mbs_wide as usize;
     let rows = if g.chroma == crate::picture::ChromaFormat::Yuv444 { 0 } else { g.chroma_mb().1 as usize / 4 };
@@ -760,14 +761,14 @@ fn write_b_macroblock(
 /// bookkeeping as P — and keeps the `nC` state. Returns the picture's
 /// motion record for the caller's reference bookkeeping.
 #[allow(clippy::too_many_arguments)]
-pub fn write_b_picture(
+pub fn write_b_picture<S: Sample>(
     w: &mut BitWriter,
     g: &Geometry,
-    tools: &IntraTools,
+    tools: &IntraTools<S>,
     qp: u8,
-    planes: &[Plane<'_>],
-    rec: &mut [Recon],
-    refs: [&[Recon]; 2],
+    planes: &[Plane<'_, S>],
+    rec: &mut [Recon<S>],
+    refs: [&[Recon<S>]; 2],
     col: &PicMotion,
 ) -> PicMotion {
     let mbs_wide = g.mbs_wide as usize;
@@ -1125,7 +1126,7 @@ mod tests {
     #[test]
     fn a_444_intra_macroblock_round_trips_through_the_reader() {
         use crate::h264::frame::LUMA_PAD;
-        let tools = IntraTools::new(false, false);
+        let tools = IntraTools::<u8>::new(false, false, 8);
         let mut seed = 77u32;
         let mut lcg = move || -> u8 {
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
@@ -1141,6 +1142,10 @@ mod tests {
                 dequant: &tools.dequant,
                 qp: qp as i32,
                 qpc: [qpc; 2],
+                qp_prime: qp as i32,
+                qpc_prime: [qpc; 2],
+                bit_depth: 8,
+                max: 255,
                 chroma_h: 16,
                 c444: true,
                 t8x8: false,
@@ -1390,7 +1395,7 @@ mod tests {
     /// residual), across the QP range.
     #[test]
     fn coded_macroblocks_round_trip_through_the_reader() {
-        let tools = IntraTools::new(false, false);
+        let tools = IntraTools::<u8>::new(false, false, 8);
         let fill = |f: &mut dyn FnMut(usize, usize) -> u8| {
             let mut y = vec![0u8; 16 * 16];
             for r in 0..16 {
@@ -1431,6 +1436,10 @@ mod tests {
                     dequant: &tools.dequant,
                     qp: qp as i32,
                     qpc: [qpc; 2],
+                    qp_prime: qp as i32,
+                    qpc_prime: [qpc; 2],
+                    bit_depth: 8,
+                    max: 255,
                     chroma_h: 8,
                     c444: false,
                     t8x8: false,
@@ -1465,7 +1474,7 @@ mod tests {
     /// in the 8x8's raster and not in four separate ones.
     #[test]
     fn coded_8x8_macroblocks_round_trip_through_the_reader() {
-        let tools = IntraTools::new(true, false);
+        let tools = IntraTools::<u8>::new(true, false, 8);
         let mut seed = 0x8080_8080u32;
         let mut lcg = move |x: usize, y: usize| -> u8 {
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223 ^ ((x * 31 + y) as u32));
@@ -1496,6 +1505,10 @@ mod tests {
                     dequant: &tools.dequant,
                     qp: qp as i32,
                     qpc: [qpc; 2],
+                    qp_prime: qp as i32,
+                    qpc_prime: [qpc; 2],
+                    bit_depth: 8,
+                    max: 255,
                     chroma_h,
                     c444,
                     t8x8: true,

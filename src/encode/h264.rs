@@ -10,29 +10,72 @@
 //! # State of it
 //!
 //! Configuration, picture typing and coding order, the access-unit envelope,
-//! and real compression on both picture types through both entropy coders:
-//! intra and P pictures go through prediction, transform, quantisation and
-//! the loop filter, decided once in the shared walks of
+//! and real compression on every picture type through both entropy coders:
+//! intra, P and B pictures go through prediction, transform, quantisation
+//! and the loop filter, decided once in the shared walks of
 //! [`super::h264_pic`] and spelled by the CAVLC
 //! ([`super::h264_cavlc_mb`]) or CABAC ([`super::h264_cabac_mb`]) writers.
-//! What still codes as `I_PCM` does so for a stated reason each —
-//! lossless, because PCM *is* the exact mode and the transform path is
-//! lossy; and 4:4:4, which the intra coder does not cover yet. B pictures
-//! are all-skip — and so are the P pictures of a stream that *has* B
-//! pictures, because an all-skip B assumes zero motion in its colocated
-//! picture (see `transform_p` below). `tools/verify_encode.sh` reports
-//! each hole as what it is, which is the honest state: the plumbing is
-//! proven and every hole has a name.
+//! What still codes as `I_PCM` does so for a stated reason: lossless,
+//! because PCM *is* the exact mode and the transform path is lossy — and
+//! the inter pictures of a lossless stream are all-skip, because a
+//! lossless inter picture has no exact spelling but PCM either.
+//!
+//! # Sample depth
+//!
+//! Eight to fourteen bits, the decoder's own range. [`H264Encoder`] is a
+//! thin face over a private `Core<S>` instantiated at the sample width the
+//! depth needs — `u8` at 8 bits, `u16` above — exactly the split
+//! [`super::h265::H265Encoder`] makes and the decoder makes on reading the
+//! SPS. Everything below the face is generic: the decision walks, the
+//! predictors and kernels (`H264Dsp<S>`, the decoder's), the writers. What
+//! the depth changes is spelled in one place each — `QP'` for the scaling
+//! tables ([`super::h264_intra::IntraCtx::qp_prime`]), the lambda scales
+//! (`satd_lambda` / `ssd_lambda` beside it), the PCM sample width, the SPS
+//! depth fields and profile, and the loop filter's thresholds (which
+//! `deblock_mb_rows` scales itself from the frame's depth) — and an 8-bit
+//! stream is byte for byte what it was before any of it existed.
 
 use super::gop::{Coded, Kind, Scheduler};
 use super::rc::{PicKind, RateController};
 use super::h264_syntax as syn;
 use super::{Access, Config, Entropy, RateControl};
 use crate::bitwriter::BitWriter;
+use crate::sample::Sample;
 use crate::{Error, Result};
 
 /// H.264 encoder. See the module documentation for what is and is not built.
+///
+/// A thin face over the private `Core<S>`, instantiated at the sample
+/// width the configuration's bit depth needs. Pictures cross this face as
+/// bytes in both directions, in the layout [`crate::Picture::into_packed`]
+/// uses: one byte per sample at 8 bits, little-endian `u16` pairs deeper —
+/// so a source picture and the decoder's output of it compare byte for
+/// byte at every depth, which is what the SELF check reads.
+/// [`H264Encoder::frame_bytes`] says how many.
 pub struct H264Encoder {
+    inner: Inner,
+}
+
+/// The two sample widths an encoder can be built at.
+enum Inner {
+    /// 8-bit samples.
+    Eight(Core<u8>),
+    /// 9 to 14 bits.
+    Wide(Core<u16>),
+}
+
+/// Run one expression against whichever width the encoder was built at.
+macro_rules! with_core {
+    ($inner:expr, $e:ident => $body:expr) => {
+        match $inner {
+            Inner::Eight($e) => $body,
+            Inner::Wide($e) => $body,
+        }
+    };
+}
+
+/// The encoder proper, at one sample width.
+struct Core<S: Sample> {
     cfg: Config,
     sched: Scheduler,
     /// The rate controller, when the configuration asked for a bitrate.
@@ -43,9 +86,11 @@ pub struct H264Encoder {
     emitted: u64,
     /// Source pictures held in display order, indexed by display position, so
     /// that a B picture held back by the scheduler still has its samples when
-    /// its anchor arrives.
-    held: std::collections::BTreeMap<u64, Vec<u8>>,
-    /// Reconstructions, in coding order, for the SELF check.
+    /// its anchor arrives — already unpacked from the caller's bytes into
+    /// samples, so the coding paths never see a byte layout.
+    held: std::collections::BTreeMap<u64, Vec<S>>,
+    /// Reconstructions, in coding order, for the SELF check — packed as
+    /// the source pictures were handed in.
     recon: Vec<Vec<u8>>,
     frame_bytes: usize,
     /// Display index of the next picture offered. Counted here rather than
@@ -69,14 +114,14 @@ pub struct H264Encoder {
     /// spatial direct derivation reads as colocated motion, at whatever
     /// granularity 8.4.1.2.1 asks for — which is why it is stored whole
     /// rather than summarised.
-    refs: Vec<(i32, Vec<syn::Recon>, super::h264_pic::PicMotion)>,
+    refs: Vec<(i32, Vec<syn::Recon<S>>, super::h264_pic::PicMotion)>,
     /// `frame_num`, which counts *reference* pictures and wraps.
     frame_num: u32,
     idr_pic_id: u32,
     /// Plane sizes of one source picture, derived once.
     plane_dims: Vec<(u32, u32)>,
     /// Kernels and derived tables for the transform intra path, built once.
-    tools: super::h264_pic::IntraTools,
+    tools: super::h264_pic::IntraTools<S>,
     /// The quantiser the PPS declares, for the whole stream. Every slice
     /// carries its own as a delta against it — see `code_picture` for why
     /// the PPS must not follow the picture.
@@ -105,15 +150,15 @@ pub struct H264Encoder {
 /// and above all not as the reference the next picture predicts from.
 ///
 /// `code_attempt` takes `&self` and so *cannot* write: every per-picture
-/// write lives in [`H264Encoder::commit`], which runs only for an attempt
-/// that is kept. That is the claim the byte-identity of every non-buffer
-/// stream rests on, enforced by the borrow checker rather than by care.
-struct Attempt {
+/// write lives in `Core::commit`, which runs only for an attempt that is
+/// kept. That is the claim the byte-identity of every non-buffer stream
+/// rests on, enforced by the borrow checker rather than by care.
+struct Attempt<S: Sample> {
     access: Access,
-    /// The reconstruction, cropped to display size.
+    /// The reconstruction, cropped to display size and packed to bytes.
     rec: Vec<u8>,
     /// The reconstruction at coded size, borders not yet replicated.
-    recon: Vec<syn::Recon>,
+    recon: Vec<syn::Recon<S>>,
     /// The picture's motion in the decoder's layout.
     motion: super::h264_pic::PicMotion,
 }
@@ -177,17 +222,79 @@ impl H264Encoder {
     /// Fails rather than starting if the configuration cannot produce a legal
     /// stream — an encoder that fails late has usually already emitted a
     /// header describing something it then cannot deliver.
+    ///
+    /// The bit depth picks the sample width once, here: 8 bits codes in
+    /// `u8`, anything deeper in `u16`, exactly as [`crate::h264::H264Decoder`]
+    /// chooses on reading the SPS. `Config::validate` bounds the depth to
+    /// the 8..=14 both decoders admit.
     pub fn new(cfg: Config) -> Result<Self> {
         cfg.validate()?;
-        if cfg.bit_depth > 8 {
-            // The reconstruction planes are u8, so anything deeper would be
-            // silently truncated. The decoder handles 8 to 14 and this must
-            // too, but a narrowed stream that looks legal is worse than a
-            // refusal that names itself.
-            return Err(Error::unsupported(
-                "H.264 encode: bit depth above 8 (encoder in progress)",
-            ));
-        }
+        let inner = if cfg.bit_depth > 8 { Inner::Wide(Core::new(cfg)?) } else { Inner::Eight(Core::new(cfg)?) };
+        Ok(H264Encoder { inner })
+    }
+
+    /// How many extra codings the declared buffer cost. Zero when no
+    /// buffer was declared, because then nothing can fail to fit.
+    pub fn recodes(&self) -> u64 {
+        with_core!(&self.inner, e => e.recoded)
+    }
+
+    /// How many bytes one source picture must be: one per sample at 8
+    /// bits, two (little-endian) deeper.
+    pub fn frame_bytes(&self) -> usize {
+        with_core!(&self.inner, e => e.frame_bytes)
+    }
+
+    /// Which macroblock kinds the pictures coded so far took, per picture
+    /// type.
+    pub fn shape_census(&self) -> &ShapeCensus {
+        with_core!(&self.inner, e => &e.census)
+    }
+
+    /// The reconstructions produced so far, in coding order, packed as
+    /// the source pictures were handed in (see [`H264Encoder`]). The SELF
+    /// property compares these against decoding the bitstream.
+    pub fn reconstructions(&self) -> &[Vec<u8>] {
+        with_core!(&self.inner, e => &e.recon)
+    }
+
+    /// Offer the next picture in display order. Returns whatever became
+    /// codable — nothing when the picture is a B held for its anchor, several
+    /// when an anchor releases the Bs behind it.
+    pub fn push(&mut self, picture: &[u8]) -> Result<Vec<Access>> {
+        with_core!(&mut self.inner, e => e.push(picture))
+    }
+
+    /// Code everything still held back.
+    pub fn flush(&mut self) -> Result<Vec<Access>> {
+        with_core!(&mut self.inner, e => e.flush())
+    }
+
+    /// Make the next picture pushed an IDR, restarting the GOP there. See
+    /// [`Scheduler::force_idr`] for who needs this and what it does to any
+    /// B pictures held back at the time.
+    pub fn force_idr(&mut self) {
+        with_core!(&mut self.inner, e => e.sched.force_idr())
+    }
+
+    /// What the rate controller achieved against what it was asked for,
+    /// in bits per second — `None` at a constant quantiser. Reported by the
+    /// encoder rather than recomputed by whoever is watching, for the
+    /// reason given on the H.265 side: one division, in one place.
+    pub fn rate_report(&self) -> Option<(f64, f64)> {
+        with_core!(&self.inner, e => e.rate_report())
+    }
+
+    /// The quantiser this picture is coded at, before any adaptive
+    /// adjustment. Lossless is signalled separately, so it has no QP of its
+    /// own and reports the lowest.
+    pub fn picture_qp(&self, kind: Kind) -> u8 {
+        with_core!(&self.inner, e => e.picture_qp(kind))
+    }
+}
+
+impl<S: Sample> Core<S> {
+    fn new(cfg: Config) -> Result<Self> {
         if cfg.sao {
             // Not "in progress": H.264 has no sample adaptive offset at
             // all. Refusing names that rather than silently ignoring a
@@ -204,7 +311,7 @@ impl H264Encoder {
             2 * (cfg.width as usize).div_ceil(sw as usize)
                 * (cfg.height as usize).div_ceil(sh as usize)
         };
-        let bps = if cfg.bit_depth > 8 { 2 } else { 1 };
+        debug_assert_eq!(S::BYTES, if cfg.bit_depth > 8 { 2 } else { 1 }, "the face picks the width");
         let sched = Scheduler::new(cfg.gop, cfg.bframes);
         let mut cfg = cfg;
         // A stream with B pictures keeps two marked references — the two
@@ -229,7 +336,7 @@ impl H264Encoder {
             plane_dims.push((cw, chh));
             plane_dims.push((cw, chh));
         }
-        let tools = super::h264_pic::IntraTools::new(cfg.transform_8x8, cfg.subparts);
+        let tools = super::h264_pic::IntraTools::new(cfg.transform_8x8, cfg.subparts, cfg.bit_depth);
         // The buffer to declare, snapped to what the syntax can carry —
         // the same rules, and the same refusals, as the H.265 side.
         let cpb = match (cfg.cpb_ms, cfg.rate) {
@@ -275,7 +382,7 @@ impl H264Encoder {
             pps_qp,
             held: std::collections::BTreeMap::new(),
             recon: Vec::new(),
-            frame_bytes: (luma + chroma) * bps,
+            frame_bytes: (luma + chroma) * S::BYTES,
             next_display: 0,
             geom,
             refs: Vec::new(),
@@ -290,33 +397,8 @@ impl H264Encoder {
         })
     }
 
-    /// How many extra codings the declared buffer cost. Zero when no
-    /// buffer was declared, because then nothing can fail to fit.
-    pub fn recodes(&self) -> u64 {
-        self.recoded
-    }
-
-    /// How many bytes one source picture must be.
-    pub fn frame_bytes(&self) -> usize {
-        self.frame_bytes
-    }
-
-    /// Which macroblock kinds the pictures coded so far took, per picture
-    /// type.
-    pub fn shape_census(&self) -> &ShapeCensus {
-        &self.census
-    }
-
-    /// The reconstructions produced so far, in coding order. The SELF property
-    /// compares these against decoding the bitstream.
-    pub fn reconstructions(&self) -> &[Vec<u8>] {
-        &self.recon
-    }
-
-    /// Offer the next picture in display order. Returns whatever became
-    /// codable — nothing when the picture is a B held for its anchor, several
-    /// when an anchor releases the Bs behind it.
-    pub fn push(&mut self, picture: &[u8]) -> Result<Vec<Access>> {
+    /// See [`H264Encoder::push`].
+    fn push(&mut self, picture: &[u8]) -> Result<Vec<Access>> {
         if picture.len() != self.frame_bytes {
             return Err(Error::bitstream(format!(
                 "H.264 encode: picture is {} bytes, expected {}",
@@ -324,27 +406,21 @@ impl H264Encoder {
                 self.frame_bytes
             )));
         }
+        let samples = super::unpack_samples::<S>(picture, self.cfg.bit_depth, "H.264")?;
         // Insert before scheduling: the scheduler may release this very
         // picture (every picture is an IDR when `gop` is 0), and `code` looks
         // the samples up by display index.
         let display = self.next_display;
         self.next_display += 1;
-        self.held.insert(display, picture.to_vec());
+        self.held.insert(display, samples);
         let ready = self.sched.push();
         self.code(ready)
     }
 
-    /// Code everything still held back.
-    pub fn flush(&mut self) -> Result<Vec<Access>> {
+    /// See [`H264Encoder::flush`].
+    fn flush(&mut self) -> Result<Vec<Access>> {
         let ready = self.sched.flush();
         self.code(ready)
-    }
-
-    /// Make the next picture pushed an IDR, restarting the GOP there. See
-    /// [`Scheduler::force_idr`] for who needs this and what it does to any
-    /// B pictures held back at the time.
-    pub fn force_idr(&mut self) {
-        self.sched.force_idr();
     }
 
     fn code(&mut self, ready: Vec<Coded>) -> Result<Vec<Access>> {
@@ -385,7 +461,7 @@ impl H264Encoder {
     /// fit and the loop runs exactly once, which is why every stream that
     /// does not ask for a buffer is byte-identical to what it was before
     /// this existed.
-    fn code_picture(&mut self, c: Coded, src: &[u8]) -> Result<Access> {
+    fn code_picture(&mut self, c: Coded, src: &[S]) -> Result<Access> {
         let mut qp = self.pick_picture_qp(&c);
         for attempt in 0..super::rc::MAX_ATTEMPTS {
             let a = self.code_attempt(&c, src, qp)?;
@@ -439,7 +515,7 @@ impl H264Encoder {
     /// headers run on. Every write this encoder makes per picture is here
     /// — `code_attempt` makes none — so a re-coded attempt leaves no
     /// trace.
-    fn commit(&mut self, c: &Coded, a: Attempt) -> Access {
+    fn commit(&mut self, c: &Coded, a: Attempt<S>) -> Access {
         let idr = c.kind == Kind::Idr;
         self.recon.push(a.rec);
         self.census.add(c.kind, &a.motion.info.mbs);
@@ -471,9 +547,9 @@ impl H264Encoder {
     /// Code one picture at a given quantiser, keeping nothing: parameter
     /// sets, the buffer SEI where a buffer is declared, slice header, then
     /// the slice data of whichever path the configuration selects — the
-    /// transform writers (either entropy coder), PCM where exactness or
-    /// 4:4:4 demands it, or the all-skip inter fallback.
-    fn code_attempt(&self, c: &Coded, src: &[u8], qp: u8) -> Result<Attempt> {
+    /// transform writers (either entropy coder), PCM where exactness
+    /// demands it, or the all-skip inter fallback.
+    fn code_attempt(&self, c: &Coded, src: &[S], qp: u8) -> Result<Attempt<S>> {
         let g = self.geom;
         let idr = c.kind == Kind::Idr;
         // Reference lists, by picture order count: list0 runs backwards from
@@ -511,7 +587,7 @@ impl H264Encoder {
         // The same border the decoder gives its own frames, because these
         // planes are the decoder's type and its intra predictors read
         // neighbours out of that border.
-        let mut recon: Vec<syn::Recon> =
+        let mut recon: Vec<syn::Recon<S>> =
             vec![syn::recon_plane(g.coded_width, g.coded_height, crate::h264::frame::LUMA_PAD)];
         if cw != 0 {
             // 4:4:4 chroma is a luma-like plane: its motion compensation
@@ -558,10 +634,7 @@ impl H264Encoder {
         //
         // Whether this picture takes the transform intra path rather than
         // I_PCM. Lossless stays PCM because PCM is the exactly-lossless mode
-        // and the transform path quantises; 4:4:4 stays PCM because
-        // `code_macroblock` has no ChromaArrayType 3 path (chroma coded like
-        // luma, a fourth residual layout); CABAC intra stays PCM until its
-        // macroblock writer exists.
+        // and the transform path quantises.
         // The envelope is about *quantising*, not about which mode picked
         // the quantiser: the transform path quantises, so lossless has to
         // stay PCM, and everything else may use it. It was spelled as
@@ -574,22 +647,13 @@ impl H264Encoder {
         let lossy = !matches!(self.cfg.rate, RateControl::Lossless);
         let transform_intra = idr && lossy;
         // Whether a P picture takes the motion-search path rather than
-        // all-skip. The same envelope as the intra transform path, plus
-        // `bframes == 0`: a stream with B pictures must keep its P motion
-        // zero, because the all-skip B reconstruction below assumes the
-        // colocated picture's motion is zero — temporal direct reads the
-        // future reference's vectors, and a B_Skip over a P with real
-        // motion reconstructs *from those vectors* in a decoder. Coding
-        // real B pictures (or replicating direct derivation) lifts this.
+        // all-skip: the same envelope as the intra transform path.
         let transform_p = !idr && c.kind == Kind::P && lossy;
         // B pictures share the envelope: inside it every picture type is
         // transform-coded, so a colocated picture's motion is always the
         // real record the direct derivation needs; outside it everything
         // is PCM or all-skip, where the zero-colocated assumption of the
-        // temporal-direct fallback below still holds. The old bframes==0
-        // hold-back on P is gone for exactly this reason — its ceiling was
-        // the all-skip B reconstruction assuming zero colocated motion,
-        // and real B pictures model colocated motion instead.
+        // temporal-direct fallback below still holds.
         let transform_b = !idr && c.kind == Kind::B && lossy;
         let mut out = Vec::new();
         out.extend_from_slice(&syn::annexb(
@@ -674,7 +738,10 @@ impl H264Encoder {
                     }; 16];
                 }
             }
-            let qpc = crate::h264::mb::chroma_qp(qp as i32, 0, 0) as i8;
+            // The chroma QP as the decoder stores it beside `QP_Y`: the
+            // 8.5.8 map, clipping at `-QpBdOffset_C` below at depth.
+            let bd_off = 6 * (g.bit_depth as i32 - 8);
+            let qpc = crate::h264::mb::chroma_qp(qp as i32, 0, bd_off) as i8;
             for addr in 0..(g.mbs_wide * g.mbs_high) as usize {
                 pm.commit(
                     addr,
@@ -767,8 +834,8 @@ impl H264Encoder {
                 w.rbsp_trailing_bits();
             }
         } else {
-            // Every macroblock skipped — still what B pictures do, and what
-            // P pictures fall back to outside the transform envelope.
+            // Every macroblock skipped — what the inter pictures of a
+            // lossless stream do, since PCM has no inter spelling.
             // `P_Skip` carries no motion vector difference and no residual:
             // the vector is the median prediction of its neighbours, which
             // in an all-skip picture is zero everywhere, so the
@@ -798,7 +865,7 @@ impl H264Encoder {
                     for i in 0..recon.len() {
                         let (a, b) = (&self.refs[p0].1[i].data, &self.refs[p1].1[i].data);
                         for (d, (&x, &y)) in recon[i].data.iter_mut().zip(a.iter().zip(b.iter())) {
-                            *d = ((x as u16 + y as u16 + 1) >> 1) as u8;
+                            *d = S::from_i32((x.to_i32() + y.to_i32() + 1) >> 1);
                         }
                     }
                 }
@@ -861,11 +928,8 @@ impl H264Encoder {
         (past, future)
     }
 
-    /// What the rate controller achieved against what it was asked for,
-    /// in bits per second — `None` at a constant quantiser. Reported by the
-    /// encoder rather than recomputed by whoever is watching, for the
-    /// reason given on the H.265 side: one division, in one place.
-    pub fn rate_report(&self) -> Option<(f64, f64)> {
+    /// See [`H264Encoder::rate_report`].
+    fn rate_report(&self) -> Option<(f64, f64)> {
         let rc = self.rc.as_ref()?;
         let target = match self.cfg.rate {
             RateControl::Bitrate { bps } => bps as f64,
@@ -874,10 +938,8 @@ impl H264Encoder {
         Some((rc.achieved_bps(self.cfg.fps), target))
     }
 
-    /// The quantiser this picture is coded at, before any adaptive
-    /// adjustment. Lossless is signalled separately, so it has no QP of its
-    /// own and reports the lowest.
-    pub fn picture_qp(&self, kind: Kind) -> u8 {
+    /// See [`H264Encoder::picture_qp`].
+    fn picture_qp(&self, kind: Kind) -> u8 {
         match self.cfg.rate {
             // Under a bitrate target the quantiser is not a function of
             // the configuration at all — it is chosen per picture from what
@@ -921,24 +983,10 @@ mod tests {
             let e = H264Encoder::new(cfg(64, 64, chroma, 8)).unwrap();
             let want = (64.0 * 64.0 * per_px) as usize;
             assert_eq!(e.frame_bytes(), want, "{chroma:?}");
-        }
-    }
-
-    /// The decoder handles 8 to 14 bits and this encoder does not yet, because
-    /// its reconstruction planes are u8 and anything deeper would be silently
-    /// narrowed. It must refuse by name rather than emit a stream whose
-    /// samples were truncated on the way through.
-    #[test]
-    fn deeper_than_eight_bits_refuses_rather_than_truncating() {
-        for depth in [10u32, 12, 14] {
-            // A match, not unwrap_err: the Ok side is the encoder itself,
-            // and making it Debug would print whole reconstruction planes.
-            match H264Encoder::new(cfg(64, 64, ChromaFormat::Yuv420, depth)) {
-                Ok(_) => panic!("{depth}-bit was accepted; samples would be truncated"),
-                Err(err) => {
-                    let s = format!("{err}");
-                    assert!(s.contains("bit depth above 8"), "{depth}-bit: {s}");
-                }
+            // Two bytes per sample deeper, whatever the depth.
+            for depth in [10u32, 12, 14] {
+                let e = H264Encoder::new(cfg(64, 64, chroma, depth)).unwrap();
+                assert_eq!(e.frame_bytes(), 2 * want, "{chroma:?} at {depth} bits");
             }
         }
     }
@@ -957,6 +1005,16 @@ mod tests {
         assert!(H264Encoder::new(cfg(64, 64, ChromaFormat::Yuv420, 16)).is_err());
     }
 
+    /// Fifteen bits and up stay refused: `Config::validate` bounds the
+    /// depth to what the decoder admits, and the refusal names the bound.
+    #[test]
+    fn deeper_than_fourteen_bits_refuses() {
+        let Err(err) = H264Encoder::new(cfg(64, 64, ChromaFormat::Yuv420, 15)) else {
+            panic!("15-bit was accepted")
+        };
+        assert!(format!("{err}").contains("bit depth outside 8..=14"), "{err}");
+    }
+
     #[test]
     fn a_wrong_sized_picture_is_rejected_by_size_not_by_luck() {
         let mut e = H264Encoder::new(cfg(64, 64, ChromaFormat::Yuv420, 8)).unwrap();
@@ -964,13 +1022,21 @@ mod tests {
         assert!(format!("{err}").contains("expected"), "{err}");
     }
 
+    /// A source sample above the declared depth is refused by name, not
+    /// coded: nothing downstream checks the range, and a wrapped sample
+    /// would be a desync far from its cause.
+    #[test]
+    fn a_sample_above_the_declared_depth_refuses() {
+        let mut e = H264Encoder::new(Config { gop: 0, ..cfg(64, 64, ChromaFormat::Yuv420, 10) }).unwrap();
+        let mut frame = vec![0u8; e.frame_bytes()];
+        frame[..2].copy_from_slice(&1024u16.to_le_bytes());
+        let err = e.push(&frame).expect_err("1024 does not fit 10 bits");
+        assert!(format!("{err}").contains("H.264 encode: source sample 1024 exceeds the declared 10-bit depth"), "{err}");
+    }
+
     /// Both entropy coders code whole GOPs now — all-intra and IP alike —
     /// so what this pins is that no configuration in that envelope errors,
-    /// and that the pictures come out typed as expected. The named holes
-    /// that remain (4:4:4 transform coding, B pictures with real motion)
-    /// are stated in the module docs rather than asserted here, because a
-    /// hole is verified by the encode gate reporting it, not by a unit
-    /// test guarding its error string.
+    /// and that the pictures come out typed as expected.
     #[test]
     fn both_entropy_coders_code_intra_and_inter_gops() {
         let frame = vec![0u8; 64 * 64 * 3 / 2];
@@ -1051,5 +1117,166 @@ mod tests {
         .unwrap();
         assert!(e.picture_qp(Kind::Idr) < e.picture_qp(Kind::P));
         assert!(e.picture_qp(Kind::P) < e.picture_qp(Kind::B));
+    }
+
+    /// `count` pictures of `w` by `h` at `bit_depth` bits, packed as
+    /// little-endian `u16`, using the whole sample range: a ramp over the
+    /// range plus a few low bits of noise, translating a little per
+    /// picture so the inter pictures have motion to find. The H.265 side's
+    /// own generator, for the same reason it exists there.
+    fn deep_frames(w: usize, h: usize, chroma: ChromaFormat, bit_depth: u32, count: usize) -> Vec<Vec<u8>> {
+        let (sw, sh) = match chroma {
+            ChromaFormat::Yuv420 => (2usize, 2usize),
+            ChromaFormat::Yuv422 => (2, 1),
+            _ => (1, 1),
+        };
+        let mono = chroma == ChromaFormat::Monochrome;
+        let (cw, ch) = if mono { (0, 0) } else { (w / sw, h / sh) };
+        let max = (1u32 << bit_depth) - 1;
+        let mut seed = 0x10b1u32;
+        (0..count)
+            .map(|f| {
+                let mut out = Vec::with_capacity(2 * (w * h + 2 * cw * ch));
+                let (dx, dy) = (3 * f, f);
+                let mut push = |v: u32| out.extend_from_slice(&(v.min(max) as u16).to_le_bytes());
+                for y in 0..h {
+                    for x in 0..w {
+                        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                        let tx = ((x + dx) as i32 % 25 - 12).unsigned_abs();
+                        let ty = ((y + dy) as i32 % 27 - 13).unsigned_abs();
+                        push((max / 16) + (max / 30) * tx + (max / 40) * ty + (seed >> 29));
+                    }
+                }
+                for c in 0..2 {
+                    for y in 0..ch {
+                        for x in 0..cw {
+                            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                            let (sx, sy) = (x + dx / sw, y + dy / sh);
+                            let r2 = ((sx as i32 % 17 - 8).abs() * (sy as i32 % 19 - 9).abs()) as u32;
+                            let base = if c == 0 { max / 3 } else { max * 2 / 3 };
+                            push(base + (r2.min(90) * max / 255) + (seed >> 30));
+                        }
+                    }
+                }
+                out
+            })
+            .collect()
+    }
+
+    /// Deep pictures code and decode: for 10, 12 and 14 bits, every
+    /// chroma format, both entropy coders, intra / P / B with the 8x8
+    /// transform and the sub-partitions on, lossy and lossless — the
+    /// production decoder rebuilds each picture byte for byte from the
+    /// stream (SELF, in process), a lossless stream reproduces the source
+    /// exactly, the decoded depth is the declared one, and the pictures
+    /// really are deep.
+    ///
+    /// The last clause is the vacuity guard: a 10-bit source whose every
+    /// sample fitted 8 bits would round-trip through an encoder that
+    /// silently narrowed, so the source is built to use the whole range
+    /// and the test asserts the reconstruction does too.
+    #[test]
+    fn deep_pictures_round_trip_through_the_decoder() {
+        for bit_depth in [10u32, 12, 14] {
+            for chroma in [ChromaFormat::Monochrome, ChromaFormat::Yuv420, ChromaFormat::Yuv422, ChromaFormat::Yuv444] {
+                let frames = deep_frames(64, 64, chroma, bit_depth, 5);
+                let max = (1u32 << bit_depth) - 1;
+                let deep = |bytes: &[u8]| bytes.chunks_exact(2).any(|p| u32::from(u16::from_le_bytes([p[0], p[1]])) > 255);
+                assert!(deep(&frames[0]), "{bit_depth}-bit {chroma:?}: the source never leaves 8 bits");
+                assert!(frames[0].chunks_exact(2).all(|p| u32::from(u16::from_le_bytes([p[0], p[1]])) <= max));
+
+                // Lossless is all-IDR: PCM has no inter spelling, so the
+                // inter pictures of a lossless stream are all-skip copies
+                // of their reference, exact only over still content — the
+                // gate's `lossless-intra` row is `--gop 0` for that reason.
+                for (rate, gop, bframes, entropy, t8x8) in [
+                    (RateControl::ConstantQp(26), 8u32, 0u32, Entropy::Cabac, false),
+                    (RateControl::ConstantQp(40), 8, 2, Entropy::Cavlc, true),
+                    (RateControl::ConstantQp(20), 8, 2, Entropy::Cabac, true),
+                    (RateControl::Lossless, 0, 0, Entropy::Cavlc, false),
+                    (RateControl::Lossless, 0, 0, Entropy::Cabac, false),
+                ] {
+                    let tag = format!("{bit_depth}-bit {chroma:?} {rate:?} gop={gop} bframes={bframes} {entropy:?} t8x8={t8x8}");
+                    let mut e = H264Encoder::new(Config {
+                        rate,
+                        gop,
+                        bframes,
+                        entropy,
+                        transform_8x8: t8x8,
+                        subparts: t8x8,
+                        ..cfg(64, 64, chroma, bit_depth)
+                    })
+                    .unwrap_or_else(|err| panic!("{tag}: {err}"));
+                    assert_eq!(e.frame_bytes(), frames[0].len(), "{tag}: two bytes per sample");
+                    let mut units = Vec::new();
+                    for f in &frames {
+                        units.extend(e.push(f).unwrap_or_else(|err| panic!("{tag}: {err}")));
+                    }
+                    units.extend(e.flush().unwrap());
+                    assert_eq!(units.len(), frames.len(), "{tag}: one access unit per picture");
+                    if gop != 0 {
+                        assert!(units[1..].iter().any(|u| !u.keyframe), "{tag}: no inter picture was coded");
+                    }
+                    if bframes > 0 {
+                        assert!(units.iter().any(|u| u.encode_index as usize != (u.poc / 2) as usize), "{tag}: no B picture was held back");
+                    }
+                    let census = e.shape_census();
+                    if rate == RateControl::Lossless {
+                        assert_eq!(census.counts[0][3], (64 / 16 * 64 / 16) * frames.len() as u64, "{tag}: lossless is all PCM");
+                    } else {
+                        // The transform paths were taken, not PCM.
+                        assert_eq!(census.counts[0][3], 0, "{tag}: a lossy intra picture coded PCM");
+                        assert!(census.counts[1].iter().sum::<u64>() > 0, "{tag}: no P macroblock");
+                        if bframes > 0 {
+                            assert!(census.counts[2].iter().sum::<u64>() > 0, "{tag}: no B macroblock");
+                        }
+                    }
+
+                    // SELF, through the production decoder. It emits
+                    // display order; the reconstructions are in coding
+                    // order, so each decoded picture is matched to the
+                    // reconstruction whose access unit carries its POC
+                    // (display index `poc / 2`, as `gop.rs` counts it) —
+                    // except that every picture of an all-IDR stream
+                    // restarts its POC at zero, where coding order *is*
+                    // display order.
+                    let mut dec = crate::h264::H264Decoder::new();
+                    for u in &units {
+                        dec.push_annexb(&u.data).unwrap_or_else(|err| panic!("{tag}: decoder rejected the stream: {err}"));
+                    }
+                    dec.flush().unwrap_or_else(|err| panic!("{tag}: decoder failed to flush: {err}"));
+                    let mut by_display = vec![None; units.len()];
+                    for u in &units {
+                        let display = if gop == 0 { u.encode_index as usize } else { (u.poc / 2) as usize };
+                        by_display[display] = Some(u.encode_index as usize);
+                    }
+                    for (i, coded) in by_display.iter().enumerate() {
+                        let want = &e.reconstructions()[coded.unwrap_or_else(|| panic!("{tag}: display index {i} never coded"))];
+                        let got = dec.next_picture().unwrap_or_else(|| panic!("{tag}: picture {i} missing"));
+                        assert_eq!(got.bit_depth, bit_depth, "{tag}: decoded depth");
+                        let got = got.into_packed();
+                        if got != *want {
+                            let at = got.iter().zip(want.iter()).position(|(a, b)| a != b);
+                            panic!(
+                                "{tag}: picture {i} decoded differently than the encoder reconstructed it ({} vs {} bytes, first difference at byte {at:?}: {:?} vs {:?})",
+                                got.len(),
+                                want.len(),
+                                at.map(|k| &got[k..(k + 8).min(got.len())]),
+                                at.map(|k| &want[k..(k + 8).min(want.len())]),
+                            );
+                        }
+                    }
+                    assert!(deep(&e.reconstructions()[0]), "{tag}: the reconstruction never leaves 8 bits");
+                    if rate == RateControl::Lossless {
+                        for (display, coded) in by_display.iter().enumerate() {
+                            assert!(
+                                e.reconstructions()[coded.unwrap()] == frames[display],
+                                "{tag}: picture {display} is not lossless"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

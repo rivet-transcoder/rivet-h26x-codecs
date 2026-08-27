@@ -35,6 +35,7 @@ use crate::encode::h264_pic::PicMotion;
 use crate::encode::h264_syntax::{Geometry, Recon};
 use crate::h264::deblock::{DeblockParams, deblock_mb_rows};
 use crate::h264::frame::Frame;
+use crate::sample::Sample;
 
 /// Run the decoder's deblocking filter over a coded picture's
 /// reconstruction, in place.
@@ -49,16 +50,23 @@ use crate::h264::frame::Frame;
 /// The slice parameters are the ones the header writes when its `deblock`
 /// flag is true — filter on, both offsets zero — and the two must stay in
 /// step: the writers call this unconditionally for exactly that reason.
-pub fn deblock_recon(dsp: &H264Dsp<u8>, g: &Geometry, pm: &mut PicMotion, rec: &mut [Recon]) {
+///
+/// The frame carries the picture's bit depth, which is what the filter
+/// scales its thresholds by (8.7.2.2: alpha, beta and tC0 are multiplied
+/// by `2^(BitDepth - 8)`) and what biases its table of QP averages — the
+/// `MbInfo` QPs the walks committed are the *unprimed* `QP_Y` / `QP_C`,
+/// exactly what the decoder's `derive()` stores, so the filter reads
+/// them the way it reads its own.
+pub fn deblock_recon<S: Sample>(dsp: &H264Dsp<S>, g: &Geometry, pm: &mut PicMotion, rec: &mut [Recon<S>]) {
     let (mbw, mbh) = (g.mbs_wide as usize, g.mbs_high as usize);
     debug_assert_eq!(pm.info.mbs.len(), mbw * mbh, "one MbInfo per macroblock");
 
     let PicMotion { info, frame: src } = pm;
-    let mut frame = Frame::<u8>::empty();
+    let mut frame = Frame::<S>::empty();
     frame.mb_width = mbw;
     frame.mb_height = mbh;
     frame.chroma = g.chroma;
-    frame.bit_depth = 8;
+    frame.bit_depth = g.bit_depth;
     std::mem::swap(&mut frame.motion, &mut src.motion);
     std::mem::swap(&mut frame.mb_intra, &mut src.mb_intra);
     std::mem::swap(&mut frame.y, &mut rec[0]);

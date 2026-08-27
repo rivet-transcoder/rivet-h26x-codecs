@@ -278,6 +278,23 @@ hevc12-cqp40-sao-ip@p12|--codec h265 --qp 40 --gop 8 --sao
 hevc12-lossless-ip@p12|--codec h265 --lossless --gop 8
 abr-64k-cpb@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8
 abr-64k-cavlc-cpb@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8 --cavlc
+h264-10-lossless-intra@p10|--codec h264 --lossless --gop 0
+h264-10-lossless-cavlc-intra@p10|--codec h264 --lossless --gop 0 --cavlc
+h264-10-cqp-intra@p10|--codec h264 --qp 26 --gop 0
+h264-10-cavlc-intra@p10|--codec h264 --qp 26 --gop 0 --cavlc
+h264-10-cqp-ip@p10|--codec h264 --qp 26 --gop 8
+h264-10-cavlc-ip@p10|--codec h264 --qp 26 --gop 8 --cavlc
+h264-10-cqp-ipb@p10|--codec h264 --qp 26 --gop 8 --bframes 2
+h264-10-cavlc-ipb@p10|--codec h264 --qp 26 --gop 8 --bframes 2 --cavlc
+h264-10-cqp40-t8x8@p10|--codec h264 --qp 40 --gop 8 --t8x8
+h264-10-cavlc-t8x8@p10|--codec h264 --qp 26 --gop 8 --cavlc --t8x8
+h264-10-cqp-subparts@p10|--codec h264 --qp 26 --gop 8 --subparts
+h264-10-cavlc40-subparts@p10|--codec h264 --qp 40 --gop 8 --cavlc --subparts
+h264-10-cqp-ipb-t8x8-subparts@p10|--codec h264 --qp 26 --gop 8 --bframes 2 --t8x8 --subparts
+h264-10-abr-128k@p10|--codec h264 --bitrate 128000 --gop 8
+h264-12-cqp-ip@p12|--codec h264 --qp 26 --gop 8
+h264-12-cavlc40-ipb-t8x8-subparts@p12|--codec h264 --qp 40 --gop 8 --bframes 2 --cavlc --t8x8 --subparts
+h264-12-lossless-intra@p12|--codec h264 --lossless --gop 0
 "}
 
 # Split a clip's format token into its chroma format and sample depth:

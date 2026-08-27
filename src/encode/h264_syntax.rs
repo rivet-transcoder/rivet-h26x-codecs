@@ -24,6 +24,7 @@ use crate::h264::SliceType;
 use crate::h264::cabac_mb::{CabacState, MB_TYPE_I_PCM, write_mb_type_i_cabac};
 use crate::encode::{Config, Entropy};
 use crate::picture::ChromaFormat;
+use crate::sample::Sample;
 
 pub use crate::encode::h265_syntax::Cpb;
 
@@ -218,12 +219,16 @@ impl Geometry {
 /// The profile that admits this configuration.
 ///
 /// I_PCM is in every profile, so what decides this is the format rather than
-/// the coding tools: 4:2:2 and 4:4:4 and depths above 8 need High 4:2:2 or
-/// High 4:4:4 Predictive, and monochrome needs High. Claiming a lower profile
-/// than the stream needs is the kind of error a decoder is entitled to reject
-/// the stream over, so this errs upwards.
+/// the coding tools (A.2): 4:4:4 needs High 4:4:4 Predictive, 4:2:2 High
+/// 4:2:2, depths of 9 and 10 bits High 10 — and anything deeper than 10
+/// bits, whatever its chroma format, is High 4:4:4 Predictive again, the
+/// only profile whose `bit_depth_luma_minus8` may exceed 2. Monochrome
+/// needs High. Claiming a lower profile than the stream needs is the kind
+/// of error a decoder is entitled to reject the stream over, so this errs
+/// upwards.
 fn profile_idc(g: &Geometry) -> u8 {
     match g.chroma {
+        _ if g.bit_depth > 10 => 244,
         ChromaFormat::Yuv444 => 244,
         ChromaFormat::Yuv422 => 122,
         _ if g.bit_depth > 8 => 110,
@@ -270,8 +275,12 @@ pub fn write_sps(
         if g.chroma == ChromaFormat::Yuv444 {
             w.flag(false); // separate_colour_plane_flag
         }
+        // One depth for both: the decoder refuses a stream whose luma and
+        // chroma depths differ (`check_supported`, src/h264/decoder.rs),
+        // monochrome included — the chroma field is still parsed and
+        // compared there even though no chroma sample exists.
         w.ue(g.bit_depth - 8); // bit_depth_luma_minus8
-        w.ue(if g.chroma == ChromaFormat::Monochrome { 0 } else { g.bit_depth - 8 });
+        w.ue(g.bit_depth - 8); // bit_depth_chroma_minus8
         w.flag(false); // qpprime_y_zero_transform_bypass_flag
         w.flag(false); // seq_scaling_matrix_present_flag
     }
@@ -454,13 +463,13 @@ pub fn write_slice_header(h: &SliceHeader, pps_qp: u8, w: &mut BitWriter) {
 /// since the cropping rectangle excludes them from display, but replication
 /// keeps the coded picture free of edges that would cost bits once this
 /// encoder predicts and transforms rather than copying.
-pub fn write_pcm_macroblock(
+pub fn write_pcm_macroblock<S: Sample>(
     w: &mut BitWriter,
     g: &Geometry,
     mb_x: u32,
     mb_y: u32,
-    planes: &[Plane<'_>],
-    dst: &mut [Recon],
+    planes: &[Plane<'_, S>],
+    dst: &mut [Recon<S>],
 ) {
     // `mb_type` 25 is I_PCM in an I slice, as ue(v) for CAVLC.
     w.ue(25);
@@ -487,12 +496,12 @@ pub fn write_pcm_macroblock(
 /// `Cabac::reinit` likewise leaves its `CabacState` alone — and a writer that
 /// reset them per macroblock would agree with the decoder on the first
 /// macroblock and diverge on the second.
-pub fn write_pcm_slice_data_cabac(
+pub fn write_pcm_slice_data_cabac<S: Sample>(
     w: &mut BitWriter,
     g: &Geometry,
     qp: u8,
-    planes: &[Plane<'_>],
-    dst: &mut [Recon],
+    planes: &[Plane<'_, S>],
+    dst: &mut [Recon<S>],
 ) {
     // `cabac_alignment_one_bit` until the slice data starts on a byte.
     w.align_one();
@@ -543,13 +552,19 @@ pub fn write_pcm_slice_data_cabac(
 /// between them, and the alignment bit and samples that follow are identical.
 /// Sources narrower than a whole macroblock repeat their edge sample, which
 /// is what the cropping in the SPS then hides.
-fn write_pcm_samples(
+///
+/// Each sample is `BitDepth` bits wide (7.3.5: `pcm_sample_luma` is
+/// `u(v)` with `v = BitDepth_Y`, and the chroma likewise) — a 10-bit
+/// picture's PCM macroblock is 1.25 times the bytes of an 8-bit one, and
+/// a writer that kept eight bits would hand the reader every sample's
+/// low byte shifted into its neighbour.
+fn write_pcm_samples<S: Sample>(
     w: &mut BitWriter,
     g: &Geometry,
     mb_x: u32,
     mb_y: u32,
-    planes: &[Plane<'_>],
-    dst: &mut [Recon],
+    planes: &[Plane<'_, S>],
+    dst: &mut [Recon<S>],
 ) {
     let bd = g.bit_depth;
     let (cw, ch) = g.chroma_mb();
@@ -564,21 +579,23 @@ fn write_pcm_samples(
             let syy = (sy + y).min(src.height.saturating_sub(1));
             for x in 0..bw {
                 let sxx = (sx + x).min(src.width.saturating_sub(1));
-                let v = src.data[syy as usize * src.stride + sxx as usize] as u32;
-                w.bits(bd, v);
+                let v = src.data[syy as usize * src.stride + sxx as usize].to_i32();
+                w.bits(bd, v as u32);
                 let d = &mut dst[p];
                 let i = ((sy + y) as usize + d.pad) * d.stride + (sx + x) as usize + d.pad;
-                d.data[i] = v as u8;
+                d.data[i] = S::from_i32(v);
             }
         }
     }
 }
 
-/// A source plane: samples, stride, and the size actually present.
+/// A source plane: samples, stride, and the size actually present. The
+/// sample type is the picture's — `u8` at 8 bits, `u16` deeper — already
+/// unpacked from the caller's bytes by the encoder's face.
 #[derive(Debug, Clone, Copy)]
-pub struct Plane<'a> {
+pub struct Plane<'a, S: Sample> {
     /// Samples, row-major.
-    pub data: &'a [u8],
+    pub data: &'a [S],
     /// Samples per row, which may exceed `width`.
     pub stride: usize,
     /// Samples present horizontally.
@@ -596,19 +613,24 @@ pub struct Plane<'a> {
 /// construction rather than by care. A second set of predictors would be a
 /// second thing to keep in step, and the drift would show up as a SELF
 /// failure hundreds of macroblocks after the cause.
-pub type Recon = crate::h264::frame::PaddedPlane<u8>;
+///
+/// Generic over the sample type for the same reason the decoder's plane
+/// is: a 10-bit picture is `u16` samples on both sides.
+pub type Recon<S> = crate::h264::frame::PaddedPlane<S>;
 
 /// A zeroed reconstruction plane of the given coded size.
-pub fn recon_plane(width: u32, height: u32, pad: usize) -> Recon {
+pub fn recon_plane<S: Sample>(width: u32, height: u32, pad: usize) -> Recon<S> {
     Recon::new(width as usize, height as usize, pad)
 }
 
-/// Copy the displayed top-left rectangle out of a padded plane, which is what
-/// a decoder emits and therefore what the SELF check compares against.
-pub fn crop_into(p: &Recon, w: u32, h: u32, out: &mut Vec<u8>) {
+/// Copy the displayed top-left rectangle out of a padded plane, packed
+/// as bytes — one per sample at 8 bits, little-endian pairs deeper, the
+/// layout [`crate::Picture::into_packed`] emits — which is what a decoder
+/// emits and therefore what the SELF check compares against.
+pub fn crop_into<S: Sample>(p: &Recon<S>, w: u32, h: u32, out: &mut Vec<u8>) {
     for y in 0..h as usize {
         let row = (y + p.pad) * p.stride + p.pad;
-        out.extend_from_slice(&p.data[row..row + w as usize]);
+        crate::encode::pack_row(&p.data[row..row + w as usize], out);
     }
 }
 
@@ -739,6 +761,98 @@ mod tests {
         )))
         .unwrap();
         assert!(sps.vui.is_none(), "no buffer, no VUI");
+    }
+
+    /// A deep SPS survives the production parser with the depth it was
+    /// written at — both fields, luma and chroma, at every depth and
+    /// chroma format, monochrome included (the decoder refuses unequal
+    /// depths, so the chroma field has to say the same even where no
+    /// chroma sample exists) — and claims a profile that admits it: High
+    /// 10 for 9 and 10 bits, High 4:2:2 for 4:2:2 up to 10 bits, High
+    /// 4:4:4 Predictive for 4:4:4 and for anything above 10 bits (A.2).
+    /// And the 8-bit SPS is byte for byte what it was.
+    #[test]
+    fn a_deep_sps_carries_its_depth_through_the_decoders_parser() {
+        for depth in [8u32, 9, 10, 12, 14] {
+            for c in [ChromaFormat::Monochrome, ChromaFormat::Yuv420, ChromaFormat::Yuv422, ChromaFormat::Yuv444] {
+                let cfg = Config { width: 64, height: 64, chroma: c, bit_depth: depth, ..Config::default() };
+                let g = Geometry::new(&cfg);
+                let sps = write_sps(&cfg, &g, 16, 16, None);
+                let parsed = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&sps))
+                    .unwrap_or_else(|e| panic!("{depth}-bit {c:?}: SPS rejected: {e}"));
+                assert_eq!(parsed.bit_depth_luma, depth, "{depth}-bit {c:?}: luma depth");
+                assert_eq!(parsed.bit_depth_chroma, depth, "{depth}-bit {c:?}: chroma depth");
+                let want_profile = match (c, depth) {
+                    (_, d) if d > 10 => 244,
+                    (ChromaFormat::Yuv444, _) => 244,
+                    (ChromaFormat::Yuv422, _) => 122,
+                    (_, d) if d > 8 => 110,
+                    _ => 100,
+                };
+                assert_eq!(parsed.profile_idc, want_profile, "{depth}-bit {c:?}: profile");
+                // The decoder's own admission test, which is what a stream
+                // has to pass before a single slice is read.
+                if depth == 8 {
+                    let eight = write_sps(&Config { bit_depth: 8, ..cfg.clone() }, &Geometry::new(&cfg), 16, 16, None);
+                    assert_eq!(sps, eight, "{c:?}: the 8-bit SPS moved");
+                }
+            }
+        }
+    }
+
+    /// A slice header written at depth — a lossless picture's slice QP of
+    /// zero against a PPS quantiser of 26, and a QP 40 one — comes back
+    /// through the production slice parser with the same `SliceQP_Y`. The
+    /// header carries the *unprimed* quantiser (7.4.3: `SliceQP_Y` in
+    /// `-QpBdOffset_Y..=51`); the primed one is derived by the reader
+    /// per macroblock, so a writer that primed it here would double the
+    /// offset on the way through.
+    #[test]
+    fn a_deep_slice_header_round_trips_its_quantiser() {
+        for depth in [8u32, 10, 12, 14] {
+            for (kind, qp) in [(Kind::Idr, 0u8), (Kind::Idr, 40), (Kind::P, 23), (Kind::B, 51)] {
+                let cfg = Config { width: 64, height: 64, bit_depth: depth, bframes: 2, ..Config::default() };
+                let g = Geometry::new(&cfg);
+                let sps_nal = write_sps(&cfg, &g, 16, 16, None);
+                let sps = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&sps_nal)).unwrap();
+                let pps_nal = write_pps(&cfg, 26);
+                let sps_look = |_id: u32| Some(sps.clone());
+                let pps = crate::h264::pps::Pps::parse(&crate::nal::unescape_rbsp(&pps_nal), &sps_look).unwrap();
+                let mut w = BitWriter::new();
+                write_slice_header(
+                    &SliceHeader {
+                        kind,
+                        frame_num: 3,
+                        idr_pic_id: 1,
+                        poc_lsb: 6,
+                        qp,
+                        log2_max_frame_num: 16,
+                        log2_max_poc_lsb: 16,
+                        reference: kind != Kind::B,
+                        deblock: true,
+                        cabac: true,
+                        direct_spatial: true,
+                    },
+                    26,
+                    &mut w,
+                );
+                w.rbsp_trailing_bits();
+                let nal_type = if kind == Kind::Idr { NAL_IDR } else { NAL_SLICE };
+                // `nal_ref_idc` as the encoder writes it: the marking
+                // syntax exists only in a reference picture's header.
+                let nal = annexb(nal_type, if kind != Kind::B { 3 } else { 0 }, &w.into_nal());
+                // The parser wants the NAL header byte in front of the RBSP.
+                let rbsp = crate::nal::unescape_rbsp(&nal[4..]);
+                let hdr = crate::nal::H264NalHeader::parse(&nal[4..]).unwrap();
+                let pps_look = |_id: u32| Some(pps.clone());
+                let (parsed, _, _) = crate::h264::slice::SliceHeader::parse(&rbsp, hdr, &pps_look, &sps_look)
+                    .unwrap_or_else(|e| panic!("{depth}-bit {kind:?} qp {qp}: slice header rejected: {e}"));
+                assert_eq!(parsed.slice_qp, qp as i32, "{depth}-bit {kind:?}: SliceQP_Y");
+                assert_eq!(parsed.frame_num, 3);
+                assert_eq!(parsed.poc_lsb, 6);
+                assert_eq!(parsed.disable_deblocking_filter_idc, 0);
+            }
+        }
     }
 
     #[test]
