@@ -10,12 +10,22 @@ reports the VUI as names — agreeing field by field with what the encoder
 was asked to write.
 
     python vui_probe.py stream.h264|stream.h265 P:T:M tv|pc
+           [--mastering-display G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)]
+           [--content-light MAXCLL,MAXFALL]
 
-Exit 0 when ffprobe's four colour fields name exactly the codes given, 1
-otherwise, printing which field disagreed. The names are libavutil's
+The two optional arguments extend the same question to the HDR10 static
+metadata SEIs (mastering display colour volume, content light level),
+which ffprobe reports as side data on the first frame, with the values in
+the SEI's own units (chromaticities as n/50000, luminances as n/10000) —
+compared here as the integers the encoder was handed. The crate has no
+reader for these SEIs at all, so this is the only reader.
+
+Exit 0 when ffprobe names exactly what was asked for, 1 otherwise,
+printing which field disagreed. The names are libavutil's
 (`av_color_*_name`), listed here for the code points a caller might ask
 for; a code outside the table fails by name rather than passing vacuously.
 """
+import json
 import os
 import subprocess
 import sys
@@ -38,11 +48,62 @@ MATRIX = {
 }
 
 
+def parse_mastering(spec):
+    """`G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)` -> dict of the ffprobe field
+    names to the integers wanted, or None if the text is not that."""
+    want = {}
+    rest = spec
+    for label, fields in (("G", ("green_x", "green_y")), ("B", ("blue_x", "blue_y")),
+                          ("R", ("red_x", "red_y")), ("WP", ("white_point_x", "white_point_y")),
+                          ("L", ("max_luminance", "min_luminance"))):
+        if not rest.startswith(label + "("):
+            return None
+        end = rest.find(")")
+        if end < 0:
+            return None
+        parts = rest[len(label) + 1:end].split(",")
+        if len(parts) != 2:
+            return None
+        try:
+            want[fields[0]], want[fields[1]] = int(parts[0]), int(parts[1])
+        except ValueError:
+            return None
+        rest = rest[end + 1:]
+    return want if rest == "" else None
+
+
+def numerator(v):
+    """ffprobe prints these as `n/d` strings; the SEI's integer is n."""
+    return int(str(v).split("/")[0])
+
+
 def main():
-    if len(sys.argv) != 4:
+    args = sys.argv[1:]
+    if len(args) < 3:
         print(__doc__)
         return 2
-    stream, colour, rng = sys.argv[1:]
+    stream, colour, rng = args[:3]
+    mastering = None
+    cll = None
+    rest = args[3:]
+    while rest:
+        if rest[0] == "--mastering-display" and len(rest) > 1:
+            mastering = parse_mastering(rest[1])
+            if mastering is None:
+                print(f"vui_probe: --mastering-display wants G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min), got {rest[1]!r}")
+                return 2
+            rest = rest[2:]
+        elif rest[0] == "--content-light" and len(rest) > 1:
+            try:
+                a, b = rest[1].split(",")
+                cll = {"max_content": int(a), "max_average": int(b)}
+            except ValueError:
+                print(f"vui_probe: --content-light wants MAXCLL,MAXFALL, got {rest[1]!r}")
+                return 2
+            rest = rest[2:]
+        else:
+            print(__doc__)
+            return 2
     try:
         p, t, m = (int(x) for x in colour.split(":"))
     except ValueError:
@@ -84,6 +145,40 @@ def main():
     for k, v in want.items():
         if got.get(k) != v:
             bad.append(f"{k}: wanted {v}, ffprobe says {got.get(k, '(absent)')}")
+
+    if mastering is not None or cll is not None:
+        out = subprocess.run(
+            [
+                ffprobe, "-v", "error", "-select_streams", "v:0", "-show_frames",
+                "-read_intervals", "%+#1", "-of", "json", stream,
+            ],
+            capture_output=True, text=True,
+        )
+        if out.returncode != 0:
+            print(f"vui_probe: ffprobe -show_frames failed: {out.stderr.strip()[-200:]}")
+            return 1
+        frames = json.loads(out.stdout).get("frames", [])
+        side = {}
+        for sd in (frames[0].get("side_data_list", []) if frames else []):
+            side[sd.get("side_data_type")] = sd
+        if mastering is not None:
+            sd = side.get("Mastering display metadata")
+            if sd is None:
+                bad.append("mastering display: wanted one, ffprobe sees no such side data")
+            else:
+                for k, v in mastering.items():
+                    if k not in sd or numerator(sd[k]) != v:
+                        bad.append(f"mastering display {k}: wanted {v}, ffprobe says {sd.get(k, '(absent)')}")
+                got["mastering_display"] = "ok"
+        if cll is not None:
+            sd = side.get("Content light level metadata")
+            if sd is None:
+                bad.append("content light level: wanted one, ffprobe sees no such side data")
+            else:
+                for k, v in cll.items():
+                    if sd.get(k) != v:
+                        bad.append(f"content light level {k}: wanted {v}, ffprobe says {sd.get(k, '(absent)')}")
+                got["content_light_level"] = "ok"
     if bad:
         print("; ".join(bad))
         return 1

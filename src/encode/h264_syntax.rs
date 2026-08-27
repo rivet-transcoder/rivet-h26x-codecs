@@ -22,7 +22,7 @@ use crate::cabac_enc::CabacEncoder;
 use crate::encode::gop::Kind;
 use crate::h264::SliceType;
 use crate::h264::cabac_mb::{CabacState, MB_TYPE_I_PCM, write_mb_type_i_cabac};
-use crate::encode::{ColourDescription, Config, Entropy};
+use crate::encode::{ColourDescription, Config, ContentLightLevel, Entropy, MasteringDisplay};
 use crate::picture::ChromaFormat;
 
 pub use crate::encode::h265_syntax::Cpb;
@@ -160,6 +160,35 @@ fn sei_nal(payload_type: u32, payload: &[u8]) -> Vec<u8> {
     }
     w.rbsp_trailing_bits();
     w.into_nal()
+}
+
+/// The `mastering_display_colour_volume` SEI (payloadType 137; D.1.29,
+/// and H.265 D.2.28 field for field): the three primaries in the SEI's
+/// own order — green, blue, red, the order both standards recommend and
+/// every writer follows — then the white point and the two luminances,
+/// all as the caller gave them. 24 bytes, byte-aligned by its own
+/// syntax, so no payload alignment bits. The test below holds it
+/// byte-identical to what x265 writes for the same values.
+pub fn write_mastering_display_sei(m: &MasteringDisplay) -> Vec<u8> {
+    let mut p = BitWriter::with_capacity(24);
+    for (x, y) in [m.green, m.blue, m.red] {
+        p.bits(16, u32::from(x)); // display_primaries_x[c]
+        p.bits(16, u32::from(y)); // display_primaries_y[c]
+    }
+    p.bits(16, u32::from(m.white_point.0)); // white_point_x
+    p.bits(16, u32::from(m.white_point.1)); // white_point_y
+    p.bits(32, m.max_luminance); // max_display_mastering_luminance
+    p.bits(32, m.min_luminance); // min_display_mastering_luminance
+    sei_nal(137, &p.into_rbsp())
+}
+
+/// The `content_light_level_info` SEI (payloadType 144; D.1.31, H.265
+/// D.2.35): the two light levels, four bytes.
+pub fn write_content_light_level_sei(c: &ContentLightLevel) -> Vec<u8> {
+    let mut p = BitWriter::with_capacity(4);
+    p.bits(16, u32::from(c.max_cll)); // max_content_light_level
+    p.bits(16, u32::from(c.max_fall)); // max_pic_average_light_level
+    sei_nal(144, &p.into_rbsp())
 }
 
 /// A `buffering_period` SEI (D.1.2), for every IDR access unit: the
@@ -777,6 +806,37 @@ mod tests {
         )))
         .unwrap();
         assert!(sps.vui.is_none(), "no buffer, no VUI");
+    }
+
+    /// The two HDR10 static-metadata SEIs are byte-identical to the ones
+    /// x265 writes for the same values (the NAL bytes after its two-byte
+    /// HEVC header, from an x265 3.x stream with
+    /// `master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)`
+    /// and `max-cll=1000,400` — BT.2020 primaries, D65, 1000 nits down to
+    /// 0.0001). There is no reader for these in the crate, so the second
+    /// writer is the fixture: it agrees with libavcodec's reading in the
+    /// gate (tools/vui_probe.py) and these bytes are what it produced.
+    /// The mastering display's `00 00 00 01` tail (min luminance 1) is
+    /// what puts an emulation-prevention byte in the fixture, so the
+    /// single escape in `sei_nal` is exercised too.
+    #[test]
+    fn the_hdr10_static_metadata_seis_match_x265_byte_for_byte() {
+        use crate::encode::{ContentLightLevel, MasteringDisplay};
+        let m = MasteringDisplay {
+            red: (34000, 16000),
+            green: (13250, 34500),
+            blue: (7500, 3000),
+            white_point: (15635, 16450),
+            max_luminance: 10_000_000,
+            min_luminance: 1,
+        };
+        let x265_mdcv = "891833c286c41d4c0bb884d03e803d13404200989680000003000180";
+        let ours: String = write_mastering_display_sei(&m).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(ours, x265_mdcv, "mastering display SEI");
+        let c = ContentLightLevel { max_cll: 1000, max_fall: 400 };
+        let x265_cll = "900403e8019080";
+        let ours: String = write_content_light_level_sei(&c).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(ours, x265_cll, "content light level SEI");
     }
 
     /// The colour description round-trips through the decoder's own SPS

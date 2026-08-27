@@ -117,6 +117,21 @@
 #               is what HDR10 and HLG are; the H.264 rows are where a
 #               primaries/matrix swap shows.
 #
+#               The same property covers the HDR10 static-metadata SEIs
+#               (mastering display colour volume, content light level)
+#               on the rows that write them: the probe is handed the
+#               values and asks ffprobe's frame side data. Its mutation:
+#               swap the red and green primaries in the writer, and the
+#               row must go red naming red_x. The H.264 SEI row is a
+#               buffer row so the two SEIs travel beside a buffering
+#               period and a pic timing, where an ordering or framing
+#               slip would show — with a 250 ms buffer, not the 125 ms
+#               of the other buffer rows: at 125 ms picture 0 was already
+#               carried by the re-code (632 bits short on the cap alone),
+#               and the 45 bytes of SEI NAL put it past what the re-code
+#               can recover, so the encoder refuses by name ("picture 0
+#               needs 3432 bits and the declared buffer affords 2893").
+#
 # Usage: verify_encode.sh [encoder] [decoder]
 #   H26X_WORK=dir   scratch directory holding the source clips (default: here)
 #   JOBS=n          configurations in parallel (default 4)
@@ -315,6 +330,8 @@ abr-64k-cpb-p3@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8 --color
 hevc-vbv-125-hdr10@src_cut|--codec h265 --bitrate 64000 --cpb-ms 125 --gop 8 --color 9:16:9
 hevc10-hdr10-ip@p10|--codec h265 --qp 26 --gop 8 --color 9:16:9
 hevc10-hlg-ipb@p10|--codec h265 --qp 26 --gop 8 --bframes 2 --color 9:18:9
+abr-64k-cpb250-hdr10-sei@src_cut|--codec h264 --bitrate 64000 --cpb-ms 250 --gop 8 --color 9:16:9 --mastering-display G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1) --content-light 1000,400
+hevc10-hdr10-sei-ip@p10|--codec h265 --qp 26 --gop 8 --color 9:16:9 --mastering-display G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1) --content-light 1000,400
 "}
 
 # Split a clip's format token into its chroma format and sample depth:
@@ -438,7 +455,14 @@ one() {
     *--color*)
       colour=$(echo "$flags" | sed -n 's/.*--color \([0-9:]*\).*/\1/p')
       range=tv; case "$flags" in *--full-range*) range=pc ;; esac
-      if ! out=$(FFPROBE="$FFPROBE" python "$VUI_PROBE" "$bs" "$colour" "$range" 2>&1); then
+      # The HDR10 static-metadata SEIs, when the row wrote them: the probe
+      # is told the same values and asks ffprobe's frame side data.
+      hdr=""
+      md=$(echo "$flags" | sed -n 's/.*--mastering-display \([^ ]*\).*/\1/p')
+      [ -n "$md" ] && hdr="$hdr --mastering-display $md"
+      cl=$(echo "$flags" | sed -n 's/.*--content-light \([^ ]*\).*/\1/p')
+      [ -n "$cl" ] && hdr="$hdr --content-light $cl"
+      if ! out=$(FFPROBE="$FFPROBE" python "$VUI_PROBE" "$bs" "$colour" "$range" $hdr 2>&1); then
         echo "VUI-FAIL    $tag: $(echo "$out" | tail -1 | head -c 120)"
         return 1
       fi

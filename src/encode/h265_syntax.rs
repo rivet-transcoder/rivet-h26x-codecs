@@ -338,6 +338,12 @@ fn write_vui(w: &mut BitWriter, colour: Option<&ColourDescription>, cpb: Option<
     w.flag(false); // bitstream_restriction_flag
 }
 
+// The HDR10 static-metadata SEIs are the same bytes in both standards
+// (payloadTypes 137 and 144, D.2.28 / D.2.35 here), so the H.264
+// module's writers serve this one; only the NAL header differs, and
+// `annexb` adds that.
+pub use crate::encode::h264_syntax::{write_content_light_level_sei, write_mastering_display_sei};
+
 /// A `buffering_period` SEI message, wrapped as a prefix SEI NAL.
 ///
 /// It carries the one number the buffer model cannot derive: how long the

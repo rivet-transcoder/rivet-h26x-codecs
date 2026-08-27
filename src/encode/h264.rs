@@ -625,6 +625,16 @@ impl H264Encoder {
                 &syn::write_pic_timing_sei(cpb, removal as u32, output.max(0) as u32),
             ));
         }
+        // HDR10 static metadata, with every IDR so that a stream joined at
+        // any of them carries it.
+        if idr {
+            if let Some(m) = self.cfg.mastering_display.as_ref() {
+                out.extend_from_slice(&syn::annexb(syn::NAL_SEI, 0, &syn::write_mastering_display_sei(m)));
+            }
+            if let Some(c) = self.cfg.content_light.as_ref() {
+                out.extend_from_slice(&syn::annexb(syn::NAL_SEI, 0, &syn::write_content_light_level_sei(c)));
+            }
+        }
 
         let cabac = self.cfg.entropy == Entropy::Cabac;
         let mut w = BitWriter::with_capacity(self.frame_bytes + 256);
