@@ -276,6 +276,13 @@ impl H265Encoder {
         self.code(ready)
     }
 
+    /// Make the next picture pushed an IDR, restarting the GOP there. See
+    /// [`Scheduler::force_idr`] for who needs this and what it does to any
+    /// B pictures held back at the time.
+    pub fn force_idr(&mut self) {
+        self.sched.force_idr();
+    }
+
     fn code(&mut self, ready: Vec<Coded>) -> Result<Vec<Access>> {
         let mut out = Vec::with_capacity(ready.len());
         for c in ready {

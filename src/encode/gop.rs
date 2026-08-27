@@ -76,6 +76,9 @@ pub struct Scheduler {
     /// B pictures held back, waiting for the anchor that follows them.
     pending: Vec<u64>,
     first: bool,
+    /// The next picture offered starts a new GOP whatever the cadence says.
+    /// Set by [`Scheduler::force_idr`], cleared when that IDR is emitted.
+    force_idr: bool,
 }
 
 impl Scheduler {
@@ -90,11 +93,33 @@ impl Scheduler {
             idr_at: 0,
             pending: Vec::new(),
             first: true,
+            force_idr: false,
         }
+    }
+
+    /// Make the **next** picture offered an IDR, wherever the GOP cadence
+    /// would have put one.
+    ///
+    /// A caller that splits a stream into independently decodable pieces
+    /// needs this: it feeds a run-in of pictures to warm the encoder up and
+    /// discards their output, so the first picture it *keeps* is not the
+    /// encoder's picture zero and has to be promoted to a random access
+    /// point by name. The GOP restarts there — the cadence counts from the
+    /// forced IDR, not from where the previous one would have fallen — so
+    /// what follows is an ordinary closed GOP and the piece stands alone.
+    ///
+    /// Any B pictures held back at that point are released ahead of it as
+    /// P pictures, the same way a scheduled IDR releases them: nothing may
+    /// predict forwards across a random access point.
+    pub fn force_idr(&mut self) {
+        self.force_idr = true;
     }
 
     /// Whether the picture at this display index starts a new GOP.
     fn is_idr(&self, display: u64) -> bool {
+        if self.force_idr {
+            return true;
+        }
         if self.first && display == 0 {
             return true;
         }
@@ -135,6 +160,7 @@ impl Scheduler {
                 out.push(self.emit(d, Kind::P, true));
             }
             self.first = false;
+            self.force_idr = false;
             out.push(self.emit(display, Kind::Idr, true));
             return out;
         }
@@ -265,6 +291,53 @@ mod tests {
         for c in run(0, 0, 5) {
             assert!(c.kind.is_keyframe(), "{c:?}");
             assert_eq!(c.poc, 0);
+        }
+    }
+
+    /// A forced IDR lands on the next picture offered, restarts the GOP
+    /// cadence from there, and releases any held B pictures ahead of it as
+    /// P pictures — the same shape a scheduled IDR has, so a decoder that
+    /// starts at the forced one sees an ordinary closed GOP.
+    #[test]
+    fn a_forced_idr_is_the_next_picture_and_restarts_the_gop() {
+        for &b in &[0u32, 2] {
+            let mut s = Scheduler::new(8, b);
+            let mut coded = Vec::new();
+            for _ in 0..5 {
+                coded.extend(s.push());
+            }
+            s.force_idr();
+            coded.extend(s.push()); // display 5
+            for _ in 6..20 {
+                coded.extend(s.push());
+            }
+            coded.extend(s.flush());
+
+            let idrs: Vec<u64> =
+                coded.iter().filter(|c| c.kind == Kind::Idr).map(|c| c.display).collect();
+            // Picture 0 by rule, 5 by request, then 13 because the cadence
+            // counts from 5 — and NOT 8, where it would have fallen.
+            assert_eq!(idrs, vec![0, 5, 13], "bframes={b}: {coded:?}");
+            let forced = coded.iter().find(|c| c.display == 5).unwrap();
+            assert_eq!(forced.poc, 0, "bframes={b}: a forced IDR restarts POC");
+            // Nothing predicts forwards across it: whatever was held back
+            // before display 5 is coded before it, and none of it as a B.
+            let at = coded.iter().position(|c| c.display == 5).unwrap();
+            assert!(coded[..at].iter().all(|c| c.display < 5), "bframes={b}: {coded:?}");
+            assert!(coded[at..].iter().all(|c| c.display >= 5), "bframes={b}: {coded:?}");
+            // With bframes=2, display 4 was held back waiting for an anchor
+            // at 6 when the request came; the forced IDR releases it, and it
+            // cannot be a B because nothing may predict across the IDR.
+            let held = coded.iter().find(|c| c.display == 4).unwrap();
+            assert_eq!(held.kind, Kind::P, "bframes={b}: {coded:?}");
+            // Every picture is still coded exactly once.
+            let mut seen: Vec<u64> = coded.iter().map(|c| c.display).collect();
+            seen.sort_unstable();
+            assert_eq!(seen, (0..20).collect::<Vec<u64>>(), "bframes={b}");
+            // The request is consumed by the IDR it produced: it does not
+            // linger and turn the picture after it into a second IDR.
+            let after = coded.iter().find(|c| c.display == 6).unwrap();
+            assert_ne!(after.kind, Kind::Idr, "bframes={b}: {after:?}");
         }
     }
 
