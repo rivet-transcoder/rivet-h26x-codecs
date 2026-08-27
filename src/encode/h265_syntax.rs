@@ -420,8 +420,13 @@ pub fn write_sps(cfg: &Config, g: &Geometry, log2_max_poc_lsb: u32, cpb: Option<
     } else {
         w.flag(false);
     }
+    // One depth for both components — `Config::bit_depth` is the
+    // picture's, and every kernel below the NAL layer takes luma and
+    // chroma at one width. Written for monochrome too: the field exists
+    // regardless (7.3.2.2), the reader keeps it, and a chroma depth that
+    // disagreed with luma's would be a second number for nothing to read.
     w.ue(g.bit_depth - 8); // bit_depth_luma_minus8
-    w.ue(if g.chroma == ChromaFormat::Monochrome { 0 } else { g.bit_depth - 8 });
+    w.ue(g.bit_depth - 8); // bit_depth_chroma_minus8
     w.ue(log2_max_poc_lsb - 4);
     w.flag(true); // sps_sub_layer_ordering_info_present_flag
     let (buffering, reorder) = dpb(cfg);
@@ -472,11 +477,18 @@ pub fn write_sps(cfg: &Config, g: &Geometry, log2_max_poc_lsb: u32, cpb: Option<
 
 /// Picture parameter set.
 ///
+/// `qp` is `init_qp`, the quantiser every slice's `slice_qp_delta` is
+/// relative to, in the range the syntax gives it — `-QpBdOffsetY..=51`
+/// (7.4.3.3.1), so negative at depths above 8. The encoder's
+/// configuration offers `0..=51` at every depth; the writer takes the
+/// whole range so a header test can reach the rest of it through the
+/// production writer rather than by hand.
+///
 /// `bypass` writes `transquant_bypass_enabled_flag` — the lossless switch.
 /// It changes nothing else here or in the slice header (the parser reads no
 /// other syntax conditionally on it); what it changes is the coding tree,
 /// where every CU then carries a `cu_transquant_bypass_flag`.
-pub fn write_pps(qp: u8, bypass: bool, deblock: bool) -> Vec<u8> {
+pub fn write_pps(qp: i32, bypass: bool, deblock: bool) -> Vec<u8> {
     let mut w = BitWriter::with_capacity(32);
     w.ue(0); // pps_pic_parameter_set_id
     w.ue(0); // pps_seq_parameter_set_id
@@ -487,7 +499,7 @@ pub fn write_pps(qp: u8, bypass: bool, deblock: bool) -> Vec<u8> {
     w.flag(false); // cabac_init_present_flag
     w.ue(0); // num_ref_idx_l0_default_active_minus1
     w.ue(0); // num_ref_idx_l1_default_active_minus1
-    w.se(qp as i32 - 26); // init_qp_minus26
+    w.se(qp - 26); // init_qp_minus26
     w.flag(false); // constrained_intra_pred_flag
     w.flag(false); // transform_skip_enabled_flag
     w.flag(false); // cu_qp_delta_enabled_flag
@@ -545,8 +557,10 @@ pub struct SliceHeader {
     pub kind: Kind,
     /// The low bits of the picture order count.
     pub poc_lsb: u32,
-    /// Quantiser for the slice.
-    pub qp: u8,
+    /// Quantiser for the slice, `SliceQpY`: `-QpBdOffsetY..=51`, the
+    /// range the parser holds it to (negative only above 8 bits — see
+    /// [`write_pps`] for why the writer takes the whole of it).
+    pub qp: i32,
     /// Width of the `poc_lsb` field, from the SPS.
     pub log2_max_poc_lsb: u32,
     /// POC deltas of the reference pictures, relative to this slice's POC:
@@ -577,7 +591,7 @@ pub struct SaoFlags {
 }
 
 /// Slice segment header, up to but not including the coded tree.
-pub fn write_slice_header(h: &SliceHeader, pps_qp: u8, nal_type: u8, deblock: bool, w: &mut BitWriter) {
+pub fn write_slice_header(h: &SliceHeader, pps_qp: i32, nal_type: u8, deblock: bool, w: &mut BitWriter) {
     w.flag(true); // first_slice_segment_in_pic_flag
     if (16..=23).contains(&nal_type) {
         w.flag(false); // no_output_of_prior_pics_flag
@@ -669,7 +683,7 @@ pub fn write_slice_header(h: &SliceHeader, pps_qp: u8, nal_type: u8, deblock: bo
         // ask the reader for.
         w.ue(0); // five_minus_max_num_merge_cand -> MaxNumMergeCand 5
     }
-    w.se(h.qp as i32 - pps_qp as i32); // slice_qp_delta
+    w.se(h.qp - pps_qp); // slice_qp_delta
     // slice_loop_filter_across_slices_enabled_flag: the reader reads it
     // when `pps_loop_filter_across_slices_enabled_flag` is set AND either
     // SAO is on for this slice or deblocking is not disabled — a
@@ -791,6 +805,82 @@ mod tests {
             assert_eq!(parsed.height, g.coded_height, "{w}x{h} {c:?}");
             assert_eq!(parsed.chroma_format_idc, chroma_idc(c), "{w}x{h} {c:?}");
             assert_eq!(parsed.bit_depth_luma, cfg.bit_depth, "{w}x{h} {c:?}");
+        }
+    }
+
+    /// Deep parameter sets and slice headers survive the production
+    /// parsers with their depth intact, and the quantiser range the
+    /// header can carry grows with it.
+    ///
+    /// What is held, field by field: the SPS's two `bit_depth_*_minus8`
+    /// (one depth, both components, monochrome included); the profile the
+    /// PTL claims — Main 10 for 4:2:0 at 9 or 10 bits, the range
+    /// extensions above that or outside 4:2:0, since a Main decoder may
+    /// refuse a Main 10 stream and a Main 10 one a 12-bit stream; and the
+    /// slice quantiser, which the parser bounds to `-QpBdOffsetY..=51` —
+    /// so at 10 bits a `slice_qp_delta` reaching QP −12 is legal and
+    /// parses, where at 8 bits the same header is rejected. The last
+    /// clause is the one that proves the parser is applying the depth it
+    /// was handed rather than a constant.
+    #[test]
+    fn deep_headers_round_trip_through_the_parsers() {
+        use crate::hevc::pps::Pps;
+        use crate::hevc::slice::SliceHeader as ParsedHeader;
+        use crate::hevc::sps::Sps;
+        use crate::nal::HevcNalHeader;
+
+        for (depth, chroma, want_profile) in [
+            (10u32, ChromaFormat::Yuv420, 2u32),
+            (10, ChromaFormat::Yuv422, 4),
+            (10, ChromaFormat::Yuv444, 4),
+            (10, ChromaFormat::Monochrome, 4),
+            (12, ChromaFormat::Yuv420, 4),
+            (14, ChromaFormat::Yuv420, 4),
+            (8, ChromaFormat::Yuv420, 1),
+        ] {
+            let tag = format!("{depth}-bit {chroma:?}");
+            let (cfg, g) = geom(64, 64, chroma);
+            let cfg = Config { bit_depth: depth, ..cfg };
+            let g = Geometry { bit_depth: depth, ..g };
+            let sps_rbsp = write_sps(&cfg, &g, 16, None);
+            let sps = Sps::parse(&crate::nal::unescape_rbsp(&sps_rbsp)).unwrap_or_else(|e| panic!("{tag}: SPS rejected: {e}"));
+            assert_eq!(sps.bit_depth_luma, depth, "{tag}: luma depth");
+            assert_eq!(sps.bit_depth_chroma, depth, "{tag}: chroma depth");
+            assert_eq!(u32::from(sps.ptl.profile_idc), want_profile, "{tag}: general_profile_idc");
+            // The VPS carries the same PTL; it must at least be a legal one.
+            assert!(!write_vps(&cfg, &g).is_empty());
+
+            let mut pps = Pps::parse(&crate::nal::unescape_rbsp(&write_pps(26, false, true))).expect("PPS");
+            pps.resolve_tiles(&sps).expect("tiles");
+
+            // The quantiser range: the parser's floor is -QpBdOffsetY,
+            // which this encoder's `u8` quantiser never reaches — but the
+            // header syntax does, and a deep decoder must take it.
+            let qp_bd_offset = 6 * (depth as i32 - 8);
+            let parse_at = |slice_qp: i32| -> Result<i32, crate::Error> {
+                let mut w = BitWriter::with_capacity(64);
+                w.bits(8, ((NAL_TRAIL_R as u32) & 0x3f) << 1);
+                w.bits(8, 1);
+                let h = SliceHeader { kind: Kind::P, poc_lsb: 2, qp: slice_qp, log2_max_poc_lsb: 16, ref_deltas: vec![-2], sao: None };
+                write_slice_header(&h, 26, NAL_TRAIL_R, true, &mut w);
+                w.flag(true);
+                w.align_zero();
+                let rbsp = w.into_rbsp();
+                let nal = HevcNalHeader::parse(&rbsp).ok_or_else(|| crate::Error::bitstream("NAL header"))?;
+                let (parsed, _, _) = ParsedHeader::parse(&rbsp, nal, &|_| Some(pps.clone()), &|_| Some(sps.clone()), None)?;
+                Ok(parsed.slice_qp)
+            };
+            assert_eq!(parse_at(51).unwrap_or_else(|e| panic!("{tag}: QP 51: {e}")), 51, "{tag}");
+            assert_eq!(parse_at(-qp_bd_offset).unwrap_or_else(|e| panic!("{tag}: QP -QpBdOffset: {e}")), -qp_bd_offset, "{tag}");
+            assert!(parse_at(-qp_bd_offset - 1).is_err(), "{tag}: a quantiser below -QpBdOffsetY must be rejected");
+            assert!(parse_at(52).is_err(), "{tag}: a quantiser above 51 must be rejected");
+
+            // The PPS quantiser has the same range (`init_qp_minus26`,
+            // 7.4.3.3.1: `-(26 + QpBdOffsetY)..=25`), and the parser holds
+            // it to the SPS it is resolved against.
+            let deep_pps = Pps::parse(&crate::nal::unescape_rbsp(&write_pps(-qp_bd_offset, false, true)))
+                .unwrap_or_else(|e| panic!("{tag}: PPS at init_qp -QpBdOffset rejected: {e}"));
+            assert_eq!(deep_pps.init_qp, -qp_bd_offset, "{tag}: init_qp");
         }
     }
 

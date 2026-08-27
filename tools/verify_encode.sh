@@ -244,21 +244,42 @@ hevc-abr-96k|--codec h265 --bitrate 96000 --gop 8
 abr-64k|--codec h264 --bitrate 64000 --gop 8
 abr-128k|--codec h264 --bitrate 128000 --gop 8
 hevc-vbv-125@src_cut|--codec h265 --bitrate 64000 --cpb-ms 125 --gop 8
+hevc10-cqp-intra@p10|--codec h265 --qp 26 --gop 0
+hevc10-cqp-ip@p10|--codec h265 --qp 26 --gop 8
+hevc10-cqp-ipb@p10|--codec h265 --qp 26 --gop 8 --bframes 2
+hevc10-cqp40-ip@p10|--codec h265 --qp 40 --gop 8
+hevc10-lossless-ip@p10|--codec h265 --lossless --gop 8
+hevc10-lossless-ipb@p10|--codec h265 --lossless --gop 8 --bframes 2
+hevc10-cqp40-sao-ip@p10|--codec h265 --qp 40 --gop 8 --sao
+hevc10-abr-96k@p10|--codec h265 --bitrate 96000 --gop 8
+hevc12-cqp-ip@p12|--codec h265 --qp 26 --gop 8
+hevc12-cqp40-sao-ip@p12|--codec h265 --qp 40 --gop 8 --sao
+hevc12-lossless-ip@p12|--codec h265 --lossless --gop 8
 "}
+
+# Split a clip's format token into its chroma format and sample depth:
+# `420` is 4:2:0 at 8 bits, `420p10` the same at 10. The depth travels in
+# the filename with the geometry, for the same reason the geometry does.
+chroma_of() { echo "${1%%p*}"; }
+depth_of() { local d=${1##*p}; [ "$d" = "$1" ] && d=8; echo "$d"; }
 
 one() {
   src=$1; name=$2; flags=$3
   base=$(basename "$src" .yuv)
   geom=$(echo "$base" | sed -n 's/.*_\([0-9]\+x[0-9]\+\)_.*/\1/p')
   fmt=$(echo "$base" | sed -n 's/.*_[0-9]\+x[0-9]\+_\(.*\)/\1/p')
+  chroma=$(chroma_of "$fmt")
+  depth=$(depth_of "$fmt")
   tag="$base/$name"
   ext=h264; case "$flags" in *"--codec h265"*) ext=h265 ;; esac
   bs="$OUT/$base.$name.$ext"
   rec="$OUT/$base.$name.rec.yuv"
 
   # The encoder writes the bitstream and, separately, the reconstruction it
-  # believes that bitstream carries.
-  if ! "$ENC" --input "$src" --size "$geom" --format "$fmt" \
+  # believes that bitstream carries. The depth is the clip's, never the
+  # row's: a row that asked for a depth the clip does not have would code
+  # the wrong number of bytes per sample and fail on the first picture.
+  if ! "$ENC" --input "$src" --size "$geom" --format "$chroma" --depth "$depth" \
        $flags --output "$bs" --recon "$rec" > "$OUT/$base.$name.enc.log" 2>&1; then
     echo "ENCODE-FAIL $tag: $(tail -1 "$OUT/$base.$name.enc.log" | head -c 100)"
     return 1
@@ -286,8 +307,11 @@ one() {
   # every luma sample comes out expanded: 68 becomes 61. That is an artefact
   # of the comparison, not a difference in the bitstream, and it cost a false
   # CROSS failure to find.
+  # Above 8 bits libavcodec emits little-endian 16-bit planes natively
+  # (`yuv420p10le` and friends) — the layout our decoder packs, so the
+  # comparison stays a plain `cmp` at every depth.
   ffargs="-pix_fmt $(ffpix "$fmt")"
-  case "$fmt" in 400|gray) ffargs="-vf extractplanes=y -pix_fmt gray" ;; esac
+  case "$chroma" in 400|gray) ffargs="-vf extractplanes=y -pix_fmt $(ffpix "$fmt")" ;; esac
   if ! "$FFMPEG" -v error -y -i "$bs" -f rawvideo $ffargs "$theirs" \
        > "$OUT/$base.$name.ff.log" 2>&1; then
     echo "CROSS-FAIL  $tag: libavcodec rejected our bitstream: $(tail -1 "$OUT/$base.$name.ff.log" | head -c 80)"
@@ -341,7 +365,7 @@ one() {
   esac
 
   # 3. QUALITY. Gated only when the configuration claims to be lossless.
-  psnr=$(psnr_of "$src" "$rec")
+  psnr=$(psnr_of "$src" "$rec" "$depth")
   size=$(stat -c %s "$bs")
   case "$flags" in
     *--lossless*)
@@ -358,41 +382,64 @@ one() {
   return 0
 }
 
-# Planar chroma format name to the ffmpeg pixel format that matches how this
-# decoder packs a picture.
+# Planar chroma format token to the ffmpeg pixel format that matches how
+# this decoder packs a picture: bytes at 8 bits, little-endian 16-bit
+# planes above (`420p10` -> `yuv420p10le`, `400p10` -> `gray10le`).
 ffpix() {
-  case "$1" in
-    400|gray) echo gray ;;
-    422) echo yuv422p ;;
-    444) echo yuv444p ;;
-    *) echo yuv420p ;;
+  local d
+  d=$(depth_of "$1")
+  [ "$d" = 8 ] && d="" || d="${d}le"
+  case "$(chroma_of "$1")" in
+    400|gray) echo "gray$d" ;;
+    422) echo "yuv422p$d" ;;
+    444) echo "yuv444p$d" ;;
+    *) echo "yuv420p$d" ;;
   esac
 }
 
+# PSNR of two raw files at a sample depth: bytes at 8, little-endian
+# 16-bit samples above, against the peak that depth has. Reading a 10-bit
+# file as bytes would compare the low and high halves of each sample as
+# if they were two samples and report nonsense with a straight face.
 psnr_of() {
-  python - "$1" "$2" <<'PY'
-import sys, math
+  python - "$1" "$2" "$3" <<'PY'
+import sys, math, array
+depth = int(sys.argv[3])
 a = open(sys.argv[1], 'rb').read()
 b = open(sys.argv[2], 'rb').read()
+if depth > 8:
+    sa = array.array('H'); sa.frombytes(a[:len(a) & ~1])
+    sb = array.array('H'); sb.frombytes(b[:len(b) & ~1])
+    if sys.byteorder != 'little':
+        sa.byteswap(); sb.byteswap()
+    a, b = sa, sb
 n = min(len(a), len(b))
 if n == 0:
     print("n/a"); raise SystemExit
+step = max(1, n // 200000) if n > 200000 else 1
 se = 0
-for i in range(0, n, max(1, n // 200000) if n > 200000 else 1):
+for i in range(0, n, step):
     d = a[i] - b[i]
     se += d * d
-cnt = len(range(0, n, max(1, n // 200000) if n > 200000 else 1))
+cnt = len(range(0, n, step))
 mse = se / cnt
-print("inf" if mse == 0 else f"{10 * math.log10(255 * 255 / mse):.2f}")
+peak = (1 << depth) - 1
+print("inf" if mse == 0 else f"{10 * math.log10(peak * peak / mse):.2f}")
 PY
 }
-export -f one ffpix psnr_of
+export -f one ffpix psnr_of chroma_of depth_of
 export ENC DEC HRD FFMPEG OUT PARAM_SETS
 
 echo "== encode verification =="
 results="$OUT/results.txt"
 : > "$results"
 for src in $SOURCES; do
+  # A clip deeper than 8 bits (format token `420p10`, `420p12`, ...) is
+  # visited only by rows that name it with `@p10` / `@p12`. A row without
+  # a suffix is an 8-bit row: most of them are H.264, which codes 8 bits
+  # only, and the H.265 rows have their deep twins listed explicitly so
+  # the tally says how many deep cells ran rather than folding them in.
+  case "$src" in *_[0-9][0-9][0-9]p[0-9]*.yuv) deep=1 ;; *) deep=0 ;; esac
   echo "$CONFIGS" | while IFS='|' read -r name flags; do
     [ -z "$name" ] && continue
     # A configuration with no flags is always a mistake — most often a
@@ -411,6 +458,9 @@ for src in $SOURCES; do
           *"$pat"*) name=${name%@*} ;;
           *) continue ;;
         esac
+        ;;
+      *)
+        [ "$deep" = 1 ] && continue
         ;;
     esac
     echo "$src|$name|$flags"

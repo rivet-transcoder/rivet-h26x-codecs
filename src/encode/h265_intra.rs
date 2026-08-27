@@ -686,7 +686,7 @@ pub(crate) fn code_cu_2nx2n_intra<S: Sample>(
     );
     if split_depth >= 1 {
         assert!(split_depth <= 2, "split_depth {split_depth} above the SPS transform depth of 2");
-        let lam = 0.85f32 * ((ctx.qp - 12) as f32 / 3.0).exp2();
+        let lam = 0.85f32 * ((ctx.qp - 12) as f32 / 3.0).exp2() * ssd_lambda_scale(ctx.bit_depth);
         let cost_u = ssd_u as f32 + lam * cu_bits(&out, geo.cat, ctx.qp, ctx.bypass);
         // The split trial, children in decode order. With the
         // deeper search on, each child is coded unsplit, re-coded
@@ -999,6 +999,32 @@ fn mode_signalling_cost(qp: i32, signal: ModeSignal) -> f32 {
     lambda_bits(qp, bins, 0)
 }
 
+/// How much a bit is worth against a SATD at `bit_depth` bits, relative
+/// to 8: `2^(BitDepth - 8)`.
+///
+/// Every Lagrangian in this encoder is the conventional
+/// `0.85 * 2^((QP - 12) / 3)`, a constant fitted at 8 bits, where the
+/// signalled QP and the sample range it was fitted against agree. Deeper
+/// samples keep the QP (`Qp'Y = QpY + QpBdOffsetY` is applied inside the
+/// scaling, not in the signalled value) but every absolute difference
+/// grows by `2^(BitDepth - 8)`, so an unscaled lambda would price bits
+/// at a quarter of their 8-bit worth at 10 bits and the decisions would
+/// drift towards spending them. HM makes the same correction on the
+/// distortion side (`DISTORTION_PRECISION_ADJUSTMENT`, shifting SAD and
+/// SATD right by `BitDepth - 8`); it is applied here on the rate side
+/// instead, which is the same comparison and leaves every 8-bit cost
+/// multiplied by exactly `1.0` — the property that keeps the 8-bit
+/// stream byte-identical.
+pub(crate) fn satd_lambda_scale(bit_depth: u32) -> f32 {
+    (1u32 << (bit_depth - 8)) as f32
+}
+
+/// The same for a cost paired with an SSD, which grows by the square:
+/// `2^(2 * (BitDepth - 8))` (HM's shift of `(BitDepth - 8) << 1` on SSE).
+pub(crate) fn ssd_lambda_scale(bit_depth: u32) -> f32 {
+    (1u32 << (2 * (bit_depth - 8))) as f32
+}
+
 /// The Lagrangian core every structure and mode cost shares — **a
 /// placeholder for real RD**, and the one place the heuristic constants
 /// live: the conventional `0.85 * 2^((QP - 12) / 3)` multiplier, and a
@@ -1142,6 +1168,7 @@ fn search_luma_mode<S: Sample>(
     let n = 1usize << log2;
     let off = plane.offset(x as isize, y as isize);
     fill_ref_avail(geo, &mut sc.avail, x, y, n, 1, 1);
+    let rate_scale = satd_lambda_scale(ctx.bit_depth);
     let mut best = (f32::MAX, 1u8);
     for mode in 0..35u8 {
         // The decoder's flags for a luma block under this SPS: reference
@@ -1153,7 +1180,7 @@ fn search_luma_mode<S: Sample>(
             Some(i) => ModeSignal::LumaMpm(i as u8),
             None => ModeSignal::LumaEscape,
         };
-        let cost = satd as f32 + mode_signalling_cost(ctx.qp, signal);
+        let cost = satd as f32 + mode_signalling_cost(ctx.qp, signal) * rate_scale;
         if cost < best.0 {
             best = (cost, mode);
         }
@@ -1290,7 +1317,7 @@ fn rdoq_trim<S: Sample>(
 
     let bd_shift = 20 - ctx.bit_depth as i32;
     let max = (1i32 << ctx.bit_depth) - 1;
-    let lambda = 0.85f32 * ((ctx.qp - 12) as f32 / 3.0).exp2();
+    let lambda = 0.85f32 * ((ctx.qp - 12) as f32 / 3.0).exp2() * ssd_lambda_scale(ctx.bit_depth);
     let params = ResidualParams {
         log2_size: log2,
         c_idx,
@@ -1454,6 +1481,7 @@ fn search_chroma_mode<S: Sample>(
     let (tbs, ntb, log2c) = chroma_tbs(geo.cat, xl, yl, log2_luma);
     let nc = 1usize << log2c;
     let (sw, sh) = sub_wh(geo.cat);
+    let rate_scale = satd_lambda_scale(ctx.bit_depth);
     let mut best = (f32::MAX, 4u8);
     for syntax in 0..5u8 {
         let mode = chroma_mode_for(geo.cat, syntax, luma0) as u32;
@@ -1472,7 +1500,7 @@ fn search_chroma_mode<S: Sample>(
             }
         }
         let signal = if syntax == 4 { ModeSignal::ChromaDerived } else { ModeSignal::ChromaExplicit };
-        let cost = satd as f32 + mode_signalling_cost(ctx.qp, signal);
+        let cost = satd as f32 + mode_signalling_cost(ctx.qp, signal) * rate_scale;
         if cost < best.0 {
             best = (cost, syntax);
         }

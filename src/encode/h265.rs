@@ -28,10 +28,11 @@ use super::{Access, Config, RateControl};
 use crate::bitwriter::BitWriter;
 use crate::cabac_enc::CabacEncoder;
 use crate::dsp::distortion::DistortionDsp;
-use crate::dsp::hevc::{HevcDsp, install_simd_u8};
+use crate::dsp::hevc::HevcDsp;
 use crate::dsp::hevc_enc::HevcEncDsp;
 use crate::dsp::Cpu;
 use crate::hevc::ctx::Contexts;
+use crate::sample::Sample;
 use crate::hevc::ctu::{
     SaoCtx, SaoMergeNb, SplitCuNb, write_cbf_chroma, write_cbf_luma, write_cu_skip_flag, write_sao,
     write_cu_transquant_bypass_flag, write_merge_flag, write_merge_idx, write_mvd,
@@ -44,12 +45,52 @@ use crate::hevc::residual::{ResidualParams, residual_scan_idx, write_residual};
 use crate::{Error, Result};
 
 /// H.265 encoder. See the module documentation for what is and is not built.
+///
+/// A thin face over the private `Core<S>`, instantiated at the sample
+/// width the configuration's bit depth needs — the same split the decoder
+/// makes at its NAL layer: everything below is generic over the crate's
+/// `Sample` trait, `u8`
+/// for 8-bit streams and `u16` for 9- to 14-bit ones, so an 8-bit encode
+/// moves half the bytes and runs the 8-bit SIMD tiers, and a deeper one
+/// runs the decoder's own 16-bit kernels for prediction, transform,
+/// deblocking and SAO rather than a second set written for the encoder.
+///
+/// Pictures cross this face as bytes in both directions, in the layout
+/// [`crate::Picture::into_packed`] uses: one byte per sample at 8 bits,
+/// little-endian `u16` pairs deeper — so a source picture and the
+/// decoder's output of it compare byte for byte at every depth, which is
+/// what the SELF check reads. [`H265Encoder::frame_bytes`] says how many.
 pub struct H265Encoder {
+    inner: Inner,
+}
+
+/// The two sample widths an encoder can be built at.
+enum Inner {
+    /// 8-bit samples.
+    Eight(Core<u8>),
+    /// 9 to 14 bits.
+    Wide(Core<u16>),
+}
+
+/// Run one expression against whichever width the encoder was built at.
+macro_rules! with_core {
+    ($inner:expr, $e:ident => $body:expr) => {
+        match $inner {
+            Inner::Eight($e) => $body,
+            Inner::Wide($e) => $body,
+        }
+    };
+}
+
+/// The encoder proper, at one sample width.
+struct Core<S: Sample> {
     cfg: Config,
     sched: Scheduler,
     /// Source pictures held in display order, so a B picture kept back by the
-    /// scheduler still has its samples when its anchor arrives.
-    held: std::collections::BTreeMap<u64, Vec<u8>>,
+    /// scheduler still has its samples when its anchor arrives — already
+    /// unpacked from the caller's bytes into samples, so the coding
+    /// paths never see a byte layout.
+    held: std::collections::BTreeMap<u64, Vec<S>>,
     /// Reconstructions in coding order, for the SELF check.
     recon: Vec<Vec<u8>>,
     frame_bytes: usize,
@@ -63,7 +104,7 @@ pub struct H265Encoder {
     /// their motion grids and extended borders, not cropped bytes: the
     /// inter decision predicts through the decoder's own MC, which reads
     /// padded planes, and derives candidates from stored motion.
-    refs: Vec<crate::hevc::frame::Frame<u8>>,
+    refs: Vec<crate::hevc::frame::Frame<S>>,
     /// The rate controller, when the configuration asked for a bitrate.
     /// `None` at a constant quantiser, which is the mode every other one
     /// is measured against.
@@ -77,7 +118,7 @@ pub struct H265Encoder {
     /// pps_qp`. At a constant quantiser this equals that quantiser and
     /// every delta is zero, which is exactly what the streams before rate
     /// control carried — that is why enabling this changed no bytes.
-    pps_qp: u8,
+    pps_qp: i32,
     /// Bytes emitted so far, to hold the controller's ledger to.
     emitted: u64,
     /// How many pictures had to be coded more than once to fit the
@@ -117,12 +158,13 @@ pub struct H265Encoder {
 /// single stray write in either coding path would leave a trace, make the
 /// second attempt something other than a clean re-run, and surface as a
 /// byte moving in a cell that had no reason to move.
-struct Attempt {
+struct Attempt<S: Sample> {
     access: Access,
-    /// The reconstruction, cropped to display size.
+    /// The reconstruction, cropped to display size and packed to bytes
+    /// (little-endian `u16` above 8 bits).
     rec: Vec<u8>,
     /// The reconstruction as a reference frame, uncropped.
-    frame: crate::hevc::frame::Frame<u8>,
+    frame: crate::hevc::frame::Frame<S>,
     /// Whether this picture empties the reference buffer first, which is
     /// what makes an IDR a random access point.
     clears_refs: bool,
@@ -136,17 +178,124 @@ impl H265Encoder {
     /// Fails rather than starting if the configuration cannot produce a legal
     /// stream — an encoder that fails late has usually already emitted a
     /// header describing something it then cannot deliver.
+    ///
+    /// The bit depth picks the sample width once, here: 8 bits codes in
+    /// `u8`, anything deeper in `u16`, exactly as [`crate::hevc::HevcDecoder`]
+    /// chooses on reading the SPS. `Config::validate` bounds the depth to
+    /// the 8..=14 both decoders and the transform arithmetic admit.
     pub fn new(cfg: Config) -> Result<Self> {
         cfg.validate()?;
-        if cfg.bit_depth > 8 {
-            // Same refusal, same reason as H.264: the reconstruction planes
-            // this encoder will share with the decision side are u8, and a
-            // silently narrowed stream that looks legal is worse than a
-            // refusal that names itself.
-            return Err(Error::unsupported(
-                "H.265 encode: bit depth above 8 (encoder in progress)",
-            ));
+        let inner = if cfg.bit_depth > 8 { Inner::Wide(Core::new(cfg)?) } else { Inner::Eight(Core::new(cfg)?) };
+        Ok(H265Encoder { inner })
+    }
+
+    /// How many bytes one source picture must be: one per sample at 8
+    /// bits, two (little-endian) deeper.
+    pub fn frame_bytes(&self) -> usize {
+        with_core!(&self.inner, e => e.frame_bytes)
+    }
+
+    /// What the rate controller achieved against what it was asked for,
+    /// in bits per second — `None` at a constant quantiser, where there
+    /// was no target to miss.
+    ///
+    /// Reported by the encoder rather than recomputed by whoever is
+    /// watching: the encoder knows the frame count, the frame rate and the
+    /// exact bytes emitted, and a second implementation of that division
+    /// somewhere else is a second thing that can be wrong. The gate reads
+    /// this line rather than doing the arithmetic itself.
+    pub fn rate_report(&self) -> Option<(f64, f64)> {
+        with_core!(&self.inner, e => e.rate_report())
+    }
+
+    /// How many extra codings the declared buffer cost: pictures that came
+    /// out too large for it and had to be coded again at a higher
+    /// quantiser. Zero when no buffer was declared, because then nothing
+    /// can fail to fit.
+    pub fn recodes(&self) -> u64 {
+        with_core!(&self.inner, e => e.recoded)
+    }
+
+    /// The reconstructions produced so far, in coding order, packed as
+    /// the source pictures were handed in (see [`H265Encoder`]).
+    pub fn reconstructions(&self) -> &[Vec<u8>] {
+        with_core!(&self.inner, e => &e.recon)
+    }
+
+    /// Offer the next picture in display order.
+    pub fn push(&mut self, picture: &[u8]) -> Result<Vec<Access>> {
+        with_core!(&mut self.inner, e => e.push(picture))
+    }
+
+    /// Code everything still held back.
+    pub fn flush(&mut self) -> Result<Vec<Access>> {
+        with_core!(&mut self.inner, e => e.flush())
+    }
+
+    /// Make the next picture pushed an IDR, restarting the GOP there. See
+    /// [`Scheduler::force_idr`] for who needs this and what it does to any
+    /// B pictures held back at the time.
+    pub fn force_idr(&mut self) {
+        with_core!(&mut self.inner, e => e.sched.force_idr())
+    }
+}
+
+/// Unpack one source picture from the caller's bytes into samples: the
+/// bytes themselves at 8 bits, little-endian pairs deeper — the layout
+/// [`crate::Picture::into_packed`] emits, so the two sides of SELF agree
+/// without a conversion in between.
+///
+/// A sample above the declared depth is refused rather than coded: the
+/// prediction and transform arithmetic assume `0..2^BitDepth`, and a
+/// 10-bit stream carrying a 12-bit value would not fail, it would wrap
+/// somewhere in the reconstruction and desync. At 8 bits every byte is
+/// in range and nothing is checked.
+fn unpack_samples<S: Sample>(bytes: &[u8], bit_depth: u32) -> Result<Vec<S>> {
+    if S::BYTES == 1 {
+        return Ok(bytes.iter().map(|&b| S::from_i32(i32::from(b))).collect());
+    }
+    let max = (1u32 << bit_depth) - 1;
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let v = u16::from_le_bytes([pair[0], pair[1]]);
+        if u32::from(v) > max {
+            return Err(Error::bitstream(format!(
+                "H.265 encode: source sample {v} exceeds the declared {bit_depth}-bit depth"
+            )));
         }
+        out.push(S::from_i32(i32::from(v)));
+    }
+    Ok(out)
+}
+
+/// The inverse of [`unpack_samples`] for one row of the reconstruction.
+fn pack_row<S: Sample>(row: &[S], out: &mut Vec<u8>) {
+    if S::BYTES == 1 {
+        out.extend(row.iter().map(|s| s.to_i32() as u8));
+    } else {
+        for s in row {
+            out.extend_from_slice(&(s.to_i32() as u16).to_le_bytes());
+        }
+    }
+}
+
+/// Replicate a `sw` by `sh` plane out to `tw` by `th` — sources at coded
+/// size, edge-extended: the coded picture is a whole number of CTUs, the
+/// display size usually is not, and the conformance window hides the
+/// difference.
+fn pad_plane<S: Sample>(src: &[S], sw: usize, sh: usize, tw: usize, th: usize) -> Vec<S> {
+    let mut out = vec![S::default(); tw * th];
+    for y in 0..th {
+        let sy = y.min(sh - 1);
+        for x in 0..tw {
+            out[y * tw + x] = src[sy * sw + x.min(sw - 1)];
+        }
+    }
+    out
+}
+
+impl<S: Sample> Core<S> {
+    fn new(cfg: Config) -> Result<Self> {
         if cfg.sao && matches!(cfg.rate, RateControl::Lossless) {
             // Every CU of a lossless picture is transquant-bypass, every
             // bypass sample is exempt from both loop filters, and SAO
@@ -171,8 +320,8 @@ impl H265Encoder {
         // Its only effect on the stream is the size of each
         // `slice_qp_delta`, since both sides derive everything else from
         // the slice quantiser.
-        let pps_qp = match cfg.rate {
-            RateControl::ConstantQp(q) => q.min(51),
+        let pps_qp: i32 = match cfg.rate {
+            RateControl::ConstantQp(q) => i32::from(q.min(51)),
             RateControl::Lossless => 26,
             RateControl::Bitrate { .. } => 26,
         };
@@ -212,27 +361,14 @@ impl H265Encoder {
             cfg,
             held: std::collections::BTreeMap::new(),
             recon: Vec::new(),
-            frame_bytes: luma + chroma,
+            frame_bytes: (luma + chroma) * S::BYTES,
             next_display: 0,
             refs: Vec::new(),
         })
     }
 
-    /// How many bytes one source picture must be.
-    pub fn frame_bytes(&self) -> usize {
-        self.frame_bytes
-    }
-
-    /// What the rate controller achieved against what it was asked for,
-    /// in bits per second — `None` at a constant quantiser, where there
-    /// was no target to miss.
-    ///
-    /// Reported by the encoder rather than recomputed by whoever is
-    /// watching: the encoder knows the frame count, the frame rate and the
-    /// exact bytes emitted, and a second implementation of that division
-    /// somewhere else is a second thing that can be wrong. The gate reads
-    /// this line rather than doing the arithmetic itself.
-    pub fn rate_report(&self) -> Option<(f64, f64)> {
+    /// See [`H265Encoder::rate_report`].
+    fn rate_report(&self) -> Option<(f64, f64)> {
         let rc = self.rc.as_ref()?;
         let target = match self.cfg.rate {
             RateControl::Bitrate { bps } => bps as f64,
@@ -241,21 +377,8 @@ impl H265Encoder {
         Some((rc.achieved_bps(self.cfg.fps), target))
     }
 
-    /// How many extra codings the declared buffer cost: pictures that came
-    /// out too large for it and had to be coded again at a higher
-    /// quantiser. Zero when no buffer was declared, because then nothing
-    /// can fail to fit.
-    pub fn recodes(&self) -> u64 {
-        self.recoded
-    }
-
-    /// The reconstructions produced so far, in coding order.
-    pub fn reconstructions(&self) -> &[Vec<u8>] {
-        &self.recon
-    }
-
-    /// Offer the next picture in display order.
-    pub fn push(&mut self, picture: &[u8]) -> Result<Vec<Access>> {
+    /// See [`H265Encoder::push`].
+    fn push(&mut self, picture: &[u8]) -> Result<Vec<Access>> {
         if picture.len() != self.frame_bytes {
             return Err(Error::bitstream(format!(
                 "H.265 encode: picture is {} bytes, expected {}",
@@ -263,24 +386,18 @@ impl H265Encoder {
                 self.frame_bytes
             )));
         }
+        let samples = unpack_samples::<S>(picture, self.cfg.bit_depth)?;
         let display = self.next_display;
         self.next_display += 1;
-        self.held.insert(display, picture.to_vec());
+        self.held.insert(display, samples);
         let ready = self.sched.push();
         self.code(ready)
     }
 
-    /// Code everything still held back.
-    pub fn flush(&mut self) -> Result<Vec<Access>> {
+    /// See [`H265Encoder::flush`].
+    fn flush(&mut self) -> Result<Vec<Access>> {
         let ready = self.sched.flush();
         self.code(ready)
-    }
-
-    /// Make the next picture pushed an IDR, restarting the GOP there. See
-    /// [`Scheduler::force_idr`] for who needs this and what it does to any
-    /// B pictures held back at the time.
-    pub fn force_idr(&mut self) {
-        self.sched.force_idr();
     }
 
     fn code(&mut self, ready: Vec<Coded>) -> Result<Vec<Access>> {
@@ -335,7 +452,7 @@ impl H265Encoder {
     /// Without a declared buffer there is nothing to fit and the loop runs
     /// exactly once, which is why every stream that does not ask for a
     /// buffer is byte-identical to what it was before this existed.
-    fn code_picture(&mut self, c: Coded, src: &[u8]) -> Result<Access> {
+    fn code_picture(&mut self, c: Coded, src: &[S]) -> Result<Access> {
         let mut qp = self.pick_picture_qp(&c)?;
         let bypass = matches!(self.cfg.rate, RateControl::Lossless);
         for attempt in 0..super::rc::MAX_ATTEMPTS {
@@ -372,7 +489,7 @@ impl H265Encoder {
 
     /// Keep what an attempt made: the reconstruction the SELF check reads,
     /// and the reference the next picture predicts from.
-    fn commit(&mut self, c: &Coded, a: Attempt) -> Access {
+    fn commit(&mut self, c: &Coded, a: Attempt<S>) -> Access {
         self.recon.push(a.rec);
         if a.clears_refs {
             self.refs.clear();
@@ -398,7 +515,7 @@ impl H265Encoder {
     }
 
     /// Code one picture at a given quantiser, keeping nothing.
-    fn code_attempt(&mut self, c: Coded, src: &[u8], qp: u8, bypass: bool) -> Result<Attempt> {
+    fn code_attempt(&mut self, c: Coded, src: &[S], qp: u8, bypass: bool) -> Result<Attempt<S>> {
         let g = self.geom;
         let pps_qp = self.pps_qp;
         // Lossless is transquant bypass: the PPS enables it, every CU says
@@ -439,38 +556,30 @@ impl H265Encoder {
         };
         let (cdw, cdh) = (dw.div_ceil(sw), dh.div_ceil(sh));
         let (ccw, cch) = (cw / sw, ch / sh);
-        let pad = |src: &[u8], sw: usize, sh: usize, tw: usize, th: usize| -> Vec<u8> {
-            let mut out = vec![0u8; tw * th];
-            for y in 0..th {
-                let sy = y.min(sh - 1);
-                for x in 0..tw {
-                    out[y * tw + x] = src[sy * sw + x.min(sw - 1)];
-                }
-            }
-            out
-        };
-        let py = pad(&src[..dw * dh], dw, dh, cw, ch);
+        let py = pad_plane(&src[..dw * dh], dw, dh, cw, ch);
         let (pcb, pcr) = if cat != 0 {
             (
-                pad(&src[dw * dh..dw * dh + cdw * cdh], cdw, cdh, ccw, cch),
-                pad(&src[dw * dh + cdw * cdh..], cdw, cdh, ccw, cch),
+                pad_plane(&src[dw * dh..dw * dh + cdw * cdh], cdw, cdh, ccw, cch),
+                pad_plane(&src[dw * dh + cdw * cdh..], cdw, cdh, ccw, cch),
             )
         } else {
             (Vec::new(), Vec::new())
         };
 
-        // The decision machinery, on the decoder's own kernels.
+        // The decision machinery, on the decoder's own kernels — the
+        // table the decoder builds for this sample width, SIMD tiers
+        // included.
         let cpu = Cpu::detect_honouring_env();
-        let mut dsp = HevcDsp::<u8>::SCALAR;
-        install_simd_u8(&mut dsp, cpu);
+        let dsp = HevcDsp::<S>::new(cpu);
         let enc = HevcEncDsp::new(cpu);
-        let dist = DistortionDsp::<u8>::new(cpu);
+        let dist = DistortionDsp::<S>::new(cpu);
+        let bit_depth = self.cfg.bit_depth;
         let ictx = IntraCtx {
             dsp: &dsp,
             enc: &enc,
             dist: &dist,
             qp: qp as i32,
-            bit_depth: 8,
+            bit_depth,
             strong_smoothing: false,
             bypass,
             // An all-intra stream has no inter pictures at all, so no
@@ -480,7 +589,7 @@ impl H265Encoder {
             // more than it saves — see `rdoq_trim`.
             free_to_trim: self.cfg.gop == 0,
         };
-        let mut pic = IntraPicture::<u8>::new_with_chroma(cw, ch, g.log2_ctb, 8, chroma);
+        let mut pic = IntraPicture::<S>::new_with_chroma(cw, ch, g.log2_ctb, bit_depth, chroma);
         // The transform-split search is on: a CU may carry four quarter-size
         // TUs where that wins the decision module's cost comparison, and the
         // writer below spells both shapes.
@@ -517,7 +626,7 @@ impl H265Encoder {
             &syn::SliceHeader {
                 kind: c.kind,
                 poc_lsb: (c.poc as u32) & ((1 << LOG2_MAX_POC_LSB) - 1),
-                qp,
+                qp: i32::from(qp),
                 log2_max_poc_lsb: LOG2_MAX_POC_LSB,
                 // An IDR references nothing, so its reference picture set
                 // is empty.
@@ -562,7 +671,7 @@ impl H265Encoder {
         // Then SAO, over the deblocked samples, which is the order 8.7
         // fixes and the order `decoder.rs` applies them in.
         let plan = self.cfg.sao.then(|| {
-            let (sps, pps) = parsed_sets(&self.cfg, &g, qp, bypass, deblock, self.cpb.as_ref());
+            let (sps, pps) = parsed_sets(&self.cfg, &g, i32::from(qp), bypass, deblock, self.cpb.as_ref());
             sao_picture(&ictx, &mut pic.recon, &mut info, &sps, &pps, &py, cw, &pcb, &pcr, ccw)
         });
         {
@@ -570,7 +679,7 @@ impl H265Encoder {
             for cy in 0..hc {
                 for cxu in 0..wc {
                     let addr = cy * wc + cxu;
-                    write_sao_for(&mut e, &mut cx, plan.as_ref(), addr, cxu, cy, qp, cat);
+                    write_sao_for(&mut e, &mut cx, plan.as_ref(), addr, cxu, cy, bit_depth, cat);
                     write_ctu_intra(&mut e, &mut cx, &decisions[addr], cxu, cy, bypass, cat);
                     e.encode_terminate(u32::from(cy == hc - 1 && cxu == wc - 1));
                 }
@@ -579,14 +688,15 @@ impl H265Encoder {
         w.align_zero();
         out.extend_from_slice(&syn::annexb(syn::NAL_IDR_N_LP, &w.into_nal()));
 
-        // The reconstruction, cropped to display size — what a decoder
-        // emits, and therefore what SELF compares against.
+        // The reconstruction, cropped to display size and packed to bytes
+        // — what a decoder emits, and therefore what SELF compares
+        // against.
         let mut rec = Vec::with_capacity(self.frame_bytes);
-        let crop = |p: &crate::hevc::frame::Plane16<u8>, tw: usize, th: usize, out: &mut Vec<u8>| {
+        let crop = |p: &crate::hevc::frame::Plane16<S>, tw: usize, th: usize, out: &mut Vec<u8>| {
             let o = p.origin();
             for y in 0..th {
                 let row = o + y * p.stride;
-                out.extend_from_slice(&p.data[row..row + tw]);
+                pack_row(&p.data[row..row + tw], out);
             }
         };
         crop(&pic.recon.y, dw, dh, &mut rec);
@@ -623,7 +733,7 @@ impl H265Encoder {
     /// the same as keeping the two nearest in display order, which is why
     /// the selection above searches by picture order count rather than
     /// taking the last.
-    fn retain_reference(&mut self, c: &Coded, mut frame: crate::hevc::frame::Frame<u8>) {
+    fn retain_reference(&mut self, c: &Coded, mut frame: crate::hevc::frame::Frame<S>) {
         if !c.reference {
             return;
         }
@@ -647,7 +757,7 @@ impl H265Encoder {
     /// most sharply that a non-skip 2Nx2N merge CU never codes
     /// `rqt_root_cbf` (the reader infers it true), which is why a merge
     /// with nothing left to code must be spelled as a skip instead.
-    fn code_inter_picture(&mut self, c: Coded, src: &[u8], qp: u8, bypass: bool) -> Result<Attempt> {
+    fn code_inter_picture(&mut self, c: Coded, src: &[S], qp: u8, bypass: bool) -> Result<Attempt<S>> {
         let g = self.geom;
         let pps_qp = self.pps_qp;
         let (dw, dh) = (self.cfg.width as usize, self.cfg.height as usize);
@@ -670,21 +780,11 @@ impl H265Encoder {
         };
         let (cdw, cdh) = (dw.div_ceil(sw), dh.div_ceil(sh));
         let (ccw, cch) = (cw / sw, ch / sh);
-        let pad = |src: &[u8], sw: usize, sh: usize, tw: usize, th: usize| -> Vec<u8> {
-            let mut out = vec![0u8; tw * th];
-            for y in 0..th {
-                let sy = y.min(sh - 1);
-                for x in 0..tw {
-                    out[y * tw + x] = src[sy * sw + x.min(sw - 1)];
-                }
-            }
-            out
-        };
-        let py = pad(&src[..dw * dh], dw, dh, cw, ch);
+        let py = pad_plane(&src[..dw * dh], dw, dh, cw, ch);
         let (pcb, pcr) = if cat != 0 {
             (
-                pad(&src[dw * dh..dw * dh + cdw * cdh], cdw, cdh, ccw, cch),
-                pad(&src[dw * dh + cdw * cdh..], cdw, cdh, ccw, cch),
+                pad_plane(&src[dw * dh..dw * dh + cdw * cdh], cdw, cdh, ccw, cch),
+                pad_plane(&src[dw * dh + cdw * cdh..], cdw, cdh, ccw, cch),
             )
         } else {
             (Vec::new(), Vec::new())
@@ -736,30 +836,32 @@ impl H265Encoder {
         let future_poc = future.map(|f| f.poc);
 
         let cpu = Cpu::detect_honouring_env();
-        let mut dsp = HevcDsp::<u8>::SCALAR;
-        install_simd_u8(&mut dsp, cpu);
+        let dsp = HevcDsp::<S>::new(cpu);
         let enc = HevcEncDsp::new(cpu);
-        let dist = DistortionDsp::<u8>::new(cpu);
+        let dist = DistortionDsp::<S>::new(cpu);
+        let bit_depth = self.cfg.bit_depth;
         let mctx = IntraCtx {
             dsp: &dsp,
             enc: &enc,
             dist: &dist,
             qp: qp as i32,
-            bit_depth: 8,
+            bit_depth,
             strong_smoothing: false,
             bypass,
             // Every inter picture this encoder codes is kept as the next
             // one's reference, so none of them is free to trim.
             free_to_trim: false,
         };
-        let mut pic = InterPicture::<u8>::new(&sps, &pps, c.poc as i32);
+        // The reconstruction takes its sample depth from the parsed SPS —
+        // the same field a decoder of this stream sizes its frames by.
+        let mut pic = InterPicture::<S>::new(&sps, &pps, c.poc as i32);
 
         let mut w = BitWriter::with_capacity(cw * ch / 4);
         syn::write_slice_header(
             &syn::SliceHeader {
                 kind: c.kind,
                 poc_lsb: (c.poc as u32) & ((1 << LOG2_MAX_POC_LSB) - 1),
-                qp,
+                qp: i32::from(qp),
                 log2_max_poc_lsb: LOG2_MAX_POC_LSB,
                 // The inline short term reference picture set: one past
                 // entry, which becomes RefPicList0, and for a B picture one
@@ -839,7 +941,7 @@ impl H265Encoder {
                     let addr = cy * wc + cxu;
                     let left = (cxu > 0).then(|| skipped[addr - 1]);
                     let above = (cy > 0).then(|| skipped[addr - wc]);
-                    write_sao_for(&mut e, &mut cx, plan.as_ref(), addr, cxu, cy, qp, cat);
+                    write_sao_for(&mut e, &mut cx, plan.as_ref(), addr, cxu, cy, bit_depth, cat);
                     match &decisions[addr] {
                         PCuDecision::Inter(d) => write_cu_inter(&mut e, &mut cx, d, left, above, cat, bypass),
                         PCuDecision::Intra(d) => write_cu_intra_in_p(&mut e, &mut cx, d, left, above, cat, bypass),
@@ -856,11 +958,11 @@ impl H265Encoder {
         out.extend_from_slice(&syn::annexb(nal, &w.into_nal()));
 
         let mut rec = Vec::with_capacity(self.frame_bytes);
-        let crop = |p: &crate::hevc::frame::Plane16<u8>, tw: usize, th: usize, out: &mut Vec<u8>| {
+        let crop = |p: &crate::hevc::frame::Plane16<S>, tw: usize, th: usize, out: &mut Vec<u8>| {
             let o = p.origin();
             for y in 0..th {
                 let row = o + y * p.stride;
-                out.extend_from_slice(&p.data[row..row + tw]);
+                pack_row(&p.data[row..row + tw], out);
             }
         };
         crop(&pic.recon.y, dw, dh, &mut rec);
@@ -896,7 +998,7 @@ fn sao_flags(sao: bool, cat: u32) -> Option<syn::SaoFlags> {
 /// filters and the candidate derivations read decoder structures, and
 /// building them from the very bytes the stream carries is what keeps the
 /// encoder's idea of the geometry and the decoder's identical.
-fn parsed_sets(cfg: &Config, g: &syn::Geometry, qp: u8, bypass: bool, deblock: bool, cpb: Option<&Cpb>) -> (crate::hevc::sps::Sps, crate::hevc::pps::Pps) {
+fn parsed_sets(cfg: &Config, g: &syn::Geometry, qp: i32, bypass: bool, deblock: bool, cpb: Option<&Cpb>) -> (crate::hevc::sps::Sps, crate::hevc::pps::Pps) {
     let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&syn::write_sps(cfg, g, LOG2_MAX_POC_LSB, cpb)))
         .expect("the encoder's own SPS parses");
     let mut pps = crate::hevc::pps::Pps::parse(&crate::nal::unescape_rbsp(&syn::write_pps(qp, bypass, deblock)))
@@ -912,17 +1014,22 @@ fn parsed_sets(cfg: &Config, g: &syn::Geometry, qp: u8, bypass: bool, deblock: b
 /// Called at the top of every CTU, ahead of the coding quadtree, which is
 /// where `decode_ctu` reads it.
 #[allow(clippy::too_many_arguments)]
-fn write_sao_for(e: &mut CabacEncoder, cx: &mut Contexts, plan: Option<&SaoPlan>, addr: usize, cxu: usize, cy: usize, qp: u8, cat: u32) {
+fn write_sao_for(e: &mut CabacEncoder, cx: &mut Contexts, plan: Option<&SaoPlan>, addr: usize, cxu: usize, cy: usize, bit_depth: u32, cat: u32) {
     let Some(plan) = plan else { return };
-    let _ = qp;
     let sctx = SaoCtx {
         sao_luma: true,
         sao_chroma: cat != 0,
         cat,
-        // Eight bits everywhere this encoder writes; `H265Encoder::new`
-        // refuses anything deeper by name.
-        cmax: (1u32 << (8u32.min(10) - 5)) - 1,
-        // No PPS range extension, so no offset scaling.
+        // `cMax` of `sao_offset_abs` (7.4.9.3.2): `(1 << (Min(bitDepth,
+        // 10) - 5)) - 1` — 7 at 8 bits, 31 at 10 and above. The reader
+        // derives it from the SPS depth (`ctu.rs`), and so must the
+        // decision (`h265_sao::sao_picture` clamps to the same cMax), or
+        // an offset of 12 at 10 bits would be spelled as a truncated
+        // unary with the wrong terminator and desync the slice.
+        cmax: (1u32 << (bit_depth.min(10) - 5)) - 1,
+        // No PPS range extension, so `log2_sao_offset_scale` is 0 at
+        // every depth: offsets are carried unscaled, and `sao_picture`
+        // chose them in the same units.
         shift: (0, 0),
     };
     // One slice, one tile: the reader's availability test for the merge
@@ -1367,6 +1474,7 @@ fn write_cu_intra_body(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, 
 mod tests {
     use super::*;
     use crate::ChromaFormat;
+    use crate::dsp::hevc::install_simd_u8;
 
     fn cfg(w: u32, h: u32, chroma: ChromaFormat) -> Config {
         Config { width: w, height: h, chroma, ..Config::default() }
@@ -2359,19 +2467,145 @@ mod tests {
         assert!(s.contains("filter-exempt"), "the refusal should say why: {s}");
     }
 
+    /// `count` pictures of detailed, moving content at `bit_depth`, packed
+    /// as little-endian `u16` the way the encoder takes them above 8
+    /// bits. The texture uses the whole sample range and every low bit —
+    /// an 8-bit picture shifted up by two would leave the low bits zero
+    /// and a depth bug that only touched them invisible.
+    fn deep_frames(w: usize, h: usize, chroma: ChromaFormat, bit_depth: u32, count: usize) -> Vec<Vec<u8>> {
+        let (sw, sh) = match chroma {
+            ChromaFormat::Yuv420 => (2usize, 2usize),
+            ChromaFormat::Yuv422 => (2, 1),
+            _ => (1, 1),
+        };
+        let mono = chroma == ChromaFormat::Monochrome;
+        let (cw, ch) = if mono { (0, 0) } else { (w / sw, h / sh) };
+        let max = (1u32 << bit_depth) - 1;
+        let mut seed = 0x10b1u32;
+        (0..count)
+            .map(|f| {
+                let mut out = Vec::with_capacity(2 * (w * h + 2 * cw * ch));
+                let (dx, dy) = (3 * f, f);
+                let mut push = |v: u32| out.extend_from_slice(&(v.min(max) as u16).to_le_bytes());
+                for y in 0..h {
+                    for x in 0..w {
+                        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                        let tx = ((x + dx) as i32 % 25 - 12).unsigned_abs();
+                        let ty = ((y + dy) as i32 % 27 - 13).unsigned_abs();
+                        // A ramp over the full range plus a few low bits of noise.
+                        push((max / 16) + (max / 30) * tx + (max / 40) * ty + (seed >> 29));
+                    }
+                }
+                for c in 0..2 {
+                    for y in 0..ch {
+                        for x in 0..cw {
+                            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                            let (sx, sy) = (x + dx / sw, y + dy / sh);
+                            let r2 = ((sx as i32 % 17 - 8).abs() * (sy as i32 % 19 - 9).abs()) as u32;
+                            let base = if c == 0 { max / 3 } else { max * 2 / 3 };
+                            push(base + (r2.min(90) * max / 255) + (seed >> 30));
+                        }
+                    }
+                }
+                out
+            })
+            .collect()
+    }
+
+    /// Deep pictures code and decode: for 10 and 12 bits, every chroma
+    /// format, intra / P / B, lossy and lossless — the production decoder
+    /// rebuilds each picture byte for byte from the stream (SELF, in
+    /// process), a lossless stream reproduces the source exactly, and the
+    /// pictures really are deep.
+    ///
+    /// The last clause is the vacuity guard: a 10-bit source whose every
+    /// sample fitted 8 bits would round-trip through an encoder that
+    /// silently narrowed, so the source is built to use the whole range
+    /// and the test asserts the reconstruction does too.
     #[test]
-    fn deeper_than_eight_bits_refuses_rather_than_truncating() {
-        for depth in [10u32, 12, 14] {
-            match H265Encoder::new(Config {
-                bit_depth: depth,
-                ..cfg(64, 64, ChromaFormat::Yuv420)
-            }) {
-                Ok(_) => panic!("{depth}-bit was accepted; samples would be truncated"),
-                Err(err) => {
-                    let s = format!("{err}");
-                    assert!(s.contains("bit depth above 8"), "{depth}-bit: {s}");
+    fn deep_pictures_round_trip_through_the_decoder() {
+        for bit_depth in [10u32, 12] {
+            for chroma in [ChromaFormat::Monochrome, ChromaFormat::Yuv420, ChromaFormat::Yuv422, ChromaFormat::Yuv444] {
+                let frames = deep_frames(64, 64, chroma, bit_depth, 5);
+                let max = (1u32 << bit_depth) - 1;
+                let deep = |bytes: &[u8]| bytes.chunks_exact(2).any(|p| u32::from(u16::from_le_bytes([p[0], p[1]])) > 255);
+                assert!(deep(&frames[0]), "{bit_depth}-bit {chroma:?}: the source never leaves 8 bits");
+                assert!(frames[0].chunks_exact(2).all(|p| u32::from(u16::from_le_bytes([p[0], p[1]])) <= max));
+
+                for (rate, bframes, sao) in [
+                    (super::super::RateControl::ConstantQp(26), 0u32, false),
+                    (super::super::RateControl::ConstantQp(40), 2, true),
+                    (super::super::RateControl::Lossless, 2, false),
+                ] {
+                    let tag = format!("{bit_depth}-bit {chroma:?} {rate:?} bframes={bframes} sao={sao}");
+                    let mut e = H265Encoder::new(Config { bit_depth, rate, gop: 8, bframes, sao, ..cfg(64, 64, chroma) })
+                        .unwrap_or_else(|err| panic!("{tag}: {err}"));
+                    assert_eq!(e.frame_bytes(), frames[0].len(), "{tag}: two bytes per sample");
+                    let mut units = Vec::new();
+                    for f in &frames {
+                        units.extend(e.push(f).unwrap_or_else(|err| panic!("{tag}: {err}")));
+                    }
+                    units.extend(e.flush().unwrap());
+                    assert_eq!(units.len(), frames.len(), "{tag}: one access unit per picture");
+                    assert!(units[1..].iter().any(|u| !u.keyframe), "{tag}: no inter picture was coded");
+                    if bframes > 0 {
+                        assert!(units.iter().any(|u| u.encode_index as usize != (u.poc / 2) as usize), "{tag}: no B picture was held back");
+                    }
+
+                    // SELF, through the production decoder. It emits
+                    // display order; the reconstructions are in coding
+                    // order, so each decoded picture is matched to the
+                    // reconstruction whose access unit carries its POC
+                    // (display index `poc / 2`, as `gop.rs` counts it).
+                    let mut dec = crate::hevc::HevcDecoder::new();
+                    for u in &units {
+                        dec.push_annexb(&u.data).unwrap_or_else(|err| panic!("{tag}: decoder rejected the stream: {err}"));
+                    }
+                    dec.flush().unwrap();
+                    let mut by_display = vec![None; units.len()];
+                    for u in &units {
+                        by_display[(u.poc / 2) as usize] = Some(u.encode_index as usize);
+                    }
+                    for (i, coded) in by_display.iter().enumerate() {
+                        let want = &e.reconstructions()[coded.unwrap_or_else(|| panic!("{tag}: display index {i} never coded"))];
+                        let got = dec.next_picture().unwrap_or_else(|| panic!("{tag}: picture {i} missing"));
+                        assert_eq!(got.bit_depth, bit_depth, "{tag}: decoded depth");
+                        assert!(got.into_packed() == *want, "{tag}: picture {i} decoded differently than the encoder reconstructed it");
+                    }
+                    assert!(deep(&e.reconstructions()[0]), "{tag}: the reconstruction never leaves 8 bits");
+                    if rate == super::super::RateControl::Lossless {
+                        for u in &units {
+                            assert!(
+                                e.reconstructions()[u.encode_index as usize] == frames[(u.poc / 2) as usize],
+                                "{tag}: picture poc {} is not lossless",
+                                u.poc
+                            );
+                        }
+                    }
                 }
             }
         }
+    }
+
+    /// A source sample above the declared depth is refused by name, not
+    /// coded: nothing downstream checks the range, and a wrapped sample
+    /// would be a desync far from its cause.
+    #[test]
+    fn a_sample_above_the_declared_depth_refuses() {
+        let mut e = H265Encoder::new(Config { bit_depth: 10, gop: 0, ..cfg(64, 64, ChromaFormat::Yuv420) }).unwrap();
+        let mut frame = vec![0u8; e.frame_bytes()];
+        frame[..2].copy_from_slice(&1024u16.to_le_bytes());
+        let err = e.push(&frame).expect_err("1024 does not fit 10 bits");
+        assert!(format!("{err}").contains("exceeds the declared 10-bit depth"), "{err}");
+    }
+
+    /// Fifteen bits and up stay refused: `Config::validate` bounds the
+    /// depth to what the decoders and the 16-bit transform path admit.
+    #[test]
+    fn deeper_than_fourteen_bits_refuses() {
+        let Err(err) = H265Encoder::new(Config { bit_depth: 16, ..cfg(64, 64, ChromaFormat::Yuv420) }) else {
+            panic!("16-bit was accepted")
+        };
+        assert!(format!("{err}").contains("bit depth outside 8..=14"), "{err}");
     }
 }

@@ -222,7 +222,7 @@ pub fn deblock_inter_picture<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &mut InterPi
 /// stream will hold.
 fn run_filter<S: Sample>(ctx: &IntraCtx<'_, S>, recon: &mut Frame<S>, info: &PicInfo) {
     let h4 = recon.height / 4;
-    let pps = Pps::parse(&crate::nal::unescape_rbsp(&crate::encode::h265_syntax::write_pps(ctx.qp.clamp(0, 51) as u8, ctx.bypass, true)))
+    let pps = Pps::parse(&crate::nal::unescape_rbsp(&crate::encode::h265_syntax::write_pps(ctx.qp.clamp(0, 51), ctx.bypass, true)))
         .expect("the encoder's own PPS parses");
     let mut scratch = DeblockScratch::default();
     deblock_rows(ctx.dsp, &mut scratch, recon, info, &pps, ctx.bit_depth, ctx.bit_depth, 0, h4);
