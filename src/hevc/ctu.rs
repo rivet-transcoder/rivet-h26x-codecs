@@ -184,10 +184,6 @@ fn bin(c: &mut Cabac, cx: &mut Contexts, ctx: usize) -> u32 {
 }
 
 impl<'a, S: Sample> SliceDec<'a, S> {
-    fn bit_depth(&self) -> u32 {
-        self.sps.bit_depth_luma
-    }
-
     /// The current block's side of the z-scan availability test (6.4.1),
     /// for a block about to ask after several neighbours.
     fn avail_ctx(&self, xc: i32, yc: i32) -> AvailCtx {
@@ -226,12 +222,14 @@ impl<'a, S: Sample> SliceDec<'a, S> {
         }
         let mut params = [SaoParams::default(); 3];
         let ncomp = if self.sps.chroma_format_idc != 0 { 3 } else { 1 };
-        let bd = self.bit_depth();
-        let cmax = (1u32 << (bd.min(10) - 5)) - 1;
         for c_idx in 0..ncomp {
             if !((self.hdr.sao_luma && c_idx == 0) || (self.hdr.sao_chroma && c_idx > 0)) {
                 continue;
             }
+            // sao_offset_abs: cMax = (1 << (Min(bitDepth, 10) - 5)) - 1 with
+            // the component's own depth (7.4.9.3.2).
+            let bd = if c_idx == 0 { self.sps.bit_depth_luma } else { self.sps.bit_depth_chroma };
+            let cmax = (1u32 << (bd.min(10) - 5)) - 1;
             if c_idx == 0 || c_idx == 1 {
                 // sao_type_idx: TR cMax 2, first bin ctx, second bypass.
                 let t = if bin(&mut self.cabac, &mut self.cx, SAO_TYPE_IDX_OFFSET) == 0 {
@@ -835,9 +833,11 @@ impl<'a, S: Sample> SliceDec<'a, S> {
         let Some(t) = (if explicit { self.hdr.pred_weights.as_ref() } else { None }) else {
             return [Weighting::Default; 3];
         };
-        let shift1 = 14 - self.bit_depth() as i32;
         let mut out = [Weighting::Default; 3];
         for c in 0..3 {
+            // shift1 = Max(2, 14 - bitDepth) of the component (8.5.3.3.4.3).
+            let bd = if c == 0 { self.sps.bit_depth_luma } else { self.sps.bit_depth_chroma };
+            let shift1 = (14 - bd as i32).max(2);
             let log2_wd = if c == 0 { t.luma_log2_denom as i32 } else { t.chroma_log2_denom as i32 } + shift1;
             let mut w = [1i32; 2];
             let mut o = [0i32; 2];
@@ -1220,10 +1220,11 @@ impl<'a, S: Sample> SliceDec<'a, S> {
         if coeffs.len() < n * n {
             coeffs.resize(1024, 0);
         }
+        let (bdy, bdc) = (self.sps.bit_depth_luma, self.sps.bit_depth_chroma);
         for (r, &l) in coeffs[..n * n].iter_mut().zip(&self.luma_res) {
-            *r = ((res_scale * l as i32) >> 3).clamp(-32768, 32767) as i16;
+            *r = ((res_scale * (((l as i32) << bdc) >> bdy)) >> 3).clamp(-32768, 32767) as i16;
         }
-        let bd = self.sps.bit_depth_chroma;
+        let bd = bdc;
         let max = (1i32 << bd) - 1;
         let plane = if c_idx == 1 { &mut self.frame.cb } else { &mut self.frame.cr };
         let stride = plane.stride;
@@ -1313,9 +1314,11 @@ impl<'a, S: Sample> SliceDec<'a, S> {
             self.luma_res_valid = true;
         }
         if res_scale != 0 && self.luma_res_valid && self.luma_res.len() == n * n {
-            // Cross-component prediction (7.3.8.12 / 8.6.6): equal bit depths here.
+            // Cross-component prediction (7.3.8.12 / 8.6.6): the luma residual
+            // brought to the chroma depth first, `(rY << BitDepthC) >> BitDepthY`.
+            let (bdy, bdc) = (self.sps.bit_depth_luma, self.sps.bit_depth_chroma);
             for (r, &l) in coeffs[..n * n].iter_mut().zip(&self.luma_res) {
-                *r = (*r as i32 + ((res_scale * l as i32) >> 3)).clamp(-32768, 32767) as i16;
+                *r = (*r as i32 + ((res_scale * (((l as i32) << bdc) >> bdy)) >> 3)).clamp(-32768, 32767) as i16;
             }
         }
         // Add to the prediction.

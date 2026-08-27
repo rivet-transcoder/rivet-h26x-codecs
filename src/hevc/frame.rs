@@ -1,5 +1,5 @@
 //! HEVC picture buffers: sample planes with a replicated border — `u8` for
-//! 8-bit streams, `u16` for 9–12-bit — and the per-picture side data later
+//! 8-bit streams, `u16` for 9–16-bit — and the per-picture side data later
 //! pictures and the loop filters read. Everything below the NAL layer is
 //! generic over the sample type ([`Sample`]), so the 8-bit decode moves half
 //! the bytes and the SIMD kernels work on twice the lanes.
@@ -203,8 +203,10 @@ pub struct Frame<S: Sample = u16> {
     pub cr: Plane16<S>,
     /// Chroma format.
     pub chroma: ChromaFormat,
-    /// Bit depth (luma; chroma equal in the profiles supported).
+    /// Luma bit depth.
     pub bit_depth: u32,
+    /// Chroma bit depth (the range extensions allow it to differ).
+    pub bit_depth_chroma: u32,
     /// Luma width / height in samples.
     pub width: usize,
     /// See `width`.
@@ -221,11 +223,16 @@ impl<S: Sample> Frame<S> {
     /// A zero-size placeholder (no buffers).
     pub fn empty() -> Self {
         let none = || Plane16 { data: Vec::new(), width: 0, height: 0, pad: 0, stride: 0 };
-        Frame { y: none(), cb: none(), cr: none(), chroma: ChromaFormat::Yuv420, bit_depth: 8, width: 0, height: 0, w4: 0, motion: Vec::new(), poc: 0 }
+        Frame { y: none(), cb: none(), cr: none(), chroma: ChromaFormat::Yuv420, bit_depth: 8, bit_depth_chroma: 8, width: 0, height: 0, w4: 0, motion: Vec::new(), poc: 0 }
     }
 
-    /// Allocate.
+    /// Allocate, with chroma at the luma bit depth.
     pub fn new(width: usize, height: usize, chroma: ChromaFormat, bit_depth: u32) -> Self {
+        Self::with_depths(width, height, chroma, bit_depth, bit_depth)
+    }
+
+    /// Allocate, with the luma and chroma bit depths given separately.
+    pub fn with_depths(width: usize, height: usize, chroma: ChromaFormat, bit_depth: u32, bit_depth_chroma: u32) -> Self {
         let (cw, ch) = match chroma {
             ChromaFormat::Monochrome => (0, 0),
             ChromaFormat::Yuv420 => (width.div_ceil(2), height.div_ceil(2)),
@@ -240,6 +247,7 @@ impl<S: Sample> Frame<S> {
             cr: Plane16::new(cw, ch, CHROMA_PAD),
             chroma,
             bit_depth,
+            bit_depth_chroma,
             width,
             height,
             w4,
@@ -283,8 +291,9 @@ impl<S: Sample> Frame<S> {
         }
     }
 
-    /// Copy the visible, cropped picture out. 8-bit output as bytes, higher
-    /// depths as little-endian `u16`.
+    /// Copy the visible, cropped picture out: bytes for `u8` planes (both
+    /// depths 8), little-endian `u16` words for `u16` ones — every plane
+    /// alike, whatever its own depth (see [`Picture::bytes_per_sample`]).
     pub fn to_picture(&self, crop: (u32, u32, u32, u32), poc: i32, decode_index: u64, pool: &crate::picture::OutputPool) -> Picture {
         let (l, r, t, b) = (crop.0 as usize, crop.1 as usize, crop.2 as usize, crop.3 as usize);
         let width = self.width.saturating_sub(l + r).max(1);
@@ -328,7 +337,18 @@ impl<S: Sample> Frame<S> {
             plane(&self.cb, l / sw, t / sh, width.div_ceil(sw), height.div_ceil(sh));
             plane(&self.cr, l / sw, t / sh, width.div_ceil(sw), height.div_ceil(sh));
         }
-        Picture { width: width as u32, height: height as u32, bit_depth: self.bit_depth, chroma: self.chroma, data, planes, poc, decode_index, pool: Some(pool.clone()) }
+        Picture {
+            width: width as u32,
+            height: height as u32,
+            bit_depth: self.bit_depth,
+            bit_depth_chroma: self.bit_depth_chroma,
+            chroma: self.chroma,
+            data,
+            planes,
+            poc,
+            decode_index,
+            pool: Some(pool.clone()),
+        }
     }
 }
 
@@ -382,9 +402,9 @@ impl<S: Sample> FramePool<S> {
 
     /// A frame of the given geometry, recycled if one is available (its
     /// samples are stale — every sample gets written before it is read).
-    pub fn take(&self, width: usize, height: usize, chroma: ChromaFormat, bit_depth: u32) -> Frame<S> {
+    pub fn take(&self, width: usize, height: usize, chroma: ChromaFormat, bit_depth: u32, bit_depth_chroma: u32) -> Frame<S> {
         let mut g = self.0.lock().unwrap();
-        if let Some(i) = g.iter().position(|f| f.width == width && f.height == height && f.chroma == chroma && f.bit_depth == bit_depth) {
+        if let Some(i) = g.iter().position(|f| f.width == width && f.height == height && f.chroma == chroma && f.bit_depth == bit_depth && f.bit_depth_chroma == bit_depth_chroma) {
             let mut f = g.swap_remove(i);
             // Motion is rewritten for every coded block; stale values only
             // remain under lost slices, where they are as good as anything.
@@ -392,7 +412,7 @@ impl<S: Sample> FramePool<S> {
             return f;
         }
         drop(g);
-        Frame::new(width, height, chroma, bit_depth)
+        Frame::with_depths(width, height, chroma, bit_depth, bit_depth_chroma)
     }
 
     /// Return a frame.
@@ -456,5 +476,48 @@ impl<S: Sample> SharedFrame<S> {
         self.progress.wait_complete();
         // SAFETY: complete — no writer remains.
         unsafe { self.get() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Unequal luma / chroma depths: every plane leaves as 16-bit words
+    /// (the HM output layout the RExt suite hashes), the 8-bit component's
+    /// values sitting in the low byte, and the picture reports both depths.
+    #[test]
+    fn unequal_depths_pack_every_plane_as_u16() {
+        for (bd_y, bd_c) in [(8u32, 12u32), (12, 8), (10, 9)] {
+            let mut f = Frame::<u16>::with_depths(8, 4, ChromaFormat::Yuv444, bd_y, bd_c);
+            let (max_y, max_c) = ((1u16 << bd_y) - 1, (1u16 << bd_c) - 1);
+            for y in 0..4 {
+                for x in 0..8 {
+                    let o = f.y.offset(x as isize, y as isize);
+                    f.y.data[o] = max_y - (x + y) as u16;
+                    let o = f.cb.offset(x as isize, y as isize);
+                    f.cb.data[o] = max_c - x as u16;
+                    f.cr.data[o] = 1 + y as u16;
+                }
+            }
+            let pic = f.to_picture((0, 0, 0, 0), 3, 0, &crate::picture::OutputPool::default());
+            assert_eq!((pic.bit_depth, pic.bit_depth_chroma), (bd_y, bd_c));
+            assert_eq!(pic.bytes_per_sample(), 2);
+            assert_eq!(pic.data.len(), 3 * 8 * 4 * 2);
+            for i in 0..3 {
+                assert_eq!(pic.plane(i).len(), 8 * 4 * 2, "plane {i}");
+            }
+            let word = |p: &[u8], i: usize| u16::from_le_bytes([p[2 * i], p[2 * i + 1]]);
+            assert_eq!(word(pic.plane(0), 0), max_y);
+            assert_eq!(word(pic.plane(0), 8 * 3 + 7), max_y - 10);
+            assert_eq!(word(pic.plane(1), 7), max_c - 7);
+            assert_eq!(word(pic.plane(2), 8 * 3), 4);
+        }
+        // Both 8-bit: bytes, as before.
+        let f = Frame::<u8>::with_depths(8, 4, ChromaFormat::Yuv420, 8, 8);
+        let pic = f.to_picture((0, 0, 0, 0), 0, 0, &crate::picture::OutputPool::default());
+        assert_eq!(pic.bytes_per_sample(), 1);
+        assert_eq!(pic.data.len(), 8 * 4 + 2 * 4 * 2);
+        assert_eq!(pic.plane(1).len(), 8);
     }
 }

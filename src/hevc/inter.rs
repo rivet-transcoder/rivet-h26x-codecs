@@ -165,7 +165,8 @@ pub fn predict_block<S: Sample>(
     ref1: Option<(&Frame<S>, Mv)>,
     weighting: [Weighting; 3],
 ) {
-    let bd = cur.bit_depth;
+    // Per component: the range extensions allow unequal luma / chroma depths.
+    let bd_of = |c: usize| if c == 0 { cur.bit_depth } else { cur.bit_depth_chroma };
     let (sw, sh) = cur.chroma.subsampling();
     let (sw, sh) = (sw as usize, sh as usize);
     let mono = cur.chroma == crate::picture::ChromaFormat::Monochrome;
@@ -226,6 +227,7 @@ pub fn predict_block<S: Sample>(
                 (plane_ref, (x / sw) as i32 + (mcx >> 3), (y / sh) as i32 + (mcy >> 3), (mcx & 7) as usize, (mcy & 7) as usize, cw, ch)
             };
             let fuse = dsp.fused_mc && matches!(weighting[c], Weighting::Default) && (!both || list == 1);
+            let bd = bd_of(c);
             if fuse {
                 let (src, sstride) = source(window, plane_ref, xi, yi, bw, bh, luma);
                 let cur_plane = match c {
@@ -248,13 +250,15 @@ pub fn predict_block<S: Sample>(
             }
         }
     }
-    let max = (1i32 << bd) - 1;
+    let (bd_y, bd_c) = (cur.bit_depth, cur.bit_depth_chroma);
     let planes: [(&mut Plane16<S>, usize, usize, usize, usize); 3] =
         [(&mut cur.y, x, y, w, h), (&mut cur.cb, x / sw, y / sh, cw, ch), (&mut cur.cr, x / sw, y / sh, cw, ch)];
     for (c, (plane, px, py, pwid, phei)) in planes.into_iter().enumerate() {
         if direct[c] || done[c] {
             continue;
         }
+        let bd = if c == 0 { bd_y } else { bd_c };
+        let max = (1i32 << bd) - 1;
         let off = plane.offset(px as isize, py as isize);
         let stride = plane.stride;
         let dst = &mut plane.data[off..];

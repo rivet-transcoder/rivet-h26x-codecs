@@ -97,7 +97,10 @@ pub fn verify<S: Sample>(frame: &Frame<S>, hash: &PictureHash) -> Result<(), Str
             1 => &frame.cb,
             _ => &frame.cr,
         };
-        let bd = frame.bit_depth;
+        // Each component at its own depth (the MD5 / CRC / checksum are
+        // per component, 8.4 of the SEI semantics: two bytes when its
+        // depth exceeds 8), so unequal depths can mix one- and two-byte planes.
+        let bd = if c == 0 { frame.bit_depth } else { frame.bit_depth_chroma };
         let wide = bd > 8;
         // The component's samples in raster order, as bytes (low byte first
         // when the depth needs two).

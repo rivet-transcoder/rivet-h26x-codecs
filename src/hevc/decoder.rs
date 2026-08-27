@@ -781,7 +781,7 @@ impl<S: Sample> RowFilterState<S> {
             // A band frame from the pool (recycled picture to picture: an
             // allocation per picture here was measurable in page faults).
             let frames = &pic.frames;
-            let src = self.sao_src.get_or_insert_with(|| Box::new(frames.take(frame.width, ctb + 4, frame.chroma, frame.bit_depth)));
+            let src = self.sao_src.get_or_insert_with(|| Box::new(frames.take(frame.width, ctb + 4, frame.chroma, frame.bit_depth, frame.bit_depth_chroma)));
             self.sao_band.fill(frame, src, ctb, r);
             sao_ctb_row(&pic.dsp, frame, src, &self.sao_band, info, &pic.sps, &pic.pps, r);
         }
@@ -1057,9 +1057,6 @@ impl<S: Sample> HevcDecoderImpl<S> {
             if sps.separate_colour_plane {
                 return Err(Error::unsupported("separate_colour_plane_flag"));
             }
-            if sps.bit_depth_luma != sps.bit_depth_chroma {
-                return Err(Error::unsupported("different luma and chroma bit depths"));
-            }
             if sps.bit_depth_luma > 12 {
                 return Err(Error::unsupported(format!("bit depth {}", sps.bit_depth_luma)));
             }
@@ -1083,7 +1080,7 @@ impl<S: Sample> HevcDecoderImpl<S> {
             // SAFETY: nothing else touches the frame before progress > 0.
             let frame: &mut Frame<S> = unsafe { pic.frame_mut() };
             if frame.width == 0 {
-                let mut f = self.frames.take(pic.sps.width as usize, pic.sps.height as usize, pic.sps.chroma_format(), pic.sps.bit_depth_luma);
+                let mut f = self.frames.take(pic.sps.width as usize, pic.sps.height as usize, pic.sps.chroma_format(), pic.sps.bit_depth_luma, pic.sps.bit_depth_chroma);
                 f.poc = pic.poc;
                 *frame = f;
             }
@@ -1239,10 +1236,9 @@ impl<S: Sample> HevcDecoderImpl<S> {
 
         self.dpb.configure(&sps);
         let chroma = sps.chroma_format();
-        let bit_depth = sps.bit_depth_luma;
         let crop = sps.conf_win;
         let idr = nal_type::is_idr(t);
-        let sets = self.dpb.apply_rps(hdr, &sps, poc, idr, chroma, bit_depth, self.decode_index, crop);
+        let sets = self.dpb.apply_rps(hdr, &sps, poc, idr, chroma, sps.bit_depth_luma, sps.bit_depth_chroma, self.decode_index, crop);
         if irap && self.no_rasl_output && !first_pic {
             let no_output = if t == nal_type::CRA { true } else { hdr.no_output_of_prior_pics };
             self.dpb.before_decode(true, no_output);

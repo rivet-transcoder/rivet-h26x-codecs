@@ -283,6 +283,7 @@ impl<S: Sample> Dpb<S> {
         idr: bool,
         chroma: ChromaFormat,
         bit_depth: u32,
+        bit_depth_chroma: u32,
         decode_index: u64,
         crop: (u32, u32, u32, u32),
     ) -> RefSets<S> {
@@ -358,11 +359,11 @@ impl<S: Sample> Dpb<S> {
         // Generate missing "Curr" references (8.3.3.2).
         let mut next_id = self.next_id;
         let mut generate = |poc: i32, long_term: bool, pics: &mut Vec<DpbPic<S>>| -> usize {
-            let mut f = Frame::<S>::new(sps.width as usize, sps.height as usize, chroma, bit_depth);
-            let mid = S::from_i32(1 << (bit_depth - 1));
-            f.y.data.fill(mid);
-            f.cb.data.fill(mid);
-            f.cr.data.fill(mid);
+            let mut f = Frame::<S>::with_depths(sps.width as usize, sps.height as usize, chroma, bit_depth, bit_depth_chroma);
+            f.y.data.fill(S::from_i32(1 << (bit_depth - 1)));
+            let mid_c = S::from_i32(1 << (bit_depth_chroma - 1));
+            f.cb.data.fill(mid_c);
+            f.cr.data.fill(mid_c);
             f.poc = poc;
             pics.push(DpbPic {
                 frame: Arc::new(SharedFrame::new(f, poc, next_id, true)),
