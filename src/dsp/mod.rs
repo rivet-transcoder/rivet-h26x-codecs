@@ -31,6 +31,9 @@ pub(crate) mod h264_avx2;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_unsafe)]
 pub(crate) mod distortion_x86;
+#[cfg(target_arch = "x86_64")]
+#[allow(unused_unsafe)]
+pub(crate) mod hevc_enc_x86;
 #[cfg(target_arch = "aarch64")]
 #[allow(unused_unsafe)]
 pub(crate) mod h264_neon;

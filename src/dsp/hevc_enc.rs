@@ -71,12 +71,17 @@ impl HevcEncDsp {
         }
     }
 
-    /// The best table for `cpu`. No rung replaces anything yet: which of
-    /// these earns a hand-written kernel is a question for a profile of a
-    /// real encode.
+    /// The best table for `cpu`: the scalar reference, then each rung of
+    /// the ladder replacing the entries it has a kernel for. The profile
+    /// that chose which (docs/encode_speed.md) put `fdct[16]` and `quant`
+    /// at 4–7% and 3–4% of an inter encode.
     pub fn new(cpu: Cpu) -> Self {
         let mut d = Self::scalar();
         d.cpu = cpu;
+        if !super::enc_simd_disabled("hevc_enc") {
+            #[cfg(target_arch = "x86_64")]
+            super::hevc_enc_x86::install(&mut d, cpu);
+        }
         d
     }
 }
@@ -130,7 +135,7 @@ fn fdct1(x: &[i32], n: usize, out: &mut [i32]) {
     }
 }
 
-fn fdct_scalar<const N: usize>(block: &mut [i16], log2: u32, bit_depth: u32) {
+pub(crate) fn fdct_scalar<const N: usize>(block: &mut [i16], log2: u32, bit_depth: u32) {
     let s1 = log2 as i32 + bit_depth as i32 - 9;
     let s2 = log2 as i32 + 6;
     let mut tmp = [0i16; 32 * 32];
@@ -161,9 +166,9 @@ fn fdct_scalar<const N: usize>(block: &mut [i16], log2: u32, bit_depth: u32) {
 }
 
 /// The DST matrix of 8.6.4.2, read the way a forward transform reads it.
-const DST4: [[i32; 4]; 4] = [[29, 55, 74, 84], [74, 74, 0, -74], [84, -29, -74, 55], [55, -84, 74, -29]];
+pub(crate) const DST4: [[i32; 4]; 4] = [[29, 55, 74, 84], [74, 74, 0, -74], [84, -29, -74, 55], [55, -84, 74, -29]];
 
-fn fdst4_scalar(block: &mut [i16], bit_depth: u32) {
+pub(crate) fn fdst4_scalar(block: &mut [i16], bit_depth: u32) {
     let s1 = 2 + bit_depth as i32 - 9;
     let s2 = 2 + 6;
     let mut tmp = [0i16; 16];
@@ -208,7 +213,7 @@ fn fskip_scalar(block: &mut [i16], log2: u32, bit_depth: u32) {
     }
 }
 
-fn quant_scalar(coeffs: &[i16], levels: &mut [i16], n: usize, scale: i32, qbits: u32, offset: i32) -> u32 {
+pub(crate) fn quant_scalar(coeffs: &[i16], levels: &mut [i16], n: usize, scale: i32, qbits: u32, offset: i32) -> u32 {
     let mut nz = 0;
     for i in 0..n * n {
         let c = coeffs[i] as i32;
