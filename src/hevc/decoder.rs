@@ -487,6 +487,9 @@ fn run_substream<S: Sample>(pic_arc: &Arc<PicShared<S>>, seg_arc: &Arc<Segment>,
         coeffs: vec![0; 1024],
         luma_res: Vec::new(),
         luma_res_valid: false,
+        wide: sps.wide_pipeline(),
+        coeffs_wide: if sps.wide_pipeline() { vec![0; 1024] } else { Vec::new() },
+        luma_res_wide: Vec::new(),
         dsp: pic.dsp,
         mc: {
             let mut m = take_scratch();
@@ -1057,15 +1060,6 @@ impl<S: Sample> HevcDecoderImpl<S> {
             if sps.separate_colour_plane {
                 return Err(Error::unsupported("separate_colour_plane_flag"));
             }
-            if sps.bit_depth_luma > 12 {
-                return Err(Error::unsupported(format!("bit depth {}", sps.bit_depth_luma)));
-            }
-            if sps.extended_precision() {
-                return Err(Error::unsupported("extended_precision_processing_flag"));
-            }
-            if sps.cabac_bypass_alignment() {
-                return Err(Error::unsupported("cabac_bypass_alignment_enabled_flag"));
-            }
             pps.resolve_tiles(&sps)?;
             self.start_picture(&hdr, sps, pps, nh)?;
             if self.skipping {
@@ -1287,6 +1281,7 @@ impl<S: Sample> HevcDecoderImpl<S> {
             }
         };
         let info = self.info_pool.take(geo);
+        let sps_wide = sps.wide_pipeline();
         let nc = info.wc * info.hc;
         let hc = info.hc;
         let wc = info.wc;
@@ -1300,7 +1295,11 @@ impl<S: Sample> HevcDecoderImpl<S> {
             poc,
             sets,
             scaling,
-            dsp: self.dsp,
+            // The wide pipeline runs its own scalar kernels for residuals
+            // and motion compensation; the loop filters it shares take the
+            // scalar table too — the SIMD u16 kernels are proven at 8–12
+            // bits by the rung sweep, not at 16.
+            dsp: if sps_wide { HevcDsp::scalar() } else { self.dsp },
             ctb_done: (0..nc).map(|_| AtomicBool::new(false)).collect(),
             done_count: AtomicUsize::new(0),
             tasks_submitted: AtomicUsize::new(0),

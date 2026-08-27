@@ -220,6 +220,44 @@ pub(crate) fn residual_scan_idx(intra: bool, log2: u32, c_idx: usize, chroma_arr
     }
 }
 
+/// A coefficient / residual word. `i16` is the 8–12-bit pipeline: the
+/// standard clips coefficients to 16 bits there and the transforms' output
+/// fits. The range extensions widen that — `extended_precision_processing_flag`
+/// lifts the coefficient range to `Max(15, BitDepth + 6)` bits, and above
+/// 12 bits the residual itself outgrows `i16` — so the same parser fills
+/// `i32` for them, and only them; every kernel of the 8–12-bit path keeps
+/// its `i16`.
+pub(crate) trait Coeff: Copy + Default + PartialEq + std::fmt::Debug + 'static {
+    /// A parsed level, clipped to the coefficient range `CoeffMin..=CoeffMax`
+    /// of `1 << log2_range` (15 for `i16`, which ignores the argument).
+    fn from_level(v: i32, log2_range: u32) -> Self;
+    /// Modular add (residual DPCM accumulates without clipping).
+    fn wrapping_add(self, o: Self) -> Self;
+}
+
+impl Coeff for i16 {
+    #[inline(always)]
+    fn from_level(v: i32, _log2_range: u32) -> Self {
+        v.clamp(-32768, 32767) as i16
+    }
+    #[inline(always)]
+    fn wrapping_add(self, o: Self) -> Self {
+        i16::wrapping_add(self, o)
+    }
+}
+
+impl Coeff for i32 {
+    #[inline(always)]
+    fn from_level(v: i32, log2_range: u32) -> Self {
+        let m = 1i32 << log2_range;
+        v.clamp(-m, m - 1)
+    }
+    #[inline(always)]
+    fn wrapping_add(self, o: Self) -> Self {
+        i32::wrapping_add(self, o)
+    }
+}
+
 /// What the transform block needs from its surroundings.
 pub struct ResidualParams {
     /// `log2TrafoSize`.
@@ -250,6 +288,27 @@ pub struct ResidualParams {
     pub trace: bool,
 }
 
+/// The range-extension knobs of `residual_coding()` that change how far
+/// the bins reach rather than which bins exist — kept apart from
+/// [`ResidualParams`] because the encoder spells that struct and never
+/// these (its writer is 8–12-bit, plain precision).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidualRange {
+    /// `log2TransformRange` of the component: 15, or `Max(15, BitDepth + 6)`
+    /// under `extended_precision_processing_flag` (7.4.3.2.2). Levels are
+    /// clipped to it; with `extended_precision` it also sizes the escape.
+    pub log2_range: u32,
+    /// `extended_precision_processing_flag`: `coeff_abs_level_remaining`
+    /// uses the limited-prefix escape (9.3.3.12).
+    pub extended_precision: bool,
+}
+
+impl ResidualRange {
+    /// Version 1 and the 8–12-bit range extensions: 16-bit coefficients,
+    /// the plain escape.
+    pub const PLAIN: ResidualRange = ResidualRange { log2_range: 15, extended_precision: false };
+}
+
 /// What [`parse_residual`] found.
 #[derive(Debug, Clone, Copy)]
 pub struct ResidualInfo {
@@ -266,7 +325,13 @@ pub struct ResidualInfo {
 /// Parse `residual_coding()` for one transform block into `coeffs`
 /// (raster order, `1 << (2 * log2_size)` entries used, all set — zeros
 /// included).
-pub fn parse_residual(cabac: &mut Cabac, cx: &mut Contexts, p: &ResidualParams, coeffs: &mut [i16]) -> Result<ResidualInfo> {
+///
+/// `ALIGN` is `cabac_bypass_alignment_enabled_flag`: the arithmetic
+/// decoder is aligned before a sub-block's sign / remaining-level bypass
+/// bins when any remaining level is coded (7.3.8.11 `escapeDataPresent`,
+/// 9.3.4.3.6). A const so the instantiation every 8–12-bit stream runs is
+/// the one without it, bin for bin; the flag is an SPS constant.
+pub(crate) fn parse_residual<C: Coeff, const ALIGN: bool>(cabac: &mut Cabac, cx: &mut Contexts, p: &ResidualParams, range: &ResidualRange, coeffs: &mut [C]) -> Result<ResidualInfo> {
     let log2 = p.log2_size;
     let n = 1usize << log2;
     // Every coefficient is written here, zeros included, because the inverse
@@ -274,10 +339,10 @@ pub fn parse_residual(cabac: &mut Cabac, cx: &mut Contexts, p: &ResidualParams, 
     // for the 32 bytes of a 4x4 block costs several times the stores, so give
     // the small sizes a constant length to clear inline.
     match log2 {
-        2 => coeffs[..16].fill(0),
-        3 => coeffs[..64].fill(0),
-        4 => coeffs[..256].fill(0),
-        _ => coeffs[..n * n].fill(0),
+        2 => coeffs[..16].fill(C::default()),
+        3 => coeffs[..64].fill(C::default()),
+        4 => coeffs[..256].fill(C::default()),
+        _ => coeffs[..n * n].fill(C::default()),
     }
     let c_idx = p.c_idx;
     let mut max_x = 0usize;
@@ -476,6 +541,16 @@ pub fn parse_residual(cabac: &mut Cabac, cx: &mut Contexts, p: &ResidualParams, 
         // Signs: one bypass read for all of them (MSB = first in reverse
         // scan); the hidden sign, if any, is the last position's.
         let n_signs = n_sig - sign_hidden as usize;
+        if ALIGN {
+            // escapeDataPresent (7.3.8.11): a level of this sub-block will be
+            // coded as coeff_abs_level_remaining — a ninth significant
+            // coefficient, a second greater1 flag, or the greater2 flag.
+            let n_g1 = abs_level[..n_sig.min(8)].iter().filter(|&&a| a >= 2).count();
+            let escape = n_sig > 8 || n_g1 > 1 || (last_greater1_idx >= 0 && abs_level[last_greater1_idx as usize] == 3);
+            if escape {
+                cabac.align_bypass();
+            }
+        }
         let signs = cabac.bypass_bits(n_signs as u32);
         // Remaining levels.
         let mut sum_abs = 0i32;
@@ -502,7 +577,7 @@ pub fn parse_residual(cabac: &mut Cabac, cx: &mut Contexts, p: &ResidualParams, 
                     let up = c_last_rice + (c_last_abs > 3 * (1 << c_last_rice)) as u32;
                     if p.persistent_rice { up } else { up.min(4) }
                 };
-                let rem = decode_abs_level_remaining(cabac, rice)?;
+                let rem = if range.extended_precision { decode_abs_level_remaining_limited(cabac, rice, range.log2_range)? } else { decode_abs_level_remaining(cabac, rice)? };
                 if first_remaining && p.persistent_rice {
                     // StatCoeff update on the sub-block's first remaining level.
                     let st = &mut cx.stat_coeff[sb_type];
@@ -528,7 +603,7 @@ pub fn parse_residual(cabac: &mut Cabac, cx: &mut Contexts, p: &ResidualParams, 
             let (xp, yp) = pos_tab[sig_pos[k] as usize];
             let xc = (xs << 2) + xp as usize;
             let yc = (ys << 2) + yp as usize;
-            coeffs[yc * n + xc] = v.clamp(-32768, 32767) as i16;
+            coeffs[yc * n + xc] = C::from_level(v, range.log2_range);
             max_x = max_x.max(xc);
             max_y = max_y.max(yc);
             if p.trace {
@@ -846,13 +921,13 @@ fn write_abs_level_remaining(e: &mut CabacEncoder, rice: u32, v: u32) {
 }
 
 /// Rotate a 4x4 residual by 180 degrees (`transform_skip_rotation_enabled_flag`).
-pub fn rotate_residual4(coeffs: &mut [i16]) {
+pub fn rotate_residual4<C: Copy>(coeffs: &mut [C]) {
     coeffs[..16].reverse();
 }
 
 /// Residual DPCM (8.6.6 / 8.6.8): accumulate the residual along rows
 /// (horizontal) or down columns (`vertical`).
-pub fn rdpcm_residual(coeffs: &mut [i16], log2: u32, vertical: bool) {
+pub(crate) fn rdpcm_residual<C: Coeff>(coeffs: &mut [C], log2: u32, vertical: bool) {
     let n = 1usize << log2;
     if vertical {
         for y in 1..n {
@@ -896,6 +971,39 @@ fn decode_abs_level_remaining(cabac: &mut Cabac, rice: u32) -> Result<i32> {
     }
     v += cabac.bypass_bits(k) as i32;
     Ok((4 << rice) as i32 + v)
+}
+
+/// `coeff_abs_level_remaining` under `extended_precision_processing_flag`
+/// (9.3.3.11 with the limited k-th order Exp-Golomb suffix of 9.3.3.12):
+/// the same code as [`decode_abs_level_remaining`] until the escape's
+/// unary prefix reaches `32 - log2TransformRange` ones in all, where it
+/// stops without a terminating zero and `log2TransformRange` raw bits
+/// follow instead of `prefix - 3 + rice`. (In HM's terms:
+/// `maximumPrefixLength = 32 - (3 + maxLog2TrDynamicRange)` after the
+/// three TR ones; the spec counts four TR ones and `maxPreExtLen = 28 -
+/// log2TransformRange` beyond them — the same bins.)
+#[inline]
+fn decode_abs_level_remaining_limited(cabac: &mut Cabac, rice: u32, log2_range: u32) -> Result<i32> {
+    let longest = 32 - log2_range;
+    let mut prefix = 0u32;
+    while prefix < longest && cabac.bypass() != 0 {
+        prefix += 1;
+    }
+    if prefix < 4 {
+        let suffix = cabac.bypass_bits(rice);
+        return Ok(((prefix << rice) + suffix) as i32);
+    }
+    let pl = prefix - 3;
+    let bits = if pl == longest - 3 { log2_range } else { pl + rice };
+    if bits > 32 {
+        return Err(Error::bitstream("coeff_abs_level_remaining runaway"));
+    }
+    let v = cabac.bypass_bits_wide(bits) as i64;
+    let base = (((1i64 << pl) - 1 + 3) << rice) + v;
+    if base > i32::MAX as i64 {
+        return Err(Error::bitstream("coeff_abs_level_remaining out of range"));
+    }
+    Ok(base as i32)
 }
 
 /// The scaling factor `m[x][y]` source for a transform block.
@@ -975,6 +1083,74 @@ pub fn scale_coefficients(
     }
 }
 
+/// [`scale_coefficients`] for the wide pipeline (`i32` coefficients, any
+/// depth, with or without extended precision): `bdShift = BitDepth +
+/// Log2(nTbS) + 10 - log2TransformRange` and the clip to
+/// `±(1 << log2TransformRange)` (8.6.3) — the 8–12-bit formula with
+/// `log2TransformRange = 15` put back in.
+#[allow(clippy::too_many_arguments)]
+pub fn scale_coefficients_i32(
+    coeffs: &mut [i32],
+    log2: u32,
+    qp: i32,
+    bit_depth: u32,
+    log2_range: u32,
+    scaling: ScalingSource,
+    transform_skip: bool,
+    max_x: usize,
+    max_y: usize,
+) {
+    const LEVEL_SCALE: [i32; 6] = [40, 45, 51, 57, 64, 72];
+    let n = 1usize << log2;
+    let bd_shift = bit_depth as i32 + log2 as i32 + 10 - log2_range as i32;
+    let round = 1i64 << (bd_shift - 1);
+    let (cmin, cmax) = (-(1i64 << log2_range), (1i64 << log2_range) - 1);
+    let ls = LEVEL_SCALE[(qp % 6) as usize] as i64;
+    let q6 = qp / 6;
+    let flat = matches!(scaling, ScalingSource::Flat) || (transform_skip && n > 4);
+    for y in 0..=max_y {
+        for x in 0..=max_x {
+            let c = coeffs[y * n + x];
+            if c == 0 {
+                continue;
+            }
+            let m: i64 = match (&scaling, flat) {
+                (_, true) | (ScalingSource::Flat, _) => 16,
+                (ScalingSource::List(list, dc), false) => {
+                    if n == 4 {
+                        list[y * 4 + x] as i64
+                    } else if n == 8 {
+                        list[y * 8 + x] as i64
+                    } else if x == 0 && y == 0 {
+                        *dc as i64
+                    } else {
+                        let r = n / 8;
+                        list[(y / r) * 8 + x / r] as i64
+                    }
+                }
+            };
+            let v = ((c as i64 * m * ls) << q6) + round;
+            coeffs[y * n + x] = (v >> bd_shift).clamp(cmin, cmax) as i32;
+        }
+    }
+}
+
+/// [`transform_skip_residual`] for the wide pipeline, at any depth and
+/// with `extended_precision_processing_flag` folded in (8.6.4.2):
+/// `bdShift = Max(20 - BitDepth, extended ? 11 : 0)`, `tsShift =
+/// (extended ? Min(5, bdShift - 2) : 5) + Log2(nTbS)`. At 16 bits without
+/// extended precision the net shift is to the *left* — the 8–12-bit
+/// kernel's `i16` result would not hold it.
+pub fn transform_skip_residual_i32(coeffs: &mut [i32], log2: u32, bit_depth: u32, extended: bool) {
+    let n = 1usize << log2;
+    let bd_shift = (20 - bit_depth as i32).max(if extended { 11 } else { 0 });
+    let ts_shift = (if extended { 5.min(bd_shift - 2) } else { 5 }) + log2 as i32;
+    let round = 1i64 << (bd_shift - 1);
+    for v in coeffs.iter_mut().take(n * n) {
+        *v = ((((*v as i64) << ts_shift) + round) >> bd_shift) as i32;
+    }
+}
+
 /// Transform-skip residual (8.6.4.2 with `transform_skip_flag`): `r = (d << tsShift + round) >> bdShift`.
 pub fn transform_skip_residual(coeffs: &mut [i16], log2: u32, bit_depth: u32) {
     let n = 1usize << log2;
@@ -1037,7 +1213,7 @@ mod write_round_trip {
         let mut out = vec![0i16; 1024];
         for (k, (p, want)) in blocks.iter().enumerate() {
             let n = 1usize << p.log2_size;
-            let ri = parse_residual(&mut d, &mut dec_cx, p, &mut out)
+            let ri = parse_residual::<i16, false>(&mut d, &mut dec_cx, p, &ResidualRange::PLAIN, &mut out)
                 .unwrap_or_else(|e| panic!("block {k}: the reader rejected what the writer produced: {e}"));
             assert!(!ri.transform_skip, "block {k}");
             assert_eq!(&out[..n * n], &want[..], "block {k}: coefficients differ");

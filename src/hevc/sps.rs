@@ -637,6 +637,22 @@ impl Sps {
         self.rext(8)
     }
 
+    /// Whether the picture decodes on the wide pipeline: `i32`
+    /// coefficients, residuals and prediction intermediates with scalar
+    /// kernels. Needed above 12 bits — `shift1 = Min(4, BitDepth - 8)`
+    /// stops the interpolation fitting 16 bits there, the residual itself
+    /// outgrows `i16` at 16 — and under `extended_precision_processing_flag`,
+    /// which widens the coefficient range to `Max(15, BitDepth + 6)` bits.
+    /// Everything at 8–12 bits stays on the `i16` kernels.
+    pub fn wide_pipeline(&self) -> bool {
+        self.extended_precision() || self.bit_depth_luma > 12 || self.bit_depth_chroma > 12
+    }
+
+    /// `log2TransformRange` of a component of `bit_depth` bits (7.4.3.2.2).
+    pub fn log2_transform_range(&self, bit_depth: u32) -> u32 {
+        if self.extended_precision() { 15.max(bit_depth + 6) } else { 15 }
+    }
+
     /// `ChromaArrayType`: the chroma format, or 0 when the colour planes
     /// are coded separately.
     pub fn chroma_array_type(&self) -> u32 {

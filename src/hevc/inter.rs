@@ -4,6 +4,7 @@
 use crate::dsp::hevc::HevcDsp;
 
 use super::frame::{Frame, Mv, Plane16, Sample};
+use super::tables::{EPEL_FILTERS, QPEL_FILTERS};
 
 /// Scratch buffers for one prediction block (allocated once per slice).
 pub struct McScratch<S: Sample = u16> {
@@ -13,6 +14,11 @@ pub struct McScratch<S: Sample = u16> {
     pub tmp: Vec<i16>,
     /// A copy of the reference window when it lies outside the padded plane.
     pub window: Vec<S>,
+    /// The wide pipeline's predictions (empty until a wide picture asks;
+    /// see [`predict_block_wide`]).
+    pub pred_wide: [[Vec<i32>; 3]; 2],
+    /// The wide pipeline's intermediate rows.
+    pub tmp_wide: Vec<i32>,
 }
 
 impl<S: Sample> McScratch<S> {
@@ -23,6 +29,17 @@ impl<S: Sample> McScratch<S> {
             pred: [[vec![0; n], vec![0; n], vec![0; n]], [vec![0; n], vec![0; n], vec![0; n]]],
             tmp: vec![0; crate::dsp::hevc::MC_TMP_LEN],
             window: vec![S::default(); (64 + 7) * (64 + 7)],
+            pred_wide: Default::default(),
+            tmp_wide: Vec::new(),
+        }
+    }
+
+    /// Allocate the wide pipeline's buffers (once).
+    fn ensure_wide(&mut self) {
+        if self.tmp_wide.is_empty() {
+            let n = 64 * 64;
+            self.pred_wide = [[vec![0; n], vec![0; n], vec![0; n]], [vec![0; n], vec![0; n], vec![0; n]]];
+            self.tmp_wide = vec![0; 64 * (64 + 7)];
         }
     }
 }
@@ -30,7 +47,7 @@ impl<S: Sample> McScratch<S> {
 impl<S: Sample> Default for McScratch<S> {
     /// Empty (a placeholder while the real one is lent out).
     fn default() -> Self {
-        McScratch { pred: [[Vec::new(), Vec::new(), Vec::new()], [Vec::new(), Vec::new(), Vec::new()]], tmp: Vec::new(), window: Vec::new() }
+        McScratch { pred: [[Vec::new(), Vec::new(), Vec::new()], [Vec::new(), Vec::new(), Vec::new()]], tmp: Vec::new(), window: Vec::new(), pred_wide: Default::default(), tmp_wide: Vec::new() }
     }
 }
 
@@ -151,6 +168,209 @@ fn copy_block<S: Sample>(dst: &mut [S], dst_stride: usize, src: &[S], src_stride
     }
 }
 
+/// The block widths a PU can have are copied with fixed-size moves; see
+/// [`copy_block`]. Copy a `bw x bh` block of `src` at `(sx, sy)` into
+/// `dst` at `(dx, dy)` when the source lies inside the padded plane, and
+/// say whether it did.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn copy_rows<S: Sample>(src: &Plane16<S>, dst: &mut Plane16<S>, sx: i32, sy: i32, dx: usize, dy: usize, bw: usize, bh: usize) -> bool {
+    let pad = src.pad as i32;
+    if sx < -pad || sy < -pad || sx + bw as i32 > src.width as i32 + pad || sy + bh as i32 > src.height as i32 + pad {
+        return false;
+    }
+    let so = src.offset(sx as isize, sy as isize);
+    let d = dst.offset(dx as isize, dy as isize);
+    copy_block(&mut dst.data[d..], dst.stride, &src.data[so..], src.stride, bw, bh);
+    true
+}
+
+/// Interpolation for the wide pipeline (8.5.3.3.3.1 at any depth): `shift1
+/// = Min(4, BitDepth - 8)`, `shift2 = 6`, `shift3 = Max(2, 14 - BitDepth)`,
+/// `i32` intermediates — above 12 bits `shift3` leaves the whole-sample
+/// prediction, and the filter sums, past `i16`. Scalar; `tmp` holds
+/// `w * (h + 7)` entries.
+#[allow(clippy::too_many_arguments)]
+fn interp_wide<S: Sample>(tmp: &mut [i32], window: &mut [S], plane: &Plane16<S>, xi: i32, yi: i32, xf: usize, yf: usize, w: usize, h: usize, luma: bool, bit_depth: u32, out: &mut [i32]) {
+    let (reach, taps) = if luma { (3usize, 8usize) } else { (1, 4) };
+    let shift1 = (bit_depth as i32 - 8).min(4);
+    let shift3 = (14 - bit_depth as i32).max(2);
+    let mut fh = [0i32; 8];
+    let mut fv = [0i32; 8];
+    for k in 0..taps {
+        fh[k] = if luma { QPEL_FILTERS[xf][k] } else { EPEL_FILTERS[xf][k] } as i32;
+        fv[k] = if luma { QPEL_FILTERS[yf][k] } else { EPEL_FILTERS[yf][k] } as i32;
+    }
+    let (src, stride) = source(window, plane, xi, yi, w, h, luma);
+    // From the window origin to the block's own top-left.
+    let at_block = reach * stride + reach;
+    match (xf, yf) {
+        (0, 0) => {
+            for y in 0..h {
+                for x in 0..w {
+                    out[y * w + x] = src[at_block + y * stride + x].to_i32() << shift3;
+                }
+            }
+        }
+        (_, 0) => {
+            for y in 0..h {
+                let base = (reach + y) * stride;
+                for x in 0..w {
+                    let mut acc = 0i32;
+                    for k in 0..taps {
+                        acc += fh[k] * src[base + x + k].to_i32();
+                    }
+                    out[y * w + x] = acc >> shift1;
+                }
+            }
+        }
+        (0, _) => {
+            for y in 0..h {
+                for x in 0..w {
+                    let mut acc = 0i32;
+                    for k in 0..taps {
+                        acc += fv[k] * src[(y + k) * stride + reach + x].to_i32();
+                    }
+                    out[y * w + x] = acc >> shift1;
+                }
+            }
+        }
+        _ => {
+            let hh = h + taps - 1;
+            for r in 0..hh {
+                for x in 0..w {
+                    let mut acc = 0i32;
+                    for k in 0..taps {
+                        acc += fh[k] * src[r * stride + x + k].to_i32();
+                    }
+                    tmp[r * w + x] = acc >> shift1;
+                }
+            }
+            for y in 0..h {
+                for x in 0..w {
+                    let mut acc = 0i32;
+                    for k in 0..taps {
+                        acc += fv[k] * tmp[(y + k) * w + x];
+                    }
+                    out[y * w + x] = acc >> 6;
+                }
+            }
+        }
+    }
+}
+
+/// [`predict_block`] on the wide pipeline (bit depths above 12, extended
+/// precision — [`super::sps::Sps::wide_pipeline`]): `i32` intermediates
+/// from [`interp_wide`], and the weighted sample prediction with the
+/// depth-limited shifts of 8.5.3.3.4.2 / 8.5.3.3.4.3 — `shift1 = Max(2, 14
+/// - bitDepth)`, `shift2 = Max(3, 15 - bitDepth)`, `log2WD` already
+/// carrying the first. Scalar. The whole-sample copy shortcut is the same
+/// one as the `i16` path's: no arithmetic, so no range.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_block_wide<S: Sample>(
+    scratch: &mut McScratch<S>,
+    cur: &mut Frame<S>,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    ref0: Option<(&Frame<S>, Mv)>,
+    ref1: Option<(&Frame<S>, Mv)>,
+    weighting: [Weighting; 3],
+) {
+    scratch.ensure_wide();
+    let bd_of = |c: usize| if c == 0 { cur.bit_depth } else { cur.bit_depth_chroma };
+    let (sw, sh) = cur.chroma.subsampling();
+    let (sw, sh) = (sw as usize, sh as usize);
+    let mono = cur.chroma == crate::picture::ChromaFormat::Monochrome;
+    let (cw, ch) = (w / sw, h / sh);
+    let mvc = |mv: Mv| -> (i32, i32) { (if sw == 2 { mv.x as i32 } else { mv.x as i32 * 2 }, if sh == 2 { mv.y as i32 } else { mv.y as i32 * 2 }) };
+    let McScratch { pred_wide: pred, tmp_wide: tmp, window, .. } = scratch;
+    let both = ref0.is_some() && ref1.is_some();
+    let mut direct = [false, mono, mono];
+    if !both {
+        let (rf, mv) = ref0.or(ref1).expect("one list");
+        let plain = |c: usize| matches!(weighting[c], Weighting::Default);
+        if mv.x & 3 == 0 && mv.y & 3 == 0 && plain(0) {
+            let xi = x as i32 + (mv.x as i32 >> 2);
+            let yi = y as i32 + (mv.y as i32 >> 2);
+            direct[0] = copy_rows(&rf.y, &mut cur.y, xi, yi, x, y, w, h);
+        }
+        let (mcx, mcy) = mvc(mv);
+        if !mono && mcx & 7 == 0 && mcy & 7 == 0 && plain(1) && plain(2) {
+            let xci = (x / sw) as i32 + (mcx >> 3);
+            let yci = (y / sh) as i32 + (mcy >> 3);
+            direct[1] = copy_rows(&rf.cb, &mut cur.cb, xci, yci, x / sw, y / sh, cw, ch);
+            direct[2] = copy_rows(&rf.cr, &mut cur.cr, xci, yci, x / sw, y / sh, cw, ch);
+        }
+    }
+    for (list, r) in [ref0, ref1].into_iter().enumerate() {
+        let Some((rf, mv)) = r else { continue };
+        for c in 0..3 {
+            if direct[c] {
+                continue;
+            }
+            let luma = c == 0;
+            let (plane_ref, xi, yi, fx, fy, bw, bh) = if luma {
+                (&rf.y, x as i32 + (mv.x as i32 >> 2), y as i32 + (mv.y as i32 >> 2), (mv.x & 3) as usize, (mv.y & 3) as usize, w, h)
+            } else {
+                let plane_ref = if c == 1 { &rf.cb } else { &rf.cr };
+                let (mcx, mcy) = mvc(mv);
+                (plane_ref, (x / sw) as i32 + (mcx >> 3), (y / sh) as i32 + (mcy >> 3), (mcx & 7) as usize, (mcy & 7) as usize, cw, ch)
+            };
+            interp_wide(tmp, window, plane_ref, xi, yi, fx, fy, bw, bh, luma, bd_of(c), &mut pred[list][c]);
+        }
+    }
+    let (bd_y, bd_c) = (cur.bit_depth, cur.bit_depth_chroma);
+    let planes: [(&mut Plane16<S>, usize, usize, usize, usize); 3] =
+        [(&mut cur.y, x, y, w, h), (&mut cur.cb, x / sw, y / sh, cw, ch), (&mut cur.cr, x / sw, y / sh, cw, ch)];
+    for (c, (plane, px, py, pwid, phei)) in planes.into_iter().enumerate() {
+        if direct[c] {
+            continue;
+        }
+        let bd = if c == 0 { bd_y } else { bd_c };
+        let max = (1i32 << bd) - 1;
+        let off = plane.offset(px as isize, py as isize);
+        let stride = plane.stride;
+        let dst = &mut plane.data[off..];
+        let a = &pred[0][c];
+        let b = &pred[1][c];
+        let put = |dst: &mut [S], f: &dyn Fn(usize) -> i32| {
+            for yy in 0..phei {
+                for xx in 0..pwid {
+                    dst[yy * stride + xx] = S::from_i32(f(yy * pwid + xx).clamp(0, max));
+                }
+            }
+        };
+        match (both, weighting[c]) {
+            (false, Weighting::Default) => {
+                let src = if ref0.is_some() { a } else { b };
+                let shift = (14 - bd as i32).max(2);
+                let round = 1 << (shift - 1);
+                put(dst, &|i| (src[i] + round) >> shift);
+            }
+            (true, Weighting::Default) => {
+                let shift = (15 - bd as i32).max(3);
+                let round = 1 << (shift - 1);
+                put(dst, &|i| (a[i] + b[i] + round) >> shift);
+            }
+            (false, Weighting::Explicit { log2_wd, w: wt, o }) => {
+                let (src, l) = if ref0.is_some() { (a, 0) } else { (b, 1) };
+                if log2_wd >= 1 {
+                    let round = 1 << (log2_wd - 1);
+                    put(dst, &|i| ((src[i] * wt[l] + round) >> log2_wd) + o[l]);
+                } else {
+                    put(dst, &|i| src[i] * wt[l] + o[l]);
+                }
+            }
+            (true, Weighting::Explicit { log2_wd, w: wt, o }) => {
+                let round = (o[0] + o[1] + 1) << log2_wd;
+                put(dst, &|i| (a[i] * wt[0] + b[i] * wt[1] + round) >> (log2_wd + 1));
+            }
+        }
+    }
+}
+
 /// Predict one prediction block of the picture (`w x h` luma at `(x, y)`).
 #[allow(clippy::too_many_arguments)]
 pub fn predict_block<S: Sample>(
@@ -174,7 +394,7 @@ pub fn predict_block<S: Sample>(
     // Chroma vectors in eighth-sample units of the chroma grid (8.5.3.2.10):
     // `mv * 2 / SubWidthC`, exact for both subsampling factors.
     let mvc = |mv: Mv| -> (i32, i32) { (if sw == 2 { mv.x as i32 } else { mv.x as i32 * 2 }, if sh == 2 { mv.y as i32 } else { mv.y as i32 * 2 }) };
-    let McScratch { pred, tmp, window } = scratch;
+    let McScratch { pred, tmp, window, .. } = scratch;
     let both = ref0.is_some() && ref1.is_some();
     // Uni-prediction, default weighting, whole-sample vector: the prediction
     // is the reference block itself — copy it straight across instead of
@@ -184,16 +404,6 @@ pub fn predict_block<S: Sample>(
     if !both {
         let (rf, mv) = ref0.or(ref1).expect("one list");
         let plain = |c: usize| matches!(weighting[c], Weighting::Default);
-        let copy_rows = |src: &Plane16<S>, dst: &mut Plane16<S>, sx: i32, sy: i32, dx: usize, dy: usize, bw: usize, bh: usize| -> bool {
-            let pad = src.pad as i32;
-            if sx < -pad || sy < -pad || sx + bw as i32 > src.width as i32 + pad || sy + bh as i32 > src.height as i32 + pad {
-                return false;
-            }
-            let so = src.offset(sx as isize, sy as isize);
-            let d = dst.offset(dx as isize, dy as isize);
-            copy_block(&mut dst.data[d..], dst.stride, &src.data[so..], src.stride, bw, bh);
-            true
-        };
         if mv.x & 3 == 0 && mv.y & 3 == 0 && plain(0) {
             let xi = x as i32 + (mv.x as i32 >> 2);
             let yi = y as i32 + (mv.y as i32 >> 2);
