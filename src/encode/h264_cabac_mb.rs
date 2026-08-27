@@ -607,6 +607,10 @@ mod tests {
             x264_old_444: false,
             field_pic: false,
             mbaff: false,
+            sp: false,
+            sp_switch: false,
+            sp_qs: 0,
+            sp_qsc: [0; 2],
         };
         let lists = ScalingLists { list4x4: [[16; 16]; 6], list8x8: [[16; 64]; 6] };
         let dq = Dequant::new(&lists);
