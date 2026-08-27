@@ -1,5 +1,7 @@
-//! H.265 / HEVC decoding: Main and Main 10 profiles (4:2:0, 8..12-bit),
-//! written from ITU-T H.265 (V11, 01/2026) with the same architecture as the
+//! H.265 / HEVC decoding: Main / Main 10 / Main 12 and the format range
+//! extensions (4:0:0 – 4:4:4 at 8–16 bits, unequal luma / chroma depths,
+//! extended precision, CABAC bypass alignment — everything but separate
+//! colour planes), written from ITU-T H.265 (V11, 01/2026) with the same architecture as the
 //! H.264 half of the crate: parameter sets, slice segments, CTU parsing and
 //! reconstruction, deblocking + SAO, and an output-order DPB.
 

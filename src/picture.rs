@@ -37,8 +37,9 @@ impl ChromaFormat {
 }
 
 /// One plane of a [`Picture`]: where it sits in the picture's data. Samples
-/// are tightly packed (stride == width), 8-bit as one byte each, higher bit
-/// depths as little-endian `u16` (values in the low bits).
+/// are tightly packed (stride == width), one byte each when every component
+/// of the picture is 8-bit, else little-endian `u16` for every plane (values
+/// in the low bits) — see [`Picture::bytes_per_sample`].
 #[derive(Debug, Clone, Copy)]
 pub struct Plane {
     /// Byte offset of the plane's first sample in [`Picture::data`].
@@ -50,7 +51,8 @@ pub struct Plane {
 }
 
 impl Plane {
-    /// The plane's size in bytes.
+    /// The plane's size in bytes for a picture whose widest component has
+    /// `bit_depth` bits (see [`Picture::bytes_per_sample`]).
     pub fn len(&self, bit_depth: u32) -> usize {
         self.width as usize * self.height as usize * if bit_depth > 8 { 2 } else { 1 }
     }
@@ -98,8 +100,13 @@ pub struct Picture {
     pub width: u32,
     /// Luma height after cropping.
     pub height: u32,
-    /// Bits per sample (8, 9, 10, 12).
+    /// Bits per luma sample (8–16).
     pub bit_depth: u32,
+    /// Bits per chroma sample (8–16). Equal to `bit_depth` in every profile
+    /// but the range extensions' unequal-depth case (`TSUNEQBD`,
+    /// `Bitdepth_A/B`); a monochrome picture reports the SPS value, which
+    /// then decides nothing but the sample size (below).
+    pub bit_depth_chroma: u32,
     /// Chroma sampling.
     pub chroma: ChromaFormat,
     /// The samples of every plane, packed.
@@ -124,10 +131,23 @@ impl Drop for Picture {
 }
 
 impl Picture {
+    /// Bytes per sample, the same for every plane: 1 when both bit depths
+    /// are 8, else 2 (little-endian, values in the low bits) — the layout
+    /// the HM reference decoder writes for unequal depths too, so a
+    /// `Bitdepth_B` picture (8-bit luma, 12-bit chroma) carries its luma as
+    /// 16-bit words holding 8-bit values.
+    pub fn bytes_per_sample(&self) -> usize {
+        if self.bit_depth > 8 || self.bit_depth_chroma > 8 {
+            2
+        } else {
+            1
+        }
+    }
+
     /// The samples of plane `i` (0 Y, 1 Cb, 2 Cr).
     pub fn plane(&self, i: usize) -> &[u8] {
         let p = &self.planes[i];
-        &self.data[p.offset..p.offset + p.len(self.bit_depth)]
+        &self.data[p.offset..p.offset + p.len(self.bit_depth.max(self.bit_depth_chroma))]
     }
 
     /// The planes concatenated: Y then Cb then Cr — the layout of a packed

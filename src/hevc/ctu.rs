@@ -10,13 +10,16 @@ use crate::{Error, Result};
 
 use super::ctx::*;
 use super::frame::{Frame, MotionInfo, Mv, SharedFrame, Sample, fill_motion};
-use super::inter::{McScratch, Weighting, predict_block};
+use super::inter::{McScratch, Weighting, predict_block, predict_block_wide};
 use super::intra::{IntraScratch, predict as intra_predict};
 use super::mvpred::{Cand, PuPos, RefCtx, amvp, merge_candidate};
 use super::pic::{AvailCtx, PicInfo, SaoParams};
 use super::pps::Pps;
-use super::residual::{ResidualParams, ScalingSource, parse_residual, rdpcm_residual, residual_scan_idx, rotate_residual4, scale_coefficients, transform_skip_residual};
-use crate::dsp::hevc::HevcDsp;
+use super::residual::{
+    ResidualParams, ResidualRange, ScalingSource, parse_residual, rdpcm_residual, residual_scan_idx, rotate_residual4, scale_coefficients, scale_coefficients_i32,
+    transform_skip_residual, transform_skip_residual_i32,
+};
+use crate::dsp::hevc::{HevcDsp, add_residual_wide, idct_wide, idst4_wide};
 use super::slice::{SliceHeader, SliceType};
 use super::sps::{ScalingList, Sps};
 
@@ -134,6 +137,14 @@ pub struct SliceDec<'a, S: Sample = u16> {
     pub luma_res: Vec<i16>,
     /// See `luma_res`.
     pub luma_res_valid: bool,
+    /// The wide pipeline ([`Sps::wide_pipeline`]): residuals and motion
+    /// compensation in `i32` through the scalar `*_wide` kernels, the
+    /// buffers below in place of `coeffs` / `luma_res`.
+    pub wide: bool,
+    /// See `wide`.
+    pub coeffs_wide: Vec<i32>,
+    /// See `wide`.
+    pub luma_res_wide: Vec<i32>,
     /// The kernels.
     pub dsp: HevcDsp<S>,
     /// Motion compensation scratch.
@@ -184,10 +195,6 @@ fn bin(c: &mut Cabac, cx: &mut Contexts, ctx: usize) -> u32 {
 }
 
 impl<'a, S: Sample> SliceDec<'a, S> {
-    fn bit_depth(&self) -> u32 {
-        self.sps.bit_depth_luma
-    }
-
     /// The current block's side of the z-scan availability test (6.4.1),
     /// for a block about to ask after several neighbours.
     fn avail_ctx(&self, xc: i32, yc: i32) -> AvailCtx {
@@ -226,12 +233,14 @@ impl<'a, S: Sample> SliceDec<'a, S> {
         }
         let mut params = [SaoParams::default(); 3];
         let ncomp = if self.sps.chroma_format_idc != 0 { 3 } else { 1 };
-        let bd = self.bit_depth();
-        let cmax = (1u32 << (bd.min(10) - 5)) - 1;
         for c_idx in 0..ncomp {
             if !((self.hdr.sao_luma && c_idx == 0) || (self.hdr.sao_chroma && c_idx > 0)) {
                 continue;
             }
+            // sao_offset_abs: cMax = (1 << (Min(bitDepth, 10) - 5)) - 1 with
+            // the component's own depth (7.4.9.3.2).
+            let bd = if c_idx == 0 { self.sps.bit_depth_luma } else { self.sps.bit_depth_chroma };
+            let cmax = (1u32 << (bd.min(10) - 5)) - 1;
             if c_idx == 0 || c_idx == 1 {
                 // sao_type_idx: TR cMax 2, first bin ctx, second bypass.
                 let t = if bin(&mut self.cabac, &mut self.cx, SAO_TYPE_IDX_OFFSET) == 0 {
@@ -822,7 +831,11 @@ impl<'a, S: Sample> SliceDec<'a, S> {
         let f1 = if cand.ref_idx[1] >= 0 { Some((self.ref_frames[1][cand.ref_idx[1] as usize], cand.mv[1])) } else { None };
         // Blocks may extend past the picture edge (the last CTB row/col);
         // predict the whole PB — the border absorbs it.
-        predict_block(&self.dsp, &mut self.mc, self.frame, x_pb as usize, y_pb as usize, w as usize, h as usize, f0, f1, weighting);
+        if self.wide {
+            predict_block_wide(&mut self.mc, self.frame, x_pb as usize, y_pb as usize, w as usize, h as usize, f0, f1, weighting);
+        } else {
+            predict_block(&self.dsp, &mut self.mc, self.frame, x_pb as usize, y_pb as usize, w as usize, h as usize, f0, f1, weighting);
+        }
         Ok(())
     }
 
@@ -835,9 +848,11 @@ impl<'a, S: Sample> SliceDec<'a, S> {
         let Some(t) = (if explicit { self.hdr.pred_weights.as_ref() } else { None }) else {
             return [Weighting::Default; 3];
         };
-        let shift1 = 14 - self.bit_depth() as i32;
         let mut out = [Weighting::Default; 3];
         for c in 0..3 {
+            // shift1 = Max(2, 14 - bitDepth) of the component (8.5.3.3.4.3).
+            let bd = if c == 0 { self.sps.bit_depth_luma } else { self.sps.bit_depth_chroma };
+            let shift1 = (14 - bd as i32).max(2);
             let log2_wd = if c == 0 { t.luma_log2_denom as i32 } else { t.chroma_log2_denom as i32 } + shift1;
             let mut w = [1i32; 2];
             let mut o = [0i32; 2];
@@ -1213,6 +1228,21 @@ impl<'a, S: Sample> SliceDec<'a, S> {
     /// its own: add the scaled luma residual of the TU.
     fn add_scaled_luma_residual(&mut self, x: usize, y: usize, log2: u32, c_idx: usize, res_scale: i32) {
         let n = 1usize << log2;
+        if self.wide {
+            if !self.luma_res_valid || self.luma_res_wide.len() != n * n {
+                return;
+            }
+            let (bdy, bdc) = (self.sps.bit_depth_luma, self.sps.bit_depth_chroma);
+            let mut coeffs = std::mem::take(&mut self.coeffs_wide);
+            for (r, &l) in coeffs[..n * n].iter_mut().zip(&self.luma_res_wide) {
+                *r = ((res_scale as i64 * (((l as i64) << bdc) >> bdy)) >> 3) as i32;
+            }
+            let plane = if c_idx == 1 { &mut self.frame.cb } else { &mut self.frame.cr };
+            let (stride, off) = (plane.stride, plane.offset(x as isize, y as isize));
+            add_residual_wide(&mut plane.data[off..], stride, &coeffs, n, (1i32 << bdc) - 1);
+            self.coeffs_wide = coeffs;
+            return;
+        }
         if !self.luma_res_valid || self.luma_res.len() != n * n {
             return;
         }
@@ -1220,10 +1250,11 @@ impl<'a, S: Sample> SliceDec<'a, S> {
         if coeffs.len() < n * n {
             coeffs.resize(1024, 0);
         }
+        let (bdy, bdc) = (self.sps.bit_depth_luma, self.sps.bit_depth_chroma);
         for (r, &l) in coeffs[..n * n].iter_mut().zip(&self.luma_res) {
-            *r = ((res_scale * l as i32) >> 3).clamp(-32768, 32767) as i16;
+            *r = ((res_scale * (((l as i32) << bdc) >> bdy)) >> 3).clamp(-32768, 32767) as i16;
         }
-        let bd = self.sps.bit_depth_chroma;
+        let bd = bdc;
         let max = (1i32 << bd) - 1;
         let plane = if c_idx == 1 { &mut self.frame.cb } else { &mut self.frame.cr };
         let stride = plane.stride;
@@ -1254,12 +1285,6 @@ impl<'a, S: Sample> SliceDec<'a, S> {
             persistent_rice: self.sps.persistent_rice(),
             trace: self.trace.tb_hit(c_idx, x, y, n),
         };
-        let mut coeffs = std::mem::take(&mut self.coeffs);
-        if coeffs.len() < n * n {
-            coeffs.resize(1024, 0);
-        }
-        let ri = parse_residual(&mut self.cabac, &mut self.cx, &params, &mut coeffs)?;
-        let ts = ri.transform_skip;
         // QP for the component.
         let qp = if c_idx == 0 {
             self.qp_y + 6 * (self.sps.bit_depth_luma as i32 - 8)
@@ -1270,6 +1295,19 @@ impl<'a, S: Sample> SliceDec<'a, S> {
             chroma_qp(self.sps.chroma_array_type(), qpi) + bd_off_c
         };
         let bd = if c_idx == 0 { self.sps.bit_depth_luma } else { self.sps.bit_depth_chroma };
+        if self.wide {
+            return self.residual_block_wide(cu, x, y, log2, c_idx, &params, keep_luma, res_scale, qp, bd);
+        }
+        let mut coeffs = std::mem::take(&mut self.coeffs);
+        if coeffs.len() < n * n {
+            coeffs.resize(1024, 0);
+        }
+        let ri = if self.sps.cabac_bypass_alignment() {
+            parse_residual::<i16, true>(&mut self.cabac, &mut self.cx, &params, &ResidualRange::PLAIN, &mut coeffs)?
+        } else {
+            parse_residual::<i16, false>(&mut self.cabac, &mut self.cx, &params, &ResidualRange::PLAIN, &mut coeffs)?
+        };
+        let ts = ri.transform_skip;
         // 4x4 intra transform-skipped / bypassed blocks may be coded rotated.
         let rotate = self.sps.ts_rotation() && log2 == 2 && cu.intra && (ts || cu.bypass);
         if cu.bypass {
@@ -1313,9 +1351,11 @@ impl<'a, S: Sample> SliceDec<'a, S> {
             self.luma_res_valid = true;
         }
         if res_scale != 0 && self.luma_res_valid && self.luma_res.len() == n * n {
-            // Cross-component prediction (7.3.8.12 / 8.6.6): equal bit depths here.
+            // Cross-component prediction (7.3.8.12 / 8.6.6): the luma residual
+            // brought to the chroma depth first, `(rY << BitDepthC) >> BitDepthY`.
+            let (bdy, bdc) = (self.sps.bit_depth_luma, self.sps.bit_depth_chroma);
             for (r, &l) in coeffs[..n * n].iter_mut().zip(&self.luma_res) {
-                *r = (*r as i32 + ((res_scale * l as i32) >> 3)).clamp(-32768, 32767) as i16;
+                *r = (*r as i32 + ((res_scale * (((l as i32) << bdc) >> bdy)) >> 3)).clamp(-32768, 32767) as i16;
             }
         }
         // Add to the prediction.
@@ -1337,6 +1377,96 @@ impl<'a, S: Sample> SliceDec<'a, S> {
         }
         (self.dsp.add_residual)(&mut plane.data[off..], stride, &coeffs, n, max);
         self.coeffs = coeffs;
+        Ok(())
+    }
+
+    /// [`Self::residual_block`] on the wide pipeline: the same steps in
+    /// `i32` — the parse clipping to `log2TransformRange` bits, the
+    /// scaling and transforms with `extended_precision_processing_flag`'s
+    /// shifts (8.6.3 / 8.6.4.2), and residuals that may exceed 16 bits
+    /// (a 16-bit stream's lossless difference, a left-shifting transform
+    /// skip) — through the scalar `*_wide` kernels.
+    #[allow(clippy::too_many_arguments)]
+    fn residual_block_wide(&mut self, cu: &CuCtx, x: usize, y: usize, log2: u32, c_idx: usize, params: &ResidualParams, keep_luma: bool, res_scale: i32, qp: i32, bd: u32) -> Result<()> {
+        let n = 1usize << log2;
+        let ext = self.sps.extended_precision();
+        let log2_range = self.sps.log2_transform_range(bd);
+        let range = ResidualRange { log2_range, extended_precision: ext };
+        let mut coeffs = std::mem::take(&mut self.coeffs_wide);
+        if coeffs.len() < n * n {
+            coeffs.resize(1024, 0);
+        }
+        let ri = if self.sps.cabac_bypass_alignment() {
+            parse_residual::<i32, true>(&mut self.cabac, &mut self.cx, params, &range, &mut coeffs)?
+        } else {
+            parse_residual::<i32, false>(&mut self.cabac, &mut self.cx, params, &range, &mut coeffs)?
+        };
+        let ts = ri.transform_skip;
+        let rotate = self.sps.ts_rotation() && log2 == 2 && cu.intra && (ts || cu.bypass);
+        if cu.bypass {
+            if rotate {
+                rotate_residual4(&mut coeffs);
+            }
+            if let Some(vertical) = ri.rdpcm {
+                rdpcm_residual(&mut coeffs, log2, vertical);
+            }
+        } else {
+            let scaling = match &self.scaling {
+                None => ScalingSource::Flat,
+                Some(sl) => {
+                    let size_id = (log2 - 2) as usize;
+                    let matrix_id = if cu.intra { c_idx } else { 3 + c_idx };
+                    let list = &sl.lists[size_id][matrix_id];
+                    let dc = if size_id >= 2 { sl.dc[size_id - 2][matrix_id] } else { 16 };
+                    ScalingSource::List(&list[..if size_id == 0 { 16 } else { 64 }], dc)
+                }
+            };
+            scale_coefficients_i32(&mut coeffs, log2, qp, bd, log2_range, scaling, ts, ri.max_x, ri.max_y);
+            // bdShift = Max(20 - BitDepth, extended_precision ? 11 : 0).
+            let bd_shift = (20 - bd as i32).max(if ext { 11 } else { 0 });
+            if ts {
+                if rotate {
+                    rotate_residual4(&mut coeffs);
+                }
+                transform_skip_residual_i32(&mut coeffs, log2, bd, ext);
+                if let Some(vertical) = ri.rdpcm {
+                    rdpcm_residual(&mut coeffs, log2, vertical);
+                }
+            } else if cu.intra && log2 == 2 && c_idx == 0 {
+                idst4_wide(&mut coeffs, log2_range, bd_shift);
+            } else {
+                idct_wide(&mut coeffs, log2, log2_range, bd_shift, ri.max_x, ri.max_y);
+            }
+        }
+        if keep_luma {
+            self.luma_res_wide.clear();
+            self.luma_res_wide.extend_from_slice(&coeffs[..n * n]);
+            self.luma_res_valid = true;
+        }
+        if res_scale != 0 && self.luma_res_valid && self.luma_res_wide.len() == n * n {
+            let (bdy, bdc) = (self.sps.bit_depth_luma, self.sps.bit_depth_chroma);
+            for (r, &l) in coeffs[..n * n].iter_mut().zip(&self.luma_res_wide) {
+                *r = (*r as i64 + ((res_scale as i64 * (((l as i64) << bdc) >> bdy)) >> 3)) as i32;
+            }
+        }
+        let max = (1i32 << bd) - 1;
+        let plane = match c_idx {
+            0 => &mut self.frame.y,
+            1 => &mut self.frame.cb,
+            _ => &mut self.frame.cr,
+        };
+        let stride = plane.stride;
+        let off = plane.offset(x as isize, y as isize);
+        if params.trace {
+            eprintln!("tb c={c_idx} x={x} y={y} n={n} bypass={} ts={ts} qp={qp} scan={} wide", cu.bypass, params.scan_idx);
+            for yy in 0..n {
+                let pred: Vec<i32> = (0..n).map(|xx| plane.data[off + yy * stride + xx].to_i32()).collect();
+                let res: Vec<i32> = (0..n).map(|xx| coeffs[yy * n + xx]).collect();
+                eprintln!("  pred {pred:?} res {res:?}");
+            }
+        }
+        add_residual_wide(&mut plane.data[off..], stride, &coeffs, n, max);
+        self.coeffs_wide = coeffs;
         Ok(())
     }
 }
@@ -2665,6 +2795,9 @@ mod write_round_trip {
             coeffs: vec![0; 1024],
             luma_res: Vec::new(),
             luma_res_valid: false,
+            wide: false,
+            coeffs_wide: Vec::new(),
+            luma_res_wide: Vec::new(),
             dsp: HevcDsp::<u8>::SCALAR,
             mc: McScratch::new(),
             intra: IntraScratch::default(),
@@ -2914,6 +3047,9 @@ mod write_round_trip {
             coeffs: vec![0; 1024],
             luma_res: Vec::new(),
             luma_res_valid: false,
+            wide: false,
+            coeffs_wide: Vec::new(),
+            luma_res_wide: Vec::new(),
             dsp: HevcDsp::<u8>::SCALAR,
             mc: McScratch::new(),
             intra: IntraScratch::default(),
@@ -3190,6 +3326,9 @@ mod write_round_trip {
             coeffs: vec![0; 1024],
             luma_res: Vec::new(),
             luma_res_valid: false,
+            wide: false,
+            coeffs_wide: Vec::new(),
+            luma_res_wide: Vec::new(),
             dsp: HevcDsp::<u8>::SCALAR,
             mc: McScratch::new(),
             intra: IntraScratch::default(),

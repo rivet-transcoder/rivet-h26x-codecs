@@ -6,7 +6,10 @@
 //!
 //! Sample planes are `u16` at any bit depth; interpolation intermediates are
 //! `i16` at 14-bit precision (8.5.3.3.3), coefficients and residuals `i16`
-//! (the standard clips them to 16 bits, 8.6.2 / 8.6.4.2).
+//! (the standard clips them to 16 bits, 8.6.2 / 8.6.4.2). Above 12 bits,
+//! and under `extended_precision_processing_flag`, none of that holds: the
+//! `*_wide` kernels at the end take `i32` and accumulate in `i64`, scalar
+//! only — nothing in the table is touched for them.
 
 use super::Cpu;
 use crate::hevc::frame::Sample;
@@ -386,6 +389,98 @@ fn add_residual_scalar<S: Sample>(dst: &mut [S], stride: usize, res: &[i16], n: 
 }
 
 // ----------------------------------------------------------------------
+// The wide pipeline: `i32` coefficients / residuals (bit depths above 12,
+// `extended_precision_processing_flag`), `i64` accumulation, scalar only.
+// Exact inverses of the `i16` kernels above where their ranges overlap —
+// the tests pin that.
+// ----------------------------------------------------------------------
+
+/// [`idct1`] over `i32` coefficients with `i64` sums: at a 22-bit coefficient
+/// range, 32 products of 90 do not fit `i32`.
+fn idct1_wide(src: &[i32], stride: usize, n: usize, nz: usize, out: &mut [i64]) {
+    if n == 1 {
+        out[0] = 64 * src[0] as i64;
+        return;
+    }
+    let half = n / 2;
+    let mut e = [0i64; 16];
+    idct1_wide(src, stride * 2, half, nz.div_ceil(2), &mut e);
+    let step = 32 / n;
+    for k in 0..half {
+        let mut o = 0i64;
+        let mut j = 1;
+        while j < nz {
+            o += TRANSFORM32[j * step][k] as i64 * src[j * stride] as i64;
+            j += 2;
+        }
+        out[k] = e[k] + o;
+        out[n - 1 - k] = e[k] - o;
+    }
+}
+
+/// Inverse DCT of an `n x n` (`n = 1 << log2`) block of `i32` coefficients
+/// in place (8.6.4.2): the first stage clips to `±(1 << log2_range)`
+/// (`coeffMin..=coeffMax`), the second shifts by `bd_shift` (`Max(20 -
+/// BitDepth, extended ? 11 : 0)`) and, unlike the `i16` kernel, has nothing
+/// to clip to — the residual is whatever the sum is.
+pub fn idct_wide(coeffs: &mut [i32], log2: u32, log2_range: u32, bd_shift: i32, max_x: usize, max_y: usize) {
+    let n = 1usize << log2;
+    let (cmin, cmax) = (-(1i64 << log2_range), (1i64 << log2_range) - 1);
+    let round2 = 1i64 << (bd_shift - 1);
+    let mut tmp = [0i32; 32 * 32];
+    let mut out = [0i64; 32];
+    for x in 0..=max_x {
+        idct1_wide(&coeffs[x..], n, n, max_y + 1, &mut out);
+        for y in 0..n {
+            tmp[y * n + x] = ((out[y] + 64) >> 7).clamp(cmin, cmax) as i32;
+        }
+    }
+    for y in 0..n {
+        idct1_wide(&tmp[y * n..], 1, n, max_x + 1, &mut out);
+        for x in 0..n {
+            coeffs[y * n + x] = ((out[x] + round2) >> bd_shift) as i32;
+        }
+    }
+}
+
+/// Inverse DST 4x4 on `i32` coefficients (see [`idct_wide`]).
+pub fn idst4_wide(coeffs: &mut [i32], log2_range: u32, bd_shift: i32) {
+    const M: [[i64; 4]; 4] = [[29, 55, 74, 84], [74, 74, 0, -74], [84, -29, -74, 55], [55, -84, 74, -29]];
+    let (cmin, cmax) = (-(1i64 << log2_range), (1i64 << log2_range) - 1);
+    let round2 = 1i64 << (bd_shift - 1);
+    let mut tmp = [0i64; 16];
+    for x in 0..4 {
+        for i in 0..4 {
+            let mut s = 0i64;
+            for j in 0..4 {
+                s += M[j][i] * coeffs[j * 4 + x] as i64;
+            }
+            tmp[i * 4 + x] = ((s + 64) >> 7).clamp(cmin, cmax);
+        }
+    }
+    for y in 0..4 {
+        for i in 0..4 {
+            let mut s = 0i64;
+            for j in 0..4 {
+                s += M[j][i] * tmp[y * 4 + j];
+            }
+            coeffs[y * 4 + i] = ((s + round2) >> bd_shift) as i32;
+        }
+    }
+}
+
+/// Add an `i32` residual block to `dst` with clipping to `0..=max`.
+pub fn add_residual_wide<S: Sample>(dst: &mut [S], stride: usize, res: &[i32], n: usize, max: i32) {
+    for y in 0..n {
+        let row = &mut dst[y * stride..y * stride + n];
+        let r = &res[y * n..y * n + n];
+        for x in 0..n {
+            row[x] = S::from_i32((row[x].to_i32() as i64 + r[x] as i64).clamp(0, max as i64) as i32);
+        }
+    }
+}
+
+// ----------------------------------------------------------------------
 // Interpolation
 // ----------------------------------------------------------------------
 
@@ -658,6 +753,53 @@ mod tests {
     fn lcg(seed: &mut u64) -> u32 {
         *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         (*seed >> 33) as u32
+    }
+
+    /// The wide kernels are the `i16` ones wherever both ranges hold: the
+    /// same random blocks through both, at `log2TransformRange = 15`.
+    #[test]
+    fn wide_transforms_equal_the_i16_kernels_in_range() {
+        let mut seed = 11u64;
+        for &(n, log2) in &[(4usize, 2u32), (8, 3), (16, 4), (32, 5)] {
+            for trial in 0..100 {
+                let mut c = vec![0i16; n * n];
+                let (mx, my) = if trial % 3 == 0 { (n - 1, n - 1) } else { ((lcg(&mut seed) as usize) % n, (lcg(&mut seed) as usize) % n) };
+                for y in 0..=my {
+                    for x in 0..=mx {
+                        if lcg(&mut seed) % 3 == 0 {
+                            // Small enough that the i16 kernel's output clip never bites.
+                            c[y * n + x] = (lcg(&mut seed) as i32 % 2048 - 1024) as i16;
+                        }
+                    }
+                }
+                let bd_shift = 20 - 8 - (trial % 3) as i32 * 2;
+                let mut want = c.clone();
+                (HevcDsp::<u16>::SCALAR.idct[(log2 - 2) as usize])(&mut want, bd_shift, mx, my);
+                let mut got: Vec<i32> = c.iter().map(|&v| v as i32).collect();
+                idct_wide(&mut got, log2, 15, bd_shift, mx, my);
+                assert_eq!(got, want.iter().map(|&v| v as i32).collect::<Vec<_>>(), "n={n} trial={trial}");
+                if n == 4 {
+                    let mut want = c.clone();
+                    (HevcDsp::<u16>::SCALAR.idst4)(&mut want, bd_shift, mx, my);
+                    let mut got: Vec<i32> = c.iter().map(|&v| v as i32).collect();
+                    idst4_wide(&mut got, 15, bd_shift);
+                    assert_eq!(got, want.iter().map(|&v| v as i32).collect::<Vec<_>>(), "dst trial={trial}");
+                }
+            }
+        }
+        // add_residual: clipping at both ends, 16-bit samples.
+        let mut a = vec![100u16, 65535, 0, 30000];
+        let mut b = a.clone();
+        let res16 = [-200i16, 5, -1, 32767];
+        let res32: Vec<i32> = res16.iter().map(|&v| v as i32).collect();
+        (HevcDsp::<u16>::SCALAR.add_residual)(&mut a, 2, &res16, 2, 65535);
+        add_residual_wide(&mut b, 2, &res32, 2, 65535);
+        assert_eq!(a, b);
+        assert_eq!(a, [0, 65535, 0, 62767]);
+        // And what only the wide one can express: a residual beyond i16.
+        let mut c = vec![1000u16; 4];
+        add_residual_wide(&mut c, 2, &[60000, -60000, 70000, -1], 2, 65535);
+        assert_eq!(c, [61000, 0, 65535, 999]);
     }
 
     #[test]

@@ -673,6 +673,7 @@ impl<S: Sample> Frame<S> {
             width: width as u32,
             height: height as u32,
             bit_depth: self.bit_depth,
+            bit_depth_chroma: self.bit_depth,
             chroma,
             planes,
             poc,

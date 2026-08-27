@@ -487,6 +487,9 @@ fn run_substream<S: Sample>(pic_arc: &Arc<PicShared<S>>, seg_arc: &Arc<Segment>,
         coeffs: vec![0; 1024],
         luma_res: Vec::new(),
         luma_res_valid: false,
+        wide: sps.wide_pipeline(),
+        coeffs_wide: if sps.wide_pipeline() { vec![0; 1024] } else { Vec::new() },
+        luma_res_wide: Vec::new(),
         dsp: pic.dsp,
         mc: {
             let mut m = take_scratch();
@@ -781,7 +784,7 @@ impl<S: Sample> RowFilterState<S> {
             // A band frame from the pool (recycled picture to picture: an
             // allocation per picture here was measurable in page faults).
             let frames = &pic.frames;
-            let src = self.sao_src.get_or_insert_with(|| Box::new(frames.take(frame.width, ctb + 4, frame.chroma, frame.bit_depth)));
+            let src = self.sao_src.get_or_insert_with(|| Box::new(frames.take(frame.width, ctb + 4, frame.chroma, frame.bit_depth, frame.bit_depth_chroma)));
             self.sao_band.fill(frame, src, ctb, r);
             sao_ctb_row(&pic.dsp, frame, src, &self.sao_band, info, &pic.sps, &pic.pps, r);
         }
@@ -1057,18 +1060,6 @@ impl<S: Sample> HevcDecoderImpl<S> {
             if sps.separate_colour_plane {
                 return Err(Error::unsupported("separate_colour_plane_flag"));
             }
-            if sps.bit_depth_luma != sps.bit_depth_chroma {
-                return Err(Error::unsupported("different luma and chroma bit depths"));
-            }
-            if sps.bit_depth_luma > 12 {
-                return Err(Error::unsupported(format!("bit depth {}", sps.bit_depth_luma)));
-            }
-            if sps.extended_precision() {
-                return Err(Error::unsupported("extended_precision_processing_flag"));
-            }
-            if sps.cabac_bypass_alignment() {
-                return Err(Error::unsupported("cabac_bypass_alignment_enabled_flag"));
-            }
             pps.resolve_tiles(&sps)?;
             self.start_picture(&hdr, sps, pps, nh)?;
             if self.skipping {
@@ -1083,7 +1074,7 @@ impl<S: Sample> HevcDecoderImpl<S> {
             // SAFETY: nothing else touches the frame before progress > 0.
             let frame: &mut Frame<S> = unsafe { pic.frame_mut() };
             if frame.width == 0 {
-                let mut f = self.frames.take(pic.sps.width as usize, pic.sps.height as usize, pic.sps.chroma_format(), pic.sps.bit_depth_luma);
+                let mut f = self.frames.take(pic.sps.width as usize, pic.sps.height as usize, pic.sps.chroma_format(), pic.sps.bit_depth_luma, pic.sps.bit_depth_chroma);
                 f.poc = pic.poc;
                 *frame = f;
             }
@@ -1239,10 +1230,9 @@ impl<S: Sample> HevcDecoderImpl<S> {
 
         self.dpb.configure(&sps);
         let chroma = sps.chroma_format();
-        let bit_depth = sps.bit_depth_luma;
         let crop = sps.conf_win;
         let idr = nal_type::is_idr(t);
-        let sets = self.dpb.apply_rps(hdr, &sps, poc, idr, chroma, bit_depth, self.decode_index, crop);
+        let sets = self.dpb.apply_rps(hdr, &sps, poc, idr, chroma, sps.bit_depth_luma, sps.bit_depth_chroma, self.decode_index, crop);
         if irap && self.no_rasl_output && !first_pic {
             let no_output = if t == nal_type::CRA { true } else { hdr.no_output_of_prior_pics };
             self.dpb.before_decode(true, no_output);
@@ -1291,6 +1281,7 @@ impl<S: Sample> HevcDecoderImpl<S> {
             }
         };
         let info = self.info_pool.take(geo);
+        let sps_wide = sps.wide_pipeline();
         let nc = info.wc * info.hc;
         let hc = info.hc;
         let wc = info.wc;
@@ -1304,7 +1295,11 @@ impl<S: Sample> HevcDecoderImpl<S> {
             poc,
             sets,
             scaling,
-            dsp: self.dsp,
+            // The wide pipeline runs its own scalar kernels for residuals
+            // and motion compensation; the loop filters it shares take the
+            // scalar table too — the SIMD u16 kernels are proven at 8–12
+            // bits by the rung sweep, not at 16.
+            dsp: if sps_wide { HevcDsp::scalar() } else { self.dsp },
             ctb_done: (0..nc).map(|_| AtomicBool::new(false)).collect(),
             done_count: AtomicUsize::new(0),
             tasks_submitted: AtomicUsize::new(0),

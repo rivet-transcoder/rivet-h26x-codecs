@@ -355,6 +355,28 @@ impl<'a> Cabac<'a> {
         q as u32
     }
 
+    /// The alignment before aligned bypass decoding (H.265 9.3.4.3.6,
+    /// `cabac_bypass_alignment_enabled_flag`): `ivlCurrRange` becomes 256,
+    /// after which every bypass bin is one raw bit of the offset. The
+    /// register model is the standard's own, so this is the assignment and
+    /// nothing else — [`Self::bypass`] and [`Self::bypass_bits`] already
+    /// divide by whatever `range` holds. Context-coded bins may follow
+    /// (256 is inside `[256, 510]`; no renormalisation is owed).
+    #[inline]
+    pub fn align_bypass(&mut self) {
+        self.range = 256;
+    }
+
+    /// Decode `n` bypass bins for any `n <= 32`, MSB first ([`Self::bypass_bits`]
+    /// takes at most 16 at a time).
+    pub fn bypass_bits_wide(&mut self, n: u32) -> u32 {
+        if n <= 16 {
+            return self.bypass_bits(n);
+        }
+        let hi = self.bypass_bits(n - 16);
+        (hi << 16) | self.bypass_bits(16)
+    }
+
     /// Decode a terminate bin. Returns 1 when the arithmetic codeword ends
     /// here (end of slice / substream, or PCM samples follow); the engine then
     /// stops and the reader is at the standard's bit position.
