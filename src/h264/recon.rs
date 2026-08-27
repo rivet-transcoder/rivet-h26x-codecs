@@ -375,7 +375,7 @@ pub fn derive<S: Sample>(
         }
         // Intra prediction modes are validated here so reconstruction
         // cannot fail on them.
-        if matches!(layer.kind, MbKind::I4x4 | MbKind::I8x8) && layer.intra_modes.iter().any(|&m| m > 8) {
+        if matches!(layer.kind, MbKind::I4x4 | MbKind::I8x8 | MbKind::Si) && layer.intra_modes.iter().any(|&m| m > 8) {
             return Err(Error::bitstream("intra prediction mode out of range"));
         }
         if layer.kind == MbKind::I16x16 && layer.intra16_mode > 3 {
@@ -447,7 +447,7 @@ pub fn derive<S: Sample>(
             }
         }
     }
-    if matches!(layer.kind, MbKind::I4x4 | MbKind::I8x8) {
+    if matches!(layer.kind, MbKind::I4x4 | MbKind::I8x8 | MbKind::Si) {
         info.intra_modes[base..base + 16].copy_from_slice(&layer.intra_modes);
     } else {
         info.intra_modes[base..base + 16].fill(2);
@@ -657,10 +657,57 @@ pub fn reconstruct<S: Sample>(
                     dsp, cur, info, ctx, nb, layer, geom, qpc, dq, true, bypass,
                 )?;
             }
+            MbKind::Si => {
+                // 8.6.2: Intra_4x4 prediction, each block reconstructed
+                // through the switching path before the next is predicted.
+                let plane = plane_mut(cur, 0);
+                let stride = plane.stride * step;
+                let off = plane.offset(px as isize, py as isize);
+                for blk_idx in 0..16 {
+                    let raster = super::mb::raster_of_blk(blk_idx);
+                    let (bx, by) = (raster % 4, raster / 4);
+                    let av = intra_avail_4x4(info, ctx, nb, bx, by);
+                    let boff = off + by * 4 * stride + bx * 4;
+                    predict_4x4(plane, boff, stride, layer.intra_modes[raster], av, bit_depth)?;
+                    super::sp::luma_block(
+                        &mut plane.data[boff..],
+                        stride,
+                        &layer.coef[0][raster * 16..raster * 16 + 16],
+                        qp,
+                        ctx.sp_qs,
+                        true,
+                        max,
+                    );
+                }
+                predict_chroma_planes(cur, info, ctx, nb, layer, geom)?;
+                sp_chroma(ctx, cur, layer, geom, qpc, max, true);
+            }
             _ => unreachable!(),
         }
     } else {
         predict_jobs(cur, layer, refs, geom, &mut scratch.mc);
+        if ctx.sp {
+            // An SP slice's P macroblock (8.6.1 / 8.6.2): every block,
+            // coded or not, is requantised with the prediction.
+            let plane = plane_mut(cur, 0);
+            let stride = plane.stride * step;
+            let off = plane.offset(px as isize, py as isize);
+            for raster in 0..16 {
+                let (bx, by) = (raster % 4, raster / 4);
+                let boff = off + by * 4 * stride + bx * 4;
+                super::sp::luma_block(
+                    &mut plane.data[boff..],
+                    stride,
+                    &layer.coef[0][raster * 16..raster * 16 + 16],
+                    qp,
+                    ctx.sp_qs,
+                    ctx.sp_switch,
+                    max,
+                );
+            }
+            sp_chroma(ctx, cur, layer, geom, qpc, max, ctx.sp_switch);
+            return Ok(());
+        }
         // Residual.
         for p in 0..planes {
             let plane = plane_mut(cur, p);
@@ -814,10 +861,54 @@ fn predict_and_add_chroma<S: Sample>(
     intra: bool,
     bypass: bool,
 ) -> Result<()> {
+    if !predict_chroma_planes(cur, info, ctx, nb, layer, geom)? {
+        return Ok(());
+    }
+    if layer.cbp & 0x30 != 0 {
+        add_chroma_residual(dsp, cur, layer, geom, qpc, dq, intra, bypass);
+    }
+    Ok(())
+}
+
+/// The SP / SI chroma reconstruction of a 4:2:0 macroblock whose
+/// prediction is in the picture: both components through
+/// [`super::sp::chroma_420`] with the macroblock's raw chroma levels.
+fn sp_chroma<S: Sample>(ctx: &SliceCtx, cur: &mut Frame<S>, layer: &MbLayer, geom: MbGeom, qpc: [i32; 2], max: i32, switching: bool) {
+    if cur.chroma != ChromaFormat::Yuv420 {
+        // 4:0:0 has none; other formats are refused with SP / SI upstream.
+        return;
+    }
+    let cstride = cur.cb.stride * geom.step;
+    let coff = cur.cb.offset((geom.x / 16 * 8) as isize, geom.yc_dst as isize);
+    for comp in 0..2 {
+        let plane = if comp == 0 { &mut cur.cb } else { &mut cur.cr };
+        super::sp::chroma_420(
+            &mut plane.data[coff..],
+            cstride,
+            &layer.chroma_dc[comp][..4],
+            &layer.chroma_ac[comp][..4],
+            qpc[comp],
+            ctx.sp_qsc[comp],
+            switching,
+            max,
+        );
+    }
+}
+
+/// Chroma intra prediction of a 4:2:0 / 4:2:2 macroblock into the picture
+/// (`false` when the picture has no chroma of that kind).
+fn predict_chroma_planes<S: Sample>(
+    cur: &mut Frame<S>,
+    info: &PicInfo,
+    ctx: &SliceCtx,
+    nb: &MbNeighbours,
+    layer: &MbLayer,
+    geom: MbGeom,
+) -> Result<bool> {
     let (mbw_c, mbh_c) = match cur.chroma {
         ChromaFormat::Yuv420 => (8usize, 8usize),
         ChromaFormat::Yuv422 => (8, 16),
-        _ => return Ok(()),
+        _ => return Ok(false),
     };
     let px = geom.x;
     let av = IntraAvail {
@@ -863,10 +954,7 @@ fn predict_and_add_chroma<S: Sample>(
         cur.bit_depth,
         mbh_c,
     )?;
-    if layer.cbp & 0x30 != 0 {
-        add_chroma_residual(dsp, cur, layer, geom, qpc, dq, intra, bypass);
-    }
-    Ok(())
+    Ok(true)
 }
 
 /// Chroma residual (DC transform + per-block AC) added to the prediction.

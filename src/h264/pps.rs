@@ -5,6 +5,27 @@ use crate::{Error, Result};
 
 use super::sps::{ScalingLists, Sps, parse_scaling_matrix};
 
+/// Slice groups (flexible macroblock ordering, 7.4.2.2) of a PPS with
+/// `num_slice_groups_minus1 > 0`; the map they describe is built per
+/// picture by [`super::fmo`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SliceGroups {
+    /// `num_slice_groups_minus1 + 1` (2..=8).
+    pub num_groups: u32,
+    /// `slice_group_map_type` (0..=6).
+    pub map_type: u32,
+    /// Type 0: `run_length_minus1[i] + 1` per group.
+    pub run_length: Vec<u32>,
+    /// Type 2: `(top_left[i], bottom_right[i])` per group but the last.
+    pub boxes: Vec<(u32, u32)>,
+    /// Types 3..=5: `slice_group_change_direction_flag`.
+    pub change_direction: bool,
+    /// Types 3..=5: `SliceGroupChangeRate = slice_group_change_rate_minus1 + 1`.
+    pub change_rate: u32,
+    /// Type 6: `slice_group_id[i]` per map unit.
+    pub slice_group_id: Vec<u8>,
+}
+
 /// A parsed PPS.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pps {
@@ -18,6 +39,8 @@ pub struct Pps {
     pub bottom_field_pic_order_in_frame_present: bool,
     /// `num_slice_groups_minus1 + 1`.
     pub num_slice_groups: u32,
+    /// The slice groups when there are more than one (FMO).
+    pub slice_groups: Option<SliceGroups>,
     /// `num_ref_idx_l0_default_active_minus1 + 1`.
     pub num_ref_idx_l0_default: u32,
     /// `num_ref_idx_l1_default_active_minus1 + 1`.
@@ -63,39 +86,61 @@ impl Pps {
         let cabac = r.flag();
         let bottom_field_pic_order_in_frame_present = r.flag();
         let num_slice_groups = r.ue() + 1;
+        if num_slice_groups > 8 {
+            return Err(Error::bitstream("PPS: num_slice_groups_minus1 out of range"));
+        }
+        let mut slice_groups = None;
         if num_slice_groups > 1 {
-            // Flexible macroblock ordering (Baseline/Extended only). Parse
-            // past it so the rest of the PPS is understood, then refuse the
-            // stream: FMO/ASO decoding is not implemented.
+            // Flexible macroblock ordering (Baseline / Extended).
             let map_type = r.ue();
+            let mut sg = SliceGroups {
+                num_groups: num_slice_groups,
+                map_type,
+                run_length: Vec::new(),
+                boxes: Vec::new(),
+                change_direction: false,
+                change_rate: 1,
+                slice_group_id: Vec::new(),
+            };
             match map_type {
                 0 => {
                     for _ in 0..num_slice_groups {
-                        r.ue();
+                        sg.run_length.push(r.ue() + 1);
                     }
                 }
+                1 => {}
                 2 => {
                     for _ in 0..num_slice_groups - 1 {
-                        r.ue();
-                        r.ue();
+                        let tl = r.ue();
+                        let br = r.ue();
+                        sg.boxes.push((tl, br));
                     }
                 }
                 3..=5 => {
-                    r.flag();
-                    r.ue();
+                    sg.change_direction = r.flag();
+                    sg.change_rate = r.ue() + 1;
                 }
                 6 => {
                     let n = r.ue() + 1;
+                    // Ceil(Log2(num_slice_groups_minus1 + 1)) bits each.
                     let bits = 32 - (num_slice_groups - 1).leading_zeros();
+                    if n > 1 << 20 {
+                        return Err(Error::bitstream("PPS: pic_size_in_map_units out of range"));
+                    }
                     for _ in 0..n {
-                        r.bits(bits.max(1));
+                        let id = r.bits(bits);
+                        if id >= num_slice_groups {
+                            return Err(Error::bitstream("PPS: slice_group_id out of range"));
+                        }
+                        sg.slice_group_id.push(id as u8);
                     }
                 }
-                _ => {}
+                _ => return Err(Error::bitstream("PPS: slice_group_map_type out of range")),
             }
-            return Err(Error::unsupported(format!(
-                "H.264 slice groups (FMO, num_slice_groups={num_slice_groups}) are not supported"
-            )));
+            if r.overrun() {
+                return Err(Error::bitstream("PPS: slice group syntax truncated"));
+            }
+            slice_groups = Some(sg);
         }
         let num_ref_idx_l0_default = r.ue() + 1;
         let num_ref_idx_l1_default = r.ue() + 1;
@@ -143,6 +188,7 @@ impl Pps {
             cabac,
             bottom_field_pic_order_in_frame_present,
             num_slice_groups,
+            slice_groups,
             num_ref_idx_l0_default,
             num_ref_idx_l1_default,
             weighted_pred,

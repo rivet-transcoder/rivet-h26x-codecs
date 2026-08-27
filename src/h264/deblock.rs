@@ -70,6 +70,9 @@ use super::tables::{ALPHA, BETA, TC0};
 /// The per-slice deblocking parameters the filter needs at each macroblock.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DeblockParams {
+    /// The slice is SP or SI: its macroblocks' edges take the intra
+    /// strengths (8.7.2.1 — bS 4 / 3 wherever p0 or q0 is in such a slice).
+    pub sp_si: bool,
     /// `disable_deblocking_filter_idc`.
     pub disable_idc: u32,
     /// `FilterOffsetA`.
@@ -639,7 +642,8 @@ pub fn deblock_mb_rows<S: Sample>(
             // 8x8 transform (luma skips them below), but 4:2:2 chroma still
             // filters its edges there with the strength they would have.
             let internal_odd = !m.transform_8x8;
-            if m.kind.is_intra() {
+            let intra_q = m.kind.is_intra() || par.sp_si;
+            if intra_q {
                 if filter_left {
                     bs_v[0] = 0x0404_0404;
                 }
@@ -699,7 +703,7 @@ pub fn deblock_mb_rows<S: Sample>(
                 // reviving only if deblocking's share of a decode grows.
                 if filter_left {
                     let ml = &info.mbs[left];
-                    if ml.kind.is_intra() {
+                    if ml.kind.is_intra() || params[ml.slice as usize].sp_si {
                         bs_v[0] = 0x0404_0404;
                     } else {
                         let c = gather_col(ml.nz_mask, 3) | gather_col(nz, 0);
@@ -717,7 +721,7 @@ pub fn deblock_mb_rows<S: Sample>(
                 }
                 if filter_top {
                     let ma = &info.mbs[above];
-                    if ma.kind.is_intra() {
+                    if ma.kind.is_intra() || params[ma.slice as usize].sp_si {
                         bs_h[0] = intra_top;
                     } else {
                         let c = ((ma.nz_mask >> 12) | nz) as u32 & 0xF;
@@ -816,6 +820,7 @@ struct Side {
 fn bs_mbaff<S: Sample>(
     frame: &Frame<S>,
     info: &PicInfo,
+    params: &[DeblockParams],
     p: Side,
     q: Side,
     mixed: bool,
@@ -825,7 +830,10 @@ fn bs_mbaff<S: Sample>(
 ) -> u8 {
     let mp = &info.mbs[p.addr];
     let mq = &info.mbs[q.addr];
-    let intra = mp.kind.is_intra() || mq.kind.is_intra();
+    let intra = mp.kind.is_intra()
+        || mq.kind.is_intra()
+        || params[mp.slice as usize].sp_si
+        || params[mq.slice as usize].sp_si;
     if intra {
         // Macroblock edges: 4 on vertical ones, and on horizontal ones
         // between two frame macroblocks; 3 otherwise (mixed, fields) and on
@@ -981,6 +989,7 @@ fn deblock_mbaff_pairs<S: Sample>(
                             bs[k] = bs_mbaff(
                                 frame,
                                 info,
+                                params,
                                 Side {
                                     addr: pa,
                                     blk: k * 4 + 3,
@@ -1067,6 +1076,7 @@ fn deblock_mbaff_pairs<S: Sample>(
                             line_bs[k] = bs_mbaff(
                                 frame,
                                 info,
+                                params,
                                 Side {
                                     addr: pa,
                                     blk: (prow / 4) * 4 + 3,
@@ -1197,7 +1207,7 @@ fn deblock_mbaff_pairs<S: Sample>(
                         // Chroma still has its edge at e == 2 only (4:2:0).
                         continue;
                     }
-                    let bs = if m.kind.is_intra() {
+                    let bs = if m.kind.is_intra() || par.sp_si {
                         0x0303_0303
                     } else {
                         let coef = nz_q | (nz_q >> 1);
@@ -1257,6 +1267,7 @@ fn deblock_mbaff_pairs<S: Sample>(
                             bs[k] = bs_mbaff(
                                 frame,
                                 info,
+                                params,
                                 Side {
                                     addr: pa,
                                     blk: 12 + k,
@@ -1288,6 +1299,7 @@ fn deblock_mbaff_pairs<S: Sample>(
                                     bs[k] = bs_mbaff(
                                         frame,
                                         info,
+                                        params,
                                         Side {
                                             addr: pa,
                                             blk: 12 + k,
@@ -1371,6 +1383,7 @@ fn deblock_mbaff_pairs<S: Sample>(
                                 bs[k] = bs_mbaff(
                                     frame,
                                     info,
+                                    params,
                                     Side {
                                         addr: pa,
                                         blk: 12 + k,
@@ -1406,6 +1419,7 @@ fn deblock_mbaff_pairs<S: Sample>(
                             bs[k] = bs_mbaff(
                                 frame,
                                 info,
+                                params,
                                 Side {
                                     addr: pa,
                                     blk: 12 + k,
@@ -1431,7 +1445,7 @@ fn deblock_mbaff_pairs<S: Sample>(
                     if !luma_edge && !chroma_edge {
                         continue;
                     }
-                    let bs = if m.kind.is_intra() {
+                    let bs = if m.kind.is_intra() || par.sp_si {
                         0x0303_0303
                     } else {
                         let coef = nz_q | (nz_q >> 4);

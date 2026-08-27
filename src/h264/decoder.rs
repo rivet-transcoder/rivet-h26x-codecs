@@ -24,8 +24,10 @@ use super::deblock::{DeblockParams, deblock_mb_rows};
 #[allow(unused_imports)]
 use super::dpb::MISSING_REF;
 use super::dpb::{DecodedPic, Dpb, PocState, RefEntry, RefMark, build_ref_lists, compute_poc};
+use super::fmo::SliceGroupMap;
 use super::frame::{Frame, FramePool, PARITY_FRAME, SharedFrame};
 use super::mb::{InfoPool, MbKind, MbLayer, MbNeighbours, PicInfo, SliceCtx};
+use super::mb::chroma_qp;
 use super::pps::Pps;
 use super::recon::{DeriveScratch, QpState, ReconScratch, SliceRefs, derive, reconstruct};
 use super::slice::{Mmco, SliceHeader, SliceType};
@@ -47,6 +49,9 @@ struct SliceJob<S: Sample> {
     refs: [Vec<RefEntry<S>>; 2],
     /// RefPicList1[0] for direct prediction.
     col: Option<RefEntry<S>>,
+    /// The picture's slice-group map when the PPS has more than one slice
+    /// group (FMO): the slice walks `next` instead of `addr + 1`.
+    fmo: Option<Arc<SliceGroupMap>>,
 }
 
 /// The state of one picture's decoding: lives on the worker (or inline).
@@ -103,6 +108,7 @@ impl<S: Sample> PictureDecoder<S> {
             refs: ref_lists,
             col,
             x264_old_444,
+            fmo,
         } = job;
         // SAFETY: this PictureDecoder is the picture's only writer; other
         // threads read only rows below the published progress. The Arc does
@@ -194,10 +200,12 @@ impl<S: Sample> PictureDecoder<S> {
         }
 
         let slice_num = slices.len() as u16;
+        let sp_slice = matches!(hdr.slice_type, SliceType::Sp | SliceType::Si);
         slices.push(DeblockParams {
             disable_idc: hdr.disable_deblocking_filter_idc,
             offset_a: hdr.filter_offset_a,
             offset_b: hdr.filter_offset_b,
+            sp_si: sp_slice,
         });
         let ctx = SliceCtx {
             slice_type: hdr.slice_type,
@@ -216,6 +224,13 @@ impl<S: Sample> PictureDecoder<S> {
             x264_old_444,
             field_pic: hdr.field_pic,
             mbaff,
+            sp: sp_slice,
+            sp_switch: hdr.sp_for_switch || hdr.slice_type == SliceType::Si,
+            sp_qs: hdr.slice_qs,
+            sp_qsc: [
+                chroma_qp(hdr.slice_qs, pps.chroma_qp_index_offset, 0),
+                chroma_qp(hdr.slice_qs, pps.second_chroma_qp_index_offset, 0),
+            ],
         };
         let mut qps = QpState {
             prev_qp: hdr.slice_qp,
@@ -243,6 +258,14 @@ impl<S: Sample> PictureDecoder<S> {
         if addr >= total_mbs {
             return Err(Error::bitstream("first_mb_in_slice beyond the picture"));
         }
+        // NextMbAddress (8.2.2.8): the next macroblock of the slice group,
+        // which without slice groups is simply the next macroblock.
+        let next_mb = |a: usize| -> usize {
+            match &fmo {
+                None => a + 1,
+                Some(m) => m.next[a] as usize,
+            }
+        };
         let data_start = (hdr.data_bit_offset / 8) as usize;
         let mut filters = RowFilters {
             row_mbs,
@@ -323,7 +346,7 @@ impl<S: Sample> PictureDecoder<S> {
                         .unwrap_or(info.as_ref().expect("buffers ensured")),
                 ];
                 filters.mb_done(store(addr), cur_main, &all[..n_planes]);
-                addr += 1;
+                addr = next_mb(addr);
             }};
         }
 
@@ -700,6 +723,24 @@ impl<S: Sample> RowFilters<'_, S> {
     }
 }
 
+/// What a cached slice-group map was built from. The PPS is held, not
+/// its address: a dropped and re-sent PPS could land on the same one.
+struct FmoKey {
+    pps: Arc<Pps>,
+    width: u32,
+    height_units: u32,
+    frame_mbs_only: bool,
+    field_pic: bool,
+    mbaff: bool,
+    change_cycle: u32,
+}
+
+/// The last slice-group map built, with its key.
+struct FmoCache {
+    key: FmoKey,
+    map: Arc<SliceGroupMap>,
+}
+
 /// A first field waiting for its second (main-thread view).
 struct OpenField<S: Sample> {
     frame: Arc<SharedFrame<S>>,
@@ -750,6 +791,9 @@ pub(crate) struct H264DecoderImpl<S: Sample> {
     dsp: H264Dsp<S>,
     /// The x264 build number from its user-data-unregistered SEI, when seen.
     x264_build: Option<u32>,
+    /// The slice-group map of the last FMO slice, keyed by what it was
+    /// built from (a re-sent PPS is a new `Arc`).
+    fmo_cache: Option<FmoCache>,
     /// A decoded first field whose second field may follow.
     open_field: Option<OpenField<S>>,
     /// Output buffers, recycled through the pictures handed out.
@@ -785,7 +829,56 @@ impl<S: Sample> H264DecoderImpl<S> {
             open_field: None,
             dsp: H264Dsp::new(crate::dsp::Cpu::detect_honouring_env()),
             output_pool: crate::picture::OutputPool::default(),
+            fmo_cache: None,
         }
+    }
+
+    /// The slice-group map for a slice of a picture under `pps` / `sps`
+    /// (`None` without slice groups), built once per distinct
+    /// `(PPS, geometry, slice_group_change_cycle)` and shared after that.
+    ///
+    /// `H26X_FMO_IDENTITY=1` hands every slice a one-group map instead of
+    /// `None`: the same binary then decodes an ordinary stream through the
+    /// slice-group path, which is how the cost of that path is measured
+    /// against the `addr + 1` one.
+    fn slice_group_map(&mut self, pps: &Arc<Pps>, sps: &Sps, hdr: &SliceHeader) -> Result<Option<Arc<SliceGroupMap>>> {
+        static IDENTITY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let identity = *IDENTITY.get_or_init(|| std::env::var_os("H26X_FMO_IDENTITY").is_some());
+        if pps.slice_groups.is_none() && !identity {
+            return Ok(None);
+        }
+        let mbaff = hdr.mbaff(sps);
+        let key = FmoKey {
+            pps: pps.clone(),
+            width: sps.pic_width_in_mbs,
+            height_units: sps.pic_height_in_map_units,
+            frame_mbs_only: sps.frame_mbs_only,
+            field_pic: hdr.field_pic,
+            mbaff,
+            change_cycle: hdr.slice_group_change_cycle,
+        };
+        if let Some(c) = &self.fmo_cache {
+            let k = &c.key;
+            if Arc::ptr_eq(&k.pps, &key.pps)
+                && (k.width, k.height_units, k.frame_mbs_only, k.field_pic, k.mbaff, k.change_cycle)
+                    == (key.width, key.height_units, key.frame_mbs_only, key.field_pic, key.mbaff, key.change_cycle)
+            {
+                return Ok(Some(c.map.clone()));
+            }
+        }
+        let map = match &pps.slice_groups {
+            Some(sg) => super::fmo::build(sg, sps, hdr.field_pic, mbaff, hdr.slice_group_change_cycle)?,
+            None => {
+                let total = (sps.pic_width_in_mbs * sps.frame_height_in_mbs() / if hdr.field_pic { 2 } else { 1 }) as usize;
+                SliceGroupMap {
+                    next: (1..=total as u32).collect(),
+                    group: vec![0; total],
+                }
+            }
+        };
+        let map = Arc::new(map);
+        self.fmo_cache = Some(FmoCache { key, map: map.clone() });
+        Ok(Some(map))
     }
 
     /// Non-fatal problems seen so far (concealed references, dropped slices).
@@ -956,7 +1049,7 @@ impl<S: Sample> H264DecoderImpl<S> {
         None
     }
 
-    fn check_supported(sps: &Sps, pps: &Pps) -> Result<()> {
+    fn check_supported(sps: &Sps) -> Result<()> {
         if sps.bit_depth_luma != sps.bit_depth_chroma {
             return Err(Error::unsupported(format!(
                 "H.264 different luma / chroma bit depths ({} / {})",
@@ -968,9 +1061,6 @@ impl<S: Sample> H264DecoderImpl<S> {
                 "H.264 bit depth {}",
                 sps.bit_depth_luma
             )));
-        }
-        if pps.num_slice_groups > 1 {
-            return Err(Error::unsupported("H.264 slice groups (FMO)"));
         }
         Ok(())
     }
@@ -1063,24 +1153,27 @@ impl<S: Sample> H264DecoderImpl<S> {
         if hdr.redundant_pic_cnt > 0 {
             return Ok(());
         }
-        // Refusing is deliberate, and it is better than what libavcodec does
-        // here rather than worse. Given the two JVT SP streams it decodes 400
-        // frames with no error and no warning, matching the reference exactly
-        // until the first SP slice at frame 10 and then differing in 78% of
-        // that frame's bytes — the signature of decoding an SP slice as an
-        // ordinary P one, which is what happens when the SP transform and
-        // quantisation path (8.5.1, 8.5.2) is not implemented. It even
-        // reports the profile as Extended on the way past.
-        //
-        // A caller who hands us a stream we refuse can try another decoder;
-        // a caller handed plausible wrong pixels has no way to find out. So
-        // this stays until 8.5.1 and 8.5.2 are actually implemented, and the
-        // absence of these streams from the pass list is not a coverage gap
-        // against libavcodec.
+        // SP / SI slices (8.6) are decoded as the Extended profile codes
+        // them: CAVLC, 4:2:0 (or 4:0:0), 8-bit, the 4x4 transform. Nothing
+        // outside that exists to be checked against, so it is refused by
+        // name rather than decoded on trust — a caller handed plausible
+        // wrong pixels has no way to find out, a refused stream can go to
+        // another decoder.
         if matches!(hdr.slice_type, SliceType::Sp | SliceType::Si) {
-            return Err(Error::unsupported("H.264 SP/SI slices"));
+            if pps.cabac {
+                return Err(Error::unsupported("H.264 SP/SI slices with CABAC"));
+            }
+            if sps.chroma_format_idc > 1 || sps.bit_depth_luma != 8 {
+                return Err(Error::unsupported(format!(
+                    "H.264 SP/SI slices at chroma_format_idc {} / {}-bit",
+                    sps.chroma_format_idc, sps.bit_depth_luma
+                )));
+            }
+            if pps.transform_8x8_mode {
+                return Err(Error::unsupported("H.264 SP/SI slices with the 8x8 transform"));
+            }
         }
-        Self::check_supported(&sps, &pps)?;
+        Self::check_supported(&sps)?;
         let pps: Arc<Pps> = self.pps[pps.id as usize]
             .clone()
             .expect("parsed from the table");
@@ -1169,6 +1262,7 @@ impl<S: Sample> H264DecoderImpl<S> {
             }
         }
 
+        let fmo = self.slice_group_map(&pps, &sps, &hdr)?;
         let cur = self.cur.as_mut().unwrap();
         if hdr.marking.ops.iter().any(|o| *o == Mmco::UnmarkAll) {
             cur.had_mmco5 = true;
@@ -1185,6 +1279,7 @@ impl<S: Sample> H264DecoderImpl<S> {
             refs,
             col,
             x264_old_444,
+            fmo,
         };
         if let Some(tx) = &cur.tx {
             let _ = tx.send(job);

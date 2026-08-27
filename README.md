@@ -34,19 +34,20 @@ h26x = { package = "rivet-h26x", version = "0.2" }
 
 | | supported | refused with `Error::Unsupported` |
 |---|---|---|
-| **H.264** | Baseline / Main / High / High 10 / High 4:2:2 / High 4:4:4 Predictive / CAVLC 4:4:4 Intra (and the Intra profiles): frames, field pictures (PAFF — field / frame reference lists and marking, field POCs, colocated field / frame mapping) and MBAFF (macroblock-adaptive frame / field: pair-wise neighbour derivation, field-scan and field-context entropy coding, mixed frame / field prediction and direct-mode mapping, mixed-edge deblocking), 4:0:0 / 4:2:0 / 4:2:2 / 4:4:4 at 8–14-bit, separate colour planes, lossless (transform bypass), CAVLC + CABAC, I/P/B, spatial + temporal direct, explicit + implicit weighting, 8x8 transform, scaling matrices, PCM, MMCO, multi-slice, frame-num gaps, all three POC types, deblocking, VUI reorder hints, the old-x264 4:4:4 CABAC quirk | unequal luma / chroma bit depths, FMO / ASO, data partitioning, SP / SI |
+| **H.264** | Baseline / Main / High / High 10 / High 4:2:2 / High 4:4:4 Predictive / CAVLC 4:4:4 Intra (and the Intra profiles): frames, field pictures (PAFF — field / frame reference lists and marking, field POCs, colocated field / frame mapping) and MBAFF (macroblock-adaptive frame / field: pair-wise neighbour derivation, field-scan and field-context entropy coding, mixed frame / field prediction and direct-mode mapping, mixed-edge deblocking), 4:0:0 / 4:2:0 / 4:2:2 / 4:4:4 at 8–14-bit, separate colour planes, lossless (transform bypass), CAVLC + CABAC, I/P/B, spatial + temporal direct, explicit + implicit weighting, 8x8 transform, scaling matrices, PCM, MMCO, multi-slice in any order (ASO), slice groups (FMO, all seven map types), SP / SI slices (Extended profile), frame-num gaps, all three POC types, deblocking, VUI reorder hints, the old-x264 4:4:4 CABAC quirk | unequal luma / chroma bit depths, data partitioning, SP / SI outside the Extended profile's shape (CABAC, 4:2:2 / 4:4:4, > 8-bit, 8x8 transform) |
 | **H.265** | Main / Main 10 / Main 12 and the format range extensions — Main 4:2:2 / 4:4:4 (10, 12, 16 Intra), the High Throughput 4:4:4 (16 Intra) and Monochrome profiles (4:0:0 / 4:2:0 / 4:2:2 / 4:4:4, 8–16-bit, unequal luma / chroma depths): CTB 16–64, AMP, transform skip (any size, rotation, single-context), scaling lists, sign hiding, PCM, `cu_transquant_bypass` (lossless), cu_qp_delta, chroma QP offset lists, cross-component prediction, implicit / explicit RDPCM, persistent Rice adaptation, high-precision weighted-prediction offsets, intra smoothing disabling, extended precision processing, CABAC bypass alignment, tiles, WPP (and both together), dependent slice segments, merge / AMVP / TMVP, explicit weighting, deblocking, SAO, long-term references, CRA / BLA / RASL handling, `pic_output_flag`, `no_output_of_prior_pics`, decoded-picture-hash SEI verification (`H26X_VERIFY_HASH=1`) | separate colour planes, SCC, multi-layer |
 
-Both decoders are **bit-exact**. H.264 passes **199 of the 199** JVT
-conformance bitstreams (AVCv1 + FRExt — every profile set, every field-picture
-and MBAFF stream) it does not refuse, against the suite's reconstructed YUV
-(libavcodec's per-frame MD5s where the zip ships none) — the other 5 are
-refused up front (FMO 3, SP/SI 2) — and **35 of the 35** JVT
-professional-profile bitstreams it accepts (High 10 / 4:2:2 / 4:4:4 Intra,
-CAVLC 4:4:4 Intra, High 4:4:4 Predictive at up to 14-bit, ten of them coded as
-separate colour planes, which libavcodec refuses; those ten are checked
-against the JM reference decoder, the rest against libavcodec — the other 3
-are FMO). Decoding is deterministic across thread counts (every suite stream
+Both decoders are **bit-exact**. H.264 passes **all 204** JVT conformance
+bitstreams (AVCv1 + FRExt — every profile set, every field-picture and MBAFF
+stream, the three FMO / ASO streams and the two SP streams) against the
+suite's reconstructed YUV (libavcodec's per-frame MD5s where the zip ships
+none; libavcodec itself refuses two of the FMO streams and decodes the SP
+ones silently wrong), and **all 38** JVT professional-profile bitstreams
+(High 10 / 4:2:2 / 4:4:4 Intra, CAVLC 4:4:4 Intra, High 4:4:4 Predictive at
+up to 14-bit, thirteen of them coded as separate colour planes, which
+libavcodec refuses; those thirteen — including the three 14-bit RGB FMO
+streams — are checked against the JM reference decoder, the rest against
+libavcodec). Decoding is deterministic across thread counts (every suite stream
 decoded on 1 and 12 threads gives the same bytes). It matches libavcodec on
 the workspace fixtures too (CAVLC/CABAC, B-pyramids, weighting, 8x8, slices,
 CQM, 10-bit, 4:2:2, 4:0:0, 4:4:4, lossless, x264 interlaced). H.265 passes **147 of the 147** JCT-VC HEVC_v1 conformance bitstreams
