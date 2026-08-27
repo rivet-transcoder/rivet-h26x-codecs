@@ -81,9 +81,22 @@
 #               quantiser back into pic_init_qp, and every H.264 row with an
 #               I and a P picture must go red.
 #
+#   7. SPEED    Reported, never gated, like QUALITY: every PASS line carries
+#               the encoder's wall time for the cell and its frames per
+#               second, and the run ends with the total over all cells. A
+#               kernel that made a decision path ten times slower passes
+#               every property above; this is where it becomes visible.
+#               Wall time under JOBS parallel cells on a shared machine is
+#               a coarse instrument — it catches an order of magnitude, not
+#               ten percent; for that use tools/ab_enc.py. H26X_SPEED_TABLE
+#               names a file to append one tab-separated row per cell to
+#               (clip, configuration, bytes, PSNR, seconds, frames/s), so
+#               two runs can be set side by side.
+#
 # Usage: verify_encode.sh [encoder] [decoder]
 #   H26X_WORK=dir   scratch directory holding the source clips (default: here)
 #   JOBS=n          configurations in parallel (default 4)
+#   H26X_SPEED_TABLE=file  append a per-cell speed row here (see 7)
 #
 # Safe to run concurrently with itself and with verify.sh: private binary
 # copies and a private scratch directory per run, for the reason recorded in
@@ -289,11 +302,17 @@ one() {
   # believes that bitstream carries. The depth is the clip's, never the
   # row's: a row that asked for a depth the clip does not have would code
   # the wrong number of bytes per sample and fail on the first picture.
+  # Timed (7): wall nanoseconds around the one process, nothing else
+  # in the cell.
+  t0=$(date +%s%N)
   if ! "$ENC" --input "$src" --size "$geom" --format "$chroma" --depth "$depth" \
        $flags --output "$bs" --recon "$rec" > "$OUT/$base.$name.enc.log" 2>&1; then
     echo "ENCODE-FAIL $tag: $(tail -1 "$OUT/$base.$name.enc.log" | head -c 100)"
     return 1
   fi
+  t1=$(date +%s%N)
+  frames=$(( $(stat -c %s "$src") / $(frame_bytes "$geom" "$chroma" "$depth") ))
+  speed=$(awk -v ns="$((t1 - t0))" -v f="$frames" 'BEGIN { s = ns / 1e9; printf "%.3f s, %.0f f/s", s, (s > 0 ? f / s : 0) }')
 
   # 1. SELF.
   ours="$OUT/$base.$name.ours.yuv"
@@ -377,19 +396,37 @@ one() {
   # 3. QUALITY. Gated only when the configuration claims to be lossless.
   psnr=$(psnr_of "$src" "$rec" "$depth")
   size=$(stat -c %s "$bs")
+  # 7. SPEED. One row per cell if a table was asked for; the PASS line
+  # carries it regardless.
+  if [ -n "$H26X_SPEED_TABLE" ]; then
+    printf '%s\t%s\t%s\t%s\t%s\n' "$base" "$name" "$size" "$psnr" "$(echo "$speed" | sed 's/ s, /\t/; s/ f\/s//')" >> "$H26X_SPEED_TABLE"
+  fi
   case "$flags" in
     *--lossless*)
       if ! cmp -s "$src" "$rec"; then
         echo "LOSSLESS-FAIL $tag: reconstruction differs from the source"
         return 1
       fi
-      echo "PASS        $tag (lossless, exact, $size bytes)" ;;
+      echo "PASS        $tag (lossless, exact, $size bytes, $speed)" ;;
     *--bitrate*)
-      echo "PASS        $tag ($size bytes, PSNR $psnr dB, rate $(printf '%.2f' "$ratio")x)" ;;
+      echo "PASS        $tag ($size bytes, PSNR $psnr dB, rate $(printf '%.2f' "$ratio")x, $speed)" ;;
     *)
-      echo "PASS        $tag ($size bytes, PSNR $psnr dB)" ;;
+      echo "PASS        $tag ($size bytes, PSNR $psnr dB, $speed)" ;;
   esac
   return 0
+}
+
+# Bytes in one raw picture of the clip, from its geometry and format —
+# what turns a clip's size into a frame count for the speed line.
+frame_bytes() {
+  w=${1%x*}; h=${1#*x}
+  bps=1; [ "${3:-8}" -gt 8 ] && bps=2
+  case "$2" in
+    400|gray) echo $((w * h * bps)) ;;
+    422) echo $((w * h * 2 * bps)) ;;
+    444) echo $((w * h * 3 * bps)) ;;
+    *) echo $((w * h * 3 / 2 * bps)) ;;
+  esac
 }
 
 # Planar chroma format token to the ffmpeg pixel format that matches how
@@ -437,8 +474,8 @@ peak = (1 << depth) - 1
 print("inf" if mse == 0 else f"{10 * math.log10(peak * peak / mse):.2f}")
 PY
 }
-export -f one ffpix psnr_of chroma_of depth_of
-export ENC DEC HRD FFMPEG OUT PARAM_SETS
+export -f one ffpix psnr_of chroma_of depth_of frame_bytes
+export ENC DEC HRD FFMPEG OUT PARAM_SETS H26X_SPEED_TABLE JOBS
 
 echo "== encode verification =="
 results="$OUT/results.txt"
@@ -487,6 +524,11 @@ bad=$(grep -cE '^(ENCODE|SELF|CROSS|LOSSLESS|RATE|HRD|PS)-FAIL' "$results")
 echo
 echo "encode: $pass passed, $bad failed"
 [ "$bad" = 0 ] || fail=1
+# 7. The speed total: encoder wall seconds summed over every PASS cell.
+# Not a gate. The number to compare is this one against the last run's on
+# the same machine; a per-cell table (H26X_SPEED_TABLE) says where it went.
+sed -n 's/^PASS .*, \([0-9.]*\) s, \([0-9]*\) f\/s)$/\1 \2/p' "$results" \
+  | awk -v cells="$pass" -v jobs="$JOBS" '{ s += $1 } END { printf "encode speed: %d cells, %.2f s of encoder wall time (summed over cells, %d in parallel)\n", cells, s, jobs }'
 
 echo
 [ "$fail" = 0 ] && echo "ALL GREEN" || echo "SOMETHING FAILED"

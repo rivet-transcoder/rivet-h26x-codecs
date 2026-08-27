@@ -329,6 +329,38 @@ from x265 with and without WPP — repeated to a length the clock can measure
 (process CPU time comes in ~15.6 ms steps, so a fifth-of-a-second clip cannot
 be compared with itself, let alone with something else).
 
+### Encoder speed
+
+The encoders share the decoders' interpolation, inverse transforms and
+loop filters, and since 2026-08-27 have SIMD tiers of their own for the
+kernels an encode profile actually spends its time in: the distortion
+metrics (SAD, SATD, SSD; SSE2 to AVX2, NEON compile-checked) and the H.265
+forward transforms and quantiser (SSE2 to AVX2). The CABAC encoder's
+per-bin cost is a table now rather than a `log2` per bin, and RDOQ skips a
+block whose last coefficient is three or more. The record, with the
+profiles that chose these and the controls behind every number, is
+`docs/encode_speed.md`.
+
+Measured as `tools/ab_enc.py` measures — one machine, interleaved runs of
+the two builds pinned to the quietest core, median of nine paired
+CPU-second ratios — 640x360 `testsrc2`, 90 frames, QP 26, the tree before
+this work (5cb468c) against after:
+
+| | H.264 intra | H.264 IP | H.264 IPB | H.264 t8x8+subparts | H.264 CAVLC IP | H.265 intra | H.265 IP | H.265 IPB |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| CPU time, after / before | 0.689 | 0.490 | 0.420 | 0.446 | 0.477 | 0.653 | 0.527 | 0.485 |
+| paired range (9 rounds) | 0.667–0.694 | 0.469–0.521 | 0.406–0.441 | 0.445–0.452 | 0.455–0.488 | 0.646–0.660 | 0.513–0.549 | 0.481–0.492 |
+
+Two same-binary controls in the same session read 1.000 (0.931–1.037)
+and 1.000 (0.991–1.009); a row's difference from 1 is real only where it
+clears that. The streams are byte for byte the ones the scalar kernels
+produce — `tools/identity_encode.sh` encodes every gate cell both ways and
+compares (280 identical, 0 moved) — so this is speed and nothing else.
+`H26X_ENC_NO_SIMD=1` (or a table name: `distortion`, `hevc_enc`) keeps the
+encode-side tables scalar for a measurement; `H26X_MAX_SIMD` caps the
+ladder as it does for the decoders. Neither encoder is threaded yet:
+`--threads` is accepted and unused.
+
 ## Provenance and licensing
 
 This is not a translation of libavcodec's C, which is LGPL and could not be
