@@ -31,7 +31,8 @@ ENC_B=${ENC_B:-$ENC}
 TAG=$$
 OUT=identity_out_$TAG
 JOBS=${JOBS:-4}
-ENV_A=${ENV_A:-H26X_ENC_NO_SIMD=1}
+# `-`, not `:-`: an explicitly empty ENV_A means "as shipped", not the default.
+ENV_A=${ENV_A-H26X_ENC_NO_SIMD=1}
 ENV_B=${ENV_B:-}
 mkdir -p "$OUT"
 trap 'rm -rf "$OUT"' EXIT

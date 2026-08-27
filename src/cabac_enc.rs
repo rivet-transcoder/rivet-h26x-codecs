@@ -41,8 +41,40 @@
 //! first slice writer lands.
 #![allow(dead_code)]
 
+use std::sync::LazyLock;
+
 use crate::bitwriter::BitWriter;
 use crate::cabac::{Ctx, LPS_RANGE, NEXT_STATE_LPS, NEXT_STATE_MPS};
+
+/// `log2(range_before / range_after)` for every context-coded bin the
+/// coder can meet, tabulated.
+///
+/// A bin's cost depends on three things only: the range it met (255
+/// values, 256..=510), the context's probability state (64), and whether
+/// it was the MPS or the LPS — the LPS sub-range is `LPS_RANGE[state]
+/// [(range >> 6) & 3]`, a function of the first two, and the MPS gets the
+/// rest. So the 32640 costs can be computed once, with the identical
+/// expression [`CabacEncoder::encode_decision`] used to evaluate inline,
+/// and looked up thereafter. The values are the same f64s bit for bit —
+/// which is the point: `f64::log2` was 8–24% of every CABAC encode
+/// profile (docs/encode_speed.md), charged per bin in the emitting
+/// encoder too, and the table makes it one load without moving any
+/// decision.
+///
+/// 255 KB, built lazily on first use. Indexed `((range - 256) * 64 +
+/// state) * 2 + is_lps`.
+static BIN_COST: LazyLock<Box<[f64]>> = LazyLock::new(|| {
+    let mut t = vec![0f64; 255 * 64 * 2].into_boxed_slice();
+    for range in 256u32..=510 {
+        for p in 0..64usize {
+            let lps = LPS_RANGE[p][((range >> 6) & 3) as usize] as u32;
+            let i = ((range - 256) as usize * 64 + p) * 2;
+            t[i] = (range as f64 / (range - lps) as f64).log2();
+            t[i + 1] = (range as f64 / lps as f64).log2();
+        }
+    }
+    t
+});
 
 /// Where an encoder's output goes: a caller's writer, or nowhere.
 ///
@@ -200,8 +232,13 @@ impl<'a> CabacEncoder<'a> {
         }
         // The bin's own information content: the interval it survived
         // divided by the interval it left. Renormalisation only rescales
-        // both, so charging it here and not again below is exact.
-        self.frac += (before as f64 / self.range as f64).log2();
+        // both, so charging it here and not again below is exact. Only a
+        // counting encoder ever reads it, and the table holds exactly the
+        // value the expression `(before as f64 / self.range as f64).log2()`
+        // would produce here — see `BIN_COST`.
+        if let Out::Count(_) = self.w {
+            self.frac += BIN_COST[((before - 256) as usize * 64 + p) * 2 + (bin != mps) as usize];
+        }
         self.renorm();
     }
 
@@ -312,6 +349,23 @@ impl<'a> CabacEncoder<'a> {
 mod tests {
     use super::*;
     use crate::cabac::{Cabac, init_ctx_h264};
+
+    /// The table IS the expression: every entry against the inline
+    /// computation it replaced, as f64 bits, so the encoder's decisions
+    /// cannot have moved by a rounding.
+    #[test]
+    fn bin_cost_table_is_the_inline_expression() {
+        for range in 256u32..=510 {
+            for p in 0..64usize {
+                let lps = LPS_RANGE[p][((range >> 6) & 3) as usize] as u32;
+                let i = ((range - 256) as usize * 64 + p) * 2;
+                let mps_cost = (range as f64 / (range - lps) as f64).log2();
+                let lps_cost = (range as f64 / lps as f64).log2();
+                assert_eq!(BIN_COST[i].to_bits(), mps_cost.to_bits(), "range {range} state {p} mps");
+                assert_eq!(BIN_COST[i + 1].to_bits(), lps_cost.to_bits(), "range {range} state {p} lps");
+            }
+        }
+    }
 
     /// What a bin is, for the round trip.
     #[derive(Clone, Copy, Debug, PartialEq)]
