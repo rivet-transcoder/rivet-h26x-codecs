@@ -24,7 +24,7 @@
 
 use crate::bitwriter::BitWriter;
 use crate::encode::gop::Kind;
-use crate::encode::Config;
+use crate::encode::{ColourDescription, Config};
 use crate::picture::ChromaFormat;
 
 /// Video parameter set.
@@ -303,28 +303,38 @@ fn write_hrd(w: &mut BitWriter, cpb: &Cpb, fps: u32) {
     w.flag(false); // cbr_flag
 }
 
-/// `vui_parameters` carrying only what the buffer model needs: the frame
-/// rate the removal times are counted in, and the HRD.
+/// `vui_parameters` (E.2.1) carrying only what was asked for: the colour
+/// description when the caller gave one, and the frame rate the removal
+/// times are counted in plus the HRD when a buffer was declared.
 ///
 /// Everything else is absent by its own flag. A VUI is optional and this
 /// encoder had none until the buffer model needed one, so the only reason
 /// any of it is here is that a removal schedule without a frame rate is not
-/// a schedule.
-fn write_vui(w: &mut BitWriter, cpb: &Cpb, fps: u32) {
+/// a schedule — and, later, that a BT.2020 PQ picture with no colour
+/// description is shown as BT.709. Each half is present only under its own
+/// condition, so a stream with a buffer and no colour is byte-identical to
+/// one from before colour existed. The inverse of `hevc::sps::parse_vui`.
+fn write_vui(w: &mut BitWriter, colour: Option<&ColourDescription>, cpb: Option<&Cpb>, fps: u32) {
     w.flag(false); // aspect_ratio_info_present_flag
     w.flag(false); // overscan_info_present_flag
-    w.flag(false); // video_signal_type_present_flag
+    // E.2.1 copies E.1.1's video_signal_type group field for field.
+    crate::encode::h264_syntax::write_video_signal_type(w, colour);
     w.flag(false); // chroma_loc_info_present_flag
     w.flag(false); // neutral_chroma_indication_flag
     w.flag(false); // field_seq_flag
     w.flag(false); // frame_field_info_present_flag
     w.flag(false); // default_display_window_flag
-    w.flag(true); // vui_timing_info_present_flag
-    w.bits(32, 1); // vui_num_units_in_tick
-    w.bits(32, fps.max(1)); // vui_time_scale — ticks per second
-    w.flag(false); // vui_poc_proportional_to_timing_flag
-    w.flag(true); // vui_hrd_parameters_present_flag
-    write_hrd(w, cpb, fps);
+    match cpb {
+        Some(cpb) => {
+            w.flag(true); // vui_timing_info_present_flag
+            w.bits(32, 1); // vui_num_units_in_tick
+            w.bits(32, fps.max(1)); // vui_time_scale — ticks per second
+            w.flag(false); // vui_poc_proportional_to_timing_flag
+            w.flag(true); // vui_hrd_parameters_present_flag
+            write_hrd(w, cpb, fps);
+        }
+        None => w.flag(false), // vui_timing_info_present_flag
+    }
     w.flag(false); // bitstream_restriction_flag
 }
 
@@ -463,12 +473,11 @@ pub fn write_sps(cfg: &Config, g: &Geometry, log2_max_poc_lsb: u32, cpb: Option<
     w.flag(false); // long_term_ref_pics_present_flag
     w.flag(false); // sps_temporal_mvp_enabled_flag
     w.flag(false); // strong_intra_smoothing_enabled_flag
-    match cpb {
-        Some(cpb) => {
-            w.flag(true); // vui_parameters_present_flag
-            write_vui(&mut w, cpb, cfg.fps);
-        }
-        None => w.flag(false), // vui_parameters_present_flag
+    if cpb.is_some() || cfg.colour.is_some() {
+        w.flag(true); // vui_parameters_present_flag
+        write_vui(&mut w, cfg.colour.as_ref(), cpb, cfg.fps);
+    } else {
+        w.flag(false); // vui_parameters_present_flag
     }
     w.flag(false); // sps_extension_present_flag
     w.rbsp_trailing_bits();
@@ -766,6 +775,56 @@ mod tests {
         let (cfg, g) = geom(64, 64, ChromaFormat::Yuv420);
         let sps = Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 8, None))).expect("SPS");
         assert!(sps.vui.is_none(), "an SPS with no buffer declared should carry no VUI");
+    }
+
+    /// The colour description round-trips through the decoder's own SPS
+    /// parser, on its own and beside a buffer; a buffer alone says
+    /// nothing about colour; neither writes no VUI (the test above). Each
+    /// code point is asserted by name so that writing one into another's
+    /// field — the mutation this exists to catch — names the field lost.
+    #[test]
+    fn the_colour_description_survives_the_decoders_own_sps_parser() {
+        use crate::encode::ColourDescription;
+        use crate::hevc::sps::Sps;
+        let colours = [
+            ColourDescription { primaries: 9, transfer: 16, matrix: 9, full_range: false }, // HDR10
+            ColourDescription { primaries: 9, transfer: 18, matrix: 9, full_range: false }, // HLG
+            ColourDescription { primaries: 1, transfer: 1, matrix: 1, full_range: true }, // BT.709 full
+            ColourDescription { primaries: 12, transfer: 17, matrix: 6, full_range: false }, // P3 / SMPTE 428 / 601
+        ];
+        let (base, g) = geom(64, 64, ChromaFormat::Yuv420);
+        for c in colours {
+            let cfg = Config { colour: Some(c), ..base.clone() };
+            let sps = Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 8, None)))
+                .unwrap_or_else(|e| panic!("{c:?}: SPS rejected: {e}"));
+            let vui = sps.vui.as_ref().unwrap_or_else(|| panic!("{c:?}: no VUI"));
+            let (p, t, m) = vui.colour_description.unwrap_or_else(|| panic!("{c:?}: no colour description"));
+            assert_eq!(p, c.primaries, "{c:?}: primaries");
+            assert_eq!(t, c.transfer, "{c:?}: transfer");
+            assert_eq!(m, c.matrix, "{c:?}: matrix");
+            assert_eq!(vui.full_range, c.full_range, "{c:?}: range");
+            assert_eq!(vui.timing, None, "{c:?}: no buffer, no clock");
+            assert!(vui.hrd.is_none(), "{c:?}: no buffer, no HRD");
+        }
+        let cpb = Cpb::new(64_000, 125).expect("representable");
+        let cfg = Config {
+            colour: Some(colours[0]),
+            rate: crate::encode::RateControl::Bitrate { bps: 64_000 },
+            cpb_ms: 125,
+            ..base.clone()
+        };
+        let sps = Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 8, Some(&cpb)))).expect("SPS");
+        let vui = sps.vui.as_ref().expect("VUI");
+        assert_eq!(vui.colour_description, Some((9, 16, 9)));
+        assert_eq!(vui.timing, Some((1, 30)));
+        assert_eq!(vui.hrd.map(|h| h.bit_rate), Some(cpb.bit_rate));
+        let cfg = Config { colour: None, ..cfg };
+        let sps = Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 8, Some(&cpb)))).expect("SPS");
+        let vui = sps.vui.as_ref().expect("VUI");
+        assert_eq!(vui.colour_description, None, "a buffer alone must not invent a colour");
+        assert!(!vui.full_range);
+        assert_eq!(vui.timing, Some((1, 30)));
+        assert_ne!(write_sps(&base, &g, 8, None), write_sps(&Config { colour: Some(colours[0]), ..base }, &g, 8, None));
     }
 
     /// The declared values are rounded **down** from what was asked for,

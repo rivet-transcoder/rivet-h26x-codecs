@@ -116,6 +116,32 @@ pub enum Entropy {
     Cabac,
 }
 
+/// The colour a stream's samples are to be interpreted in: the H.273
+/// code points a display needs to show BT.2020 PQ as HDR rather than as
+/// washed-out BT.709, carried in the SPS VUI (`video_signal_type_present_flag`,
+/// H.264 E.1.1 / H.265 E.2.1). A stream without one says nothing, which
+/// every player reads as BT.709 limited range.
+///
+/// The codes are the standard's own, not an enum: the writer copies them
+/// into three 8-bit fields, the reader (`h264::sps::Vui`, `hevc::sps::Vui`)
+/// hands them back as the same three numbers, and an enum in between would
+/// be a place for a value to fail to round-trip. BT.2020 PQ is `9, 16, 9`;
+/// HLG is `9, 18, 9`; SDR BT.709 is `1, 1, 1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColourDescription {
+    /// `colour_primaries` (H.273 table 2): 1 BT.709, 9 BT.2020.
+    pub primaries: u8,
+    /// `transfer_characteristics` (H.273 table 3): 1 BT.709, 16 PQ (SMPTE
+    /// ST 2084), 18 HLG (ARIB STD-B67).
+    pub transfer: u8,
+    /// `matrix_coefficients` (H.273 table 4): 1 BT.709, 9 BT.2020
+    /// non-constant luminance.
+    pub matrix: u8,
+    /// `video_full_range_flag`: false is studio range (16..235 at 8
+    /// bits), true is full range.
+    pub full_range: bool,
+}
+
 /// Everything the encoder needs that is not a picture.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -182,6 +208,13 @@ pub struct Config {
     /// `sample_adaptive_offset_enabled_flag` in the SPS, which makes one
     /// or two more flags appear in *every* slice header.
     pub sao: bool,
+    /// Colour description to write into the SPS VUI, or `None` to write
+    /// nothing about colour — which is what every stream this encoder
+    /// wrote before the field existed, so an unset field keeps them all
+    /// byte-identical. Set for HDR: without it a BT.2020 PQ picture is
+    /// displayed as BT.709 by every player that does not read the
+    /// container's colour box, and some that do.
+    pub colour: Option<ColourDescription>,
 }
 
 impl Default for Config {
@@ -202,6 +235,7 @@ impl Default for Config {
             sao: false,
             fps: 30,
             cpb_ms: 0,
+            colour: None,
         }
     }
 }
