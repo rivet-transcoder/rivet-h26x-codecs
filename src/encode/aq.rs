@@ -20,6 +20,28 @@
 //! improvement, because the property it improves — evenness of visible
 //! error — is not one the gate measures.
 //!
+//! Measured (2026-09-13, strength 1.0 against the same row without it,
+//! `tools/verify_encode.sh`):
+//!
+//! ```text
+//!   clip / row              size      PSNR    what moved
+//!   odd    cqp-ip  qp 26    -5.8%   -1.79 dB  46 of 60 P CUs left the picture QP (12 CTBs of 16x16)
+//!   odd    cqp-intra        -8.3%   -1.79 dB  9 of 12 CTBs
+//!   odd    cqp40-ip         +3.9%   -1.14 dB  36 of 60
+//!   grad   cqp-ip  qp 26    -2.0%   +0.24 dB  1 of 4 CTBs
+//!   cut    cqp-ip  qp 26    -0.1%   -0.02 dB  49 of 336 P CUs
+//!   detail, motion, static  +0.0..0.3%  0.00  NOTHING moved: four 32x32 CTBs of equal
+//!                                            variance round every zero-mean offset to 0,
+//!                                            and the cost is the zero delta's bin per CU
+//! ```
+//!
+//! So on this corpus the switch only does something where a picture's
+//! blocks actually differ in variance — the odd-sized clip's twelve, and
+//! the fade clip's busy-left/flat-right halves, which were added for
+//! exactly that reason — and the cells on the uniform clips prove the
+//! syntax and nothing else. The trade where it does act is the one the
+//! paragraph above describes: fewer bits, lower global PSNR.
+//!
 //! # The offset
 //!
 //! Per CTB, the luma variance in 8-bit units (deeper samples are scaled

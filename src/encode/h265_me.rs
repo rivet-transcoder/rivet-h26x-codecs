@@ -63,6 +63,49 @@
 //! no collocated picture), which makes the spatial + zero candidate set
 //! the *complete* derivation for these streams, not a subset.
 //!
+//! # Priced, not built (2026-09-13)
+//!
+//! Three of the standard's inter tools were costed against this corpus
+//! before deciding not to build them. The numbers are here so the next
+//! reader decides against a bigger corpus rather than re-deriving them.
+//!
+//! - **Prediction-unit partitions, symmetric and AMP.** The encoder codes
+//!   one `PART_2Nx2N` unit per CTB. `tools/partition_opportunity.py`
+//!   (integer-sample SAD, ±4, a split must beat the whole block by 5%)
+//!   over the seven 8-bit 4:2:0 clips: 16.2% of blocks would take a
+//!   symmetric split and 13.3% an AMP shape beyond it — but 7.1% and
+//!   less once the smooth-gradient clip is set aside (an integer search
+//!   approximates a fractional pan with two offsets, which quarter-sample
+//!   refinement does without a split), and the AMP count lives in the
+//!   fractal half of the cut clip, where a 32x8 strip overfits. The
+//!   clips with real uniform motion and the held frame come out at 0.0%.
+//!   Against that: a second vector and `part_mode` on every split unit,
+//!   and under this SPS's `max_transform_hierarchy_depth_inter` an
+//!   inferred transform split (`interSplitFlag`) the inter writer would
+//!   have to learn to spell. The symmetric shapes are the prerequisite
+//!   for AMP, and AMP's own value sits inside the probe's bias.
+//! - **Temporal merge / AMVP candidates (TMVP).** The SPS disables it;
+//!   the decoder's derivation is complete and the motion grid the
+//!   collocated picture would need is already kept in `Frame`. What a
+//!   temporal candidate can buy is turning an AMVP unit into a merge
+//!   (its `mvd` and `mvp_l0_flag` for a `merge_idx`), so the ceiling is
+//!   bounded by the AMVP share: on the corpus's census at QP 26 that is
+//!   56 of 336 P CUs on the cut clip and 0–1 of 28–60 on every other,
+//!   about 12% corpus-wide and nearly all on one clip. At ten to twenty
+//!   bits per unit that is under half a percent of the cut stream and
+//!   nothing elsewhere, for `slice_temporal_mvp_enabled_flag`,
+//!   `collocated_ref_idx` and a second reader-derivation to mirror.
+//! - **WPP / tile-parallel coding.** A speed tool, not a compression
+//!   one, and the corpus cannot measure it: every clip is two CTB rows.
+//!   The ceiling is rows over two (entropy sync lets a row start when
+//!   the row above is two CTBs ahead) — nothing at 64x64, up to ~17x on
+//!   1080p at CTB 32 in the limit — bought with `entry_point_offset`s in
+//!   the slice header, a context save after the second CTB of each row,
+//!   and a decision walk that runs per row behind the same lag. rivet
+//!   already parallelises across pictures and chunks, so this would buy
+//!   latency rather than throughput there; the timing that would justify
+//!   it needs a clip with seconds and rows, which the corpus lacks.
+//!
 //! # Scope (v1) — the same deliberately fixed geometry as the intra module
 //!
 //! - **P slices, one reference** (list 0, `ref_idx` 0), `PART_2Nx2N`

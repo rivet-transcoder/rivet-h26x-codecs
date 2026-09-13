@@ -62,12 +62,31 @@
 //!   `c_idx == 0 || cat == 3`). One 4:4:4 corner is refused by name:
 //!   `PART_NxN` (8x8 CTUs, test-only geometry) would need four chroma
 //!   modes and per-4x4 chroma TBs.
+//!
+//!   Priced rather than built (2026-09-13): `PART_NxN` exists only at
+//!   the minimum coding block, 8x8, and the production encoder codes one
+//!   CU per 16 or 32 CTB — so no gate row can take the corner until the
+//!   coding quadtree splits (`split_cu_flag` decisions at every depth,
+//!   per-size decisions and writers, the deblocker's and the quantiser
+//!   chain's per-CU geometry), and a census of it today is zero by
+//!   construction. The one number this corpus offers is the transform
+//!   split census on intra pictures at QP 26 — 3 of 4 CTBs on detail,
+//!   32 of 48 on cut, 3 of 4 on static already take four quarter-size
+//!   TUs under the one mode the CU chose — which says smaller blocks
+//!   want different transforms and hints, without showing, that they
+//!   would want different modes. The instrument that would show it is
+//!   an intra twin of `tools/partition_opportunity.py` (best-of-35 SATD
+//!   per 8x8 against one mode per 32x32); it was not written, and the
+//!   corner stays refused by name with that as its price tag.
 //! - **One slice, one tile, raster CTU order.** Availability reduces to
 //!   picture geometry plus z-scan order, mirrored from the decoder.
 //! - **Flat scaling lists, no transform skip, no RDPCM, no rotation** —
 //!   matching what `write_sps` / `write_pps` currently emit (no scaling
 //!   lists, `transform_skip_enabled_flag` 0, no range extensions).
-//! - **Fixed QP** — no `cu_qp_delta`, so a decision carries no QP field.
+//! - **One quantiser per CU, the caller's** — `IntraCtx::qp`, which the
+//!   picture loop varies per CTB under adaptive quantisation; the
+//!   decision records the `QpY` a decoder will hold in
+//!   [`CuDecision::qp_y`] and never chooses it.
 //! - **Lossless is a whole-picture switch** (`IntraCtx::bypass`): every CU
 //!   gets `cu_transquant_bypass_flag`, the residual is carried raw, and the
 //!   PPS must set `transquant_bypass_enabled_flag` to match.
