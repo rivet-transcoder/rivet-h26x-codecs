@@ -163,6 +163,11 @@ fn main() {
         if enc.recodes() != 0 {
             eprintln!("rate: {} extra codings to fit the declared buffer", enc.recodes());
         }
+        // The controller's model check: how far, in quantiser steps of
+        // its law, the pictures landed from where they were planned.
+        if let Some(err) = enc.plan_error() {
+            eprintln!("rate: plan error {err:.2} steps per picture");
+        }
         // The coding-unit census, the H.265 twin of the H.264 shape line
         // below: a row turns a feature on, this says whether the clip
         // took it.

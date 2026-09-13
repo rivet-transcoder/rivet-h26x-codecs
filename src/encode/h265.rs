@@ -113,6 +113,12 @@ struct Core<S: Sample> {
     /// The display-size luma of the last picture pushed, which the next
     /// one's inter cost is measured against. `None` without a lookahead.
     last_luma: Option<Vec<S>>,
+    /// The quantiser the last kept picture was coded at, which is what
+    /// the lookahead's inter-cost floor ([`PicCost::inter_floor`]) is
+    /// scaled by: a picture predicted from a reference carries that
+    /// reference's quantisation noise as residual however still the
+    /// content is. `None` before the first picture.
+    last_qp: Option<u8>,
     geom: syn::Geometry,
     /// Reference pictures as the decoder holds them — full `Frame`s with
     /// their motion grids and extended borders, not cropped bytes: the
@@ -238,6 +244,14 @@ impl H265Encoder {
     /// can fail to fit.
     pub fn recodes(&self) -> u64 {
         with_core!(&self.inner, e => e.recoded)
+    }
+
+    /// The rate controller's model check: the mean distance, in quantiser
+    /// steps of its law, between what each picture was planned at and
+    /// what it cost — see `RateController::plan_error`. `None` at a
+    /// constant quantiser, where nothing was planned.
+    pub fn plan_error(&self) -> Option<f64> {
+        with_core!(&self.inner, e => e.plan_error())
     }
 
     /// The reconstructions produced so far, in coding order, packed as
@@ -374,8 +388,14 @@ impl<S: Sample> Core<S> {
             offered: 0,
             costs: std::collections::BTreeMap::new(),
             last_luma: None,
+            last_qp: None,
             refs: Vec::new(),
         })
+    }
+
+    /// See [`H265Encoder::plan_error`].
+    fn plan_error(&self) -> Option<f64> {
+        self.rc.as_ref()?.plan_error()
     }
 
     /// See [`H265Encoder::rate_report`].
@@ -502,13 +522,13 @@ impl<S: Sample> Core<S> {
             // `None` means no buffer was declared and nothing can fail.
             let affordable = self.rc.as_ref().and_then(|rc| rc.affordable_bits());
             let Some(afford) = affordable else {
-                return Ok(self.commit(&c, a));
+                return Ok(self.commit(&c, a, qp));
             };
             if bits <= afford {
                 if let Some(rc) = self.rc.as_mut() {
                     rc.note_recode(qp);
                 }
-                return Ok(self.commit(&c, a));
+                return Ok(self.commit(&c, a, qp));
             }
             if attempt + 1 == super::rc::MAX_ATTEMPTS || qp >= 51 {
                 // The declared buffer is smaller than this content can be
@@ -529,8 +549,9 @@ impl<S: Sample> Core<S> {
 
     /// Keep what an attempt made: the reconstruction the SELF check reads,
     /// and the reference the next picture predicts from.
-    fn commit(&mut self, c: &Coded, a: Attempt<S>) -> Access {
+    fn commit(&mut self, c: &Coded, a: Attempt<S>, qp: u8) -> Access {
         self.recon.push(a.rec);
+        self.last_qp = Some(qp);
         self.census.by_kind[Census::slot(c.kind)].add(&a.census);
         if a.clears_refs {
             self.refs.clear();
@@ -563,11 +584,15 @@ impl<S: Sample> Core<S> {
     /// each with the kind it will be coded as ([`Scheduler::preview`])
     /// and the cost that kind pays: an intra picture its intra cost, an
     /// inter picture the cheaper of the two, since a block the previous
-    /// picture predicts badly is still coded intra.
+    /// picture predicts badly is still coded intra — with the inter cost
+    /// held above the reference's quantisation noise
+    /// ([`PicCost::inter_floor`]) at the quantiser the last picture was
+    /// coded at.
     fn lookahead_window(&self, c: &Coded, upcoming: &[Coded]) -> (f64, Vec<(PicKind, f64)>) {
+        let qp_ref = self.last_qp.map_or(26, i32::from);
         let cost_of = |kind: Kind, display: u64| -> f64 {
             let pc = self.costs.get(&display).copied().unwrap_or_default();
-            let cost = if kind.is_intra() { pc.intra } else { pc.intra.min(pc.inter) };
+            let cost = if kind.is_intra() { pc.intra } else { pc.intra.min(pc.inter.max(pc.inter_floor(qp_ref))) };
             (cost as f64).max(1.0)
         };
         let mine = cost_of(c.kind, c.display);
@@ -1125,7 +1150,43 @@ pub(crate) struct PicCost {
     pub inter: u64,
 }
 
+/// The share of a picture's intra cost that predicting it from a
+/// reference coded at quantiser 45 leaves as residual, however still the
+/// content — the reference's own quantisation noise, which the
+/// source-against-source inter cost cannot see.
+///
+/// Measured once: on the corpus's held-frame clip, whose inter cost is
+/// exactly zero, the first P picture after a keyframe coded at 45 cost
+/// 41928 bits at quantiser 0 against the keyframe's 85600 units of intra
+/// cost — 41928 / 3.55 (the inter bits-per-cost median of the same run)
+/// is 11.8k units, 0.14 of the intra cost. Without the floor that
+/// picture was planned as free and coded at quantiser 0, twelve times
+/// the keyframe; with it the plan sees what a decoder's reference
+/// actually holds.
+const REF_NOISE_AT_45: f64 = 0.14;
+
+/// Quantiser steps per halving of the reference-noise floor as the
+/// reference's quantiser falls. The step size itself halves every six,
+/// and the first version of the floor followed it — which planned the
+/// odd-sized clip's P pictures (reference at 28) from a floor three
+/// times too low (0.02 of the intra cost predicted, 0.058 measured from
+/// the bits a P at 26 actually cost) and walked their quantiser to 0
+/// chasing bits the model said were not there. Twelve fits the two
+/// points measured (0.14 at 45, 0.058 at 28: `0.14 * 2^(-17/12)` is
+/// 0.052), and on the corpus took the odd clip's ABR ratio from 1.45 to
+/// 1.16 and the held clip's from 1.21 to 0.78 with every other clip
+/// unchanged. Two points is a fit, not a law; the plan error the
+/// controller reports is where a third point would show.
+const REF_NOISE_HALVING: f64 = 12.0;
+
 impl PicCost {
+    /// The least an inter picture predicted from a reference coded at
+    /// `qp_ref` can cost: [`REF_NOISE_AT_45`] of the intra cost, scaled
+    /// by the reference's step size.
+    fn inter_floor(&self, qp_ref: i32) -> u64 {
+        (self.intra as f64 * REF_NOISE_AT_45 * 2f64.powf((qp_ref - 45) as f64 / REF_NOISE_HALVING)) as u64
+    }
+
     /// Measure a `w` by `h` luma plane (stride `w`), and `prev` — the
     /// picture pushed before it at the same size — when there is one.
     fn measure<S: Sample>(luma: &[S], w: usize, h: usize, prev: Option<&[S]>) -> Self {

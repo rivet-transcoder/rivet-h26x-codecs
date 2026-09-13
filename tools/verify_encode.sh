@@ -284,6 +284,11 @@ hevc-aq40-sao-ip|--codec h265 --qp 40 --gop 8 --sao --aq 1.0
 hevc-abr-aq-64k|--codec h265 --bitrate 64000 --gop 8 --aq 1.0
 hevc10-aq-ip@p10|--codec h265 --qp 26 --gop 8 --aq 1.0
 hevc12-aq40-ip@p12|--codec h265 --qp 40 --gop 8 --aq 1.0
+hevc-abr-la-64k|--codec h265 --bitrate 64000 --gop 8 --lookahead 8
+hevc-abr-la-96k|--codec h265 --bitrate 96000 --gop 8 --lookahead 8
+hevc-abr-la-ipb-64k|--codec h265 --bitrate 64000 --gop 8 --bframes 2 --lookahead 4
+hevc-vbv-la-125@src_cut|--codec h265 --bitrate 64000 --cpb-ms 125 --gop 8 --lookahead 8
+hevc10-abr-la-96k@p10|--codec h265 --bitrate 96000 --gop 8 --lookahead 8
 abr-64k-cpb@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8
 abr-64k-cavlc-cpb@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8 --cavlc
 h264-10-lossless-intra@p10|--codec h264 --lossless --gop 0

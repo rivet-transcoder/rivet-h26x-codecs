@@ -363,14 +363,22 @@ const SEED_QP_MAX: f64 = 45.0;
 /// been observed yet: bits per unit of cost at quantiser 0, before the
 /// `2^(-qp/6)` factor.
 ///
-/// A calibration, taken once on this project's corpus: the median over
-/// every keyframe of `bits * 2^(qp/6) / cost` with the cost measured as
-/// `encode::h265::PicCost` measures it (see [`RateController::pick_qp_ahead`]
-/// for the run that produced it). It replaces the bits-per-pixel anchor
+/// A calibration, taken on this project's corpus (2026-09-13, the four
+/// `--bitrate` rows over every clip under `--lookahead 8`, 75 keyframes,
+/// cost measured as `encode::h265::PicCost` measures it): the median of
+/// `bits * 2^(qp/6) / cost` was 4.23 at the seed's own operating point
+/// (quartiles 3.64 and 4.79, extremes 1.16 and 7.20). A first pass with a
+/// placeholder of 40 — eight times too high — put every keyframe at the
+/// clamp's ceiling and measured 4.76 there; the law is approximate
+/// enough over twenty quantiser steps that the number at the operating
+/// point is the one to keep. Inter pictures came out at a median of 3.55
+/// over 417, the same order, which is what lets a keyframe's observed
+/// value stand in for the first P. It replaces the bits-per-pixel anchor
 /// only for the very first picture of a stream; every picture after that
 /// is pinned by an observation, and the [`SEED_QP_MIN`] / [`SEED_QP_MAX`]
-/// clamp bounds how wrong this constant is allowed to be.
-const SEED_BITS_PER_COST: f64 = 40.0;
+/// clamp bounds how wrong this constant is allowed to be — it is what
+/// kept the placeholder from being worse than a seed.
+const SEED_BITS_PER_COST: f64 = 4.2;
 
 /// Which complexity estimate a picture draws on, and what share of the
 /// budget it is given.
@@ -482,6 +490,14 @@ pub struct RateController {
     /// The kind most recently pinned by an observation, which an
     /// unobserved kind borrows its bits-per-cost from under lookahead.
     last_observed: Option<PicKind>,
+    /// The bits the picture being coded was planned at, for the plan
+    /// error below. 0 before the first pick.
+    planned: f64,
+    /// Accumulated `6 * |log2(actual / planned)|` over accounted
+    /// pictures, and how many — the model check
+    /// [`RateController::plan_error`] reports.
+    plan_error: f64,
+    plan_count: u64,
 }
 
 impl RateController {
@@ -543,7 +559,21 @@ impl RateController {
             pending: None,
             last_cost: [None; 3],
             last_observed: None,
+            planned: 0.0,
+            plan_error: 0.0,
+            plan_count: 0,
         }
+    }
+
+    /// How far pictures landed from their plan, on average, in quantiser
+    /// steps of the law: `6 * |log2(actual bits / planned bits)|` per
+    /// picture, meaned. The controller's model check — it chooses a
+    /// quantiser to land a target, and this is how wrong that choice was,
+    /// reported so a change to the model can be measured against the
+    /// pictures it planned rather than only against the band. `None`
+    /// before any picture has been accounted.
+    pub fn plan_error(&self) -> Option<f64> {
+        (self.plan_count > 0).then(|| self.plan_error / self.plan_count as f64)
     }
 
     /// The bits this picture is aiming for: its share by kind, plus a
@@ -678,17 +708,16 @@ impl RateController {
         let c = self.complexity[kind as usize];
         // Invert bits(qp) = k * cost * 2^(-qp/6). Under lookahead `k` is
         // bits per unit of cost and may be borrowed from another kind or
-        // seeded from the calibration; a pick from the calibration alone
-        // — nothing observed of any kind — is bounded the way every other
-        // seed is, because a calibration is a guess about the codec and
-        // the clamp is what limits the cost of guessing wrong.
-        let (k_eff, from_seed) = if ahead {
-            (self.k_for(kind) * cost, !c.observed && self.last_observed.is_none())
-        } else {
-            (c.k, false)
-        };
+        // seeded from the calibration; either way a pick for a kind that
+        // has not been observed is a guess about that kind, and it is
+        // bounded the way every other seed is. The past-only path seeds
+        // through the same clamp inside `seed_k`. Without it a P picture
+        // whose cost the lookahead put near zero — a held frame, whose
+        // residual is really the reference's quantisation noise — was
+        // planned at quantiser 0 and cost twelve times its keyframe.
+        let (k_eff, guess) = if ahead { (self.k_for(kind) * cost, !c.observed) } else { (c.k, false) };
         let want = 6.0 * (k_eff / target).log2();
-        let want = if from_seed { want.clamp(SEED_QP_MIN, SEED_QP_MAX) } else { want };
+        let want = if guess { want.clamp(SEED_QP_MIN, SEED_QP_MAX) } else { want };
         let mut qp = want.round().clamp(QP_MIN as f64, QP_MAX as f64) as i32;
         // The step limit stops the quantiser pulsing between *considered*
         // choices, so it applies only between two of them — see
@@ -739,6 +768,7 @@ impl RateController {
             self.last_cost[kind as usize] = Some(cost);
         }
         self.pending = Some((kind, qp, cost));
+        self.planned = target;
         qp
     }
 
@@ -774,6 +804,13 @@ impl RateController {
         // quantiser that produced it. A picture that coded to nothing says
         // nothing about complexity, so it is not allowed to zero the
         // estimate.
+        // The model check, reported never gated: how far the picture
+        // landed from what it was planned at, in quantiser steps of the
+        // law (six per doubling). Zero would mean the model was exact.
+        if bits > 0 && self.planned > 0.0 {
+            self.plan_error += (bits as f64 / self.planned).log2().abs() * 6.0;
+            self.plan_count += 1;
+        }
         if bits > 0 {
             // Per unit of lookahead cost, which is one without a lookahead.
             let k_obs = bits as f64 * 2f64.powf(qp as f64 / 6.0) / cost;
@@ -832,6 +869,9 @@ impl RateController {
             pending: self.pending,
             last_cost: self.last_cost,
             last_observed: self.last_observed,
+            planned: self.planned,
+            plan_error: self.plan_error,
+            plan_count: self.plan_count,
         }
     }
 
@@ -1089,8 +1129,9 @@ mod tests {
     /// The first P picture of a stream under lookahead is planned from
     /// the keyframe's measured bits per unit of cost, not from the
     /// bits-per-pixel seed: four times the cost asks for twelve more
-    /// quantiser steps, the law's own slope, and a fresh controller with
-    /// nothing observed is held inside the seed clamp instead.
+    /// quantiser steps, the law's own slope — inside the seed clamp,
+    /// which a guess about an unobserved kind never escapes, whether the
+    /// guess is the calibration or a borrowed measurement.
     #[test]
     fn an_unmeasured_kind_borrows_the_measured_bits_per_cost() {
         // Nothing observed: the calibration alone, clamped like a seed at
@@ -1105,22 +1146,29 @@ mod tests {
         // One keyframe observed at a plausible cost; its k per unit cost
         // is then what plans the first P, so a P at cost c and a P at
         // cost 4c on two copies of the same state differ by the law's own
-        // slope, twelve steps.
+        // slope, twelve steps, when both land inside the clamp.
         let mut rc = RateController::new(600_000, 30, W, H, 8, 0);
         let cost_i = 1e6;
         let first = rc.pick_qp_ahead(PicKind::Intra, cost_i, &[(PicKind::Intra, cost_i)]);
         rc.account(synth_bits(K_INTRA, first));
         let mut lo = rc.clone_for_test();
         let mut hi = rc.clone_for_test();
-        let q_lo = lo.pick_qp_ahead(PicKind::Inter, 2e5, &[(PicKind::Inter, 2e5)]);
-        let q_hi = hi.pick_qp_ahead(PicKind::Inter, 8e5, &[(PicKind::Inter, 8e5)]);
-        assert!(q_lo > 0 && q_hi < 51, "the picks must sit inside the range for the slope to show: {q_lo}, {q_hi}");
+        let q_lo = lo.pick_qp_ahead(PicKind::Inter, 4e5, &[(PicKind::Inter, 4e5)]);
+        let q_hi = hi.pick_qp_ahead(PicKind::Inter, 1.6e6, &[(PicKind::Inter, 1.6e6)]);
+        assert!(f64::from(q_lo) > SEED_QP_MIN && f64::from(q_hi) < SEED_QP_MAX, "the picks must sit inside the clamp for the slope to show: {q_lo}, {q_hi}");
         assert!((i32::from(q_hi) - i32::from(q_lo) - 12).abs() <= 1, "cost x4 moved the quantiser from {q_lo} to {q_hi}, not by twelve");
+        // A borrowed measurement is still a guess about this kind: a
+        // negligible cost is held at the seed floor rather than planned
+        // at quantiser 0 — the held-frame case, whose true residual is
+        // the reference's quantisation noise.
+        let mut held = rc.clone_for_test();
+        let q_held = held.pick_qp_ahead(PicKind::Inter, 1.0, &[(PicKind::Inter, 1.0)]);
+        assert_eq!(f64::from(q_held), SEED_QP_MIN, "a borrowed pick at a negligible cost escaped the seed clamp: {q_held}");
         // And it was the keyframe's measurement that planned it, not the
         // calibration: the same P on a controller that observed nothing
         // lands elsewhere.
         let mut blind = RateController::new(600_000, 30, W, H, 8, 0);
-        let q_blind = blind.pick_qp_ahead(PicKind::Inter, 2e5, &[(PicKind::Inter, 2e5)]);
+        let q_blind = blind.pick_qp_ahead(PicKind::Inter, 4e5, &[(PicKind::Inter, 4e5)]);
         assert_ne!(q_blind, q_lo, "the borrowed k made no difference to the first P");
     }
 
