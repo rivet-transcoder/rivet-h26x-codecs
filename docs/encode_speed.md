@@ -398,6 +398,12 @@ ms, IPB 141.5 → 42.3 ms; H.264 intra 62.5 → 50.2 ms and H.265 intra 402.7
 → 262.9 ms, the intra paths being the ones that spend least in these
 kernels.
 
+Re-run on the rebase onto develop 4128e49 (08657cc, 2026-09-13): masks 0
+and 63, both sweeps `OK`, the same 56 cells identical across the builds
+and self-consistent. The timings were not re-recorded — the box was
+carrying two other tracks' gate sweeps at the time, and the table above
+is the quiet-box record at d0dde0a (the kernels have not changed since).
+
 Two things learned porting: wasm has no `psadbw` and no `pmulhuw`. SAD is
 `u8x16_sub_sat` both ways or'd together and `u16x8_extadd_pairwise_u8x16`
 (NEON's shape, not x86's); the quantiser's exact 32-bit product is a
@@ -421,6 +427,9 @@ Linux, alongside the `hevc_neon_u8` dot-product tests that
 `H26X_REQUIRE_DOTPROD=1` forbids from skipping. The x86 and MSRV jobs
 pass too. This is the first execution of `distortion_neon.rs`, which had
 been on develop installed-but-unexecuted since `agent/enc-speed`.
+Re-run on the rebase onto develop 4128e49 (08657cc, run 34785319047,
+2026-09-13): the same five tests `ok` on both arm64 runners, 239 passed
+on each, all six jobs green.
 
 The NEON transform is not the pair-table shape: NEON has no `pmaddwd`,
 and its natural idiom is `smlal`/`smlal2` by lane, so stage one takes
@@ -441,4 +450,38 @@ cell of `verify_encode.sh`'s list, bitstream and reconstruction compared
 byte for byte through `identity_encode.sh`. The cap applies to every
 table the encoder builds, the shared decoder kernels included, so it is
 the whole encoder's rung-independence that is asserted.
-LADDER_RESULT_PLACEHOLDER
+
+Run on the rebase onto develop 4128e49 (2026-09-13, a Zen 5 box that
+takes every rung to AVX-512, `JOBS=6`): 34 8-bit rows over 9 clips is 309
+cells a rung, each encoded twice —
+
+```
+-- rung sse2 (selects: SSE2) --           identity: 309 identical, 0 moved
+-- rung ssse3 (selects: SSSE3) --         identity: 309 identical, 0 moved
+-- rung sse41 (selects: SSE4.1) --        identity: 309 identical, 0 moved
+-- rung avx (selects: AVX (VEX-128)) --   identity: 309 identical, 0 moved
+-- rung avx2 (selects: AVX2) --           identity: 309 identical, 0 moved
+-- rung avx512 (selects: AVX-512) --      identity: 309 identical, 0 moved
+ladder: 6 rungs identical, 0 failed
+LADDER IDENTICAL
+```
+
+The gate bites. A binary built aside with the AVX2 SAD dropping the last
+row of a 16-wide block, run over two clips on rungs `avx` and `avx2`:
+`avx` stays 68 identical, `avx2` reports 34 of 68 cells MOVED, bitstreams
+differing by 1 to 57 bytes — all of them H.264 inter rows. What did not
+move is instructive rather than vacuous: the H.264 intra-only rows, two IP
+rows on the detail clip whose search happened not to flip, and all twelve
+H.265 rows on both clips — the H.265 encoder searches at the CTB size
+(`log2_cu = log2_ctb_size`; the writer takes 32 for a 64x64 clip and 16
+only where that pads less, as for `odd`), so on these clips its SAD calls
+never take the 16-wide path; that combination does not exist in the
+encoder. The H.265 rows are reached through the quantiser: the same two
+clips with the AVX2 quantiser's rounding offset doubled give `avx` 68
+identical again and `avx2` 18 of 68 MOVED — every H.265 row that
+quantises, on both clips, while the six lossless cells and all 44 H.264
+cells (which never call `hevc_enc.quant`) stay identical. A first
+attempt at that mutation, `offset + 1`, moved nothing on either rung:
+it changes a level only when `|c| * scale + offset` sits exactly one
+below a multiple of `2^qbits`, and `qbits` is 20 to 23 at 8 bits — a
+mutation the gate cannot be blamed for missing.
