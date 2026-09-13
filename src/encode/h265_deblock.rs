@@ -709,7 +709,7 @@ mod tests {
         let mut decisions = Vec::new();
         for cy in 0..h / n {
             for cx in 0..w / n {
-                decisions.push(PCuDecision::Inter(pic.code_ctu(&ctx, &refp, cx, cy, &src_y, w, &src_cb, &src_cr, w / 2)));
+                decisions.push(PCuDecision::Inter(pic.code_ctu(&ctx, &[&refp], cx, cy, &src_y, w, &src_cb, &src_cr, w / 2)));
             }
         }
         assert!(

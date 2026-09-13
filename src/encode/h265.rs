@@ -27,7 +27,6 @@ use super::aq;
 use super::h265_wp;
 use super::h265_syntax::{self as syn, Cpb, PpsOptions};
 use crate::hevc::ctu::explicit_weighting;
-use crate::hevc::inter::Weighting;
 use super::{Access, Config, RateControl};
 use crate::bitwriter::BitWriter;
 use crate::cabac_enc::CabacEncoder;
@@ -42,7 +41,7 @@ use crate::hevc::ctu::{
     write_cu_skip_flag, write_sao,
     write_cu_transquant_bypass_flag, write_merge_flag, write_merge_idx, write_mvd,
     write_inter_pred_idc, write_mvp_flag, write_part_mode_inter, write_pred_mode_flag,
-    write_rqt_root_cbf,
+    write_ref_idx, write_rqt_root_cbf,
     write_intra_chroma_pred_mode, write_mpm_idx, write_prev_intra_luma_pred_flag,
     write_rem_intra_luma_pred_mode, write_split_cu_flag, write_split_transform_flag,
 };
@@ -863,7 +862,10 @@ impl<S: Sample> Core<S> {
         frame.poc = c.poc as i32;
         frame.extend_rows(0, frame.height);
         self.refs.push(frame);
-        while self.refs.len() > 2 {
+        // Two for the B geometry above, or as many past pictures as
+        // `max_refs` lets a P picture choose between — whichever is more.
+        let keep = (self.cfg.max_refs as usize).max(2);
+        while self.refs.len() > keep {
             self.refs.remove(0);
         }
     }
@@ -943,19 +945,23 @@ impl<S: Sample> Core<S> {
         // the time one of those codes — and the retention below keeps them
         // until the last picture that can reference them has been coded.
         let cur = c.poc as i32;
-        let past = self
-            .refs
-            .iter()
-            .filter(|f| f.poc < cur)
-            .max_by_key(|f| f.poc)
-            .ok_or_else(|| Error::bitstream("H.265 encode: an inter picture with no past reference"))?;
+        // RefPicList0: the past references, nearest first, capped by what
+        // the configuration asks for (`max_refs`, 1 by default) and what
+        // the SPS sized the decoded picture buffer to hold. Nearest first
+        // is not cosmetic — it is the order the reader builds the list in
+        // from the reference picture set, so index 0 must be the nearest.
+        // A B picture takes one past reference: its second list is the
+        // future anchor, and `max_refs` names the P choice only.
+        let mut l0: Vec<&crate::hevc::frame::Frame<S>> = self.refs.iter().filter(|f| f.poc < cur).collect();
+        l0.sort_by_key(|f| -f.poc);
+        l0.truncate(if c.kind == Kind::B { 1 } else { (self.cfg.max_refs.max(1) as usize).min(l0.len()) });
+        let past = *l0.first().ok_or_else(|| Error::bitstream("H.265 encode: an inter picture with no past reference"))?;
         let future = self.refs.iter().filter(|f| f.poc > cur).min_by_key(|f| f.poc);
         if c.kind == Kind::B && future.is_none() {
             return Err(Error::bitstream(
                 "H.265 encode: a B picture with no future reference",
             ));
         }
-        let ref_poc = past.poc;
         let future_poc = future.map(|f| f.poc);
 
         let cpu = Cpu::detect_honouring_env();
@@ -988,19 +994,28 @@ impl<S: Sample> Core<S> {
         // reader's own `explicit_weighting`.
         let wp = (self.cfg.weighted_pred && c.kind == Kind::P).then(|| {
             let identity = h265_wp::PlaneFit::identity(0);
-            let luma = h265_wp::fit_plane(&src[..dw * dh], dw, &past.y, dw, dh, bit_depth);
-            let (cb, cr) = if cat != 0 {
-                (
-                    h265_wp::fit_plane(&src[dw * dh..dw * dh + cdw * cdh], cdw, &past.cb, cdw, cdh, bit_depth),
-                    h265_wp::fit_plane(&src[dw * dh + cdw * cdh..], cdw, &past.cr, cdw, cdh, bit_depth),
-                )
-            } else {
-                (identity, identity)
-            };
-            let fits = [luma, cb, cr];
-            (h265_wp::table_for(h265_wp::entry_for(fits, bit_depth, bit_depth)), fits)
+            // One entry per reference in the list, each its own fit: an
+            // older reference of a fade is further down the ramp and
+            // wants a different gain.
+            let fits: Vec<[h265_wp::PlaneFit; 3]> = l0
+                .iter()
+                .map(|rf| {
+                    let luma = h265_wp::fit_plane(&src[..dw * dh], dw, &rf.y, dw, dh, bit_depth);
+                    let (cb, cr) = if cat != 0 {
+                        (
+                            h265_wp::fit_plane(&src[dw * dh..dw * dh + cdw * cdh], cdw, &rf.cb, cdw, cdh, bit_depth),
+                            h265_wp::fit_plane(&src[dw * dh + cdw * cdh..], cdw, &rf.cr, cdw, cdh, bit_depth),
+                        )
+                    } else {
+                        (identity, identity)
+                    };
+                    [luma, cb, cr]
+                })
+                .collect();
+            let entries = fits.iter().map(|f| h265_wp::entry_for(*f, bit_depth, bit_depth)).collect();
+            (h265_wp::table_for(entries), fits)
         });
-        pic.wp = wp.as_ref().map_or([Weighting::Default; 3], |(t, _)| explicit_weighting(t, bit_depth, bit_depth, [0, -1]));
+        pic.wp = wp.as_ref().map_or(Vec::new(), |(t, _)| (0..l0.len()).map(|r| explicit_weighting(t, bit_depth, bit_depth, [r as i8, -1])).collect());
 
         let mut w = BitWriter::with_capacity(cw * ch / 4);
         syn::write_slice_header(
@@ -1009,12 +1024,18 @@ impl<S: Sample> Core<S> {
                 poc_lsb: (c.poc as u32) & ((1 << LOG2_MAX_POC_LSB) - 1),
                 qp: i32::from(qp),
                 log2_max_poc_lsb: LOG2_MAX_POC_LSB,
-                // The inline short term reference picture set: one past
-                // entry, which becomes RefPicList0, and for a B picture one
-                // future entry, which becomes RefPicList1.
-                ref_deltas: match future_poc {
-                    Some(f) if c.kind == Kind::B => vec![ref_poc - cur, f - cur],
-                    _ => vec![ref_poc - cur],
+                // The inline short term reference picture set: one entry
+                // per reference this slice will use — every picture in
+                // RefPicList0, and for a B picture the future anchor. The
+                // header writer counts these to decide
+                // `num_ref_idx_active_override_flag`, so the set and the
+                // declared counts cannot disagree.
+                ref_deltas: {
+                    let mut d: Vec<i32> = l0.iter().map(|f| f.poc - cur).collect();
+                    if let (Some(f), Kind::B) = (future_poc, c.kind) {
+                        d.push(f - cur);
+                    }
+                    d
                 },
                 // As in `code_picture`, and from the same switch.
                 sao: sao_flags(self.cfg.sao, cat),
@@ -1063,7 +1084,7 @@ impl<S: Sample> Core<S> {
                     Some(r1) if c.kind == Kind::B => {
                         pic.code_ctu_b(&cctx, past, r1, cxu, cy, &py, cw, &pcb, &pcr, ccw)
                     }
-                    _ => pic.code_ctu(&cctx, past, cxu, cy, &py, cw, &pcb, &pcr, ccw),
+                    _ => pic.code_ctu(&cctx, &l0, cxu, cy, &py, cw, &pcb, &pcr, ccw),
                 };
                 // The decision module answers `UseIntra` when its
                 // flatness proxy says inter has lost. The CU is then
@@ -1094,16 +1115,17 @@ impl<S: Sample> Core<S> {
         // reports it on every clip.
         let mut wp_stats = (0u64, 0u64, 0u64);
         if let Some((_, fits)) = &wp {
-            if fits[0].used() {
+            if fits.iter().any(|f| f[0].used()) {
                 wp_stats.0 = 1;
                 let n = 1usize << g.log2_ctb;
                 for (addr, d) in decisions.iter().enumerate() {
                     let PCuDecision::Inter(d) = d else { continue };
-                    if d.ref_idx < 0 {
+                    if d.ref_idx < 0 || !fits[d.ref_idx as usize][0].used() {
                         continue;
                     }
                     let (x0, y0) = ((addr % wc) * n, (addr / wc) * n);
-                    let (plain, weighted) = pic.weighting_gain(&mctx, past, x0, y0, &py, cw, d.mv);
+                    let r = d.ref_idx as usize;
+                    let (plain, weighted) = pic.weighting_gain(&mctx, l0[r], r, x0, y0, &py, cw, d.mv);
                     wp_stats.1 += u64::from(weighted < plain);
                     wp_stats.2 += u64::from(weighted > plain);
                 }
@@ -1140,7 +1162,7 @@ impl<S: Sample> Core<S> {
                     let delta = offsets.is_some().then(|| chain.spell(pd.qp_y(), pd.any_cbf())).flatten();
                     census.qp_delta += u64::from(delta.is_some());
                     match pd {
-                        PCuDecision::Inter(d) => write_cu_inter(&mut e, &mut cx, d, left, above, cat, bypass, delta),
+                        PCuDecision::Inter(d) => write_cu_inter(&mut e, &mut cx, d, left, above, cat, bypass, delta, l0.len() as u32),
                         PCuDecision::Intra(d) => write_cu_intra_in_p(&mut e, &mut cx, d, left, above, cat, bypass, delta),
                     }
                     e.encode_terminate(u32::from(cy == hc - 1 && cxu == wc - 1));
@@ -1421,6 +1443,10 @@ pub struct KindCensus {
     /// The same, higher weighted than plain — the fit's prediction
     /// failing.
     pub wp_lost: u64,
+    /// Inter CUs predicted from a list-0 reference other than the
+    /// nearest (`ref_idx` 1 or more) — the choice multi-reference
+    /// prediction exists for, taken.
+    pub ref_older: u64,
 }
 
 impl KindCensus {
@@ -1453,6 +1479,7 @@ impl KindCensus {
                         InterCuKind::UseIntra => unreachable!("replaced by the intra decision"),
                     }
                     c.bi += u64::from(d.ref_idx >= 0 && d.ref_idx_l1 >= 0);
+                    c.ref_older += u64::from(d.ref_idx >= 1);
                 }
             }
         }
@@ -1473,6 +1500,7 @@ impl KindCensus {
         self.wp_on += other.wp_on;
         self.wp_won += other.wp_won;
         self.wp_lost += other.wp_lost;
+        self.ref_older += other.ref_older;
     }
 
     /// The nonzero counters, named, for a census line.
@@ -1490,6 +1518,7 @@ impl KindCensus {
             ("wp_on", self.wp_on),
             ("wp_won", self.wp_won),
             ("wp_lost", self.wp_lost),
+            ("ref_older", self.ref_older),
         ]
         .into_iter()
         .filter(|&(_, n)| n != 0)
@@ -1589,9 +1618,11 @@ fn write_cu_inter(
     cat: u32,
     pps_bypass: bool,
     qp_delta: Option<i32>,
+    nref: u32,
 ) {
     let log2 = d.log2_cu;
     debug_assert!(pps_bypass || !d.bypass, "a bypass CU is unspellable unless the PPS enables the flag");
+    debug_assert!(u32::from(d.ref_idx.max(0) as u8) < nref.max(1), "a CU naming a reference beyond the active list");
     // One CU per CTU, so the coding quadtree never splits and the flag is
     // coded exactly once, false - the same shape the intra writer spells.
     let nb = SplitCuNb {
@@ -1631,6 +1662,14 @@ fn write_cu_inter(
         }
         InterCuKind::Amvp { mvp_flag, mvd } => {
             write_merge_flag(e, cx, false);
+            // `ref_idx_l0` exists only when the slice declares more than
+            // one active reference — the reader's `if nref > 1` — so a
+            // single-reference stream writes nothing here and is
+            // unchanged. `nref` is the count the slice header derived
+            // from its own reference picture set.
+            if nref > 1 {
+                write_ref_idx(e, cx, nref, u32::from(d.ref_idx.max(0) as u8));
+            }
             write_mvd(e, cx, mvd);
             write_mvp_flag(e, cx, mvp_flag != 0);
             write_rqt_root_cbf(e, cx, d.rqt_root_cbf);
@@ -2319,6 +2358,65 @@ mod tests {
         assert!(with >= without && with <= without + 2 * held.len(), "the table of defaults should cost bits, not bytes: {with} against {without}");
     }
 
+    /// Two references: every P slice declares two active references in
+    /// list 0, `ref_idx` is coded on every AMVP unit, and the stream
+    /// round-trips through the decoder — with B pictures (whose lists
+    /// stay one each), under weighted prediction (an entry per
+    /// reference), and at 10 bits. The census says how often the older
+    /// reference was chosen, which is reported rather than asserted:
+    /// at this encoder's block size the honest answer is usually zero.
+    /// At the default of one reference the stream is what it always was.
+    #[test]
+    fn two_references_round_trip_and_the_default_is_unchanged() {
+        for (chroma, bit_depth, bframes, weighted_pred) in [
+            (ChromaFormat::Yuv420, 8u32, 0u32, false),
+            (ChromaFormat::Yuv420, 8, 2, false),
+            (ChromaFormat::Yuv444, 8, 0, true),
+            (ChromaFormat::Yuv420, 10, 0, false),
+        ] {
+            let tag = format!("{chroma:?} {bit_depth}-bit bframes={bframes} wp={weighted_pred}");
+            // Drifting content, so the older reference is a genuinely
+            // different picture; a fade under weighting, so each
+            // reference wants its own gain.
+            let frames = if weighted_pred { fade_frames(chroma, bit_depth, 8) } else { aq_frames(chroma, bit_depth, 8) };
+            let encode = |max_refs: u32| -> (Vec<Access>, Vec<Vec<u8>>, Census) {
+                let mut e = H265Encoder::new(Config { gop: 8, bframes, bit_depth, max_refs, weighted_pred, ..cfg(64, 64, chroma) })
+                    .unwrap_or_else(|err| panic!("{tag}: {err}"));
+                let mut units = Vec::new();
+                for f in &frames {
+                    units.extend(e.push(f).unwrap_or_else(|err| panic!("{tag}: {err}")));
+                }
+                units.extend(e.flush().unwrap());
+                (units, e.reconstructions().to_vec(), *e.census())
+            };
+            let (two, recon, census) = encode(2);
+            let (one, _, _) = encode(1);
+            assert_eq!(two.len(), frames.len(), "{tag}");
+            let bytes = |u: &[Access]| u.iter().flat_map(|a| a.data.iter().copied()).collect::<Vec<u8>>();
+            assert_ne!(bytes(&two), bytes(&one), "{tag}: a second reference changed nothing — the header must at least declare it");
+            let p = &census.by_kind[1];
+            assert!(p.cus > 0, "{tag}: no P picture");
+            // Reported, not required: `ref_older` is how many CUs took
+            // the older picture.
+            eprintln!("{tag}: {} of {} P CUs chose the older reference", p.ref_older, p.cus);
+
+            let mut dec = crate::hevc::HevcDecoder::new();
+            for u in &two {
+                dec.push_annexb(&u.data).unwrap_or_else(|err| panic!("{tag}: {err}"));
+            }
+            dec.flush().unwrap();
+            let mut by_display = vec![None; two.len()];
+            for u in &two {
+                by_display[(u.poc / 2) as usize] = Some(u.encode_index as usize);
+            }
+            for (i, coded) in by_display.iter().enumerate() {
+                let want = &recon[coded.unwrap_or_else(|| panic!("{tag}: display index {i} never coded"))];
+                let got = dec.next_picture().unwrap_or_else(|| panic!("{tag}: picture {i} missing"));
+                assert!(got.into_packed() == *want, "{tag}: picture {i} differs from the reconstruction");
+            }
+        }
+    }
+
     /// A lookahead holds pictures back and hands the controller their
     /// costs: the first `lookahead` pushes return nothing, every picture
     /// is still coded exactly once with the typing and order it would
@@ -2574,7 +2672,7 @@ mod tests {
         let emitted = |d: &InterCuDecision, qp: i32| -> f32 {
             let mut cx = Contexts::new(1, qp);
             let mut e = CabacEncoder::counting();
-            write_cu_inter(&mut e, &mut cx, d, None, None, 1, false, None);
+            write_cu_inter(&mut e, &mut cx, d, None, None, 1, false, None, 1);
             e.fractional_bits() as f32
         };
 
@@ -2753,7 +2851,7 @@ mod tests {
         let mut any_skip = false;
         for cy in 0..hc {
             for cx in 0..wc {
-                let d = pic.code_ctu(&ctx, &refp, cx, cy, &py, w, &pcb, &pcr, cw);
+                let d = pic.code_ctu(&ctx, &[&refp], cx, cy, &py, w, &pcb, &pcr, cw);
                 any_skip |= matches!(d.kind, InterCuKind::Skip { .. });
             }
         }
@@ -2953,7 +3051,7 @@ mod tests {
         let (mut luma, mut chr) = (false, false);
         for cy in 0..hc {
             for cx in 0..wc {
-                let d = pic.code_ctu(&ctx, &refp, cx, cy, &py, w, &pcb, &pcr, cw);
+                let d = pic.code_ctu(&ctx, &[&refp], cx, cy, &py, w, &pcb, &pcr, cw);
                 luma |= d.cbf_luma && d.rqt_root_cbf;
                 chr |= d.cbf_chroma[0] || d.cbf_chroma[1] || d.cbf_chroma_bot[0] || d.cbf_chroma_bot[1];
             }
@@ -3128,7 +3226,7 @@ mod tests {
         let mut intra_cus = 0usize;
         for cy in 0..2 {
             for cx in 0..2 {
-                let d = pic.code_ctu(&ctx, &refp, cx, cy, py, w, pcb, pcr, w / 2);
+                let d = pic.code_ctu(&ctx, &[&refp], cx, cy, py, w, pcb, pcr, w / 2);
                 if matches!(d.kind, InterCuKind::UseIntra) {
                     intra_cus += 1;
                     // The marks `coding_unit` records before it parses any
@@ -3247,7 +3345,7 @@ mod tests {
         let (mut intra_cus, mut split_cus) = (0usize, 0usize);
         for cy in 0..2 {
             for cx in 0..2 {
-                let d = pic.code_ctu(&ctx, &refp, cx, cy, py, w, pcb, pcr, w / 2);
+                let d = pic.code_ctu(&ctx, &[&refp], cx, cy, py, w, pcb, pcr, w / 2);
                 if matches!(d.kind, InterCuKind::UseIntra) {
                     intra_cus += 1;
                     let id = pic.code_ctu_intra(&ctx, cx, cy, py, w, pcb, pcr, w / 2);

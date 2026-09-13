@@ -141,9 +141,10 @@ pub(crate) fn entry_for(fits: [PlaneFit; 3], bit_depth_luma: u32, bit_depth_chro
     WeightEntry { luma: comp(&fits[0], bit_depth_luma), chroma: [comp(&fits[1], bit_depth_chroma), comp(&fits[2], bit_depth_chroma)] }
 }
 
-/// A one-reference P slice's table from its entry.
-pub(crate) fn table_for(entry: WeightEntry) -> PredWeightTable {
-    PredWeightTable { luma_log2_denom: LOG2_DENOM, chroma_log2_denom: LOG2_DENOM, lists: [vec![entry], Vec::new()] }
+/// A P slice's table from its list-0 entries, one per reference in
+/// `RefPicList0` order.
+pub(crate) fn table_for(entries: Vec<WeightEntry>) -> PredWeightTable {
+    PredWeightTable { luma_log2_denom: LOG2_DENOM, chroma_log2_denom: LOG2_DENOM, lists: [entries, Vec::new()] }
 }
 
 #[cfg(test)]

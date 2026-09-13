@@ -771,18 +771,35 @@ pub fn write_slice_header(h: &SliceHeader, pps_qp: i32, nal_type: u8, deblock: b
         }
     }
     if matches!(h.kind, Kind::P | Kind::B) {
-        // num_ref_idx_active_override_flag: 0, taking the PPS defaults.
-        // Both num_ref_idx_lX_default_active_minus1 are 0 there, so the
-        // reader resolves [1, 0] for P and [1, 1] for B — exactly the one
-        // reference per list the decision modules search. Verified against
+        // How many references each list actually has, read off the very
+        // set this header just wrote: negatives become RefPicList0 and
+        // positives RefPicList1, so counting them is counting the lists.
+        // Deriving it here rather than taking it as a parameter is what
+        // keeps the two from disagreeing — a header that declares more
+        // entries than its own reference picture set carries is a stream
+        // no decoder can build the lists for.
+        let n0 = h.ref_deltas.iter().filter(|d| **d < 0).count().max(1);
+        let n1 = if h.kind == Kind::B { h.ref_deltas.iter().filter(|d| **d > 0).count().max(1) } else { 1 };
+        // num_ref_idx_active_override_flag. The PPS defaults are one per
+        // list, so the flag is needed exactly when some list has more —
+        // and when it is clear the reader resolves [1, 0] for P and
+        // [1, 1] for B, which is what every stream this encoder wrote
+        // before multiple references existed relied on. Verified against
         // the header parser, not inferred: it copies the PPS defaults and
         // overwrites them only when this flag is set.
         //
-        // The coupling this buys is worth naming: change those PPS
-        // defaults and every slice header written this way silently means
-        // something else. Both are written from one contract in this file,
-        // which is why the shorter form wins.
-        w.flag(false);
+        // The coupling is worth naming: change those PPS defaults and
+        // every header written this way silently means something else.
+        // Both are written from one contract in this file, which is why
+        // the derivation lives here.
+        let override_counts = n0 > 1 || (h.kind == Kind::B && n1 > 1);
+        w.flag(override_counts);
+        if override_counts {
+            w.ue(n0 as u32 - 1); // num_ref_idx_l0_active_minus1
+            if h.kind == Kind::B {
+                w.ue(n1 as u32 - 1); // num_ref_idx_l1_active_minus1
+            }
+        }
         // lists_modification_present_flag is 0 in the PPS, so no list
         // modification syntax follows; mvd_l1_zero_flag is read for B.
         if h.kind == Kind::B {
@@ -1152,6 +1169,10 @@ mod tests {
             // Denominator 0 (weights in whole units), 4:4:4, the luma
             // offset at the floor.
             (ChromaFormat::Yuv444, 8, Kind::P, 0, 0, vec![entry(3, -128, [2, 0], [5, -6])], vec![]),
+            // Two entries in list 0 — a two-reference P, whose header
+            // must declare the count for the reader to read both — with
+            // mixed flags.
+            (ChromaFormat::Yuv420, 8, Kind::P, 6, 6, vec![entry(64, 0, [64, 64], [0, 0]), entry(52, -4, [60, 64], [2, 0])], vec![]),
             // A B slice with both lists.
             (ChromaFormat::Yuv422, 8, Kind::B, 6, 6, vec![entry(70, 2, [64, 64], [0, 0])], vec![entry(58, -2, [60, 68], [3, -3])]),
             // Monochrome: no chroma syntax at all.
@@ -1188,6 +1209,7 @@ mod tests {
             let nal = HevcNalHeader::parse(&rbsp).expect("NAL header");
             let (parsed, _, _) = ParsedHeader::parse(&rbsp, nal, &|_| Some(pps.clone()), &|_| Some(sps.clone()), None)
                 .unwrap_or_else(|e| panic!("{tag}: the header must parse: {e}"));
+            assert_eq!(parsed.num_ref_idx, [l0.len() as u32, if kind == Kind::B { 1 } else { 0 }], "{tag}: the active counts the header declares");
             assert_eq!(parsed.pred_weights.as_ref(), Some(&table), "{tag}: the parsed table differs from the written one");
             assert_eq!(parsed.max_num_merge_cand, 5, "{tag}: what follows the table did not land");
             assert_eq!(parsed.slice_qp, 31, "{tag}: the slice QP after the table");
