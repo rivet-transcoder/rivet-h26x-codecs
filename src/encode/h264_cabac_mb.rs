@@ -51,6 +51,7 @@ use crate::h264::cabac_mb::{
 };
 use crate::h264::cavlc::part_index_of;
 use crate::picture::ChromaFormat;
+use crate::sample::Sample;
 
 /// What one written macroblock leaves for its neighbours' contexts: the
 /// [`WrittenMb`] the primitives read, plus the two facts that live outside
@@ -255,13 +256,13 @@ fn write_b_body(
 /// spells bins and keeps the `WrittenMb` chain. The slice header is
 /// already written; the final terminate closes the RBSP (no
 /// `rbsp_trailing_bits` — see the module docs).
-pub fn write_intra_picture_cabac(
+pub fn write_intra_picture_cabac<S: Sample>(
     w: &mut BitWriter,
     g: &Geometry,
-    tools: &IntraTools,
+    tools: &IntraTools<S>,
     qp: u8,
-    planes: &[Plane<'_>],
-    rec: &mut [Recon],
+    planes: &[Plane<'_, S>],
+    rec: &mut [Recon<S>],
 ) -> PicMotion {
     let mbw = g.mbs_wide as usize;
     let total = mbw * g.mbs_high as usize;
@@ -295,14 +296,14 @@ pub fn write_intra_picture_cabac(
 /// codes `mb_skip_flag` per macroblock, the macroblock layers, and the
 /// `end_of_slice_flag`s. The slice header (with `cabac_init_idc` 0) is
 /// already written; the final terminate closes the RBSP.
-pub fn write_p_picture_cabac(
+pub fn write_p_picture_cabac<S: Sample>(
     w: &mut BitWriter,
     g: &Geometry,
-    tools: &IntraTools,
+    tools: &IntraTools<S>,
     qp: u8,
-    planes: &[Plane<'_>],
-    rec: &mut [Recon],
-    refp: &[Recon],
+    planes: &[Plane<'_, S>],
+    rec: &mut [Recon<S>],
+    refp: &[Recon<S>],
 ) -> PicMotion {
     let mbw = g.mbs_wide as usize;
     let total = mbw * g.mbs_high as usize;
@@ -370,14 +371,14 @@ pub fn write_p_picture_cabac(
 /// Returns the picture's motion record for the caller's reference
 /// bookkeeping.
 #[allow(clippy::too_many_arguments)]
-pub fn write_b_picture_cabac(
+pub fn write_b_picture_cabac<S: Sample>(
     w: &mut BitWriter,
     g: &Geometry,
-    tools: &IntraTools,
+    tools: &IntraTools<S>,
     qp: u8,
-    planes: &[Plane<'_>],
-    rec: &mut [Recon],
-    refs: [&[Recon]; 2],
+    planes: &[Plane<'_, S>],
+    rec: &mut [Recon<S>],
+    refs: [&[Recon<S>]; 2],
     col: &PicMotion,
 ) -> PicMotion {
     let mbw = g.mbs_wide as usize;

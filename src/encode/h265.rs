@@ -240,44 +240,7 @@ impl H265Encoder {
     }
 }
 
-/// Unpack one source picture from the caller's bytes into samples: the
-/// bytes themselves at 8 bits, little-endian pairs deeper — the layout
-/// [`crate::Picture::into_packed`] emits, so the two sides of SELF agree
-/// without a conversion in between.
-///
-/// A sample above the declared depth is refused rather than coded: the
-/// prediction and transform arithmetic assume `0..2^BitDepth`, and a
-/// 10-bit stream carrying a 12-bit value would not fail, it would wrap
-/// somewhere in the reconstruction and desync. At 8 bits every byte is
-/// in range and nothing is checked.
-fn unpack_samples<S: Sample>(bytes: &[u8], bit_depth: u32) -> Result<Vec<S>> {
-    if S::BYTES == 1 {
-        return Ok(bytes.iter().map(|&b| S::from_i32(i32::from(b))).collect());
-    }
-    let max = (1u32 << bit_depth) - 1;
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
-        let v = u16::from_le_bytes([pair[0], pair[1]]);
-        if u32::from(v) > max {
-            return Err(Error::bitstream(format!(
-                "H.265 encode: source sample {v} exceeds the declared {bit_depth}-bit depth"
-            )));
-        }
-        out.push(S::from_i32(i32::from(v)));
-    }
-    Ok(out)
-}
-
-/// The inverse of [`unpack_samples`] for one row of the reconstruction.
-fn pack_row<S: Sample>(row: &[S], out: &mut Vec<u8>) {
-    if S::BYTES == 1 {
-        out.extend(row.iter().map(|s| s.to_i32() as u8));
-    } else {
-        for s in row {
-            out.extend_from_slice(&(s.to_i32() as u16).to_le_bytes());
-        }
-    }
-}
+use super::{pack_row, unpack_samples};
 
 /// Replicate a `sw` by `sh` plane out to `tw` by `th` — sources at coded
 /// size, edge-extended: the coded picture is a whole number of CTUs, the
@@ -386,7 +349,7 @@ impl<S: Sample> Core<S> {
                 self.frame_bytes
             )));
         }
-        let samples = unpack_samples::<S>(picture, self.cfg.bit_depth)?;
+        let samples = unpack_samples::<S>(picture, self.cfg.bit_depth, "H.265")?;
         let display = self.next_display;
         self.next_display += 1;
         self.held.insert(display, samples);
