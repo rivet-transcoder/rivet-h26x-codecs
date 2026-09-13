@@ -334,8 +334,12 @@ be compared with itself, let alone with something else).
 The encoders share the decoders' interpolation, inverse transforms and
 loop filters, and since 2026-08-27 have SIMD tiers of their own for the
 kernels an encode profile actually spends its time in: the distortion
-metrics (SAD, SATD, SSD; SSE2 to AVX2, NEON compile-checked) and the H.265
-forward transforms and quantiser (SSE2 to AVX2). The CABAC encoder's
+metrics (SAD, SATD, SSD) and the H.265 forward transforms and quantiser,
+each on the same three architectures as the decode kernels — SSE2 to
+AVX2, NEON (bit-exact on the CI arm64 runners) and wasm `simd128`
+(bit-exact and round-tripped inside the module by `tools/wasm.sh`) — and
+`tools/verify_enc_ladder.sh` holds every `H26X_MAX_SIMD` rung of an encode
+to the scalar reference's bytes. The CABAC encoder's
 per-bin cost is a table now rather than a `log2` per bin, and RDOQ skips a
 block whose last coefficient is three or more. The record, with the
 profiles that chose these and the controls behind every number, is

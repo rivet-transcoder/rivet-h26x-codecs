@@ -303,8 +303,9 @@ design, not a serialisation fix, and was not attempted.
 - **NEON** kernels are compile-checked against `aarch64-unknown-linux-gnu`
   (`--tests` too) and carry the x86 module's bit-exactness test, which no
   machine here can run. They need the CI runners (a PR against develop);
-  nothing was pushed.
-- **wasm simd128** tier: not written.
+  nothing was pushed. *(Taken up by the portability round below.)*
+- **wasm simd128** tier: not written. *(Written in the portability round
+  below.)*
 - **`DistortionDsp<u16>`**: scalar. The u8 kernels' shapes carry over
   (`psadbw` does not; a u16 SAD is `pabsw` of a difference and `pmaddwd`
   against ones), an afternoon's work once the u16 encoder path has a
@@ -314,3 +315,130 @@ design, not a serialisation fix, and was not attempted.
 - **A README benchmark table per rung** for the encoders was not
   generated; the method (`tools/ab_enc.py`, `H26X_MAX_SIMD`) and this
   note's tables are what exist.
+
+## Portability round: wasm simd128 and NEON for the encode kernels (`agent/wasm-enc`, 2026-08-27)
+
+The decode kernels run on x86 (SSE2 to AVX-512), NEON and wasm `simd128`;
+after `agent/enc-speed` the encode-only kernels ran only on x86, with a
+NEON distortion kernel written blind. This round gives every encode kernel
+that has an x86 tier the other two, and adds the ladder gate the encoders
+were missing.
+
+### Inventory, before and after
+
+A cell says which rung replaces the scalar entry on that tier; `—` means
+the scalar reference runs there. H.264's seven encode kernels have no x86
+tier (the note above says why) and therefore none here either.
+
+Before (develop 64166be):
+
+| table | kernel | x86-128 (SSE2/SSSE3/AVX) | AVX2 | NEON | wasm simd128 |
+|---|---|---|---|---|---|
+| `distortion` | `sad` / `satd` / `ssd` (u8) | yes | widths ≥16 | written, never executed | — |
+| `hevc_enc` | `fdct` 4/8/16/32, `fdst4` | yes | 16 and 32 | — | — |
+| `hevc_enc` | `quant` | yes | yes | — | — |
+| `hevc_enc` | `fskip` | — | — | — | — |
+| `h264_enc` | all seven | — | — | — | — |
+
+After (this branch):
+
+| table | kernel | x86-128 (SSE2/SSSE3/AVX) | AVX2 | NEON | wasm simd128 |
+|---|---|---|---|---|---|
+| `distortion` | `sad` / `satd` / `ssd` (u8) | yes | widths ≥16 | yes (`distortion_neon.rs`, CI-executed) | yes (`distortion_wasm128.rs`) |
+| `hevc_enc` | `fdct` 4/8/16/32, `fdst4` | yes | 16 and 32 | yes (`hevc_enc_neon.rs`, CI-executed) | yes (`hevc_enc_wasm128.rs`) |
+| `hevc_enc` | `quant` | yes | yes | yes | yes |
+| `hevc_enc` | `fskip` | — | — | — | — |
+| `h264_enc` | all seven | — | — | — | — |
+
+The H.265 matrix now lives in three compile-time layouts in
+`hevc_enc::layouts` — the `pmaddwd` pair table (x86 and wasm), the
+transposed matrix and the matrix itself (NEON's `smlal`-by-lane wants the
+weights of eight consecutive outputs contiguous in stage one and the
+weights of one output row contiguous in stage two) — every one built from
+the decoder's `TRANSFORM32` and read back against it by a test, so the
+three tiers cannot disagree with the reference about a coefficient.
+
+### wasm, verified inside the module (`tools/wasm.sh`, node 22)
+
+`cargo test` does not run on wasm32, so the x86 modules' randomised sweeps
+were exported from `examples/wasm_probe` (`h26x_enc_dsp_check`) and run
+inside both builds, and an encode → decode round trip (`h26x_encode`)
+hashes bitstream, decoded pictures and the encoder's reconstruction
+inside the module. What a run prints:
+
+- which encode-side entries each build's tables took: scalar mask 0,
+  simd128 mask 63 (all six groups) — the rung name alone cannot say this;
+- the sweep: `scalar OK`, `simd128 OK` (24 rounds over sixteen distortion
+  shapes with random strides and offsets and pinned extreme rows; 40
+  rounds per transform size at bit depths 8/10/12; the quantiser at every
+  third QP, intra and inter, with i16-extreme rows);
+- the round trip, h264 and h265 × intra / IP / IPB at QP 26 and IP at QP
+  40, on synthesised frames and the seven 8-bit gate clips (`ENC_CLIPS`):
+  **56 cells identical across the builds and self-consistent** (decoded ==
+  reconstruction, the SELF property, on both builds);
+- kernel timings from outside the module, ns per call group, best of three:
+
+| group | scalar | simd128 | ratio |
+|---|---:|---:|---:|
+| sad+satd+ssd 4x4 | 40.8 | 17.3 | 2.36x |
+| sad+satd+ssd 8x8 | 127.8 | 24.3 | 5.26x |
+| sad+satd+ssd 16x16 | 478.5 | 68.9 | 6.94x |
+| sad+satd+ssd 32x32 | 1812.8 | 219.7 | 8.25x |
+| sad+satd+ssd 64x64 | 7103.6 | 805.5 | 8.82x |
+| fdct+quant 4x4 | 51.2 | 16.5 | 3.10x |
+| fdct+quant 8x8 | 235.7 | 42.7 | 5.52x |
+| fdct+quant 16x16 | 2150.1 | 204.2 | 10.53x |
+| fdct+quant 32x32 | 15809.1 | 1490.6 | 10.61x |
+
+Whole encodes inside wasm, scalar build → simd128 build, best of three
+(these include the decode-shared kernels' tier, which wasm cannot switch
+off separately — there is no environment there): `src_cut` 96 frames
+64x64, H.264 IP 64.6 → 23.9 ms, IPB 82.5 → 28.7 ms, H.265 IP 108.6 → 39.3
+ms, IPB 141.5 → 42.3 ms; H.264 intra 62.5 → 50.2 ms and H.265 intra 402.7
+→ 262.9 ms, the intra paths being the ones that spend least in these
+kernels.
+
+Two things learned porting: wasm has no `psadbw` and no `pmulhuw`. SAD is
+`u8x16_sub_sat` both ways or'd together and `u16x8_extadd_pairwise_u8x16`
+(NEON's shape, not x86's); the quantiser's exact 32-bit product is a
+widening and an `i32x4_mul`, whose low half is the whole product because
+it is under 2^31. Everything else is the x86 128-bit kernel instruction
+for instruction.
+
+### NEON, verified on the CI runners
+
+No ARM here; the only execution route is a PR against develop, whose
+`ubuntu-24.04-arm` and `macos-latest` jobs run `cargo test --release`
+with `H26X_REQUIRE_DOTPROD=1`. **PR #5** (`agent/wasm-enc`, do not
+merge), run 33116493939 at d0dde0a: `tests (linux arm64 (NEON))` pass
+in 57 s, `tests (macos arm64 (NEON))` pass in 1 m 16 s, and both job logs
+carry the lines that matter —
+`dsp::distortion_neon::tests::{neon_matches_scalar,
+full_deflection_is_exact}` and
+`dsp::hevc_enc_neon::tests::{forward_transforms_match_scalar,
+quantiser_matches_scalar, new_installs_neon}` all `ok`, 239 passed on
+Linux, alongside the `hevc_neon_u8` dot-product tests that
+`H26X_REQUIRE_DOTPROD=1` forbids from skipping. The x86 and MSRV jobs
+pass too. This is the first execution of `distortion_neon.rs`, which had
+been on develop installed-but-unexecuted since `agent/enc-speed`.
+
+The NEON transform is not the pair-table shape: NEON has no `pmaddwd`,
+and its natural idiom is `smlal`/`smlal2` by lane, so stage one takes
+each input sample as a lane against eight consecutive outputs' weights
+(the transposed matrix) and stage two takes one output row's weights as
+the lanes against the intermediate's rows (the matrix itself) — no
+transpose in either stage. The rounding term is the accumulator's initial
+value, the shift is `sshl` by a negative count, `sqxtn` is the clamp. The
+quantiser is `umull` of the u16 magnitude by the scale, `ushl` by
+`-qbits`, and the zero count comes from subtracting `cmeq`-with-zero
+masks into a lane counter. No timing: nothing here runs it.
+
+### The encoder ladder
+
+`tools/verify_enc_ladder.sh`: every `H26X_MAX_SIMD` rung the host can
+take, against the scalar reference (`H26X_NO_SIMD=1`), over every 8-bit
+cell of `verify_encode.sh`'s list, bitstream and reconstruction compared
+byte for byte through `identity_encode.sh`. The cap applies to every
+table the encoder builds, the shared decoder kernels included, so it is
+the whole encoder's rung-independence that is asserted.
+LADDER_RESULT_PLACEHOLDER
