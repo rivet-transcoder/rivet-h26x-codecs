@@ -22,7 +22,7 @@ fn die(msg: &str) -> ! {
          \x20      [--recon F] [--codec h264|h265] [--qp N | --lossless | --bitrate BPS]\n\
          \x20      [--fps N] [--cpb-ms N]\n\
          \x20      [--gop N] [--bframes N] [--cavlc] [--t8x8] [--subparts] [--sao]\n\
-         \x20      [--aq STRENGTH] [--depth N] [--threads N]"
+         \x20      [--aq STRENGTH] [--lookahead N] [--depth N] [--threads N]"
     );
     std::process::exit(2);
 }
@@ -86,6 +86,9 @@ fn main() {
             "--subparts" => cfg.subparts = true,
             // H.265 only: adaptive quantisation at this strength (0 off).
             "--aq" => cfg.aq_strength = val(&mut i, &args, "--aq").parse().unwrap_or_else(|_| die("--aq")),
+            // H.265 only, with --bitrate: hold this many pictures back and
+            // let the rate controller see them.
+            "--lookahead" => cfg.lookahead = val(&mut i, &args, "--lookahead").parse().unwrap_or_else(|_| die("--lookahead")),
             other => die(&format!("unknown argument {other}")),
         }
         i += 1;

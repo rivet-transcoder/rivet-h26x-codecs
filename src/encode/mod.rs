@@ -199,6 +199,22 @@ pub struct Config {
     /// `mb_qp_delta` is a different mechanism this encoder does not
     /// drive yet.
     pub aq_strength: f32,
+    /// Rate-control lookahead (H.265 only): how many pictures the encoder
+    /// holds back before coding one, so the controller can place bits by
+    /// what is coming. 0 is off, which is the default; every picture is
+    /// then coded as soon as the picture typing allows, and the stream is
+    /// byte-identical to one from an encoder that never had it.
+    ///
+    /// Only meaningful with [`RateControl::Bitrate`]: a lookahead informs
+    /// a rate controller, and a fixed quantiser has none to inform, so
+    /// asking for one anyway refuses by name — as a coded picture buffer
+    /// does. Each held picture is measured once (an 8x8 SATD sum, intra
+    /// and against the previous picture) and the controller allocates the
+    /// window's budget by those measurements; see `encode::rc`'s lookahead
+    /// section for exactly what changes. Costs `lookahead` pictures of
+    /// output delay and their source samples in memory. Ignored by H.264,
+    /// whose rate control does not drive the lookahead path yet.
+    pub lookahead: u32,
 }
 
 impl Default for Config {
@@ -220,6 +236,7 @@ impl Default for Config {
             fps: 30,
             cpb_ms: 0,
             aq_strength: 0.0,
+            lookahead: 0,
         }
     }
 }
@@ -240,6 +257,14 @@ impl Config {
         }
         if !(self.aq_strength >= 0.0) || self.aq_strength > 4.0 {
             return Err(crate::Error::unsupported("encode: aq_strength outside 0.0..=4.0"));
+        }
+        if self.lookahead > 0 && !matches!(self.rate, RateControl::Bitrate { .. }) {
+            return Err(crate::Error::unsupported(
+                "encode: a lookahead without a bitrate target (a lookahead informs a rate controller; a fixed quantiser has none)",
+            ));
+        }
+        if self.lookahead > 250 {
+            return Err(crate::Error::unsupported("encode: lookahead above 250 pictures"));
         }
         Ok(())
     }

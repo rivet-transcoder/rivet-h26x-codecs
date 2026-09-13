@@ -101,6 +101,18 @@ struct Core<S: Sample> {
     /// code, so inferring the index from it fails the moment the scheduler
     /// releases pictures as fast as they arrive.
     next_display: u64,
+    /// Display index of the next picture to offer the *scheduler*. Equal
+    /// to `next_display` without a lookahead — every picture is offered
+    /// as it arrives — and behind it by up to `cfg.lookahead` with one,
+    /// which is what holds pictures back for the rate controller to see.
+    offered: u64,
+    /// Each held picture's lookahead cost by display index, measured once
+    /// when it was pushed and dropped when it is coded. Empty without a
+    /// lookahead.
+    costs: std::collections::BTreeMap<u64, PicCost>,
+    /// The display-size luma of the last picture pushed, which the next
+    /// one's inter cost is measured against. `None` without a lookahead.
+    last_luma: Option<Vec<S>>,
     geom: syn::Geometry,
     /// Reference pictures as the decoder holds them — full `Frame`s with
     /// their motion grids and extended borders, not cropped bytes: the
@@ -359,6 +371,9 @@ impl<S: Sample> Core<S> {
             recon: Vec::new(),
             frame_bytes: (luma + chroma) * S::BYTES,
             next_display: 0,
+            offered: 0,
+            costs: std::collections::BTreeMap::new(),
+            last_luma: None,
             refs: Vec::new(),
         })
     }
@@ -385,24 +400,53 @@ impl<S: Sample> Core<S> {
         let samples = unpack_samples::<S>(picture, self.cfg.bit_depth, "H.265")?;
         let display = self.next_display;
         self.next_display += 1;
+        if self.cfg.lookahead > 0 {
+            // Measured once, here, against the picture pushed before it —
+            // which may already have been coded and left `held`, so its
+            // luma is kept aside for exactly this.
+            let (dw, dh) = (self.cfg.width as usize, self.cfg.height as usize);
+            let cost = PicCost::measure(&samples[..dw * dh], dw, dh, self.last_luma.as_deref());
+            self.costs.insert(display, cost);
+            self.last_luma = Some(samples[..dw * dh].to_vec());
+        }
         self.held.insert(display, samples);
-        let ready = self.sched.push();
-        self.code(ready)
+        // Offer the scheduler everything but the last `lookahead` pictures.
+        // Without a lookahead that is the picture just pushed, once, which
+        // is the path every stream took before one existed.
+        let mut out = Vec::new();
+        while self.next_display - self.offered > u64::from(self.cfg.lookahead) {
+            self.offered += 1;
+            let ready = self.sched.push();
+            out.extend(self.code(ready)?);
+        }
+        Ok(out)
     }
 
     /// See [`H265Encoder::flush`].
     fn flush(&mut self) -> Result<Vec<Access>> {
+        let mut out = Vec::new();
+        // Whatever the lookahead was still holding back goes to the
+        // scheduler first, in order, so it types them as it would have.
+        while self.offered < self.next_display {
+            self.offered += 1;
+            let ready = self.sched.push();
+            out.extend(self.code(ready)?);
+        }
         let ready = self.sched.flush();
-        self.code(ready)
+        out.extend(self.code(ready)?);
+        Ok(out)
     }
 
     fn code(&mut self, ready: Vec<Coded>) -> Result<Vec<Access>> {
         let mut out = Vec::with_capacity(ready.len());
-        for c in ready {
+        for (i, &c) in ready.iter().enumerate() {
             let src = self.held.remove(&c.display).ok_or_else(|| {
                 Error::bitstream("H.265 encode: scheduler released an absent picture")
             })?;
-            let access = self.code_picture(c, &src)?;
+            // The pictures released alongside this one and not yet coded
+            // are part of what a lookahead can see.
+            let access = self.code_picture(c, &src, &ready[i + 1..])?;
+            self.costs.remove(&c.display);
             // The ledger closes here, at the one place every picture of
             // every kind passes through — an accounting call inside each
             // coding path could be forgotten in one of them, and the
@@ -448,8 +492,8 @@ impl<S: Sample> Core<S> {
     /// Without a declared buffer there is nothing to fit and the loop runs
     /// exactly once, which is why every stream that does not ask for a
     /// buffer is byte-identical to what it was before this existed.
-    fn code_picture(&mut self, c: Coded, src: &[S]) -> Result<Access> {
-        let mut qp = self.pick_picture_qp(&c)?;
+    fn code_picture(&mut self, c: Coded, src: &[S], upcoming: &[Coded]) -> Result<Access> {
+        let mut qp = self.pick_picture_qp(&c, upcoming)?;
         let bypass = matches!(self.cfg.rate, RateControl::Lossless);
         for attempt in 0..super::rc::MAX_ATTEMPTS {
             let a = self.code_attempt(c, src, qp, bypass)?;
@@ -496,19 +540,42 @@ impl<S: Sample> Core<S> {
     }
 
     /// The quantiser this picture starts at, before any buffer escalation.
-    fn pick_picture_qp(&mut self, c: &Coded) -> Result<u8> {
+    /// `upcoming` is what was released with it and is still to code.
+    fn pick_picture_qp(&mut self, c: &Coded, upcoming: &[Coded]) -> Result<u8> {
         Ok(match self.cfg.rate {
             RateControl::Lossless => 26,
             RateControl::ConstantQp(q) => q.min(51),
             RateControl::Bitrate { .. } => {
-                let kind = match c.kind {
-                    Kind::Idr | Kind::I => PicKind::Intra,
-                    Kind::P => PicKind::Inter,
-                    Kind::B => PicKind::B,
-                };
-                self.rc.as_mut().expect("a bitrate configuration builds a controller").pick_qp(kind)
+                let kind = pic_kind(c.kind);
+                if self.cfg.lookahead == 0 {
+                    self.rc.as_mut().expect("a bitrate configuration builds a controller").pick_qp(kind)
+                } else {
+                    let (cost, window) = self.lookahead_window(c, upcoming);
+                    self.rc.as_mut().expect("a bitrate configuration builds a controller").pick_qp_ahead(kind, cost, &window)
+                }
             }
         })
+    }
+
+    /// What the rate controller may plan this picture against: its own
+    /// cost and the window — this picture, the ones released with it and
+    /// still to code, and everything the scheduler has not released yet,
+    /// each with the kind it will be coded as ([`Scheduler::preview`])
+    /// and the cost that kind pays: an intra picture its intra cost, an
+    /// inter picture the cheaper of the two, since a block the previous
+    /// picture predicts badly is still coded intra.
+    fn lookahead_window(&self, c: &Coded, upcoming: &[Coded]) -> (f64, Vec<(PicKind, f64)>) {
+        let cost_of = |kind: Kind, display: u64| -> f64 {
+            let pc = self.costs.get(&display).copied().unwrap_or_default();
+            let cost = if kind.is_intra() { pc.intra } else { pc.intra.min(pc.inter) };
+            (cost as f64).max(1.0)
+        };
+        let mine = cost_of(c.kind, c.display);
+        let mut window = vec![(pic_kind(c.kind), mine)];
+        window.extend(upcoming.iter().map(|u| (pic_kind(u.kind), cost_of(u.kind, u.display))));
+        let ahead = self.next_display - self.offered;
+        window.extend(self.sched.preview(ahead).iter().map(|p| (pic_kind(p.kind), cost_of(p.kind, p.display))));
+        (mine, window)
     }
 
     /// Code one picture at a given quantiser, keeping nothing.
@@ -1021,6 +1088,69 @@ impl<S: Sample> Core<S> {
     /// only: an attempt stays free of writes to `self`.
     fn aq_offsets(&self, py: &[S], cw: usize, ch: usize) -> Option<Vec<i32>> {
         (self.cfg.aq_strength > 0.0).then(|| aq::ctb_offsets(py, cw, cw, ch, self.geom.log2_ctb, self.cfg.bit_depth, self.cfg.aq_strength))
+    }
+}
+
+/// The rate controller's kind for a scheduled picture.
+fn pic_kind(kind: Kind) -> PicKind {
+    match kind {
+        Kind::Idr | Kind::I => PicKind::Intra,
+        Kind::P => PicKind::Inter,
+        Kind::B => PicKind::B,
+    }
+}
+
+/// One source picture's lookahead cost: what the rate controller plans
+/// its bits by before it is coded. See `encode::rc`'s lookahead section
+/// for what the controller does with it.
+///
+/// Both are sums of 8x8 luma SATDs over the display-size picture (whole
+/// blocks only; a partial edge block is not counted, which biases every
+/// picture of a stream identically). `intra` is each block against its
+/// own mean — the residual the DC predictor would leave, a bound on
+/// what any intra mode leaves. `inter` is each block against the same
+/// block of the previous source picture at zero motion — the residual
+/// a skip would leave, a bound on what a motion search leaves. Bounds
+/// rather than the encoder's real costs, deliberately: a lookahead that
+/// ran the decision machinery would cost as much as coding, and what
+/// the controller needs is a number that moves *with* the content,
+/// which is calibrated once ([`SEED_BITS_PER_COST`](super::rc)) and
+/// then pinned by every observation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PicCost {
+    /// Sum of 8x8 SATDs against each block's mean.
+    pub intra: u64,
+    /// Sum of 8x8 SATDs against the previous source picture; equal to
+    /// `intra` for the first picture, which has none.
+    pub inter: u64,
+}
+
+impl PicCost {
+    /// Measure a `w` by `h` luma plane (stride `w`), and `prev` — the
+    /// picture pushed before it at the same size — when there is one.
+    fn measure<S: Sample>(luma: &[S], w: usize, h: usize, prev: Option<&[S]>) -> Self {
+        let dist = DistortionDsp::<S>::new(Cpu::detect_honouring_env());
+        let (bw, bh) = (w / 8, h / 8);
+        let mut flat = [S::default(); 64];
+        let (mut intra, mut inter) = (0u64, 0u64);
+        for by in 0..bh {
+            for bx in 0..bw {
+                let at = by * 8 * w + bx * 8;
+                let block = &luma[at..];
+                let mut sum = 0i32;
+                for y in 0..8 {
+                    for x in 0..8 {
+                        sum += block[y * w + x].to_i32();
+                    }
+                }
+                flat.fill(S::from_i32((sum + 32) >> 6));
+                intra += u64::from((dist.satd)(block, w, &flat, 8, 8, 8));
+                if let Some(p) = prev {
+                    inter += u64::from((dist.satd)(block, w, &p[at..], w, 8, 8));
+                }
+            }
+        }
+        PicCost { intra, inter: if prev.is_some() { inter } else { intra } }
     }
 }
 
@@ -1922,6 +2052,72 @@ mod tests {
         .err()
         .expect("adaptive quantisation on a lossless stream must refuse");
         assert!(format!("{err}").contains("adaptive quantisation"), "{err}");
+    }
+
+    /// A lookahead holds pictures back and hands the controller their
+    /// costs: the first `lookahead` pushes return nothing, every picture
+    /// is still coded exactly once with the typing and order it would
+    /// have had without one, the stream round-trips through the decoder,
+    /// the ledger holds — and the stream *differs* from the one coded
+    /// without a lookahead, or the feature was inert. A lookahead without
+    /// a bitrate target refuses by name.
+    #[test]
+    fn a_lookahead_delays_output_and_codes_every_picture_once() {
+        // One GOP exactly, so that `poc / 2` is the display index — a
+        // second IDR would restart POC and alias display 0.
+        let frames = aq_frames(ChromaFormat::Yuv420, 8, 8);
+        for (bframes, lookahead) in [(0u32, 3u32), (2, 2), (2, 8), (0, 12)] {
+            let tag = format!("bframes={bframes} lookahead={lookahead}");
+            let run = |lookahead: u32| -> (Vec<Access>, Vec<Vec<u8>>) {
+                let mut e = H265Encoder::new(Config {
+                    gop: 8,
+                    bframes,
+                    lookahead,
+                    fps: 25,
+                    rate: super::super::RateControl::Bitrate { bps: 400_000 },
+                    ..cfg(64, 64, ChromaFormat::Yuv420)
+                })
+                .unwrap_or_else(|err| panic!("{tag}: {err}"));
+                let mut units = Vec::new();
+                for (i, f) in frames.iter().enumerate() {
+                    let out = e.push(f).unwrap_or_else(|err| panic!("{tag}: {err}"));
+                    if (i as u32) < lookahead {
+                        assert!(out.is_empty(), "{tag}: picture {i} was released before the lookahead filled");
+                    }
+                    units.extend(out);
+                }
+                units.extend(e.flush().unwrap());
+                assert!(e.rate_report().is_some(), "{tag}: no rate report");
+                (units, e.reconstructions().to_vec())
+            };
+            let (with, recon) = run(lookahead);
+            let (without, _) = run(0);
+            assert_eq!(with.len(), frames.len(), "{tag}: one access unit per picture");
+            let typing = |u: &[Access]| u.iter().map(|a| (a.poc, a.keyframe, a.encode_index)).collect::<Vec<_>>();
+            assert_eq!(typing(&with), typing(&without), "{tag}: the lookahead changed the picture typing or order");
+            let bytes = |u: &[Access]| u.iter().flat_map(|a| a.data.iter().copied()).collect::<Vec<u8>>();
+            assert_ne!(bytes(&with), bytes(&without), "{tag}: the lookahead changed nothing about the stream");
+
+            let mut dec = crate::hevc::HevcDecoder::new();
+            for u in &with {
+                dec.push_annexb(&u.data).unwrap_or_else(|err| panic!("{tag}: {err}"));
+            }
+            dec.flush().unwrap();
+            let mut by_display = vec![None; with.len()];
+            for u in &with {
+                by_display[(u.poc / 2) as usize] = Some(u.encode_index as usize);
+            }
+            for (i, coded) in by_display.iter().enumerate() {
+                let want = &recon[coded.unwrap_or_else(|| panic!("{tag}: display index {i} never coded"))];
+                let got = dec.next_picture().unwrap_or_else(|| panic!("{tag}: picture {i} missing"));
+                assert!(got.into_packed() == *want, "{tag}: picture {i} differs from the reconstruction");
+            }
+        }
+
+        let err = H265Encoder::new(Config { lookahead: 4, ..cfg(64, 64, ChromaFormat::Yuv420) })
+            .err()
+            .expect("a lookahead at a constant quantiser must refuse");
+        assert!(format!("{err}").contains("lookahead"), "{err}");
     }
 
     /// Intra 4:2:0 codes for real now; everything else still refuses by
