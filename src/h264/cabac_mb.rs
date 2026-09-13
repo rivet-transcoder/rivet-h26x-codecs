@@ -4617,6 +4617,43 @@ mod mb_round_trip {
         }
     }
 
+    /// The unary guard of `decode_qp_delta` is the bit depth's, not 8's
+    /// (7.4.5: the widest legal step is `-(26 + QpBdOffsetY / 2)`, whose
+    /// mapped unary is `52 + QpBdOffsetY` one-bins): -32 at 10 bits is 64
+    /// of them, legal there and a runaway at 8. The bins are written here
+    /// rather than by `write_mb_qp_delta_cabac`, which asserts the 8-bit
+    /// range.
+    #[test]
+    fn qp_delta_unary_guard_follows_bit_depth() {
+        fn bins(v: i32) -> Vec<u8> {
+            let mut w = BitWriter::new();
+            let mut st = CabacState::new(SliceType::I, 0, 26);
+            let mut e = CabacEncoder::new(&mut w);
+            e.encode_decision(&mut st.ctx[CTX_MB_QP_DELTA], 1);
+            let k = if v > 0 { 2 * v - 1 } else { -2 * v } as u32;
+            for i in 1..k {
+                e.encode_decision(&mut st.ctx[CTX_MB_QP_DELTA + if i == 1 { 2 } else { 3 }], 1);
+            }
+            e.encode_decision(&mut st.ctx[CTX_MB_QP_DELTA + if k == 1 { 2 } else { 3 }], 0);
+            e.encode_terminate(1);
+            drop(e);
+            w.align_zero();
+            w.into_rbsp()
+        }
+        let read = |v: i32, depth: u32| {
+            let data = bins(v);
+            let mut st = CabacState::new(SliceType::I, 0, 26);
+            let mut c = Cabac::new(&data);
+            decode_qp_delta(&mut c, &mut st, depth)
+        };
+        for (v, depth) in [(25, 8), (-26, 8), (30, 10), (-32, 10), (-44, 14)] {
+            assert_eq!(read(v, depth).unwrap(), v, "{v} at {depth} bits");
+        }
+        for (v, depth) in [(-27, 8), (30, 8), (-32, 8), (-33, 10), (-45, 14)] {
+            assert!(read(v, depth).is_err(), "{v} at {depth} bits");
+        }
+    }
+
     /// `mb_qp_delta` over a chain of macroblocks: consecutive nonzero
     /// deltas exercise the prev-nonzero context, zeros reset it, and the
     /// values cover both signs and both extremes.

@@ -1432,6 +1432,71 @@ fn write_run_before(w: &mut BitWriter, run: usize, zeros_left: usize) {
 mod cavlc_round_trip {
     use super::*;
 
+    /// One I_16x16 macroblock with nothing coded, written by hand —
+    /// `intra_chroma_pred_mode`, `mb_qp_delta`, then the DC coeff_token for
+    /// no coefficients (nC = 0: a single 1) — read by the production parser
+    /// as macroblock 0 of an I slice at `bit_depth` whose QP so far is
+    /// `prev_qp`. `mb_type` is the caller's to read, so it is passed (3:
+    /// I_16x16_2_0_0, DC prediction, no cbp) rather than written. Returns
+    /// the delta read and the QP_Y it produced.
+    fn parse_lone_i16x16(bit_depth: u32, prev_qp: i32, qp_delta: i32) -> Result<(i32, i32)> {
+        let mut w = BitWriter::new();
+        w.ue(0);
+        w.se(qp_delta);
+        w.bit(1);
+        w.rbsp_trailing_bits();
+        let data = w.into_rbsp();
+        let mut r = BitReader::new(&data);
+        let ctx = SliceCtx {
+            slice_type: SliceType::I,
+            slice_num: 0,
+            num_ref_idx: [0, 0],
+            direct_spatial: false,
+            transform_8x8_mode: false,
+            constrained_intra_pred: false,
+            direct_8x8_inference: true,
+            chroma_format_idc: 1,
+            cabac: false,
+            bit_depth,
+            transform_bypass: false,
+            scaling_plane: 0,
+            x264_old_444: false,
+            field_pic: false,
+            mbaff: false,
+            sp: false,
+            sp_switch: false,
+            sp_qs: 0,
+            sp_qsc: [0; 2],
+        };
+        let info = PicInfo::new(1, 1);
+        let mut nb = MbNeighbours::default();
+        nb.derive_into(&info, 0, 0);
+        nb.gather_nz(&info, 1, 2);
+        let mut layer = MbLayer::new(MbKind::I4x4);
+        let dq = crate::h264::transform::Dequant::new(&crate::h264::sps::ScalingLists::flat());
+        let mut qps = crate::h264::recon::QpState { prev_qp, chroma_offset: [0; 2] };
+        parse_mb_cavlc(&mut r, &ctx, &info, &nb, 3, &mut layer, &dq, &mut qps)?;
+        Ok((layer.qp_delta, layer.qp))
+    }
+
+    /// 7.4.5: `mb_qp_delta` runs from `-(26 + QpBdOffsetY / 2)` to
+    /// `25 + QpBdOffsetY / 2`, and QP_Y wraps in `-QpBdOffsetY..=51`. At
+    /// 10 bits a step of 30 is legal and takes a QP of 40 to 6; at 8 bits
+    /// the same step is a broken stream. x264's mb-tree takes such steps
+    /// on the I picture of every 10-bit encode.
+    #[test]
+    fn qp_delta_range_follows_bit_depth() {
+        // ((40 + 30 + 52 + 24) % 64) - 12
+        assert_eq!(parse_lone_i16x16(10, 40, 30).unwrap(), (30, 6));
+        // ((5 - 32 + 52 + 24) % 64) - 12: out through the bottom of the range
+        assert_eq!(parse_lone_i16x16(10, 5, -32).unwrap(), (-32, 37));
+        assert_eq!(parse_lone_i16x16(8, 20, 25).unwrap(), (25, 45));
+        assert_eq!(parse_lone_i16x16(8, 20, -26).unwrap(), (-26, 46));
+        for (depth, delta) in [(8, 26), (8, -27), (10, 32), (10, -33)] {
+            assert!(parse_lone_i16x16(depth, 20, delta).is_err(), "{delta} at {depth} bits");
+        }
+    }
+
     /// Write a block, read it back with the production reader, and require
     /// the coefficients and TotalCoeff to match. CAVLC carries no adaptive
     /// state between blocks, so those two are the whole of the state and the
