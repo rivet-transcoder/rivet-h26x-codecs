@@ -304,22 +304,30 @@ fn write_hrd(w: &mut BitWriter, cpb: &Cpb, fps: u32) {
 }
 
 /// `vui_parameters` (E.2.1) carrying only what was asked for: the colour
-/// description when the caller gave one, and the frame rate the removal
-/// times are counted in plus the HRD when a buffer was declared.
+/// description and the chroma siting when the caller gave them, and the
+/// frame rate the removal times are counted in plus the HRD when a buffer
+/// was declared.
 ///
 /// Everything else is absent by its own flag. A VUI is optional and this
 /// encoder had none until the buffer model needed one, so the only reason
 /// any of it is here is that a removal schedule without a frame rate is not
 /// a schedule — and, later, that a BT.2020 PQ picture with no colour
-/// description is shown as BT.709. Each half is present only under its own
+/// description is shown as BT.709. Each part is present only under its own
 /// condition, so a stream with a buffer and no colour is byte-identical to
 /// one from before colour existed. The inverse of `hevc::sps::parse_vui`.
-fn write_vui(w: &mut BitWriter, colour: Option<&ColourDescription>, cpb: Option<&Cpb>, fps: u32) {
+fn write_vui(
+    w: &mut BitWriter,
+    colour: Option<&ColourDescription>,
+    chroma_loc: Option<u8>,
+    cpb: Option<&Cpb>,
+    fps: u32,
+) {
     w.flag(false); // aspect_ratio_info_present_flag
     w.flag(false); // overscan_info_present_flag
-    // E.2.1 copies E.1.1's video_signal_type group field for field.
+    // E.2.1 copies E.1.1's video_signal_type and chroma_loc_info groups
+    // field for field.
     crate::encode::h264_syntax::write_video_signal_type(w, colour);
-    w.flag(false); // chroma_loc_info_present_flag
+    crate::encode::h264_syntax::write_chroma_loc(w, chroma_loc);
     w.flag(false); // neutral_chroma_indication_flag
     w.flag(false); // field_seq_flag
     w.flag(false); // frame_field_info_present_flag
@@ -470,9 +478,9 @@ pub fn write_sps(cfg: &Config, g: &Geometry, log2_max_poc_lsb: u32, cpb: Option<
     w.flag(false); // long_term_ref_pics_present_flag
     w.flag(false); // sps_temporal_mvp_enabled_flag
     w.flag(false); // strong_intra_smoothing_enabled_flag
-    if cpb.is_some() || cfg.colour.is_some() {
+    if cpb.is_some() || cfg.colour.is_some() || cfg.chroma_loc.is_some() {
         w.flag(true); // vui_parameters_present_flag
-        write_vui(&mut w, cfg.colour.as_ref(), cpb, cfg.fps);
+        write_vui(&mut w, cfg.colour.as_ref(), cfg.chroma_loc, cpb, cfg.fps);
     } else {
         w.flag(false); // vui_parameters_present_flag
     }
@@ -800,6 +808,7 @@ mod tests {
             assert_eq!(t, c.transfer, "{c:?}: transfer");
             assert_eq!(m, c.matrix, "{c:?}: matrix");
             assert_eq!(vui.full_range, c.full_range, "{c:?}: range");
+            assert_eq!(vui.chroma_loc, None, "{c:?}: no siting asked for, none written");
             assert_eq!(vui.timing, None, "{c:?}: no buffer, no clock");
             assert!(vui.hrd.is_none(), "{c:?}: no buffer, no HRD");
         }
@@ -821,7 +830,23 @@ mod tests {
         assert_eq!(vui.colour_description, None, "a buffer alone must not invent a colour");
         assert!(!vui.full_range);
         assert_eq!(vui.timing, Some((1, 30)));
-        assert_ne!(write_sps(&base, &g, 8, None), write_sps(&Config { colour: Some(colours[0]), ..base }, &g, 8, None));
+        // The chroma siting: alone it is a VUI that says nothing about
+        // colour, and every code comes back for both fields.
+        for t in 0..=5u8 {
+            let cfg = Config { chroma_loc: Some(t), ..base.clone() };
+            let sps = Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 8, None))).expect("SPS");
+            let vui = sps.vui.as_ref().expect("a siting alone is a VUI");
+            assert_eq!(vui.chroma_loc, Some((t, t)), "chroma_sample_loc_type {t}");
+            assert_eq!(vui.colour_description, None, "a siting alone must not invent a colour");
+        }
+        let cfg = Config { colour: Some(colours[0]), chroma_loc: Some(1), ..base.clone() };
+        let sps = Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 8, None))).expect("SPS");
+        let vui = sps.vui.as_ref().expect("VUI");
+        assert_eq!(vui.colour_description, Some((9, 16, 9)));
+        assert_eq!(vui.chroma_loc, Some((1, 1)));
+        let plain = write_sps(&base, &g, 8, None);
+        assert_ne!(plain, write_sps(&Config { colour: Some(colours[0]), ..base.clone() }, &g, 8, None));
+        assert_ne!(plain, write_sps(&Config { chroma_loc: Some(0), ..base }, &g, 8, None));
     }
 
     /// The buffering period SEI is escaped once and sized as RBSP: what a

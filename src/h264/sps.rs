@@ -49,6 +49,11 @@ pub struct Vui {
     /// `colour_primaries`, `transfer_characteristics`, `matrix_coefficients`
     /// when `colour_description_present_flag`.
     pub colour_description: Option<(u8, u8, u8)>,
+    /// `(chroma_sample_loc_type_top_field, chroma_sample_loc_type_bottom_field)`
+    /// when `chroma_loc_info_present_flag` — H.273's siting codes, 0..=5.
+    /// Not applied by the decoder, which reconstructs samples where the
+    /// stream put them; kept for a consumer that resamples.
+    pub chroma_loc: Option<(u8, u8)>,
     /// `(num_units_in_tick, time_scale)` when timing_info_present.
     pub timing: Option<(u32, u32)>,
     /// `fixed_frame_rate_flag`.
@@ -343,8 +348,9 @@ fn parse_vui(r: &mut BitReader) -> Vui {
     }
     if r.flag() {
         // chroma_loc_info_present_flag
-        r.ue();
-        r.ue();
+        let top = r.ue();
+        let bottom = r.ue();
+        vui.chroma_loc = Some((top as u8, bottom as u8));
     }
     if r.flag() {
         // timing_info_present_flag

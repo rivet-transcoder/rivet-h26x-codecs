@@ -45,6 +45,17 @@
 //! pictures under the other one to garbage — which is how rivet's first
 //! H.264 file failed with the whole gate green. See `tools/param_sets.py`.
 //!
+//! One more exact property applies only to what the samples cannot show:
+//! **the stream says what colour it is**. A [`ColourDescription`], a
+//! chroma siting or the HDR10 static metadata change no sample, so SELF
+//! and CROSS pass whether the VUI and SEIs carry them or not, and the
+//! crate's own parsers are the writers' inverses — a shared misreading of
+//! E.1.1 round-trips cleanly. The gate therefore asks a *third* reader:
+//! `tools/vui_probe.py` has ffprobe name every field, and a `--color` row
+//! is green only when the names are exactly the codes the encoder was
+//! handed (`VUI-FAIL` otherwise). A player showing BT.2020 PQ as washed-out
+//! BT.709 is the failure that row exists to prevent.
+//!
 //! # Shape
 //!
 //! Deliberately the mirror of the decoders: an `H264Encoder` takes pictures
@@ -252,6 +263,19 @@ pub struct Config {
     /// displayed as BT.709 by every player that does not read the
     /// container's colour box, and some that do.
     pub colour: Option<ColourDescription>,
+    /// Where the 4:2:0 chroma samples sit relative to the luma grid, as
+    /// H.273's `chroma_sample_loc_type` (0 left — the siting every decoder
+    /// assumes when nothing is said; 1 centre — JPEG / MPEG-1, what a 2x2
+    /// box average produces; 2 top-left; 3 top; 4 bottom-left; 5 bottom),
+    /// written into the SPS VUI's `chroma_loc_info_present_flag` group for
+    /// both fields — or `None` to write nothing, which keeps every stream
+    /// from before the field existed byte-identical. A consumer that
+    /// upsamples at the wrong siting loses about a decibel of chroma on
+    /// detail; the field is what lets it not. 4:2:0 only: the siting
+    /// describes a subsampled grid, E.2.1 says the flag should be 0 for
+    /// any other format, and libavcodec reports none there whatever the
+    /// VUI says — so a siting beside another format is refused by name.
+    pub chroma_loc: Option<u8>,
     /// HDR10 mastering display colour volume, written as an SEI in every
     /// IDR / IRAP access unit — or `None` for no such SEI, which is what
     /// every stream before the field existed had. Meaningful beside a
@@ -281,6 +305,7 @@ impl Default for Config {
             fps: 30,
             cpb_ms: 0,
             colour: None,
+            chroma_loc: None,
             mastering_display: None,
             content_light: None,
         }
@@ -300,6 +325,14 @@ impl Config {
         }
         if self.max_refs == 0 {
             return Err(crate::Error::unsupported("encode: max_refs must be at least 1"));
+        }
+        if self.chroma_loc.is_some_and(|t| t > 5) {
+            return Err(crate::Error::unsupported("encode: chroma_loc outside 0..=5 (H.273 chroma_sample_loc_type)"));
+        }
+        if self.chroma_loc.is_some() && self.chroma != ChromaFormat::Yuv420 {
+            return Err(crate::Error::unsupported(
+                "encode: chroma_loc is a 4:2:0 siting (E.2.1: chroma_loc_info_present_flag should be 0 for any other format)",
+            ));
         }
         Ok(())
     }

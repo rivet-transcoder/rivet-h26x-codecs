@@ -117,6 +117,23 @@
 #               is what HDR10 and HLG are; the H.264 rows are where a
 #               primaries/matrix swap shows.
 #
+#               The same property covers the chroma siting
+#               (`chroma_sample_loc_type`, ffprobe's chroma_location) on
+#               the rows that write one — and only those: for an absent
+#               field libavcodec reports the type 0 the standard infers
+#               ("left"), never "unspecified", so a written 0 is invisible
+#               to it and absence is not checkable here (the parser test
+#               holds "unasked, unwritten"). And it reports a siting for
+#               4:2:0 only — 4:2:2 / 4:4:4 read "unspecified" whatever the
+#               VUI says (E.2.1 wants the flag 0 there, and the encoder
+#               refuses a siting off 4:2:0 by name) — so the siting rows
+#               name 4:2:0 clips and carry non-zero codes: the H.264
+#               `@src_cut` row 1 ("center", the 2x2 box siting), the H.265
+#               `@420p10` row 2 ("topleft", BT.2100's 4:2:0 siting). Its
+#               mutation: stub the writer to the zero flag, and both rows
+#               must go red naming chroma_location while every other
+#               --color row stays green.
+#
 #               The same property covers the HDR10 static-metadata SEIs
 #               (mastering display colour volume, content light level)
 #               on the rows that write them: the probe is handed the
@@ -343,10 +360,11 @@ h264-12-cqp-ip@p12|--codec h264 --qp 26 --gop 8
 h264-12-cavlc40-ipb-t8x8-subparts@p12|--codec h264 --qp 40 --gop 8 --bframes 2 --cavlc --t8x8 --subparts
 h264-12-lossless-intra@p12|--codec h264 --lossless --gop 0
 cqp-ip-srgb-pc|--codec h264 --qp 26 --gop 8 --color 1:13:6 --full-range
-abr-64k-cpb-p3@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8 --color 12:17:6
+abr-64k-cpb-p3@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8 --color 12:17:6 --chroma-loc 1
 hevc-vbv-125-hdr10@src_cut|--codec h265 --bitrate 64000 --cpb-ms 125 --gop 8 --color 9:16:9
 hevc10-hdr10-ip@p10|--codec h265 --qp 26 --gop 8 --color 9:16:9
 hevc10-hlg-ipb@p10|--codec h265 --qp 26 --gop 8 --bframes 2 --color 9:18:9
+hevc10-hlg-topleft-ip@420p10|--codec h265 --qp 26 --gop 8 --color 9:18:9 --chroma-loc 2
 abr-64k-cpb250-hdr10-sei@src_cut|--codec h264 --bitrate 64000 --cpb-ms 250 --gop 8 --color 9:16:9 --mastering-display G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1) --content-light 1000,400
 hevc10-hdr10-sei-ip@p10|--codec h265 --qp 26 --gop 8 --color 9:16:9 --mastering-display G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1) --content-light 1000,400
 "}
@@ -479,6 +497,10 @@ one() {
       [ -n "$md" ] && hdr="$hdr --mastering-display $md"
       cl=$(echo "$flags" | sed -n 's/.*--content-light \([^ ]*\).*/\1/p')
       [ -n "$cl" ] && hdr="$hdr --content-light $cl"
+      # The chroma siting, when the row wrote one; without it the probe
+      # insists the stream says nothing about siting.
+      loc=$(echo "$flags" | sed -n 's/.*--chroma-loc \([0-9]*\).*/\1/p')
+      [ -n "$loc" ] && hdr="$hdr --chroma-loc $loc"
       if ! out=$(FFPROBE="$FFPROBE" python "$VUI_PROBE" "$bs" "$colour" "$range" $hdr 2>&1); then
         echo "VUI-FAIL    $tag: $(echo "$out" | tail -1 | head -c 120)"
         return 1

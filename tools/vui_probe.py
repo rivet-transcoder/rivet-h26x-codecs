@@ -10,10 +10,21 @@ reports the VUI as names — agreeing field by field with what the encoder
 was asked to write.
 
     python vui_probe.py stream.h264|stream.h265 P:T:M tv|pc
+           [--chroma-loc N]
            [--mastering-display G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)]
            [--content-light MAXCLL,MAXFALL]
 
-The two optional arguments extend the same question to the HDR10 static
+`--chroma-loc` asks the same of the VUI's chroma siting
+(`chroma_sample_loc_type`, which ffprobe names as `chroma_location`),
+and only then: for a VUI that says nothing about siting libavcodec
+reports the type 0 the standard infers ("left") on 4:2:0 and
+"unspecified" on 4:2:2 / 4:4:4 — and the latter whatever the VUI says,
+since it exports a siting for 4:2:0 alone. So absence is not checkable
+here (the crate's parser test holds "unasked, unwritten"), a written 0
+is invisible, and a siting is only verifiable on a 4:2:0 stream —
+which is why the gate's siting rows name 4:2:0 clips and carry 1 and 2.
+
+The two HDR arguments extend the same question to the HDR10 static
 metadata SEIs (mastering display colour volume, content light level),
 which ffprobe reports as side data on the first frame, with the values in
 the SEI's own units (chromaticities as n/50000, luminances as n/10000) —
@@ -46,6 +57,9 @@ MATRIX = {
     7: "smpte240m", 8: "ycgco", 9: "bt2020nc", 10: "bt2020c", 11: "smpte2085",
     12: "chroma-derived-nc", 13: "chroma-derived-c", 14: "ictcp",
 }
+# H.273 chroma_sample_loc_type -> libavutil's av_chroma_location_name
+# (AVCHROMA_LOC_LEFT is 1, so the code is the enum minus one).
+CHROMA_LOC = {0: "left", 1: "center", 2: "topleft", 3: "top", 4: "bottomleft", 5: "bottom"}
 
 
 def parse_mastering(spec):
@@ -85,9 +99,20 @@ def main():
     stream, colour, rng = args[:3]
     mastering = None
     cll = None
+    chroma_loc = None
     rest = args[3:]
     while rest:
-        if rest[0] == "--mastering-display" and len(rest) > 1:
+        if rest[0] == "--chroma-loc" and len(rest) > 1:
+            try:
+                chroma_loc = int(rest[1])
+            except ValueError:
+                print(f"vui_probe: --chroma-loc wants a chroma_sample_loc_type, got {rest[1]!r}")
+                return 2
+            if chroma_loc not in CHROMA_LOC:
+                print(f"vui_probe: no libavutil name for chroma_location={chroma_loc}; extend the table")
+                return 1
+            rest = rest[2:]
+        elif rest[0] == "--mastering-display" and len(rest) > 1:
             mastering = parse_mastering(rest[1])
             if mastering is None:
                 print(f"vui_probe: --mastering-display wants G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min), got {rest[1]!r}")
@@ -123,12 +148,14 @@ def main():
             return 1
         want[field] = table[code]
     want["color_range"] = rng
+    if chroma_loc is not None:
+        want["chroma_location"] = CHROMA_LOC[chroma_loc]
 
     ffprobe = os.environ.get("FFPROBE", "ffprobe")
     out = subprocess.run(
         [
             ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
-            "stream=color_primaries,color_transfer,color_space,color_range",
+            "stream=color_primaries,color_transfer,color_space,color_range,chroma_location",
             "-of", "default=noprint_wrappers=1", stream,
         ],
         capture_output=True, text=True,

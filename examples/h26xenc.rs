@@ -10,7 +10,7 @@
 //!   h26xenc --input src.yuv --size 64x64 --format 420 --output out.264 \
 //!           --recon out.rec.yuv [--codec h264|h265] [--qp N | --lossless]
 //!           [--gop N] [--bframes N] [--cavlc] [--threads N]
-//!           [--color PRIMARIES:TRANSFER:MATRIX [--full-range]]
+//!           [--color PRIMARIES:TRANSFER:MATRIX [--full-range]] [--chroma-loc N]
 //!           [--mastering-display G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)]
 //!           [--content-light MAXCLL,MAXFALL]
 
@@ -57,7 +57,7 @@ fn die(msg: &str) -> ! {
          \x20      [--gop N] [--bframes N] [--cavlc] [--t8x8] [--subparts] [--sao]\n\
          \x20      [--depth N] [--threads N]\n\
          \x20      [--color PRIMARIES:TRANSFER:MATRIX (H.273 codes, e.g. 9:16:9 for HDR10)]\n\
-         \x20      [--full-range]\n\
+         \x20      [--full-range] [--chroma-loc N (H.273 chroma_sample_loc_type 0..=5)]\n\
          \x20      [--mastering-display G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)] (ST 2086, SEI units)\n\
          \x20      [--content-light MAXCLL,MAXFALL] (cd/m2)"
     );
@@ -136,6 +136,15 @@ fn main() {
             }
             // `video_full_range_flag`, beside a --color.
             "--full-range" => full_range = true,
+            // The VUI chroma siting, as H.273's chroma_sample_loc_type.
+            // Absent, the stream says nothing about siting.
+            "--chroma-loc" => {
+                let s = val(&mut i, &args, "--chroma-loc");
+                cfg.chroma_loc = Some(match s.parse::<u8>() {
+                    Ok(t) if t <= 5 => t,
+                    _ => die("--chroma-loc wants a chroma_sample_loc_type 0..=5 (0 left, 1 centre, 2 top-left)"),
+                });
+            }
             // HDR10 static metadata: an SEI each, in every IDR access unit.
             "--mastering-display" => {
                 let s = val(&mut i, &args, "--mastering-display");

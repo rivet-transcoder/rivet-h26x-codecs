@@ -75,19 +75,25 @@ fn write_hrd(w: &mut BitWriter, cpb: &Cpb) {
 }
 
 /// `vui_parameters()` (E.1.1) carrying only what was asked for: the
-/// colour description when the caller gave one, and the clock the removal
-/// delays are counted in plus the NAL HRD when a buffer was declared.
-/// Everything else is absent by its own flag — a VUI is optional and this
-/// encoder wrote none until a buffer needed one — and each of the two
-/// halves is present only under its own condition, so a stream with a
-/// buffer and no colour is byte-identical to one from before colour
-/// existed. The inverse of `h264::sps::parse_vui`, which keeps every
-/// field written here.
-fn write_vui(w: &mut BitWriter, colour: Option<&ColourDescription>, cpb: Option<&Cpb>, fps: u32) {
+/// colour description and the chroma siting when the caller gave them,
+/// and the clock the removal delays are counted in plus the NAL HRD when
+/// a buffer was declared. Everything else is absent by its own flag — a
+/// VUI is optional and this encoder wrote none until a buffer needed one
+/// — and each part is present only under its own condition, so a stream
+/// with a buffer and no colour is byte-identical to one from before
+/// colour existed. The inverse of `h264::sps::parse_vui`, which keeps
+/// every field written here.
+fn write_vui(
+    w: &mut BitWriter,
+    colour: Option<&ColourDescription>,
+    chroma_loc: Option<u8>,
+    cpb: Option<&Cpb>,
+    fps: u32,
+) {
     w.flag(false); // aspect_ratio_info_present_flag
     w.flag(false); // overscan_info_present_flag
     write_video_signal_type(w, colour);
-    w.flag(false); // chroma_loc_info_present_flag
+    write_chroma_loc(w, chroma_loc);
     match cpb {
         Some(cpb) => {
             w.flag(true); // timing_info_present_flag
@@ -130,6 +136,24 @@ pub(crate) fn write_video_signal_type(w: &mut BitWriter, colour: Option<&ColourD
             w.bits(8, u32::from(c.matrix)); // matrix_coefficients
         }
         None => w.flag(false), // video_signal_type_present_flag
+    }
+}
+
+/// The `chroma_loc_info_present_flag` group of a VUI (E.1.1): one
+/// `chroma_sample_loc_type` for each field, the same value twice because
+/// this encoder codes frames, or the one zero flag that says nothing
+/// about siting — under which every decoder assumes type 0.
+///
+/// Identical in H.264 and H.265 (E.2.1), so the H.265 writer calls this
+/// one.
+pub(crate) fn write_chroma_loc(w: &mut BitWriter, chroma_loc: Option<u8>) {
+    match chroma_loc {
+        Some(t) => {
+            w.flag(true); // chroma_loc_info_present_flag
+            w.ue(u32::from(t)); // chroma_sample_loc_type_top_field
+            w.ue(u32::from(t)); // chroma_sample_loc_type_bottom_field
+        }
+        None => w.flag(false), // chroma_loc_info_present_flag
     }
 }
 
@@ -388,9 +412,9 @@ pub fn write_sps(
     } else {
         w.flag(false);
     }
-    if cpb.is_some() || cfg.colour.is_some() {
+    if cpb.is_some() || cfg.colour.is_some() || cfg.chroma_loc.is_some() {
         w.flag(true); // vui_parameters_present_flag
-        write_vui(&mut w, cfg.colour.as_ref(), cpb, cfg.fps);
+        write_vui(&mut w, cfg.colour.as_ref(), cfg.chroma_loc, cpb, cfg.fps);
     } else {
         w.flag(false); // vui_parameters_present_flag
     }
@@ -989,6 +1013,7 @@ mod tests {
             assert_eq!(t, c.transfer, "{c:?}: transfer");
             assert_eq!(m, c.matrix, "{c:?}: matrix");
             assert_eq!(vui.full_range, c.full_range, "{c:?}: range");
+            assert_eq!(vui.chroma_loc, None, "{c:?}: no siting asked for, none written");
             assert_eq!(vui.timing, None, "{c:?}: no buffer, no clock");
             assert_eq!(vui.nal_hrd, None, "{c:?}: no buffer, no HRD");
             assert!(!vui.bitstream_restriction);
@@ -1015,11 +1040,49 @@ mod tests {
         assert_eq!(vui.colour_description, None, "a buffer alone must not invent a colour");
         assert!(!vui.full_range);
         assert_eq!(vui.timing, Some((1, 60)));
+        // The chroma siting: alone it is a VUI that says nothing about
+        // colour, and every code comes back for both fields.
+        for t in 0..=5u8 {
+            let cfg = Config { chroma_loc: Some(t), ..base.clone() };
+            let sps = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 16, 16, None)))
+                .expect("SPS");
+            let vui = sps.vui.as_ref().expect("a siting alone is a VUI");
+            assert_eq!(vui.chroma_loc, Some((t, t)), "chroma_sample_loc_type {t}");
+            assert_eq!(vui.colour_description, None, "a siting alone must not invent a colour");
+        }
+        // Beside a colour: both there, neither disturbing the other.
+        let cfg = Config { colour: Some(colours[0]), chroma_loc: Some(1), ..base.clone() };
+        let sps = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 16, 16, None)))
+            .expect("SPS");
+        let vui = sps.vui.as_ref().expect("VUI");
+        assert_eq!(vui.colour_description, Some((9, 16, 9)));
+        assert_eq!(vui.chroma_loc, Some((1, 1)));
         // Neither: the bytes from before either existed.
         let plain = write_sps(&base, &g, 16, 16, None);
         let sps = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&plain)).expect("SPS");
-        assert!(sps.vui.is_none(), "no buffer and no colour, no VUI");
-        assert_ne!(plain, write_sps(&Config { colour: Some(colours[0]), ..base }, &g, 16, 16, None));
+        assert!(sps.vui.is_none(), "no buffer, no colour and no siting, no VUI");
+        assert_ne!(plain, write_sps(&Config { colour: Some(colours[0]), ..base.clone() }, &g, 16, 16, None));
+        assert_ne!(plain, write_sps(&Config { chroma_loc: Some(0), ..base }, &g, 16, 16, None));
+    }
+
+    /// A chroma siting describes a 4:2:0 grid and nothing else: E.2.1
+    /// wants `chroma_loc_info_present_flag` 0 for any other format, and
+    /// libavcodec reports no siting there whatever is written — so the
+    /// configuration is refused by name rather than written into a VUI
+    /// no reader will honour. A code above 5 is refused likewise.
+    #[test]
+    fn a_chroma_siting_is_refused_off_420_and_above_5() {
+        let (base, _) = geom(64, 64, ChromaFormat::Yuv420);
+        assert!(Config { chroma_loc: Some(2), ..base.clone() }.validate().is_ok(), "4:2:0 takes a siting");
+        assert!(Config { chroma_loc: None, chroma: ChromaFormat::Yuv444, ..base.clone() }.validate().is_ok());
+        for c in [ChromaFormat::Monochrome, ChromaFormat::Yuv422, ChromaFormat::Yuv444] {
+            let e = Config { chroma_loc: Some(0), chroma: c, ..base.clone() }
+                .validate()
+                .expect_err("a siting off 4:2:0 must be refused");
+            assert!(e.to_string().contains("chroma_loc"), "{c:?}: {e}");
+        }
+        let e = Config { chroma_loc: Some(6), ..base }.validate().expect_err("6 is not a chroma_sample_loc_type");
+        assert!(e.to_string().contains("0..=5"), "{e}");
     }
 
     #[test]
