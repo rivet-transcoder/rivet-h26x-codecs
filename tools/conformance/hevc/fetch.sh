@@ -16,6 +16,7 @@ done < list.txt
 echo fetched
 mkdir -p streams
 for z in zips/*.zip; do
+  [ -f "$z" ] || continue  # an empty zips/ leaves the glob unexpanded: no "streams/*" directory
   d="streams/$(basename "${z%.zip}")"
   [ -d "$d" ] || (mkdir -p "$d" && cd "$d" && unzip -qq -o "../../$z" >/dev/null 2>&1)
 done

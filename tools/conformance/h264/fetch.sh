@@ -12,7 +12,7 @@ done
 echo fetched
 for dir in AVCv1 FRExt; do
   cd $dir
-  for z in *.zip; do d="${z%.zip}"; [ -d "$d" ] || (mkdir -p "$d" && cd "$d" && unzip -qq -o "../$z" >/dev/null 2>&1); done
+  for z in *.zip; do [ -f "$z" ] || continue; d="${z%.zip}"; [ -d "$d" ] || (mkdir -p "$d" && cd "$d" && unzip -qq -o "../$z" >/dev/null 2>&1); done
   cd ..
 done
 echo unzipped

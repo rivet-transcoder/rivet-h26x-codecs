@@ -15,6 +15,7 @@ while read -r z; do
 done < list.txt
 echo fetched
 for z in zips/*; do
+  [ -f "$z" ] || continue  # an empty zips/ leaves the glob unexpanded: no "streams/*" directory
   n=$(basename "$z"); d="streams/${n%.*}"
   if [ -d "$d" ]; then continue; fi
   mkdir -p "$d"
