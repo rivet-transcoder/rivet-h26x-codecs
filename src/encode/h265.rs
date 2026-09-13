@@ -1872,14 +1872,23 @@ mod tests {
                     assert!(census.by_kind[2].cus > 0, "{tag}: no B picture was coded");
                 }
 
+                // The decoder emits display order; the reconstructions
+                // are in coding order, matched through each access unit's
+                // POC as `deep_pictures_round_trip_through_the_decoder`
+                // does.
                 let mut dec = crate::hevc::HevcDecoder::new();
                 for u in &units {
                     dec.push_annexb(&u.data).unwrap_or_else(|err| panic!("{tag} qp {qp}: {err}"));
                 }
                 dec.flush().unwrap();
-                for (i, want) in e.reconstructions().iter().enumerate() {
+                let mut by_display = vec![None; units.len()];
+                for u in &units {
+                    by_display[(u.poc / 2) as usize] = Some(u.encode_index as usize);
+                }
+                for (i, coded) in by_display.iter().enumerate() {
+                    let want = &e.reconstructions()[coded.unwrap_or_else(|| panic!("{tag} qp {qp}: display index {i} never coded"))];
                     let got = dec.next_picture().unwrap_or_else(|| panic!("{tag} qp {qp}: picture {i} missing"));
-                    assert_eq!(&got.into_packed(), want, "{tag} qp {qp}: picture {i} differs from the reconstruction");
+                    assert!(got.into_packed() == *want, "{tag} qp {qp}: picture {i} differs from the reconstruction");
                 }
             }
         }
