@@ -29,11 +29,13 @@
 //! SPS. Everything below the face is generic: the decision walks, the
 //! predictors and kernels (`H264Dsp<S>`, the decoder's), the writers. What
 //! the depth changes is spelled in one place each — `QP'` for the scaling
-//! tables ([`super::h264_intra::IntraCtx::qp_prime`]), the lambda scales
-//! (`satd_lambda` / `ssd_lambda` beside it), the PCM sample width, the SPS
-//! depth fields and profile, and the loop filter's thresholds (which
-//! `deblock_mb_rows` scales itself from the frame's depth) — and an 8-bit
-//! stream is byte for byte what it was before any of it existed.
+//! tables ([`super::h264_intra::IntraCtx::qp_prime`]), the PCM sample
+//! width, the SPS depth fields and profile, and the loop filter's
+//! thresholds (which `deblock_mb_rows` scales itself from the frame's
+//! depth) — and an 8-bit stream is byte for byte what it was before any
+//! of it existed. What the depth deliberately does *not* change is the
+//! mode-decision multiplier: `satd_lambda` in [`super::h264_intra`]
+//! records the measurement that decided it.
 
 use super::gop::{Coded, Kind, Scheduler};
 use super::rc::{PicKind, RateController};

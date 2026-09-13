@@ -875,8 +875,7 @@ fn code_luma_8x8<S: Sample>(
 /// It still has no rate term for the residual, which is where the 8x8
 /// transform mostly earns its keep, so it takes 8x8 less often than a
 /// real rate-distortion decision would. One function, one comparison.
-/// `lam` is the multiplier in squared-error units at the picture's
-/// depth ([`ssd_lambda`]).
+/// `lam` is the multiplier in squared-error units ([`ssd_lambda`]).
 fn placeholder_inter_transform_size(ssd_4x4: u64, ssd_8x8: u64, lam: f32) -> bool {
     ssd_8x8 as f32 + lam < ssd_4x4 as f32
 }
@@ -1471,10 +1470,8 @@ fn se_bits(v: i16) -> f32 {
 /// rate term for the *residual*, which is the other half of what
 /// splitting buys. One function, one comparison.
 ///
-/// `lam` is the multiplier in SATD units at the picture's depth
-/// ([`satd_lambda`]), which is what makes the bit prices here hold at
-/// 10 bits — a SATD there is four times the 8-bit one for the same
-/// content, a bit is not.
+/// `lam` is the multiplier in SATD units ([`satd_lambda`], which records
+/// why it is the same at every depth).
 #[allow(clippy::too_many_arguments)]
 fn placeholder_partition_cost(
     kind: InterMbKind,

@@ -31,7 +31,6 @@ use crate::dsp::distortion::DistortionDsp;
 use crate::dsp::h264::{H264Dsp, NO_DC};
 use crate::dsp::h264_enc::{H264EncDsp, Quant, qbits4, qbits8, quant_offset};
 use crate::encode::h264_syntax::Recon;
-use crate::encode::h265_intra::{satd_lambda_scale, ssd_lambda_scale};
 use crate::sample::Sample;
 use crate::h264::cavlc::sub_block_counts_8x8;
 use crate::h264::intra::{IntraAvail, predict_4x4, predict_8x8, predict_16x16, predict_chroma};
@@ -1034,8 +1033,8 @@ fn chosen_nxn_modes(_out: &MbDecision, chosen: &[u8; 16]) -> [u8; 16] {
 /// on offer ([`intra_distortion`]), and that is worth stating plainly
 /// because it looks like an inconsistency and is one.
 ///
-/// `lambda` is the multiplier already scaled to the depth and to the
-/// measure `distortion` is in ([`intra_lambda`]).
+/// `lambda` is the multiplier for the measure `distortion` is in
+/// ([`intra_lambda`]).
 fn placeholder_intra_cost(kind: MbKind, distortion: u64, lambda: f32) -> f32 {
     let bits = match kind {
         MbKind::I16x16 => 2.0,
@@ -1046,26 +1045,41 @@ fn placeholder_intra_cost(kind: MbKind, distortion: u64, lambda: f32) -> f32 {
 }
 
 /// The multiplier [`placeholder_intra_cost`] prices bits at: [`lambda`]
-/// scaled to the depth in the units [`intra_distortion`] measures in —
-/// squared error when the 8x8 transform is on offer, SATD otherwise.
-/// At 8 bits the scale is exactly one and the arithmetic is what it
-/// always was.
+/// for the units [`intra_distortion`] measures in — squared error when
+/// the 8x8 transform is on offer, SATD otherwise ([`satd_lambda`] says
+/// why neither is scaled to the depth).
 fn intra_lambda<S: Sample>(ctx: &IntraCtx<S>) -> f32 {
     if ctx.t8x8 { ssd_lambda(ctx) } else { satd_lambda(ctx) }
 }
 
-/// [`lambda`] at the picture's quantiser, scaled to price bits against
-/// a SATD at the picture's depth (`2^(BitDepth - 8)`: a SATD grows with
-/// the sample range, a bit does not).
+/// [`lambda`] at the picture's quantiser, for a cost paired with a SATD —
+/// at every depth, unscaled, and the one place a depth scale would go.
+///
+/// The textbook scale (`2^(BitDepth - 8)`: a SATD grows with the sample
+/// range, a bit does not; what the H.265 side applies) was built and then
+/// measured over the 50 lossy deep gate cells against this unscaled form,
+/// and lost on both axes at once: +1.23% bytes and -1.31 dB mean PSNR,
+/// `cavlc40-subparts` at +37 to +53% bytes and -5 to -8.7 dB, and no
+/// cell better. Both worse together means the decisions are wrong, not
+/// traded. Every cost here prices bits as a constant — a flag, a few
+/// `mb_type` bins, an `se(v)` length — and never the residual, so the
+/// rate side is a fraction of the truth, and a larger multiplier only
+/// amplifies the bias toward the cheap-looking mode, which then spends
+/// more residual bits *and* reconstructs worse. Halving the multiplier
+/// at depth instead moved the same cells the other way (-0.09% bytes,
+/// +0.13 dB mean): the slope says the 8-bit multiplier is already large
+/// for these placeholders, which is the residual rate term's problem to
+/// fix, not a constant's. Until that term exists the multiplier tuned
+/// against the placeholders at 8 bits is kept as it is at every depth.
 pub(crate) fn satd_lambda<S: Sample>(ctx: &IntraCtx<S>) -> f32 {
-    lambda(ctx.qp) * satd_lambda_scale(ctx.bit_depth)
+    lambda(ctx.qp)
 }
 
-/// [`lambda`] at the picture's quantiser, scaled to price bits against
-/// a sum of squared errors at the picture's depth (`2^(2 (BitDepth -
-/// 8))`).
+/// [`lambda`] at the picture's quantiser, for a cost paired with a sum
+/// of squared errors — unscaled likewise (the textbook `2^(2 (BitDepth -
+/// 8))` was the other half of the measurement [`satd_lambda`] records).
 pub(crate) fn ssd_lambda<S: Sample>(ctx: &IntraCtx<S>) -> f32 {
-    lambda(ctx.qp) * ssd_lambda_scale(ctx.bit_depth)
+    lambda(ctx.qp)
 }
 
 /// How far a coded candidate's reconstruction landed from the source —
