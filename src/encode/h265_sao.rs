@@ -132,9 +132,18 @@ struct Tally {
 /// The buckets below make the score exact for those samples too, and
 /// cost nothing on video-range content, whose samples never come within
 /// an offset of a rail.
+///
+/// A `Cat` is a kilobyte, nearly all of it buckets, and a pass fills 32
+/// of them (band) or five (edge), seven or more passes per CTB component.
+/// Zeroing that on the stack for every pass was a measurable share of the
+/// encode, so the arrays live in [`Stats`] for the whole picture and
+/// [`Cat::clear`] touches the buckets only where the previous pass did.
 #[derive(Clone, Copy, Default)]
 struct Cat {
     all: Tally,
+    /// Whether any bucket below holds a sample — set by `add`, cleared by
+    /// `clear`, and the only thing `clear` needs to look at.
+    dirty: bool,
     /// `up[h]`: the samples exactly `h` below the top rail (`max - rec ==
     /// h`), for `h < CLIP_REACH`. A positive offset `o > h` moves them by
     /// `h`, not `o`.
@@ -155,11 +164,25 @@ impl Cat {
         if up < CLIP_REACH {
             self.up[up].count += 1;
             self.up[up].sum += e;
+            self.dirty = true;
         }
         let down = r as usize;
         if down < CLIP_REACH {
             self.down[down].count += 1;
             self.down[down].sum += e;
+            self.dirty = true;
+        }
+    }
+
+    /// Back to empty, at the cost of what the last pass put here: the
+    /// count and sum always, the buckets only if one was used.
+    #[inline]
+    fn clear(&mut self) {
+        self.all = Tally::default();
+        if self.dirty {
+            self.up = [Tally::default(); CLIP_REACH];
+            self.down = [Tally::default(); CLIP_REACH];
+            self.dirty = false;
         }
     }
 
@@ -199,7 +222,7 @@ impl Cat {
     /// Whether any sample of this category is near enough to a rail for
     /// some spellable offset to clip it.
     fn near_a_rail(&self) -> bool {
-        self.up.iter().chain(self.down.iter()).any(|t| t.count != 0)
+        self.dirty
     }
 
     /// The offset to take within `[lo, hi]`, and its exact `delta`.
@@ -223,6 +246,16 @@ impl Cat {
         }
         (o, d)
     }
+}
+
+/// The category statistics of one pass — 32 bands, or the five edge
+/// categories of one class — owned by `sao_picture` for the whole picture
+/// and refilled by every pass, so that a `Cat`'s rail buckets are cleared
+/// only after a pass that used them (see [`Cat`]).
+#[derive(Default)]
+struct Stats {
+    bands: [Cat; 32],
+    edge: [Cat; 5],
 }
 
 /// The Lagrangian the SAO decision prices bins with — the intra module's
@@ -325,30 +358,30 @@ impl<S: Sample> Comp<'_, S> {
         d
     }
 
-    /// Band statistics: one bucket per band, `v >> shift` exactly as
-    /// `sao_ctb`'s table lookup indexes it.
-    fn band_stats(&self) -> [Cat; 32] {
-        let mut cats = [Cat::default(); 32];
+    /// Band statistics into `cats`: one bucket per band, `v >> shift`
+    /// exactly as `sao_ctb`'s table lookup indexes it.
+    fn band_stats(&self, cats: &mut [Cat; 32]) {
+        cats.iter_mut().for_each(Cat::clear);
         for y in self.y0..self.y0 + self.h {
             for x in self.x0..self.x0 + self.w {
                 let v = self.rec_at(x, y);
                 cats[((v >> self.shift) & 31) as usize].add(v, self.err_at(x, y), self.max);
             }
         }
-        cats
     }
 
-    /// Edge statistics for one class: five buckets by `edgeIdx`, skipping
-    /// samples the filter will not touch because a classifying neighbour
-    /// is unusable. `usable` is the caller's mirror of the filter's own.
-    fn edge_stats(&self, class: u8, usable: &dyn Fn(usize, usize, i32, i32) -> bool) -> [Cat; 5] {
+    /// Edge statistics for one class into `cats`: five buckets by
+    /// `edgeIdx`, skipping samples the filter will not touch because a
+    /// classifying neighbour is unusable. `usable` is the caller's mirror
+    /// of the filter's own.
+    fn edge_stats(&self, class: u8, usable: &dyn Fn(usize, usize, i32, i32) -> bool, cats: &mut [Cat; 5]) {
         let (hp, vp): ([i32; 2], [i32; 2]) = match class {
             0 => ([-1, 1], [0, 0]),
             1 => ([0, 0], [-1, 1]),
             2 => ([-1, 1], [-1, 1]),
             _ => ([1, -1], [-1, 1]),
         };
-        let mut cats = [Cat::default(); 5];
+        cats.iter_mut().for_each(Cat::clear);
         for y in self.y0..self.y0 + self.h {
             for x in self.x0..self.x0 + self.w {
                 let (xa, ya) = (x as i32 + hp[0], y as i32 + vp[0]);
@@ -363,21 +396,20 @@ impl<S: Sample> Comp<'_, S> {
                 cats[e].add(v, self.err_at(x, y), self.max);
             }
         }
-        cats
     }
 
     /// The best parameters for this component, and the SSD they achieve —
     /// against `ssd_off` as the do-nothing baseline.
-    fn decide(&self, cmax: i64, lam: f32, first_two: bool, usable: &dyn Fn(usize, usize, i32, i32) -> bool) -> (SaoParams, f32, i64) {
+    fn decide(&self, cmax: i64, lam: f32, first_two: bool, usable: &dyn Fn(usize, usize, i32, i32) -> bool, stats: &mut Stats) -> (SaoParams, f32, i64) {
         let base = self.ssd_off();
         let mut best = SaoParams::default();
         let mut best_cost = base as f32 + lam * bins_of(&best, cmax as u32, first_two) as f32;
         let mut best_dist = base;
 
         // Band: every one of the 32 wrapping four-band windows.
-        let bands = self.band_stats();
+        self.band_stats(&mut stats.bands);
         let mut per_band = [(0i64, 0i64); 32]; // (offset, delta)
-        for (b, c) in bands.iter().enumerate() {
+        for (b, c) in stats.bands.iter().enumerate() {
             per_band[b] = c.choose(-cmax, cmax);
         }
         for pos in 0..32usize {
@@ -407,14 +439,14 @@ impl<S: Sample> Comp<'_, S> {
         // so the clamp is one-sided and a category that wants the other
         // direction simply takes zero.
         for class in 0..4u8 {
-            let cats = self.edge_stats(class, usable);
+            self.edge_stats(class, usable, &mut stats.edge);
             let mut p = SaoParams { type_idx: 2, band_or_class: class, offsets: [0; 4] };
             let mut delta = 0i64;
             // off_tab order: categories 0, 1 take offsets 0, 1 (positive);
             // categories 3, 4 take offsets 2, 3 (negative). Category 2 has
             // no offset in the syntax at all.
             for (slot, cat) in [(0usize, 0usize), (1, 1), (2, 3), (3, 4)] {
-                let c = &cats[cat];
+                let c = &stats.edge[cat];
                 let (o, d) = if slot < 2 { c.choose(0, cmax) } else { c.choose(-cmax, 0) };
                 if o != 0 && d < 0 {
                     p.offsets[slot] = o as i16;
@@ -437,7 +469,7 @@ impl<S: Sample> Comp<'_, S> {
     /// The SSD this component would have under someone else's parameters —
     /// what a merge candidate has to be scored on, since a merged CTB
     /// applies the neighbour's offsets to its own samples.
-    fn ssd_under(&self, p: &SaoParams, usable: &dyn Fn(usize, usize, i32, i32) -> bool) -> i64 {
+    fn ssd_under(&self, p: &SaoParams, usable: &dyn Fn(usize, usize, i32, i32) -> bool, stats: &mut Stats) -> i64 {
         let base = self.ssd_off();
         match p.type_idx {
             0 => base,
@@ -446,18 +478,18 @@ impl<S: Sample> Comp<'_, S> {
                 for k in 0..4 {
                     table[(k + p.band_or_class as usize) & 31] = p.offsets[k];
                 }
-                let bands = self.band_stats();
+                self.band_stats(&mut stats.bands);
                 let mut d = 0i64;
-                for (b, c) in bands.iter().enumerate() {
+                for (b, c) in stats.bands.iter().enumerate() {
                     d += c.delta(table[b] as i64);
                 }
                 base + d
             }
             _ => {
-                let cats = self.edge_stats(p.band_or_class, usable);
+                self.edge_stats(p.band_or_class, usable, &mut stats.edge);
                 let tab = [p.offsets[0] as i64, p.offsets[1] as i64, 0, p.offsets[2] as i64, p.offsets[3] as i64];
                 let mut d = 0i64;
-                for (i, c) in cats.iter().enumerate() {
+                for (i, c) in stats.edge.iter().enumerate() {
                     d += c.delta(tab[i]);
                 }
                 base + d
@@ -514,10 +546,12 @@ pub fn sao_picture<S: Sample>(
     let mut merges: Vec<Option<SaoMerge>> = vec![None; wc * hc];
     // What the decision believes the filtered picture's error will be,
     // per component. Every candidate is scored analytically, per category,
-    // and never by filtering — which is sound only if this module
-    // classifies samples exactly as `hevc::sao` does. The debug check at
-    // the end holds it to that.
+    // and never by filtering — which is sound only if this module models
+    // `hevc::sao` exactly. The check at the end holds it to that.
     let mut predicted = [0i64; 3];
+    // The statistics of whichever pass ran last; boxed because it is most
+    // of a wasm page.
+    let mut stats = Box::new(Stats::default());
 
     for ry in 0..hc {
         for rx in 0..wc {
@@ -568,13 +602,13 @@ pub fn sao_picture<S: Sample>(
                     // constraint rather than picking a shape it cannot
                     // spell.
                     let fixed = own[1];
-                    let (p, cost, dist) = comp.decide_constrained(fixed.type_idx, fixed.band_or_class, cmax, lam, &u);
+                    let (p, cost, dist) = comp.decide_constrained(fixed.type_idx, fixed.band_or_class, cmax, lam, &u, &mut stats);
                     own[2] = p;
                     own_cost += cost;
                     own_dist[2] = dist;
                     continue;
                 }
-                let (p, cost, dist) = comp.decide(cmax, lam, true, &u);
+                let (p, cost, dist) = comp.decide(cmax, lam, true, &u, &mut stats);
                 own[c] = p;
                 own_cost += cost;
                 own_dist[c] = dist;
@@ -590,7 +624,7 @@ pub fn sao_picture<S: Sample>(
                 for (c, comp) in comps.iter().enumerate() {
                     let (pw, ph) = (comp.pw, comp.ph);
                     let u = move |x: usize, y: usize, xn: i32, yn: i32| usable(x, y, xn, yn, pw, ph);
-                    dist[c] = comp.ssd_under(&cand[c], &u);
+                    dist[c] = comp.ssd_under(&cand[c], &u, &mut stats);
                 }
                 // One or two merge bins, and nothing else.
                 let cost = dist.iter().sum::<i64>() as f32 + lam * if which == SaoMerge::Left { 1.0 } else { 2.0 };
@@ -663,7 +697,7 @@ impl<S: Sample> Comp<'_, S> {
     /// [`Comp::decide`] with the type and class already fixed by another
     /// component — the Cr case, whose `sao_type_idx` and `sao_eo_class`
     /// come from Cb and whose four offsets are its own.
-    fn decide_constrained(&self, type_idx: u8, class: u8, cmax: i64, lam: f32, usable: &dyn Fn(usize, usize, i32, i32) -> bool) -> (SaoParams, f32, i64) {
+    fn decide_constrained(&self, type_idx: u8, class: u8, cmax: i64, lam: f32, usable: &dyn Fn(usize, usize, i32, i32) -> bool, stats: &mut Stats) -> (SaoParams, f32, i64) {
         let base = self.ssd_off();
         if type_idx == 0 {
             return (SaoParams::default(), base as f32, base);
@@ -671,9 +705,9 @@ impl<S: Sample> Comp<'_, S> {
         let mut p = SaoParams { type_idx, band_or_class: class, offsets: [0; 4] };
         let mut delta = 0i64;
         if type_idx == 1 {
-            let bands = self.band_stats();
+            self.band_stats(&mut stats.bands);
             for k in 0..4 {
-                let c = &bands[(class as usize + k) & 31];
+                let c = &stats.bands[(class as usize + k) & 31];
                 let (o, d) = c.choose(-cmax, cmax);
                 if o != 0 && d < 0 {
                     p.offsets[k] = o as i16;
@@ -681,9 +715,9 @@ impl<S: Sample> Comp<'_, S> {
                 }
             }
         } else {
-            let cats = self.edge_stats(class, usable);
+            self.edge_stats(class, usable, &mut stats.edge);
             for (slot, cat) in [(0usize, 0usize), (1, 1), (2, 3), (3, 4)] {
-                let c = &cats[cat];
+                let c = &stats.edge[cat];
                 let (o, d) = if slot < 2 { c.choose(0, cmax) } else { c.choose(-cmax, 0) };
                 if o != 0 && d < 0 {
                     p.offsets[slot] = o as i16;
