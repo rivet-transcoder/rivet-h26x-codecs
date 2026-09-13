@@ -56,8 +56,10 @@
 //! rounded mean of `src - rec` over its samples, clamped to the syntax's
 //! range (cMax, and to the sign the syntax forces in edge mode). The
 //! change in SSD from applying offset `o` to a category is then
-//! `count * o^2 - 2 * o * sum`, exactly, so no filtering is needed to
-//! score a candidate.
+//! `count * o^2 - 2 * o * sum` for the samples the offset moves in full,
+//! and a smaller, fixed amount for each one the filter's clip stops at a
+//! rail (see [`Cat`]) — exactly, so no filtering is needed to score a
+//! candidate.
 //!
 //! The winner is the smallest `distortion + lambda * bins`, with `lambda`
 //! and the bin counts the same placeholder policy the other decision
@@ -122,11 +124,14 @@ struct Tally {
 /// of room to the rail the offset pushes towards is moved by `min(o, h)`,
 /// so its share of the SSD change is `h^2 - 2*h*e` rather than
 /// `o^2 - 2*o*e`, and a model that adds `count*o^2 - 2*o*sum` over the
-/// whole category is wrong by exactly that difference. It was: on real
-/// content whose chroma sat near zero, the model check caught the
-/// decision predicting a few tens more error than the filter produced —
-/// a legal stream chosen against a filter that does not exist. The
-/// buckets below make the score exact for those samples too.
+/// whole category is wrong by exactly that difference. It was: on content
+/// that touches black or white — a full-range gradient, a chroma plane
+/// with lanczos ringing at zero — the model check caught the decision
+/// predicting tens to hundreds more units of error than the filter
+/// produced: a legal stream chosen against a filter that does not exist.
+/// The buckets below make the score exact for those samples too, and
+/// cost nothing on video-range content, whose samples never come within
+/// an offset of a rail.
 #[derive(Clone, Copy, Default)]
 struct Cat {
     all: Tally,
@@ -613,42 +618,45 @@ pub fn sao_picture<S: Sample>(
         sao_ctb_row(ctx.dsp, recon, &src, &band, info, sps, pps, ry);
     }
 
+    let plan = SaoPlan { params, merges, predicted };
+
     // The decision scored every candidate analytically, never by
-    // filtering. That is only sound if this module classifies samples
-    // exactly as the filter above does, so in a debug build the two are
-    // compared for real: one pass over the picture, against the very
-    // prediction the choices were made on. A mismatch means the decision
-    // is choosing against a model of a filter that does not exist — a bug
-    // that produces legal streams and worse pictures, and that nothing
-    // else here would notice.
-    #[cfg(debug_assertions)]
-    {
-        let mut actual = [0i64; 3];
-        for c in 0..ncomp {
-            let (csw, csh) = if c == 0 { (1, 1) } else { (sw, sh) };
-            let (plane, src, stride) = match c {
-                0 => (&recon.y, src_y, y_stride),
-                1 => (&recon.cb, src_cb, c_stride),
-                _ => (&recon.cr, src_cr, c_stride),
-            };
-            let (pw, ph) = (recon.width / csw, recon.height / csh);
-            for y in 0..ph {
-                for x in 0..pw {
-                    let e = plane.data[plane.offset(x as isize, y as isize)].to_i32() as i64 - src[y * stride + x].to_i32() as i64;
-                    actual[c] += e * e;
-                }
+    // filtering. That is only sound if this module models the filter
+    // above exactly — classifies samples as it does, moves them as it
+    // does — so the two are compared for real, in every build: one pass
+    // over the picture, against the very prediction the choices were made
+    // on. A mismatch means the decision is choosing against a model of a
+    // filter that does not exist — a bug that produces legal streams and
+    // worse pictures, and that nothing else here would notice. The pass
+    // is a few operations per sample, one picture per picture, against
+    // the hundreds the coding decisions spend on each.
+    let mut actual = [0i64; 3];
+    for c in 0..ncomp {
+        let (csw, csh) = if c == 0 { (1, 1) } else { (sw, sh) };
+        let (plane, src, stride) = match c {
+            0 => (&recon.y, src_y, y_stride),
+            1 => (&recon.cb, src_cb, c_stride),
+            _ => (&recon.cr, src_cr, c_stride),
+        };
+        let (pw, ph) = (recon.width / csw, recon.height / csh);
+        for y in 0..ph {
+            let row = &plane.data[plane.offset(0, y as isize)..][..pw];
+            let src = &src[y * stride..][..pw];
+            for (r, s) in row.iter().zip(src) {
+                let e = r.to_i32() as i64 - s.to_i32() as i64;
+                actual[c] += e * e;
             }
         }
-        for c in 0..ncomp {
-            debug_assert_eq!(
-                actual[c], predicted[c],
-                "SAO component {c}: the decision predicted {} and the filter produced {} - the two classify samples differently",
-                predicted[c], actual[c]
-            );
-        }
+    }
+    for c in 0..ncomp {
+        assert_eq!(
+            actual[c], plan.predicted[c],
+            "SAO component {c}: the decision predicted {} and the filter produced {} - the two model the filter differently",
+            plan.predicted[c], actual[c]
+        );
     }
 
-    SaoPlan { params, merges }
+    plan
 }
 
 impl<S: Sample> Comp<'_, S> {
@@ -759,6 +767,14 @@ mod tests {
         /// window, which is what a band offset can undo and an edge offset
         /// cannot see at all.
         BandShift,
+        /// Errors of two sizes on a white picture: most samples come back
+        /// `amount` too low, every eighth on a diagonal lattice only two
+        /// too low. All of them share the top band, so the one band offset
+        /// that fixes the many overshoots the few — and the filter's clip
+        /// stops those at the rail. This is the content the model check
+        /// fired on: an offset model without the clip predicts an error
+        /// for the few that the filter never produces.
+        Rail,
     }
 
     fn scene(w: usize, h: usize, kind: Err_, amount: i32) -> Scene {
@@ -777,6 +793,7 @@ mod tests {
             match kind {
                 Err_::Ringing => (60 + ((x % 5) as i32 - 2) * 18 + ((y % 7) as i32 - 3) * 9).clamp(10, 245) as u8,
                 Err_::BandShift => (96 + ((x / 8 + y / 8) % 32) as i32 % 32).clamp(96, 127) as u8,
+                Err_::Rail => 255,
             }
         };
         let mut src_y = vec![0u8; w * h];
@@ -823,6 +840,9 @@ mod tests {
                         Err_::BandShift => {
                             if (96..=127).contains(&v) { amount } else { 0 }
                         }
+                        Err_::Rail => {
+                            if (x + y) % 8 == 0 { -2 } else { -amount }
+                        }
                     };
                     plane.data[o + y * stride + x] = (v + e).clamp(0, 255) as u8;
                 }
@@ -842,16 +862,99 @@ mod tests {
         }
         /// Luma SSD against the source, over the whole picture.
         fn ssd(&self) -> i64 {
-            let (o, stride) = (self.recon.y.origin(), self.recon.y.stride);
-            let mut d = 0i64;
-            for y in 0..self.h {
-                for x in 0..self.w {
-                    let e = self.recon.y.data[o + y * stride + x] as i64 - self.src_y[y * self.w + x] as i64;
-                    d += e * e;
-                }
-            }
-            d
+            self.ssd_all()[0]
         }
+        /// SSD against the source per component, over the whole picture —
+        /// the number `SaoPlan::predicted` claims to be.
+        fn ssd_all(&self) -> [i64; 3] {
+            let plane_ssd = |plane: &Plane16<u8>, src: &[u8], w: usize, h: usize| {
+                let (o, stride) = (plane.origin(), plane.stride);
+                let mut d = 0i64;
+                for y in 0..h {
+                    for x in 0..w {
+                        let e = plane.data[o + y * stride + x] as i64 - src[y * w + x] as i64;
+                        d += e * e;
+                    }
+                }
+                d
+            };
+            let (w, h) = (self.w, self.h);
+            [
+                plane_ssd(&self.recon.y, &self.src_y, w, h),
+                plane_ssd(&self.recon.cb, &self.src_cb, w / 2, h / 2),
+                plane_ssd(&self.recon.cr, &self.src_cr, w / 2, h / 2),
+            ]
+        }
+    }
+
+    /// `Cat::delta` must be the filter's arithmetic, clip included: the
+    /// change in SSD from writing `clip(r + o)` over every sample of the
+    /// category, computed here the slow way, one sample at a time, at
+    /// every depth the encoder writes and every offset the syntax spells.
+    /// The model this replaced scored `count*o^2 - 2*o*sum`, which is the
+    /// same number only while no sample sits within `|o|` of a rail; here
+    /// a quarter of the samples hug each rail, so any offset beyond the
+    /// nearest of them clips and the two part company.
+    #[test]
+    fn the_category_model_is_the_clipped_filter_exactly() {
+        for max in [255i32, 1023, 4095] {
+            // Fixed pseudo-random content, so a failure names one case.
+            let mut seed = 0x2545_F491u32;
+            let mut next = || {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                (seed >> 8) as i32
+            };
+            let mut cat = Cat::default();
+            let mut samples = Vec::new();
+            for i in 0..400 {
+                let r = match i % 4 {
+                    0 => next().rem_euclid(40),
+                    1 => max - next().rem_euclid(40),
+                    _ => next().rem_euclid(max + 1),
+                };
+                let s = (r + next().rem_euclid(81) - 40).clamp(0, max);
+                cat.add(r, (s - r) as i64, max);
+                samples.push((r as i64, s as i64));
+            }
+            let mut clipped = 0usize;
+            for o in -(CLIP_REACH as i64)..=CLIP_REACH as i64 {
+                let slow: i64 = samples
+                    .iter()
+                    .map(|&(r, s)| {
+                        let f = (r + o).clamp(0, max as i64);
+                        clipped += usize::from(f != r + o);
+                        (f - s) * (f - s) - (r - s) * (r - s)
+                    })
+                    .sum();
+                assert_eq!(cat.delta(o), slow, "max {max}, offset {o}");
+            }
+            assert!(clipped > 0, "max {max}: no sample was ever clipped, so the agreement above is the old model's too");
+        }
+    }
+
+    /// The model check on content at the rails, in both build profiles:
+    /// `SaoPlan::predicted` is the SSD every choice was priced on, and it
+    /// must be what the filter then produced. The scene puts every sample
+    /// within seven of white and rewards an offset that pushes some of
+    /// them past it; a category model without the clip — the one this
+    /// replaced — predicts sixteen units of error for each of those where
+    /// the filter leaves zero, and this fails (at `sao_picture`'s own
+    /// check first, which runs in every build).
+    #[test]
+    fn the_prediction_survives_the_filters_clip_at_the_rail() {
+        let kit = Kit::new();
+        let ctx = kit.ctx(30);
+        let mut sc = scene(64, 64, Err_::Rail, 7);
+        let before = sc.ssd();
+        let plan = sc.run(&ctx);
+        assert!(sc.ssd() < before, "SAO made the white picture worse ({before} -> {})", sc.ssd());
+        assert_eq!(plan.predicted, sc.ssd_all(), "the decision's predicted SSD is not what the filter produced");
+        // The guard against a vacuous agreement: the scene is only a test
+        // of the clip if an offset that reaches past the rail was taken —
+        // three or more on band 31, where every sample of the picture sits
+        // and the lattice samples have two of room.
+        let clipping = plan.params.iter().any(|p| p[0].type_idx == 1 && (0..4).any(|k| (p[0].band_or_class as usize + k) & 31 == 31 && p[0].offsets[k] >= 3));
+        assert!(clipping, "no luma band offset of three or more reached band 31, so nothing was clipped");
     }
 
     /// The property that matters: SAO must leave the picture closer to the
