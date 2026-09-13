@@ -794,3 +794,381 @@ pub extern "C" fn h26x_selftest() -> u32 {
 
     fail
 }
+
+// ----------------------------------------------------------------------
+// The encode-side kernel tables
+// ----------------------------------------------------------------------
+//
+// `distortion_x86.rs` and `hevc_enc_x86.rs` end in test modules that drive
+// the encode-only kernels over randomised inputs against the scalar
+// references; the wasm tier (`distortion_wasm128.rs`, `hevc_enc_wasm128.rs`)
+// cannot have one, for the reason `h26x_selftest` gives. So the same sweep
+// lives here — same LCG, same block shapes, same extreme-row planes and
+// i16-extreme residual rows — and `tools/wasm.sh` runs it inside the
+// module on both builds.
+
+/// Which encode-side entries the installed tables replaced, as a bitmask:
+/// 1 = `distortion.sad`, 2 = `distortion.satd`, 4 = `distortion.ssd`,
+/// 8 = `hevc_enc.fdct` (all four), 16 = `hevc_enc.fdst4`, 32 =
+/// `hevc_enc.quant`.
+///
+/// The encode sweep below compares the installed table with the scalar
+/// one, and a build whose tier installed nothing would agree with itself
+/// vacuously. `h26x_rung` says what the CPU has; this says what the
+/// *encode* tables actually took from it, which is a separate fact — the
+/// rung was "SIMD128" for a long time while these tables were scalar.
+#[unsafe(no_mangle)]
+pub extern "C" fn h26x_enc_installed() -> u32 {
+    let cpu = h26x::dsp::Cpu::detect();
+    let ds = dist_table(h26x::dsp::Cpu::SCALAR);
+    let d = dist_table(cpu);
+    let hs = hevc_enc_table(h26x::dsp::Cpu::SCALAR);
+    let h = hevc_enc_table(cpu);
+    let mut m = 0;
+    m |= (d.sad as usize != ds.sad as usize) as u32;
+    m |= ((d.satd as usize != ds.satd as usize) as u32) << 1;
+    m |= ((d.ssd as usize != ds.ssd as usize) as u32) << 2;
+    m |= ((0..4).all(|i| h.fdct[i] as usize != hs.fdct[i] as usize) as u32) << 3;
+    m |= ((h.fdst4 as usize != hs.fdst4 as usize) as u32) << 4;
+    m |= ((h.quant as usize != hs.quant as usize) as u32) << 5;
+    m
+}
+
+/// The tables, built by one outlined function so that the two builds
+/// `h26x_enc_installed` compares come from one copy of the construction:
+/// a generic fn item (`fdct_scalar::<N>`) inlined into two call sites can
+/// land as two entries in the wasm function table, and then the scalar
+/// table would look "replaced" by itself.
+#[inline(never)]
+fn dist_table(cpu: h26x::dsp::Cpu) -> h26x::dsp::distortion::DistortionDsp<u8> {
+    h26x::dsp::distortion::DistortionDsp::<u8>::new(cpu)
+}
+
+#[inline(never)]
+fn hevc_enc_table(cpu: h26x::dsp::Cpu) -> h26x::dsp::hevc_enc::HevcEncDsp {
+    h26x::dsp::hevc_enc::HevcEncDsp::new(cpu)
+}
+
+/// Block shapes both encoders ask for, plus a few they do not, so the
+/// remainders (a lone four-wide column, a width of twelve) are reached.
+const DIST_SIZES: [(usize, usize); 16] = [
+    (4, 4),
+    (4, 8),
+    (4, 16),
+    (8, 4),
+    (8, 8),
+    (8, 16),
+    (12, 8),
+    (12, 12),
+    (16, 4),
+    (16, 8),
+    (16, 16),
+    (20, 8),
+    (24, 16),
+    (32, 32),
+    (48, 16),
+    (64, 64),
+];
+
+/// Two planes: random bytes, with whole rows pinned to 0 or 255 now and
+/// then so the extremes (a difference of ±255 in every lane, a Hadamard
+/// coefficient of ±4080) are actually exercised.
+fn dist_planes(seed: &mut u64) -> (Vec<u8>, Vec<u8>) {
+    let n = 96 * 96;
+    let mut a = vec![0u8; n];
+    let mut b = vec![0u8; n];
+    for y in 0..96 {
+        let mode = lcg(seed) % 8;
+        for x in 0..96 {
+            let (va, vb) = match mode {
+                0 => (0, 255),
+                1 => (255, 0),
+                2 => (lcg(seed) as u8, 255),
+                _ => (lcg(seed) as u8, lcg(seed) as u8),
+            };
+            a[y * 96 + x] = va;
+            b[y * 96 + x] = vb;
+        }
+    }
+    (a, b)
+}
+
+/// A residual block: mostly the range a real residual has, with whole
+/// rows at the i16 extremes now and then so the clamp after each stage
+/// and the widest products are reached.
+fn residual_block(seed: &mut u64, n: usize, bit_depth: u32) -> Vec<i16> {
+    let span = 1i32 << bit_depth;
+    let mut b = vec![0i16; n * n];
+    for y in 0..n {
+        let mode = lcg(seed) % 6;
+        for x in 0..n {
+            b[y * n + x] = match mode {
+                0 => 32767,
+                1 => -32768,
+                2 => (lcg(seed) as i32 & 0xffff) as i16,
+                _ => ((lcg(seed) as i32 % (2 * span)) - span) as i16,
+            };
+        }
+    }
+    b
+}
+
+/// Compare every entry of the installed encode-side tables — the
+/// distortion metrics and the H.265 forward transforms and quantiser —
+/// against the scalar reference over randomised inputs, returning a
+/// bitmask of the groups that disagreed: 1 = sad, 2 = satd, 4 = ssd, 8 =
+/// fdct, 16 = fdst4, 32 = quant (the same bits as `h26x_enc_installed`).
+///
+/// The trials mirror the x86 modules' tests: 24 rounds over the sixteen
+/// distortion shapes with random strides and offsets; 40 rounds of each
+/// transform size at bit depths 8, 10 and 12; and the quantiser at every
+/// third QP, intra and inter, over 12-bit-range coefficients including the
+/// i16 extremes.
+#[unsafe(no_mangle)]
+pub extern "C" fn h26x_enc_dsp_check() -> u32 {
+    use h26x::dsp::distortion::DistortionDsp;
+    use h26x::dsp::hevc_enc::{HevcEncDsp, qbits, quant_offset, quant_scale};
+    let cpu = h26x::dsp::Cpu::detect();
+    let mut fail = 0u32;
+
+    let s = DistortionDsp::<u8>::scalar();
+    let d = DistortionDsp::<u8>::new(cpu);
+    let mut seed = 0x5add_u64;
+    for _ in 0..24 {
+        let (a, b) = dist_planes(&mut seed);
+        for &(w, h) in &DIST_SIZES {
+            let sa = w + (lcg(&mut seed) as usize % 24);
+            let sb = w + (lcg(&mut seed) as usize % 24);
+            let oa = lcg(&mut seed) as usize % 64;
+            let ob = lcg(&mut seed) as usize % 64;
+            let (pa, pb) = (&a[oa..], &b[ob..]);
+            fail |= ((d.sad)(pa, sa, pb, sb, w, h) != (s.sad)(pa, sa, pb, sb, w, h)) as u32;
+            fail |= (((d.satd)(pa, sa, pb, sb, w, h) != (s.satd)(pa, sa, pb, sb, w, h)) as u32) << 1;
+            fail |= (((d.ssd)(pa, sa, pb, sb, w, h) != (s.ssd)(pa, sa, pb, sb, w, h)) as u32) << 2;
+        }
+    }
+    // The saturating extremes as a closed form, so the sweep does not rest
+    // on the scalar reference alone.
+    {
+        let a = vec![0u8; 64 * 64];
+        let b = vec![255u8; 64 * 64];
+        fail |= ((d.sad)(&a, 64, &b, 64, 64, 64) != 255 * 4096) as u32;
+        fail |= (((d.satd)(&a, 64, &b, 64, 64, 64) != 256 * ((16 * 255 + 1) >> 1)) as u32) << 1;
+        fail |= (((d.ssd)(&a, 64, &b, 64, 64, 64) != 255u64 * 255 * 4096) as u32) << 2;
+    }
+
+    let s = HevcEncDsp::scalar();
+    let d = HevcEncDsp::new(cpu);
+    let mut seed = 0xfdc7_u64;
+    for log2 in 2..6u32 {
+        let n = 1usize << log2;
+        for bit_depth in [8u32, 10, 12] {
+            for _ in 0..40 {
+                let src = residual_block(&mut seed, n, bit_depth);
+                let mut want = src.clone();
+                let mut got = src.clone();
+                (s.fdct[(log2 - 2) as usize])(&mut want, log2, bit_depth);
+                (d.fdct[(log2 - 2) as usize])(&mut got, log2, bit_depth);
+                fail |= ((got != want) as u32) << 3;
+                if log2 == 2 {
+                    let mut want = src.clone();
+                    let mut got = src.clone();
+                    (s.fdst4)(&mut want, bit_depth);
+                    (d.fdst4)(&mut got, bit_depth);
+                    fail |= ((got != want) as u32) << 4;
+                }
+            }
+        }
+    }
+    let mut seed = 0x9a47_u64;
+    for log2 in 2..6u32 {
+        let n = 1usize << log2;
+        for bit_depth in [8u32, 10] {
+            for qp in (0..52).step_by(3) {
+                for intra in [true, false] {
+                    let qb = qbits(qp, log2, bit_depth);
+                    let off = quant_offset(qb, intra);
+                    let scale = quant_scale((qp % 6) as usize);
+                    let coeffs = residual_block(&mut seed, n, 12);
+                    let mut want = vec![0i16; n * n];
+                    let mut got = vec![0i16; n * n];
+                    let nw = (s.quant)(&coeffs, &mut want, n, scale, qb, off);
+                    let ng = (d.quant)(&coeffs, &mut got, n, scale, qb, off);
+                    fail |= ((got != want || ng != nw) as u32) << 5;
+                }
+            }
+        }
+    }
+    fail
+}
+
+/// A timing loop over the installed encode-side kernels, for
+/// `tools/wasm.sh` to clock from outside (the module has no clock).
+/// `group` 0 is the distortion trio (sad + satd + ssd) over the square
+/// shape `4 << shape` (4x4 to 64x64); group 1 is the H.265 forward
+/// transform plus quantiser at `log2 = 2 + shape` (4x4 to 32x32). `iters`
+/// calls of the group. Returns a sink so nothing is optimised away.
+#[unsafe(no_mangle)]
+pub extern "C" fn h26x_enc_bench(group: u32, shape: u32, iters: u32) -> u32 {
+    use h26x::dsp::distortion::DistortionDsp;
+    use h26x::dsp::hevc_enc::{HevcEncDsp, qbits};
+    let cpu = h26x::dsp::Cpu::detect();
+    let mut seed = 0xbe9c_u64;
+    let mut sink = 0u64;
+    if group == 0 {
+        let d = DistortionDsp::<u8>::new(cpu);
+        let (a, b) = dist_planes(&mut seed);
+        let n = 4usize << shape.min(4);
+        for i in 0..iters as usize {
+            let o = (i & 31) * 3;
+            sink = sink
+                .wrapping_add((d.sad)(&a[o..], 96, &b[o..], 96, n, n) as u64)
+                .wrapping_add((d.satd)(&a[o..], 96, &b[o..], 96, n, n) as u64)
+                .wrapping_add((d.ssd)(&a[o..], 96, &b[o..], 96, n, n));
+        }
+    } else {
+        let d = HevcEncDsp::new(cpu);
+        let log2 = 2 + shape.min(3);
+        let n = 1usize << log2;
+        let src = residual_block(&mut seed, n, 8);
+        let mut work = src.clone();
+        let mut levels = vec![0i16; n * n];
+        for _ in 0..iters {
+            work.copy_from_slice(&src);
+            (d.fdct[(log2 - 2) as usize])(&mut work, log2, 8);
+            sink = sink.wrapping_add((d.quant)(&work, &mut levels, n, 20560, qbits(26, log2, 8), 1 << 10) as u64);
+        }
+    }
+    (sink ^ (sink >> 32)) as u32
+}
+
+// ----------------------------------------------------------------------
+// An encode round trip
+// ----------------------------------------------------------------------
+
+/// Encode `frames` raw 8-bit 4:2:0 pictures of `w` x `h` at `ptr` — H.265
+/// when `hevc` is nonzero, H.264 otherwise — at constant QP `qp` with a
+/// GOP of `gop` and `bframes` B pictures, then decode the stream with the
+/// matching decoder. Writes 32 bytes to `out`: the FNV-1a hash of the
+/// bitstream, the hash of the decoded pictures (as `h26x_decode` hashes
+/// them), the hash of the encoder's own reconstructions in display order,
+/// and the stream length, each as little-endian u64. Returns the number
+/// of pictures decoded, or `u32::MAX` if the encoder or decoder refused.
+///
+/// This is what makes the encode kernels' wasm story checkable end to
+/// end: `tools/wasm.sh` runs it on the scalar and the simd128 build and
+/// compares all three hashes, which is the module-side form of
+/// `tools/identity_encode.sh`, and the SELF property (decoded == encoder's
+/// reconstruction) is asserted inside as well.
+#[unsafe(no_mangle)]
+pub extern "C" fn h26x_encode(
+    ptr: *const u8,
+    len: usize,
+    w: u32,
+    h: u32,
+    hevc: u32,
+    qp: u32,
+    gop: u32,
+    bframes: u32,
+    out: *mut u8,
+) -> u32 {
+    use h26x::encode::{Config, RateControl};
+    let data = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let mut cfg = Config::default();
+    cfg.width = w;
+    cfg.height = h;
+    cfg.rate = RateControl::ConstantQp(qp as u8);
+    cfg.gop = gop;
+    cfg.bframes = bframes;
+    cfg.threads = 1;
+    let fb = (w * h + 2 * (w.div_ceil(2) * h.div_ceil(2))) as usize;
+    if fb == 0 || data.len() < fb {
+        return u32::MAX;
+    }
+    let mut stream = Vec::new();
+    let mut pocs: Vec<(bool, i32)> = Vec::new();
+    // Reconstructions come out in coding order and are hashed in display
+    // order, which is what the decoder emits.
+    let recon: Vec<Vec<u8>>;
+    macro_rules! drive {
+        ($enc:expr) => {{
+            let mut enc = match $enc {
+                Ok(e) => e,
+                Err(_) => return u32::MAX,
+            };
+            for chunk in data.chunks_exact(fb) {
+                match enc.push(chunk) {
+                    Ok(units) => {
+                        for a in units {
+                            stream.extend_from_slice(&a.data);
+                            pocs.push((a.keyframe, a.poc));
+                        }
+                    }
+                    Err(_) => return u32::MAX,
+                }
+            }
+            match enc.flush() {
+                Ok(units) => {
+                    for a in units {
+                        stream.extend_from_slice(&a.data);
+                        pocs.push((a.keyframe, a.poc));
+                    }
+                }
+                Err(_) => return u32::MAX,
+            }
+            recon = enc.reconstructions().to_vec();
+        }};
+    }
+    if hevc != 0 {
+        drive!(h26x::encode::h265::H265Encoder::new(cfg));
+    } else {
+        drive!(h26x::encode::h264::H264Encoder::new(cfg));
+    }
+    let mut hs = Hasher::new();
+    hs.write(&stream);
+    let mut hd = Hasher::new();
+    let mut frames = 0u32;
+    let ok = if hevc != 0 {
+        let mut d = h26x::hevc::HevcDecoder::new();
+        run(&stream, &mut frames, &mut hd, &mut d, |d, n| d.push_nal(n).is_ok(), |d| d.try_next_picture(), |d| d.flush().is_ok(), |d| d.next_picture())
+    } else {
+        let mut d = h26x::h264::H264Decoder::new();
+        run(&stream, &mut frames, &mut hd, &mut d, |d, n| d.push_nal(n).is_ok(), |d| d.try_next_picture(), |d| d.flush().is_ok(), |d| d.next_picture())
+    };
+    if !ok {
+        return u32::MAX;
+    }
+    // The encoder's reconstructions, display order, hashed the way the
+    // decoder's output is: equal hashes are the SELF property. POC restarts
+    // at every IDR, so display order is per coded video sequence — sort by
+    // (sequence, poc), the sequence counted up at each keyframe, exactly
+    // as `h26xenc` writes its `--recon` file.
+    let mut hr = Hasher::new();
+    if recon.len() != pocs.len() {
+        return u32::MAX;
+    }
+    let mut seq = 0u32;
+    let keys: Vec<(u32, i32)> = pocs
+        .iter()
+        .map(|&(key, poc)| {
+            if key {
+                seq += 1;
+            }
+            (seq, poc)
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..recon.len()).collect();
+    order.sort_by_key(|&i| keys[i]);
+    for i in order {
+        hr.write(&w.to_le_bytes());
+        hr.write(&h.to_le_bytes());
+        hr.write(&recon[i]);
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(hs.0.to_le_bytes().as_ptr(), out, 8);
+        std::ptr::copy_nonoverlapping(hd.0.to_le_bytes().as_ptr(), out.add(8), 8);
+        std::ptr::copy_nonoverlapping(hr.0.to_le_bytes().as_ptr(), out.add(16), 8);
+        std::ptr::copy_nonoverlapping((stream.len() as u64).to_le_bytes().as_ptr(), out.add(24), 8);
+    }
+    frames
+}

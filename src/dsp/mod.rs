@@ -68,6 +68,15 @@ pub(crate) mod hevc_wasm128;
 #[cfg(target_arch = "aarch64")]
 #[allow(unused_unsafe)]
 pub(crate) mod neon_dotprod;
+// The encode-only tiers beyond x86: the same kernels as `distortion_x86`
+// and `hevc_enc_x86`, on NEON and on wasm `simd128`.
+#[cfg(target_arch = "aarch64")]
+#[allow(unused_unsafe)]
+pub(crate) mod hevc_enc_neon;
+#[cfg(target_arch = "wasm32")]
+pub(crate) mod distortion_wasm128;
+#[cfg(target_arch = "wasm32")]
+pub(crate) mod hevc_enc_wasm128;
 
 /// Whether `H26X_ENC_NO_SIMD` asks the encode-only kernel table `table`
 /// (`distortion`, `h264_enc` or `hevc_enc`) to keep its scalar references
