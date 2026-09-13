@@ -94,32 +94,129 @@ pub struct SaoPlan {
     /// `params` entry equals the neighbour's, because that is what the
     /// reader will copy.
     pub merges: Vec<Option<SaoMerge>>,
+    /// Per component, the SSD against the source the decision predicted
+    /// the filtered picture would have — the number every choice above was
+    /// made on. The model check holds it to what the filter then produced.
+    pub predicted: [i64; 3],
 }
 
-/// Per-category statistics for one candidate: how many samples fell into
-/// each category, and the total error `src - rec` over them.
+/// How close to a rail a sample can be and still be clipped by an offset
+/// this encoder can spell: `cMax` of `sao_offset_abs` is 31 from ten bits
+/// up (7 at eight), so a sample with 31 or more of room to the rail is
+/// moved by any legal offset in full, and only the ones nearer than that
+/// need telling apart.
+const CLIP_REACH: usize = 31;
+
+/// A count of samples and the total error `src - rec` over them.
 #[derive(Clone, Copy, Default)]
-struct Cat {
+struct Tally {
     count: i64,
     sum: i64,
 }
 
+/// Per-category statistics for one candidate: the samples that fell into
+/// the category, and — kept apart from the rest — the ones near enough to
+/// a rail that the filter's clip would move them by less than the offset.
+///
+/// The filter writes `clip(rec + o)`, not `rec + o`. A sample with `h`
+/// of room to the rail the offset pushes towards is moved by `min(o, h)`,
+/// so its share of the SSD change is `h^2 - 2*h*e` rather than
+/// `o^2 - 2*o*e`, and a model that adds `count*o^2 - 2*o*sum` over the
+/// whole category is wrong by exactly that difference. It was: on real
+/// content whose chroma sat near zero, the model check caught the
+/// decision predicting a few tens more error than the filter produced —
+/// a legal stream chosen against a filter that does not exist. The
+/// buckets below make the score exact for those samples too.
+#[derive(Clone, Copy, Default)]
+struct Cat {
+    all: Tally,
+    /// `up[h]`: the samples exactly `h` below the top rail (`max - rec ==
+    /// h`), for `h < CLIP_REACH`. A positive offset `o > h` moves them by
+    /// `h`, not `o`.
+    up: [Tally; CLIP_REACH],
+    /// `down[h]`: the samples exactly `h` above zero (`rec == h`). A
+    /// negative offset `-o` with `o > h` moves them by `-h`.
+    down: [Tally; CLIP_REACH],
+}
+
 impl Cat {
-    /// The change in SSD from adding `o` to every sample of this category:
-    /// `sum((r + o) - s)^2 - sum(r - s)^2` = `count*o^2 - 2*o*sum`, where
-    /// `sum` is `sum(s - r)`. Negative is an improvement.
-    fn delta(&self, o: i64) -> i64 {
-        self.count * o * o - 2 * o * self.sum
+    /// Record one sample: its reconstruction `r`, its error `e = src -
+    /// rec`, and the top rail `max` of its bit depth.
+    #[inline]
+    fn add(&mut self, r: i32, e: i64, max: i32) {
+        self.all.count += 1;
+        self.all.sum += e;
+        let up = (max - r) as usize;
+        if up < CLIP_REACH {
+            self.up[up].count += 1;
+            self.up[up].sum += e;
+        }
+        let down = r as usize;
+        if down < CLIP_REACH {
+            self.down[down].count += 1;
+            self.down[down].sum += e;
+        }
     }
 
-    /// The offset this category would like, before the syntax's limits:
-    /// the rounded mean error, which is the minimiser of `delta`.
-    fn best(&self) -> i64 {
-        if self.count == 0 {
+    /// The change in SSD from the filter adding `o` to every sample of
+    /// this category and clipping: `sum(clip(r + o) - s)^2 - sum(r - s)^2`.
+    /// For a sample moved in full that is `o^2 - 2*o*e`; for one with only
+    /// `h < |o|` of room it is `h^2 - 2*h*e` in the offset's direction.
+    /// Negative is an improvement.
+    fn delta(&self, o: i64) -> i64 {
+        if o == 0 {
             return 0;
         }
-        let (n, s) = (self.count, self.sum);
+        let m = o.unsigned_abs() as usize;
+        debug_assert!(m <= CLIP_REACH, "SAO offset {o} is beyond what the syntax can spell");
+        let (side, sign) = if o > 0 { (&self.up, 1i64) } else { (&self.down, -1i64) };
+        let (mut n, mut s, mut d) = (self.all.count, self.all.sum, 0i64);
+        for (h, t) in side[..m.min(CLIP_REACH)].iter().enumerate() {
+            n -= t.count;
+            s -= t.sum;
+            let oe = sign * h as i64;
+            d += t.count * oe * oe - 2 * oe * t.sum;
+        }
+        d + n * o * o - 2 * o * s
+    }
+
+    /// The offset this category would like, before the syntax's limits
+    /// and before clipping: the rounded mean error, which is the
+    /// minimiser of the unclipped `count*o^2 - 2*o*sum`.
+    fn best(&self) -> i64 {
+        if self.all.count == 0 {
+            return 0;
+        }
+        let (n, s) = (self.all.count, self.all.sum);
         if s >= 0 { (2 * s + n) / (2 * n) } else { -((-2 * s + n) / (2 * n)) }
+    }
+
+    /// Whether any sample of this category is near enough to a rail for
+    /// some spellable offset to clip it.
+    fn near_a_rail(&self) -> bool {
+        self.up.iter().chain(self.down.iter()).any(|t| t.count != 0)
+    }
+
+    /// The offset to take within `[lo, hi]`, and its exact `delta`.
+    ///
+    /// Where nothing clips, `delta` is the quadratic `best` minimises and
+    /// the rounded mean is taken outright, so the choice on such content
+    /// is unchanged by the clipping model. Where a sample could clip, the
+    /// quadratic is not the score any more and its minimiser is only a
+    /// starting point: every spellable offset is scored exactly and the
+    /// mean is kept unless one is strictly better.
+    fn choose(&self, lo: i64, hi: i64) -> (i64, i64) {
+        let mut o = self.best().clamp(lo, hi);
+        let mut d = self.delta(o);
+        if self.near_a_rail() {
+            for cand in lo..=hi {
+                let dc = self.delta(cand);
+                if dc < d {
+                    (o, d) = (cand, dc);
+                }
+            }
+        }
+        (o, d)
     }
 }
 
@@ -229,10 +326,8 @@ impl<S: Sample> Comp<'_, S> {
         let mut cats = [Cat::default(); 32];
         for y in self.y0..self.y0 + self.h {
             for x in self.x0..self.x0 + self.w {
-                let b = (self.rec_at(x, y) >> self.shift) as usize;
-                let c = &mut cats[b & 31];
-                c.count += 1;
-                c.sum += self.err_at(x, y);
+                let v = self.rec_at(x, y);
+                cats[((v >> self.shift) & 31) as usize].add(v, self.err_at(x, y), self.max);
             }
         }
         cats
@@ -260,8 +355,7 @@ impl<S: Sample> Comp<'_, S> {
                 let a = self.rec_at(xa as usize, ya as usize);
                 let b = self.rec_at(xb as usize, yb as usize);
                 let e = (2 + (v - a).signum() + (v - b).signum()) as usize;
-                cats[e].count += 1;
-                cats[e].sum += self.err_at(x, y);
+                cats[e].add(v, self.err_at(x, y), self.max);
             }
         }
         cats
@@ -279,8 +373,7 @@ impl<S: Sample> Comp<'_, S> {
         let bands = self.band_stats();
         let mut per_band = [(0i64, 0i64); 32]; // (offset, delta)
         for (b, c) in bands.iter().enumerate() {
-            let o = c.best().clamp(-cmax, cmax);
-            per_band[b] = (o, c.delta(o));
+            per_band[b] = c.choose(-cmax, cmax);
         }
         for pos in 0..32usize {
             let mut p = SaoParams { type_idx: 1, band_or_class: pos as u8, offsets: [0; 4] };
@@ -317,9 +410,7 @@ impl<S: Sample> Comp<'_, S> {
             // no offset in the syntax at all.
             for (slot, cat) in [(0usize, 0usize), (1, 1), (2, 3), (3, 4)] {
                 let c = &cats[cat];
-                let want = c.best();
-                let o = if slot < 2 { want.clamp(0, cmax) } else { want.clamp(-cmax, 0) };
-                let d = c.delta(o);
+                let (o, d) = if slot < 2 { c.choose(0, cmax) } else { c.choose(-cmax, 0) };
                 if o != 0 && d < 0 {
                     p.offsets[slot] = o as i16;
                     delta += d;
@@ -421,7 +512,6 @@ pub fn sao_picture<S: Sample>(
     // and never by filtering — which is sound only if this module
     // classifies samples exactly as `hevc::sao` does. The debug check at
     // the end holds it to that.
-    #[cfg_attr(not(debug_assertions), allow(unused_mut, unused_variables))]
     let mut predicted = [0i64; 3];
 
     for ry in 0..hc {
@@ -576,8 +666,7 @@ impl<S: Sample> Comp<'_, S> {
             let bands = self.band_stats();
             for k in 0..4 {
                 let c = &bands[(class as usize + k) & 31];
-                let o = c.best().clamp(-cmax, cmax);
-                let d = c.delta(o);
+                let (o, d) = c.choose(-cmax, cmax);
                 if o != 0 && d < 0 {
                     p.offsets[k] = o as i16;
                     delta += d;
@@ -587,9 +676,7 @@ impl<S: Sample> Comp<'_, S> {
             let cats = self.edge_stats(class, usable);
             for (slot, cat) in [(0usize, 0usize), (1, 1), (2, 3), (3, 4)] {
                 let c = &cats[cat];
-                let want = c.best();
-                let o = if slot < 2 { want.clamp(0, cmax) } else { want.clamp(-cmax, 0) };
-                let d = c.delta(o);
+                let (o, d) = if slot < 2 { c.choose(0, cmax) } else { c.choose(-cmax, 0) };
                 if o != 0 && d < 0 {
                     p.offsets[slot] = o as i16;
                     delta += d;
