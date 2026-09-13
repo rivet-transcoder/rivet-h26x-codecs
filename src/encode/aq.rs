@@ -62,7 +62,15 @@ const SLOPE: f64 = 0.5;
 /// (coded size; whole CTBs of `1 << log2_ctb`) would like, in raster CTB
 /// order, at `strength`. All zero at strength 0, and all zero on a
 /// picture whose blocks all have the same variance.
-pub(crate) fn ctb_offsets<S: Sample>(luma: &[S], stride: usize, width: usize, height: usize, log2_ctb: u32, bit_depth: u32, strength: f32) -> Vec<i32> {
+pub(crate) fn ctb_offsets<S: Sample>(
+    luma: &[S],
+    stride: usize,
+    width: usize,
+    height: usize,
+    log2_ctb: u32,
+    bit_depth: u32,
+    strength: f32,
+) -> Vec<i32> {
     let n = 1usize << log2_ctb;
     let (wc, hc) = (width.div_ceil(n), height.div_ceil(n));
     if strength <= 0.0 {
@@ -92,7 +100,11 @@ pub(crate) fn ctb_offsets<S: Sample>(luma: &[S], stride: usize, width: usize, he
     let mean_e = energy.iter().sum::<f64>() / energy.len() as f64;
     energy
         .iter()
-        .map(|&e| (f64::from(strength) * SLOPE * (e - mean_e)).round().clamp(-f64::from(AQ_MAX_OFFSET), f64::from(AQ_MAX_OFFSET)) as i32)
+        .map(|&e| {
+            (f64::from(strength) * SLOPE * (e - mean_e))
+                .round()
+                .clamp(-f64::from(AQ_MAX_OFFSET), f64::from(AQ_MAX_OFFSET)) as i32
+        })
         .collect()
 }
 
@@ -113,7 +125,7 @@ mod tests {
                     (false, false) => 128,
                     (true, false) => 100,
                     (false, true) => 128 + ((x as i32 % 4) - 2) * 3, // mild
-                    (true, true) => r, // full-range noise
+                    (true, true) => r,                               // full-range noise
                 };
                 p[y * 64 + x] = v.clamp(0, 255) as u8;
             }
@@ -125,18 +137,38 @@ mod tests {
     fn flat_blocks_are_quantised_finer_and_noisy_ones_coarser() {
         let off = ctb_offsets::<u8>(&quadrants(), 64, 64, 64, 5, 8, 1.0);
         assert_eq!(off.len(), 4);
-        assert!(off[0] < 0 && off[1] < 0, "flat blocks should get a finer quantiser: {off:?}");
-        assert_eq!(off[0], off[1], "two equally flat blocks get the same offset: {off:?}");
-        assert!(off[3] > 0, "the noisy block should get a coarser quantiser: {off:?}");
-        assert!(off[2] > off[0] && off[2] < off[3], "mild texture lands between: {off:?}");
+        assert!(
+            off[0] < 0 && off[1] < 0,
+            "flat blocks should get a finer quantiser: {off:?}"
+        );
+        assert_eq!(
+            off[0], off[1],
+            "two equally flat blocks get the same offset: {off:?}"
+        );
+        assert!(
+            off[3] > 0,
+            "the noisy block should get a coarser quantiser: {off:?}"
+        );
+        assert!(
+            off[2] > off[0] && off[2] < off[3],
+            "mild texture lands between: {off:?}"
+        );
         assert!(off.iter().all(|o| o.abs() <= AQ_MAX_OFFSET));
     }
 
     #[test]
     fn strength_zero_and_uniform_pictures_offset_nothing() {
-        assert!(ctb_offsets::<u8>(&quadrants(), 64, 64, 64, 5, 8, 0.0).iter().all(|&o| o == 0));
+        assert!(
+            ctb_offsets::<u8>(&quadrants(), 64, 64, 64, 5, 8, 0.0)
+                .iter()
+                .all(|&o| o == 0)
+        );
         let flat = vec![77u8; 64 * 64];
-        assert!(ctb_offsets::<u8>(&flat, 64, 64, 64, 5, 8, 2.0).iter().all(|&o| o == 0));
+        assert!(
+            ctb_offsets::<u8>(&flat, 64, 64, 64, 5, 8, 2.0)
+                .iter()
+                .all(|&o| o == 0)
+        );
     }
 
     /// A deeper picture that is the 8-bit one shifted up must get the
@@ -145,7 +177,10 @@ mod tests {
     fn depth_does_not_change_the_offsets() {
         let p8 = quadrants();
         let p10: Vec<u16> = p8.iter().map(|&v| u16::from(v) << 2).collect();
-        assert_eq!(ctb_offsets::<u8>(&p8, 64, 64, 64, 5, 8, 1.0), ctb_offsets::<u16>(&p10, 64, 64, 64, 5, 10, 1.0));
+        assert_eq!(
+            ctb_offsets::<u8>(&p8, 64, 64, 64, 5, 8, 1.0),
+            ctb_offsets::<u16>(&p10, 64, 64, 64, 5, 10, 1.0)
+        );
     }
 
     #[test]
@@ -153,6 +188,9 @@ mod tests {
         let a = ctb_offsets::<u8>(&quadrants(), 64, 64, 64, 5, 8, 1.0);
         let b = ctb_offsets::<u8>(&quadrants(), 64, 64, 64, 5, 8, 4.0);
         assert!(b[3] >= a[3] && b[0] <= a[0], "{a:?} vs {b:?}");
-        assert_eq!(b[3], AQ_MAX_OFFSET, "at strength 4 the noisy block hits the clamp: {b:?}");
+        assert_eq!(
+            b[3], AQ_MAX_OFFSET,
+            "at strength 4 the noisy block hits the clamp: {b:?}"
+        );
     }
 }
