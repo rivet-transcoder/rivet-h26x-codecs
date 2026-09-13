@@ -970,7 +970,7 @@ pub fn parse_mb_cavlc(
 
     if layer.has_residual() {
         layer.qp_delta = r.se();
-        if !(-26..=25).contains(&layer.qp_delta) {
+        if !super::mb::qp_delta_range(ctx.bit_depth).contains(&layer.qp_delta) {
             return Err(Error::bitstream("mb_qp_delta out of range"));
         }
         layer.qp = super::mb::next_qp(qps.prev_qp, layer.qp_delta, ctx.bit_depth);

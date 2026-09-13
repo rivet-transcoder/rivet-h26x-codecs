@@ -1639,18 +1639,21 @@ pub(crate) fn write_cbp_cabac(
     }
 }
 
-/// `mb_qp_delta` (9.3.3.1.1.5): mapped unary.
-fn decode_qp_delta(c: &mut Cabac, st: &mut CabacState) -> Result<i32> {
+/// `mb_qp_delta` (9.3.3.1.1.5): mapped unary. The unary prefix of the
+/// widest legal value (`-(26 + QpBdOffsetY / 2)`, 7.4.5) is `52 +
+/// QpBdOffsetY` bins long; past that the stream is broken.
+fn decode_qp_delta(c: &mut Cabac, st: &mut CabacState, bit_depth: u32) -> Result<i32> {
     let inc = st.prev_qp_delta_nonzero as usize;
     if bin(c, st, CTX_MB_QP_DELTA + inc) == 0 {
         return Ok(0);
     }
+    let max_k = 52 + 6 * (bit_depth - 8);
     let mut k = 1u32;
     let mut ctx = CTX_MB_QP_DELTA + 2;
     while bin(c, st, ctx) != 0 {
         k += 1;
         ctx = CTX_MB_QP_DELTA + 3;
-        if k > 52 {
+        if k > max_k {
             return Err(Error::bitstream("mb_qp_delta runaway"));
         }
     }
@@ -2945,8 +2948,8 @@ pub fn parse_mb_cabac(
     }
 
     if layer.has_residual() {
-        layer.qp_delta = decode_qp_delta(c, st)?;
-        if !(-26..=25).contains(&layer.qp_delta) {
+        layer.qp_delta = decode_qp_delta(c, st, ctx.bit_depth)?;
+        if !super::mb::qp_delta_range(ctx.bit_depth).contains(&layer.qp_delta) {
             return Err(Error::bitstream("mb_qp_delta out of range"));
         }
         st.prev_qp_delta_nonzero = layer.qp_delta != 0;
@@ -3890,7 +3893,7 @@ mod mb_round_trip {
             }
         }
         if layer.has_residual() {
-            layer.qp_delta = decode_qp_delta(c, st).expect("mb_qp_delta rejected");
+            layer.qp_delta = decode_qp_delta(c, st, ctx.bit_depth).expect("mb_qp_delta rejected");
             st.prev_qp_delta_nonzero = layer.qp_delta != 0;
             parse_residual_cabac(c, st, ctx, info, nb, layer, None).expect("residual rejected");
         } else {
