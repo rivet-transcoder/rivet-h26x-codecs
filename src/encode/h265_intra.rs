@@ -156,6 +156,15 @@ pub struct CuDecision {
     /// entry is a raw spatial residual sample (source minus prediction,
     /// raster), not a transform level.
     pub bypass: bool,
+    /// `QpY` of this CU as a decoder will hold it — the quantiser the
+    /// residual was coded at when the CU carries a cbf, and the
+    /// *predicted* quantiser when it carries none: a residual-free CU
+    /// codes no `cu_qp_delta`, so whatever the encoder wanted for it, the
+    /// reader derives `qPY_PRED` and so must every consumer here — the
+    /// deblocker reads this for its `QpY` average. The decision modules
+    /// fill it with the context quantiser; the encoder's quantiser chain
+    /// overwrites it when the picture varies the quantiser per CTB.
+    pub qp_y: i32,
     /// Chosen luma prediction modes (0 planar, 1 DC, 2..=34 angular), one
     /// per prediction block in z-order. `PART_2Nx2N` has one prediction
     /// block; its mode is replicated across all four entries so a reader
@@ -268,6 +277,23 @@ pub struct CuDecision {
     pub chroma: [[i16; 1024]; 2],
 }
 
+impl CuDecision {
+    /// Whether any transform block of this CU carries coefficients — the
+    /// condition under which a decoder reads a `cu_qp_delta` somewhere in
+    /// the CU's tree (`transform_unit`: the first unit with a coded luma
+    /// or chroma cbf), and therefore whether the CU can carry a
+    /// quantiser of its own at all.
+    pub fn any_cbf(&self) -> bool {
+        self.cbf_luma.iter().any(|&f| f)
+            || self.cbf_chroma.iter().any(|&f| f)
+            || self.cbf_chroma_bot.iter().any(|&f| f)
+            || self.cbf_chroma_tu.iter().flatten().any(|&f| f)
+            || self.cbf_chroma_tu_bot.iter().flatten().any(|&f| f)
+            || self.cbf_chroma_leaf.iter().flatten().any(|&f| f)
+            || self.cbf_chroma_leaf_bot.iter().flatten().any(|&f| f)
+    }
+}
+
 impl Default for CuDecision {
     fn default() -> Self {
         CuDecision {
@@ -276,6 +302,7 @@ impl Default for CuDecision {
             split_tu: false,
             split_child: [false; 4],
             bypass: false,
+            qp_y: 26,
             luma_modes: [1; 4],
             luma_syntax: [LumaModeSyntax::default(); 4],
             chroma_syntax: 4,
@@ -495,7 +522,7 @@ impl<S: Sample> IntraPicture<S> {
         } else {
             (&src_cb[..0], &src_cr[..0])
         };
-        let mut out = CuDecision { log2_cu: geo.log2_cu, bypass: ctx.bypass, ..CuDecision::default() };
+        let mut out = CuDecision { log2_cu: geo.log2_cu, bypass: ctx.bypass, qp_y: ctx.qp, ..CuDecision::default() };
 
         let IntraPicture { recon, modes, scratch, .. } = self;
         if geo.log2_cu == 3 {
@@ -641,7 +668,7 @@ pub(crate) fn code_cu_2nx2n_intra<S: Sample>(
     } else {
         (&src_cb[..0], &src_cr[..0])
     };
-    let mut out = CuDecision { log2_cu: geo.log2_cu, bypass: ctx.bypass, ..CuDecision::default() };
+    let mut out = CuDecision { log2_cu: geo.log2_cu, bypass: ctx.bypass, qp_y: ctx.qp, ..CuDecision::default() };
     // PART_2Nx2N. The luma mode is chosen once, by SATD on the
     // unsplit CU-sized prediction, and both transform structures
     // reuse it — a per-structure mode search would be fairer and
@@ -1839,7 +1866,7 @@ fn cu_bits(d: &CuDecision, cat: u32, qp: i32, bypass: bool) -> f32 {
     // other counted costs use. Two structures of the same CU carry the
     // same mode syntax and the same neighbours, so everything shared
     // cancels in the difference that decides between them.
-    crate::encode::h265::write_ctu_intra(&mut e, &mut cx, d, 1, 1, bypass, cat);
+    crate::encode::h265::write_ctu_intra(&mut e, &mut cx, d, 1, 1, bypass, cat, None);
     e.fractional_bits() as f32
 }
 

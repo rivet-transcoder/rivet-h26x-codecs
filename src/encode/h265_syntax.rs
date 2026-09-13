@@ -488,7 +488,35 @@ pub fn write_sps(cfg: &Config, g: &Geometry, log2_max_poc_lsb: u32, cpb: Option<
 /// It changes nothing else here or in the slice header (the parser reads no
 /// other syntax conditionally on it); what it changes is the coding tree,
 /// where every CU then carries a `cu_transquant_bypass_flag`.
+///
+/// Everything else is [`PpsOptions::default`]: the stream every caller
+/// before the per-CU quantiser and weighted prediction existed asked
+/// for, byte for byte. Those go through [`write_pps_opts`].
 pub fn write_pps(qp: i32, bypass: bool, deblock: bool) -> Vec<u8> {
+    write_pps_opts(qp, bypass, deblock, &PpsOptions::default())
+}
+
+/// The picture-parameter-set switches that make more syntax appear in
+/// the coding tree or the slice header — each `false` / `None` by default
+/// so that a stream not asking for the feature is byte-identical to one
+/// from an encoder that never had it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PpsOptions {
+    /// `cu_qp_delta_enabled_flag`, with `diff_cu_qp_delta_depth` when
+    /// set: the quantiser may then change per quantisation group, and
+    /// every transform unit that carries a coded cbf and is the first in
+    /// its group codes `cu_qp_delta_abs` (and a sign). `Some(0)` makes
+    /// the group the CTB.
+    pub cu_qp_delta_depth: Option<u32>,
+    /// `weighted_pred_flag`: every P slice header carries a
+    /// `pred_weight_table`.
+    pub weighted_pred: bool,
+    /// `weighted_bipred_flag`: every B slice header carries one.
+    pub weighted_bipred: bool,
+}
+
+/// [`write_pps`] with the optional switches spelled out.
+pub fn write_pps_opts(qp: i32, bypass: bool, deblock: bool, opts: &PpsOptions) -> Vec<u8> {
     let mut w = BitWriter::with_capacity(32);
     w.ue(0); // pps_pic_parameter_set_id
     w.ue(0); // pps_seq_parameter_set_id
@@ -502,12 +530,22 @@ pub fn write_pps(qp: i32, bypass: bool, deblock: bool) -> Vec<u8> {
     w.se(qp - 26); // init_qp_minus26
     w.flag(false); // constrained_intra_pred_flag
     w.flag(false); // transform_skip_enabled_flag
-    w.flag(false); // cu_qp_delta_enabled_flag
+    // Fifth member of the flag-that-grows-syntax family this file keeps
+    // meeting: setting it makes `diff_cu_qp_delta_depth` follow here and
+    // `cu_qp_delta_abs` appear in the coding tree. The reader takes the
+    // depth only when the flag is set (`pps.rs`), so the writer does too.
+    w.flag(opts.cu_qp_delta_depth.is_some()); // cu_qp_delta_enabled_flag
+    if let Some(depth) = opts.cu_qp_delta_depth {
+        w.ue(depth); // diff_cu_qp_delta_depth
+    }
     w.se(0); // pps_cb_qp_offset
     w.se(0); // pps_cr_qp_offset
     w.flag(false); // pps_slice_chroma_qp_offsets_present_flag
-    w.flag(false); // weighted_pred_flag
-    w.flag(false); // weighted_bipred_flag
+    // Each of these makes a `pred_weight_table` appear in every slice
+    // header of that type, which the slice header writer must then
+    // carry.
+    w.flag(opts.weighted_pred); // weighted_pred_flag
+    w.flag(opts.weighted_bipred); // weighted_bipred_flag
     w.flag(bypass); // transquant_bypass_enabled_flag
     w.flag(false); // tiles_enabled_flag
     w.flag(false); // entropy_coding_sync_enabled_flag

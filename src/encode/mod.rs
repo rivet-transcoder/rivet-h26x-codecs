@@ -77,6 +77,7 @@ pub mod h265_deblock;
 pub mod h265_intra;
 pub mod h265_me;
 pub(crate) mod rc;
+pub(crate) mod aq;
 pub(crate) mod h265_sao;
 pub mod hrd;
 pub mod h265_syntax;
@@ -182,6 +183,22 @@ pub struct Config {
     /// `sample_adaptive_offset_enabled_flag` in the SPS, which makes one
     /// or two more flags appear in *every* slice header.
     pub sao: bool,
+    /// Adaptive quantisation strength (H.265 only): 0 is off, which is
+    /// the default. Above 0 the PPS sets `cu_qp_delta_enabled_flag` and
+    /// every coding tree block is quantised at its own offset from the
+    /// picture quantiser, chosen from its luma variance — flat blocks
+    /// finer, textured blocks coarser, zero-mean over the picture, and at
+    /// most six steps either way. 1.0 is the strength the
+    /// measurements in `encode::aq` were taken at.
+    ///
+    /// A switch rather than always-on for the reason SAO is: it costs a
+    /// `cu_qp_delta` per coded block and it trades global PSNR for a
+    /// more even distribution of error, which a caller measuring PSNR
+    /// does not want. Off, the stream is byte-identical to one from an
+    /// encoder that never had it. Ignored by H.264, whose per-macroblock
+    /// `mb_qp_delta` is a different mechanism this encoder does not
+    /// drive yet.
+    pub aq_strength: f32,
 }
 
 impl Default for Config {
@@ -202,6 +219,7 @@ impl Default for Config {
             sao: false,
             fps: 30,
             cpb_ms: 0,
+            aq_strength: 0.0,
         }
     }
 }
@@ -219,6 +237,9 @@ impl Config {
         }
         if self.max_refs == 0 {
             return Err(crate::Error::unsupported("encode: max_refs must be at least 1"));
+        }
+        if !(self.aq_strength >= 0.0) || self.aq_strength > 4.0 {
+            return Err(crate::Error::unsupported("encode: aq_strength outside 0.0..=4.0"));
         }
         Ok(())
     }

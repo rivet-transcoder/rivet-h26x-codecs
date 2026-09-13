@@ -269,6 +269,13 @@ pub struct InterCuDecision {
     /// CU is exempt from the in-loop filters sample for sample, which is
     /// what keeps a lossless stream lossless once deblocking is on.
     pub bypass: bool,
+    /// `QpY` of this CU as a decoder will hold it: the context quantiser
+    /// when the CU carries residual, the *predicted* one when it does not
+    /// — a skip or a root-cbf-0 CU codes no `cu_qp_delta`. Filled with
+    /// the context quantiser here; the encoder's quantiser chain
+    /// overwrites it when the picture varies the quantiser per CTB. Read
+    /// by the deblocker. See `CuDecision::qp_y`.
+    pub qp_y: i32,
     /// The choice, with its signalling payload.
     pub kind: InterCuKind,
     /// The chosen motion vector, quarter luma samples, list 0. Filled for
@@ -338,6 +345,7 @@ impl Default for InterCuDecision {
         InterCuDecision {
             log2_cu: 0,
             bypass: false,
+            qp_y: 26,
             kind: InterCuKind::Skip { merge_idx: 0 },
             mv: Mv::ZERO,
             ref_idx: 0,
@@ -375,6 +383,36 @@ pub enum PCuDecision {
     /// An intra CU inside the P slice, decided by the intra module over
     /// this same picture's reconstruction.
     Intra(Box<CuDecision>),
+}
+
+impl PCuDecision {
+    /// The `QpY` a decoder holds for this CU — see `InterCuDecision::qp_y`.
+    pub fn qp_y(&self) -> i32 {
+        match self {
+            PCuDecision::Inter(d) => d.qp_y,
+            PCuDecision::Intra(d) => d.qp_y,
+        }
+    }
+
+    /// Store the `QpY` the encoder's quantiser chain settled on.
+    pub fn set_qp_y(&mut self, qp_y: i32) {
+        match self {
+            PCuDecision::Inter(d) => d.qp_y = qp_y,
+            PCuDecision::Intra(d) => d.qp_y = qp_y,
+        }
+    }
+
+    /// Whether the CU carries any coded cbf, which is when — and only
+    /// when — a decoder reads a `cu_qp_delta` inside it. An inter CU's
+    /// tree exists exactly when `rqt_root_cbf` is set, and a tree at
+    /// this geometry always carries a cbf (the decision spells a
+    /// residual-free tree as a skip or a root cbf of 0).
+    pub fn any_cbf(&self) -> bool {
+        match self {
+            PCuDecision::Inter(d) => d.rqt_root_cbf,
+            PCuDecision::Intra(d) => d.any_cbf(),
+        }
+    }
 }
 
 /// Per-picture state of the P-picture walk: the reconstruction the next
@@ -551,7 +589,7 @@ impl<S: Sample> InterPicture<S> {
     ) -> InterCuDecision {
         let n = 1usize << self.log2_cu;
         let (x0, y0) = (cu_x * n, cu_y * n);
-        let mut out = InterCuDecision { log2_cu: self.log2_cu, bypass: ctx.bypass, ..InterCuDecision::default() };
+        let mut out = InterCuDecision { log2_cu: self.log2_cu, bypass: ctx.bypass, qp_y: ctx.qp, ..InterCuDecision::default() };
 
         // Mark the CTB as this (single) slice's, as the decoder does at CTB
         // start: `avail_ctx` reads the current CTB's slice address, and
@@ -729,7 +767,7 @@ impl<S: Sample> InterPicture<S> {
     ) -> InterCuDecision {
         let n = 1usize << self.log2_cu;
         let (x0, y0) = (cu_x * n, cu_y * n);
-        let mut out = InterCuDecision { log2_cu: self.log2_cu, bypass: ctx.bypass, ..InterCuDecision::default() };
+        let mut out = InterCuDecision { log2_cu: self.log2_cu, bypass: ctx.bypass, qp_y: ctx.qp, ..InterCuDecision::default() };
 
         let ctb = self.info.ctb_of(x0, y0);
         self.info.ctb_slice_addr[ctb] = 0;

@@ -377,28 +377,27 @@ impl<'a, S: Sample> SliceDec<'a, S> {
     }
 
     /// `qPY_PRED` for the CU at `(x_cb, y_cb)` in the current QG (8.6.1).
+    ///
+    /// This method resolves the two neighbouring quantisation groups —
+    /// available, and inside the current CTB — and hands what it found to
+    /// [`qp_y_pred_from`], which is the arithmetic. The split is so the
+    /// encoder can call the same arithmetic over its own state rather than
+    /// retype it beside a comment saying it matches.
     fn qp_y_pred(&mut self, x_cb: i32, y_cb: i32) -> i32 {
         let (xq, yq) = self.qg;
         let prev = self.qg_qp_prev;
         let ctb_cur = self.info.ctb_of(x_cb as usize, y_cb as usize);
         let ac = self.avail_ctx(x_cb, y_cb);
-        let qa = if self.info.available_at(&ac, xq - 1, yq) && self.info.ctb_of((xq - 1) as usize, yq as usize) == ctb_cur {
-            self.info.qp_y[self.info.idx4((xq - 1) as usize, yq as usize)] as i32
-        } else {
-            prev
-        };
-        let qb = if self.info.available_at(&ac, xq, yq - 1) && self.info.ctb_of(xq as usize, (yq - 1) as usize) == ctb_cur {
-            self.info.qp_y[self.info.idx4(xq as usize, (yq - 1) as usize)] as i32
-        } else {
-            prev
-        };
-        (qa + qb + 1) >> 1
+        let qa = (self.info.available_at(&ac, xq - 1, yq) && self.info.ctb_of((xq - 1) as usize, yq as usize) == ctb_cur)
+            .then(|| self.info.qp_y[self.info.idx4((xq - 1) as usize, yq as usize)] as i32);
+        let qb = (self.info.available_at(&ac, xq, yq - 1) && self.info.ctb_of(xq as usize, (yq - 1) as usize) == ctb_cur)
+            .then(|| self.info.qp_y[self.info.idx4(xq as usize, (yq - 1) as usize)] as i32);
+        qp_y_pred_from(qa, qb, prev)
     }
 
     fn set_qp(&mut self, x_cb: i32, y_cb: i32) {
         let pred = self.qp_y_pred(x_cb, y_cb);
-        let bd_off = 6 * (self.sps.bit_depth_luma as i32 - 8);
-        self.qp_y = ((pred + self.cu_qp_delta_val + 52 + 2 * bd_off) % (52 + bd_off)) - bd_off;
+        self.qp_y = qp_y_from_pred(pred, self.cu_qp_delta_val, self.sps.bit_depth_luma);
     }
 
     fn coding_unit(&mut self, x0: i32, y0: i32, log2_cb: u32, depth: u32) -> Result<()> {
@@ -1845,6 +1844,76 @@ pub(crate) fn write_rqt_root_cbf(e: &mut CabacEncoder, cx: &mut Contexts, cbf: b
     e.encode_decision(&mut cx.c[NO_RESIDUAL_DATA_FLAG_OFFSET], cbf as u32);
 }
 
+/// Write `cu_qp_delta_abs` and `cu_qp_delta_sign_flag`: the inverse of the
+/// read in `transform_unit`, for the value `CuQpDeltaVal` the reader will
+/// hold afterwards.
+///
+/// Present exactly when the reader reads it: the PPS sets
+/// `cu_qp_delta_enabled_flag`, this transform unit carries a coded luma or
+/// chroma cbf, and no earlier unit of the same quantisation group coded
+/// one (`IsCuQpDeltaCoded`). A unit with nothing coded takes no bin here,
+/// and a CU whose every cbf is clear therefore cannot carry a delta at all
+/// — its `QpY` is the prediction, whatever the encoder wanted, which is
+/// the rule an encoder choosing per-CU quantisers has to respect (see
+/// `encode::h265`'s quantiser chain).
+///
+/// The spelling is the reader's: a truncated unary prefix of the
+/// magnitude, cMax 5, first bin in one context and the rest in another;
+/// at 5 an Exp-Golomb order-0 suffix of the remainder in bypass; then a
+/// bypass sign for any nonzero value.
+#[allow(dead_code)]
+pub(crate) fn write_cu_qp_delta(e: &mut CabacEncoder, cx: &mut Contexts, val: i32) {
+    let abs = val.unsigned_abs();
+    let prefix = abs.min(5);
+    for i in 0..prefix {
+        e.encode_decision(&mut cx.c[CU_QP_DELTA_OFFSET + usize::from(i != 0)], 1);
+    }
+    if prefix < 5 {
+        e.encode_decision(&mut cx.c[CU_QP_DELTA_OFFSET + usize::from(prefix != 0)], 0);
+    } else {
+        // cu_qp_delta_abs suffix, EG0: ones while the remainder covers the
+        // next doubling (starting at 1 << 0), a zero, then the remainder's
+        // bits — the reader's k grows the same way.
+        let mut rem = abs - 5;
+        let mut k = 0u32;
+        while rem >= (1 << k) {
+            e.encode_bypass(1);
+            rem -= 1 << k;
+            k += 1;
+            debug_assert!(k <= 24, "cu_qp_delta too large to binarise");
+        }
+        e.encode_bypass(0);
+        e.encode_bypass_bits(k, rem);
+    }
+    if abs != 0 {
+        e.encode_bypass((val < 0) as u32);
+    }
+}
+
+/// `qPY_PRED` (8.6.1) from what the neighbouring quantisation groups
+/// offer: `qa` and `qb` are the `QpY` of the group to the left and above
+/// the current one when each is available *and* inside the current CTB,
+/// `None` otherwise — in which case the previous group's `qPY_PREV`
+/// stands in for it.
+///
+/// The arithmetic behind the reader's `qp_y_pred`, as a function of what
+/// it resolved, so the encoder's quantiser chain calls this rather than
+/// a copy. At the geometry this crate's encoder codes — one CU per CTB,
+/// `diff_cu_qp_delta_depth` 0 — both neighbours always fall outside the
+/// current CTB and the prediction is simply `qPY_PREV`; the function is
+/// still the general one so that stops being true silently.
+pub(crate) fn qp_y_pred_from(qa: Option<i32>, qb: Option<i32>, prev: i32) -> i32 {
+    (qa.unwrap_or(prev) + qb.unwrap_or(prev) + 1) >> 1
+}
+
+/// `QpY` from `qPY_PRED` and `CuQpDeltaVal` (8.6.1): the sum, wrapped
+/// into `-QpBdOffsetY..=51` modulo `52 + QpBdOffsetY`. The reader's
+/// `set_qp`, as a function.
+pub(crate) fn qp_y_from_pred(pred: i32, delta: i32, bit_depth_luma: u32) -> i32 {
+    let bd_off = 6 * (bit_depth_luma as i32 - 8);
+    ((pred + delta + 52 + 2 * bd_off) % (52 + bd_off)) - bd_off
+}
+
 /// Which of the two `sao_merge` flags the reader will actually read for
 /// this CTB, already resolved by the caller — the same three-part test
 /// `parse_sao` performs per flag: the neighbour exists in the picture, it
@@ -2062,7 +2131,7 @@ mod write_round_trip {
     use crate::bitwriter::BitWriter;
     use crate::encode::Config;
     use crate::encode::gop::Kind;
-    use crate::encode::h265_syntax::{Geometry as EncGeometry, NAL_IDR_N_LP, NAL_TRAIL_R, SliceHeader as EncSliceHeader, write_pps, write_slice_header, write_sps};
+    use crate::encode::h265_syntax::{Geometry as EncGeometry, NAL_IDR_N_LP, NAL_TRAIL_R, PpsOptions, SliceHeader as EncSliceHeader, write_pps, write_pps_opts, write_slice_header, write_sps};
     use crate::hevc::pic::Geometry as PicGeometry;
     use crate::hevc::residual::write_residual;
     use crate::nal::{HevcNalHeader, unescape_rbsp};
@@ -2128,6 +2197,25 @@ mod write_round_trip {
         exp_pred: Vec<u8>,
         cx: Contexts,
         rng: Lcg,
+        /// `cu_qp_delta_enabled_flag` with `Log2MinCuQpDeltaSize`: the
+        /// writer then mirrors the reader's quantisation-group state
+        /// below and codes a delta in the first unit of each group that
+        /// carries a cbf.
+        qp_delta: Option<u32>,
+        /// `SliceQpY`, and the reader's running `QpY` / `qPY_PREV` /
+        /// group state, kept exactly as `coding_quadtree` keeps them.
+        slice_qp: i32,
+        qp_y: i32,
+        qp_y_prev: i32,
+        qg: (i32, i32),
+        qg_qp_prev: i32,
+        first_qg: bool,
+        is_cu_qp_delta_coded: bool,
+        cu_qp_delta_val: i32,
+        /// Expected `PicInfo::qp_y` after the decode, filled per CU with
+        /// the `QpY` in force after its transform tree, as the reader
+        /// fills it.
+        exp_qp: Vec<i8>,
     }
 
     impl CtuWriter {
@@ -2159,6 +2247,59 @@ mod write_round_trip {
                 exp_pred: vec![2; w4 * h4],
                 cx: Contexts::new(0, qp),
                 rng: Lcg(seed),
+                qp_delta: None,
+                slice_qp: qp,
+                qp_y: qp,
+                qp_y_prev: qp,
+                qg: (0, 0),
+                qg_qp_prev: qp,
+                first_qg: true,
+                is_cu_qp_delta_coded: false,
+                cu_qp_delta_val: 0,
+                exp_qp: vec![qp as i8; w4 * h4],
+            }
+        }
+
+        /// Enable per-group quantiser deltas at `diff_cu_qp_delta_depth`
+        /// — the PPS under test must carry the same.
+        fn with_qp_delta(mut self, diff_depth: u32) -> Self {
+            self.qp_delta = Some(self.log2_ctb - diff_depth);
+            self
+        }
+
+        /// `qPY_PRED` for the current group, resolved over the writer's
+        /// own expected map exactly as the reader resolves it over
+        /// `PicInfo::qp_y`: a neighbouring group counts only when it lies
+        /// inside the picture and inside the current CTB (a raster walk
+        /// over one slice and tile has already coded any such position).
+        fn qp_pred(&self) -> i32 {
+            let (xq, yq) = self.qg;
+            let ctb_x0 = (xq >> self.log2_ctb) << self.log2_ctb;
+            let ctb_y0 = (yq >> self.log2_ctb) << self.log2_ctb;
+            let qa = (xq - 1 >= ctb_x0).then(|| self.exp_qp[self.idx4(xq - 1, yq)] as i32);
+            let qb = (yq - 1 >= ctb_y0).then(|| self.exp_qp[self.idx4(xq, yq - 1)] as i32);
+            qp_y_pred_from(qa, qb, self.qg_qp_prev)
+        }
+
+        /// A `CuQpDeltaVal` whose magnitude lands in each spelling regime:
+        /// zero, the prefix alone (1..=4), the smallest suffix (5), a
+        /// short suffix, and the far end of the legal range at eight bits
+        /// (`-26..=25`).
+        fn gen_qp_delta(&mut self) -> i32 {
+            let mag = match self.rng.below(6) {
+                0 => 0,
+                1 => 1 + self.rng.below(4) as i32,
+                2 => 5,
+                3 => 6 + self.rng.below(7) as i32,
+                4 => 13 + self.rng.below(8) as i32,
+                _ => 21 + self.rng.below(5) as i32,
+            };
+            if mag == 0 {
+                0
+            } else if self.rng.chance(50) {
+                -mag.min(26)
+            } else {
+                mag.min(25)
             }
         }
 
@@ -2237,6 +2378,19 @@ mod write_round_trip {
             } else {
                 log2_cb > self.log2_min_cb
             };
+            // A quantisation group starts at every node at least the
+            // group's size — the reader's reset of `IsCuQpDeltaCoded`,
+            // `CuQpDeltaVal` and `qPY_PREV` at the top of
+            // `coding_quadtree`.
+            if let Some(log2_qg) = self.qp_delta {
+                if log2_cb >= log2_qg {
+                    self.is_cu_qp_delta_coded = false;
+                    self.cu_qp_delta_val = 0;
+                    self.qg = (x0, y0);
+                    self.qg_qp_prev = if self.first_qg { self.slice_qp } else { self.qp_y_prev };
+                    self.first_qg = false;
+                }
+            }
             if split {
                 let half = size / 2;
                 let x1 = x0 + half;
@@ -2253,6 +2407,14 @@ mod write_round_trip {
                 }
             } else {
                 self.cu(e, x0, y0, log2_cb, depth);
+            }
+            // End of a group: the reader remembers the last CU's QpY as
+            // the next group's qPY_PREV.
+            if let Some(log2_qg) = self.qp_delta {
+                let mask = (1i32 << log2_qg) - 1;
+                if ((x0 + size) & mask) == 0 && ((y0 + size) & mask) == 0 {
+                    self.qp_y_prev = self.qp_y;
+                }
             }
         }
 
@@ -2313,9 +2475,14 @@ mod write_round_trip {
             PicInfo::fill4(&mut self.ct_depth, self.w4, x0 as usize, y0 as usize, n as usize, n as usize, depth as u8);
             if self.p_slice {
                 self.p_cu(e, x0, y0, log2_cb, by);
-                return;
+            } else {
+                self.intra_cu_body(e, x0, y0, log2_cb, by);
             }
-            self.intra_cu_body(e, x0, y0, log2_cb, by);
+            // The reader records QpY over the CU after its transform tree
+            // (`coding_unit`'s bookkeeping block): the value in force
+            // then, which a delta coded inside the tree has already moved
+            // and which a CU coding no delta leaves as it was.
+            PicInfo::fill4(&mut self.exp_qp, self.w4, x0 as usize, y0 as usize, n as usize, n as usize, self.qp_y as i8);
         }
 
         /// One CU of a P slice, in `coding_unit`'s exact order: the skip
@@ -2479,6 +2646,17 @@ mod write_round_trip {
             } else {
                 true
             };
+            // cu_qp_delta_abs / sign: the first unit of a quantisation
+            // group that carries a coded cbf — luma, or the chroma flags
+            // this unit holds, inherited ones included — exactly
+            // `transform_unit`'s gate, and before any residual.
+            if self.qp_delta.is_some() && !self.is_cu_qp_delta_coded && (cbf_luma || cbf_c[0] || cbf_c[1]) {
+                let v = self.gen_qp_delta();
+                write_cu_qp_delta(e, &mut self.cx, v);
+                self.is_cu_qp_delta_coded = true;
+                self.cu_qp_delta_val = v;
+                self.qp_y = qp_y_from_pred(self.qp_pred(), v, 8);
+            }
             if cbf_luma {
                 let scan = if intra {
                     let mode = self.intra_mode[self.idx4(x0, y0)] as u32;
@@ -2619,7 +2797,7 @@ mod write_round_trip {
     /// spelling), the luma cbfs, the QP map, and — the desync detector —
     /// the entire CABAC context state after the last CTU.
     fn round_trip(width: u32, height: u32, qp: i32, seed: u64) {
-        round_trip_cfg(width, height, qp, seed, false, false);
+        round_trip_cfg(width, height, qp, seed, false, false, None);
     }
 
     /// One CTB's SAO parameters, drawn at random but only from what the
@@ -2660,16 +2838,19 @@ mod write_round_trip {
     /// Returns how many (CTB, component) pairs took each `sao_type_idx` —
     /// off, band, edge — so a caller can prove its corpus reached every
     /// branch rather than assuming a small picture did.
-    fn round_trip_cfg(width: u32, height: u32, qp: i32, seed: u64, bypass: bool, sao: bool) -> [usize; 3] {
+    fn round_trip_cfg(width: u32, height: u32, qp: i32, seed: u64, bypass: bool, sao: bool, qp_delta: Option<u32>) -> [usize; 3] {
         // The configuration under test is the one the encoder actually
         // writes: parse the written SPS/PPS with the production parsers and
         // drive both sides from the result.
         let cfg = Config { width, height, chroma: ChromaFormat::Yuv420, bit_depth: 8, sao, ..Config::default() };
         let g = EncGeometry::new(&cfg);
         let sps = Sps::parse(&unescape_rbsp(&write_sps(&cfg, &g, 8, None))).expect("the encoder's SPS must parse");
-        let mut pps = Pps::parse(&unescape_rbsp(&write_pps(26, bypass, false))).expect("the encoder's PPS must parse");
+        let opts = PpsOptions { cu_qp_delta_depth: qp_delta, ..PpsOptions::default() };
+        let mut pps = Pps::parse(&unescape_rbsp(&write_pps_opts(26, bypass, false, &opts))).expect("the encoder's PPS must parse");
         pps.resolve_tiles(&sps).expect("one tile covering the picture");
-        assert!(!pps.sign_data_hiding && !pps.transform_skip_enabled && !pps.cu_qp_delta_enabled);
+        assert!(!pps.sign_data_hiding && !pps.transform_skip_enabled);
+        assert_eq!(pps.cu_qp_delta_enabled, qp_delta.is_some(), "the PPS must carry the per-group quantiser switch");
+        assert_eq!(pps.diff_cu_qp_delta_depth, qp_delta.unwrap_or(0), "the PPS must carry the group depth");
         assert_eq!(pps.transquant_bypass_enabled, bypass, "the PPS must carry the bypass switch");
 
         // The slice NAL: two header bytes, the slice segment header, byte
@@ -2687,6 +2868,9 @@ mod write_round_trip {
         w.flag(true); // byte_alignment(): alignment_bit_equal_to_one
         w.align_zero();
         let mut wr = CtuWriter::new(&sps, qp, seed, bypass);
+        if let Some(d) = qp_delta {
+            wr = wr.with_qp_delta(d);
+        }
         // The SAO parameters this slice will carry, decided up front so
         // the assertions below have something independent to compare the
         // decoder's against. A merge copies the neighbour's array, which
@@ -2820,7 +3004,10 @@ mod write_round_trip {
         assert_eq!(dec.info.cbf_luma, wr.exp_cbf_luma, "{tag}: cbf_luma differs");
         assert_eq!(dec.info.filter_exempt, wr.exp_exempt, "{tag}: the bypass CUs (filter-exempt map) differ");
         assert!(dec.info.pred_mode.iter().all(|&p| p == 1), "{tag}: every CU is intra");
-        assert!(dec.info.qp_y.iter().all(|&q| q as i32 == qp), "{tag}: QP map differs");
+        // The QP map: the slice quantiser everywhere without deltas, and
+        // with them the per-CU value the writer's mirror of the reader's
+        // group state arrived at — prediction, wrap and all.
+        assert_eq!(dec.info.qp_y, wr.exp_qp, "{tag}: QP map differs");
         // The SAO parameters, per CTB — including the ones a merge made
         // the reader copy rather than read. `want` is what the encoder
         // would hand `hevc::sao`, so this is the assertion that says the
@@ -2864,7 +3051,7 @@ mod write_round_trip {
     fn round_trips_sao_parameters() {
         let mut kinds = [0usize; 3];
         for (w, h, qp, seed) in [(64u32, 64u32, 26i32, 60u64), (128, 64, 26, 61), (96, 96, 33, 62), (40, 40, 26, 63), (64, 64, 51, 64), (24, 16, 45, 65)] {
-            let k = round_trip_cfg(w, h, qp, seed, false, true);
+            let k = round_trip_cfg(w, h, qp, seed, false, true, None);
             for i in 0..3 {
                 kinds[i] += k[i];
             }
@@ -2924,10 +3111,10 @@ mod write_round_trip {
     #[test]
     fn round_trips_transquant_bypass() {
         for (qp, seed) in [(26, 21u64), (26, 22), (12, 23), (51, 24)] {
-            round_trip_cfg(64, 64, qp, seed, true, false);
+            round_trip_cfg(64, 64, qp, seed, true, false, None);
         }
-        round_trip_cfg(96, 96, 33, 25, true, false); // 32x32 CTUs, 3x3
-        round_trip_cfg(40, 40, 26, 26, true, false); // partial CTBs under bypass
+        round_trip_cfg(96, 96, 33, 25, true, false, None); // 32x32 CTUs, 3x3
+        round_trip_cfg(40, 40, 26, 26, true, false, None); // partial CTBs under bypass
     }
 
     // ------------------------------------------------------------------
@@ -3073,17 +3260,22 @@ mod write_round_trip {
     /// back. Motion *values* are checked by the scripted tests below,
     /// because merge and AMVP derive them from decoded neighbour state the
     /// writer does not mirror.
-    fn p_round_trip(width: u32, height: u32, qp: i32, seed: u64, nref: u32, max_merge: u32) {
+    fn p_round_trip(width: u32, height: u32, qp: i32, seed: u64, nref: u32, max_merge: u32, qp_delta: Option<u32>) {
         let cfg = Config { width, height, chroma: ChromaFormat::Yuv420, bit_depth: 8, max_refs: 4, ..Config::default() };
         let g = EncGeometry::new(&cfg);
         let sps = Sps::parse(&unescape_rbsp(&write_sps(&cfg, &g, 8, None))).expect("the encoder's SPS must parse");
-        let mut pps = Pps::parse(&unescape_rbsp(&write_pps(26, false, false))).expect("the encoder's PPS must parse");
+        let opts = PpsOptions { cu_qp_delta_depth: qp_delta, ..PpsOptions::default() };
+        let mut pps = Pps::parse(&unescape_rbsp(&write_pps_opts(26, false, false, &opts))).expect("the encoder's PPS must parse");
+        assert_eq!(pps.cu_qp_delta_enabled, qp_delta.is_some(), "the PPS must carry the per-group quantiser switch");
         pps.resolve_tiles(&sps).expect("one tile covering the picture");
         let wc = sps.pic_width_in_ctbs() as usize;
         let hc = sps.pic_height_in_ctbs() as usize;
         let mut w = BitWriter::new();
         write_p_header(&mut w, qp, 4, 8, nref, max_merge);
         let mut wr = CtuWriter::for_p(&sps, qp, seed, nref, max_merge);
+        if let Some(d) = qp_delta {
+            wr = wr.with_qp_delta(d);
+        }
         {
             let mut e = CabacEncoder::new(&mut w);
             for ctb in 0..wc * hc {
@@ -3104,7 +3296,7 @@ mod write_round_trip {
             assert_eq!(dec.info.pred_mode, wr.exp_pred, "{tag}: the pred_mode map differs");
             assert_eq!(dec.info.cbf_luma, wr.exp_cbf_luma, "{tag}: cbf_luma differs");
             assert_eq!(dec.info.intra_mode, wr.intra_mode, "{tag}: intra modes differ");
-            assert!(dec.info.qp_y.iter().all(|&q| q as i32 == qp), "{tag}: QP map differs");
+            assert_eq!(dec.info.qp_y, wr.exp_qp, "{tag}: QP map differs");
             assert_eq!(dec.cx.c, wr.cx.c, "{tag}: CABAC context states diverged");
             assert_eq!(dec.cx.stat_coeff, wr.cx.stat_coeff, "{tag}");
         });
@@ -3115,12 +3307,60 @@ mod write_round_trip {
     /// by the writer's walk, partial-CTU edges included.
     #[test]
     fn p_round_trips() {
-        p_round_trip(64, 64, 26, 41, 1, 5);
-        p_round_trip(64, 64, 33, 42, 4, 5);
-        p_round_trip(128, 64, 26, 43, 2, 5);
-        p_round_trip(96, 96, 18, 44, 4, 1); // merge_idx never coded (cMax 1)
-        p_round_trip(40, 40, 26, 45, 2, 3); // partial CTBs
-        p_round_trip(64, 64, 51, 46, 1, 2);
+        p_round_trip(64, 64, 26, 41, 1, 5, None);
+        p_round_trip(64, 64, 33, 42, 4, 5, None);
+        p_round_trip(128, 64, 26, 43, 2, 5, None);
+        p_round_trip(96, 96, 18, 44, 4, 1, None); // merge_idx never coded (cMax 1)
+        p_round_trip(40, 40, 26, 45, 2, 3, None); // partial CTBs
+        p_round_trip(64, 64, 51, 46, 1, 2, None);
+    }
+
+    /// Per-group quantiser deltas round-trip through the production
+    /// parser: every spelling regime of `cu_qp_delta_abs` (the prefix
+    /// alone, the EG0 suffix from 5 up, the far end of the legal range),
+    /// both signs, and the reader's group state — a delta coded once per
+    /// CTB in the first unit carrying a cbf, `qPY_PREV` chaining across
+    /// CTBs, the QP map wrapping modulo 52 — asserted as the decoded QP
+    /// map against the writer's mirror of that state, and as the CABAC
+    /// contexts afterwards.
+    ///
+    /// Intra slices; P slices, where skipped and root-cbf-0 CUs carry no
+    /// delta and keep the running QpY; bypass CUs, which still carry a
+    /// delta when they have cbfs (scaling never runs, the syntax is
+    /// present); SAO alongside; and partial CTBs. The group is the CTB
+    /// (`diff_cu_qp_delta_depth` 0), the one geometry the encoder codes
+    /// — see `qp_y_pred_from` for why that keeps the prediction trivial,
+    /// and the `encode::h265` quantiser chain for the encoder's mirror.
+    #[test]
+    fn qp_deltas_round_trip() {
+        for seed in 1..=12u64 {
+            round_trip_cfg(64, 64, 26, seed, false, false, Some(0));
+        }
+        round_trip_cfg(96, 96, 33, 60, false, false, Some(0));
+        round_trip_cfg(40, 40, 26, 61, false, false, Some(0));
+        round_trip_cfg(64, 64, 45, 62, true, false, Some(0));
+        round_trip_cfg(64, 64, 26, 63, false, true, Some(0));
+        p_round_trip(64, 64, 26, 70, 1, 5, Some(0));
+        p_round_trip(128, 64, 33, 71, 2, 5, Some(0));
+        p_round_trip(40, 40, 26, 72, 2, 3, Some(0));
+        p_round_trip(64, 64, 51, 73, 1, 2, Some(0));
+    }
+
+    /// The two 8.6.1 functions the reader and the encoder share, pinned
+    /// at the values the text gives: an absent neighbour takes
+    /// `qPY_PREV`, two present ones average with rounding up, and the sum
+    /// wraps into `-QpBdOffsetY..=51`.
+    #[test]
+    fn qp_prediction_arithmetic_is_the_standards() {
+        assert_eq!(qp_y_pred_from(None, None, 30), 30);
+        assert_eq!(qp_y_pred_from(Some(20), None, 30), 25);
+        assert_eq!(qp_y_pred_from(None, Some(21), 30), 26); // (30 + 21 + 1) >> 1
+        assert_eq!(qp_y_pred_from(Some(20), Some(21), 30), 21);
+        assert_eq!(qp_y_from_pred(30, 5, 8), 35);
+        assert_eq!(qp_y_from_pred(50, 5, 8), 3); // 55 wraps modulo 52
+        assert_eq!(qp_y_from_pred(1, -5, 8), 48);
+        assert_eq!(qp_y_from_pred(0, -12, 10), -12); // 10 bits: floor is -12
+        assert_eq!(qp_y_from_pred(0, -13, 10), 51);
     }
 
     /// One 32x32 picture = one CTU = one 2Nx2N AMVP CU with no residual

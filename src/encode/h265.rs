@@ -23,7 +23,8 @@ use super::h265_intra::{CuDecision, IntraCtx, IntraPicture};
 use super::h265_me::{InterCuDecision, InterCuKind, InterPicture, PCuDecision, MAX_MERGE_CAND};
 use super::rc::{PicKind, RateController};
 use super::h265_sao::{SaoPlan, sao_picture};
-use super::h265_syntax::{self as syn, Cpb};
+use super::aq;
+use super::h265_syntax::{self as syn, Cpb, PpsOptions};
 use super::{Access, Config, RateControl};
 use crate::bitwriter::BitWriter;
 use crate::cabac_enc::CabacEncoder;
@@ -34,7 +35,8 @@ use crate::dsp::Cpu;
 use crate::hevc::ctx::Contexts;
 use crate::sample::Sample;
 use crate::hevc::ctu::{
-    SaoCtx, SaoMergeNb, SplitCuNb, write_cbf_chroma, write_cbf_luma, write_cu_skip_flag, write_sao,
+    SaoCtx, SaoMergeNb, SplitCuNb, qp_y_from_pred, qp_y_pred_from, write_cbf_chroma, write_cbf_luma, write_cu_qp_delta,
+    write_cu_skip_flag, write_sao,
     write_cu_transquant_bypass_flag, write_merge_flag, write_merge_idx, write_mvd,
     write_inter_pred_idc, write_mvp_flag, write_part_mode_inter, write_pred_mode_flag,
     write_rqt_root_cbf,
@@ -134,6 +136,13 @@ struct Core<S: Sample> {
     /// controller is handed these rather than the caller's request, so what
     /// it aims at and what the stream promises are one number.
     cpb: Option<Cpb>,
+    /// The PPS switches this stream declares beyond the quantiser and the
+    /// two flags `write_pps` takes by position: per-CTB quantiser deltas
+    /// when adaptive quantisation is on. Fixed for the stream, like the
+    /// PPS itself.
+    pps_opts: PpsOptions,
+    /// What every kept picture coded, by picture kind. See [`Census`].
+    census: Census,
 }
 
 /// One coded picture, before anything about it has been kept.
@@ -168,6 +177,9 @@ struct Attempt<S: Sample> {
     /// Whether this picture empties the reference buffer first, which is
     /// what makes an IDR a random access point.
     clears_refs: bool,
+    /// What this picture's CUs were coded as, added to the encoder's
+    /// census only if the attempt is kept.
+    census: KindCensus,
 }
 
 /// The POC LSB width the SPS declares. Fixed and generous, as on the H.264
@@ -222,6 +234,13 @@ impl H265Encoder {
         with_core!(&self.inner, e => &e.recon)
     }
 
+    /// What the pictures coded so far were made of — see [`Census`]. A
+    /// configuration row turns a code path on; this is what says whether
+    /// the clip took it.
+    pub fn census(&self) -> &Census {
+        with_core!(&self.inner, e => &e.census)
+    }
+
     /// Offer the next picture in display order.
     pub fn push(&mut self, picture: &[u8]) -> Result<Vec<Access>> {
         with_core!(&mut self.inner, e => e.push(picture))
@@ -269,6 +288,18 @@ impl<S: Sample> Core<S> {
                 "H.265 encode: sample adaptive offset on a lossless picture (every sample is filter-exempt)",
             ));
         }
+        if cfg.aq_strength > 0.0 && matches!(cfg.rate, RateControl::Lossless) {
+            // Every CU of a lossless picture is transquant-bypass and
+            // scaling never runs, so a per-CTB quantiser would be a
+            // `cu_qp_delta` in every coded CU steering nothing.
+            return Err(Error::unsupported(
+                "H.265 encode: adaptive quantisation on a lossless picture (no quantiser to adapt)",
+            ));
+        }
+        // Adaptive quantisation is the one thing that varies the
+        // quantiser below the slice, so it is what turns the PPS switch
+        // on; the group is the CTB, the granularity the decision makes.
+        let pps_opts = PpsOptions { cu_qp_delta_depth: (cfg.aq_strength > 0.0).then_some(0), ..PpsOptions::default() };
         let (sw, sh) = cfg.chroma.subsampling();
         let luma = cfg.width as usize * cfg.height as usize;
         let chroma = if cfg.chroma == crate::ChromaFormat::Monochrome {
@@ -316,6 +347,8 @@ impl<S: Sample> Core<S> {
         Ok(Self {
             geom: g,
             cpb,
+            pps_opts,
+            census: Census::default(),
             sched: Scheduler::new(cfg.gop, cfg.bframes),
             rc,
             pps_qp,
@@ -454,6 +487,7 @@ impl<S: Sample> Core<S> {
     /// and the reference the next picture predicts from.
     fn commit(&mut self, c: &Coded, a: Attempt<S>) -> Access {
         self.recon.push(a.rec);
+        self.census.by_kind[Census::slot(c.kind)].add(&a.census);
         if a.clears_refs {
             self.refs.clear();
         }
@@ -575,7 +609,7 @@ impl<S: Sample> Core<S> {
         // does not, SELF fails on every coded edge while CROSS stays
         // green.
         let deblock = true;
-        out.extend_from_slice(&syn::annexb(syn::NAL_PPS, &syn::write_pps(self.pps_qp, bypass, deblock)));
+        out.extend_from_slice(&syn::annexb(syn::NAL_PPS, &syn::write_pps_opts(self.pps_qp, bypass, deblock, &self.pps_opts)));
         // A buffering period may begin at any IRAP, and this encoder makes
         // every one of them one: the message carries the initial removal
         // delay, which is the single number the schedule cannot derive
@@ -620,9 +654,21 @@ impl<S: Sample> Core<S> {
         // derives its boundary strengths from them exactly as a decoder
         // derives them from what it just parsed.
         let mut decisions = Vec::with_capacity(wc * hc);
+        // Per-CTB quantisers, when adaptive quantisation asks for them:
+        // each CTB codes at the picture quantiser plus its offset, and
+        // the chain settles what a decoder will actually hold for it —
+        // the offset only if the CTB carries a cbf to hang the delta on.
+        let offsets = self.aq_offsets(&py, cw, ch);
+        let mut chain = QpChain::new(i32::from(qp), bit_depth);
         for cy in 0..hc {
             for cxu in 0..wc {
-                decisions.push(pic.code_ctu(&ictx, cxu, cy, &py, cw, &pcb, &pcr, ccw));
+                let want = ctb_qp(qp, offsets.as_deref(), cy * wc + cxu);
+                let cctx = IntraCtx { qp: want, ..ictx };
+                let mut d = pic.code_ctu(&cctx, cxu, cy, &py, cw, &pcb, &pcr, ccw);
+                if offsets.is_some() {
+                    d.qp_y = chain.settle(want, d.any_cbf());
+                }
+                decisions.push(d);
             }
         }
         // After the whole picture reconstructs — intra prediction reads
@@ -634,16 +680,25 @@ impl<S: Sample> Core<S> {
         // Then SAO, over the deblocked samples, which is the order 8.7
         // fixes and the order `decoder.rs` applies them in.
         let plan = self.cfg.sao.then(|| {
-            let (sps, pps) = parsed_sets(&self.cfg, &g, i32::from(qp), bypass, deblock, self.cpb.as_ref());
+            let (sps, pps) = parsed_sets(&self.cfg, &g, i32::from(qp), bypass, deblock, self.cpb.as_ref(), &self.pps_opts);
             sao_picture(&ictx, &mut pic.recon, &mut info, &sps, &pps, &py, cw, &pcb, &pcr, ccw)
         });
+        let mut census = KindCensus::of_intra(&decisions, i32::from(qp));
         {
             let mut e = CabacEncoder::new(&mut w);
+            // The writer's own copy of the quantiser chain: it must spell
+            // the delta against the same prediction the decision pass
+            // settled with, and a decoder derives that prediction from
+            // the stream alone.
+            let mut chain = QpChain::new(i32::from(qp), bit_depth);
             for cy in 0..hc {
                 for cxu in 0..wc {
                     let addr = cy * wc + cxu;
                     write_sao_for(&mut e, &mut cx, plan.as_ref(), addr, cxu, cy, bit_depth, cat);
-                    write_ctu_intra(&mut e, &mut cx, &decisions[addr], cxu, cy, bypass, cat);
+                    let d = &decisions[addr];
+                    let delta = offsets.is_some().then(|| chain.spell(d.qp_y, d.any_cbf())).flatten();
+                    census.qp_delta += u64::from(delta.is_some());
+                    write_ctu_intra(&mut e, &mut cx, d, cxu, cy, bypass, cat, delta);
                     e.encode_terminate(u32::from(cy == hc - 1 && cxu == wc - 1));
                 }
             }
@@ -677,6 +732,7 @@ impl<S: Sample> Core<S> {
             rec,
             frame: pic.recon,
             clears_refs: true,
+            census,
         })
     }
 
@@ -772,7 +828,7 @@ impl<S: Sample> Core<S> {
         // downstream reads `init_qp_minus26` out of it, so it was never
         // going to break — it was going to sit here being wrong, which is
         // how the last two stale comments started.
-        let pps_rbsp = syn::write_pps(self.pps_qp, bypass, true);
+        let pps_rbsp = syn::write_pps_opts(self.pps_qp, bypass, true, &self.pps_opts);
         let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&sps_rbsp))?;
         let mut pps = crate::hevc::pps::Pps::parse(&crate::nal::unescape_rbsp(&pps_rbsp))?;
         pps.resolve_tiles(&sps)?;
@@ -859,13 +915,19 @@ impl<S: Sample> Core<S> {
         let mut decisions = Vec::with_capacity(wc * hc);
         // Decide and reconstruct first; serialise below. See the same
         // split in `code_picture` for why SAO forces it.
+        // Per-CTB quantisers, exactly as the intra path derives and
+        // settles them.
+        let offsets = self.aq_offsets(&py, cw, ch);
+        let mut chain = QpChain::new(i32::from(qp), bit_depth);
         for cy in 0..hc {
             for cxu in 0..wc {
+                let want = ctb_qp(qp, offsets.as_deref(), cy * wc + cxu);
+                let cctx = IntraCtx { qp: want, ..mctx };
                 let d = match future {
                     Some(r1) if c.kind == Kind::B => {
-                        pic.code_ctu_b(&mctx, past, r1, cxu, cy, &py, cw, &pcb, &pcr, ccw)
+                        pic.code_ctu_b(&cctx, past, r1, cxu, cy, &py, cw, &pcb, &pcr, ccw)
                     }
-                    _ => pic.code_ctu(&mctx, past, cxu, cy, &py, cw, &pcb, &pcr, ccw),
+                    _ => pic.code_ctu(&cctx, past, cxu, cy, &py, cw, &pcb, &pcr, ccw),
                 };
                 // The decision module answers `UseIntra` when its
                 // flatness proxy says inter has lost. The CU is then
@@ -874,11 +936,15 @@ impl<S: Sample> Core<S> {
                 // I slice runs, reading the inter neighbours already
                 // reconstructed beside it, which the PPS's
                 // `constrained_intra_pred_flag` 0 makes references.
-                let coded = if matches!(d.kind, InterCuKind::UseIntra) {
-                    PCuDecision::Intra(Box::new(pic.code_ctu_intra(&mctx, cxu, cy, &py, cw, &pcb, &pcr, ccw)))
+                let mut coded = if matches!(d.kind, InterCuKind::UseIntra) {
+                    PCuDecision::Intra(Box::new(pic.code_ctu_intra(&cctx, cxu, cy, &py, cw, &pcb, &pcr, ccw)))
                 } else {
                     PCuDecision::Inter(d)
                 };
+                if offsets.is_some() {
+                    let q = chain.settle(want, coded.any_cbf());
+                    coded.set_qp_y(q);
+                }
                 skipped[cy * wc + cxu] = matches!(&coded, PCuDecision::Inter(d) if matches!(d.kind, InterCuKind::Skip { .. }));
                 decisions.push(coded);
             }
@@ -897,17 +963,22 @@ impl<S: Sample> Core<S> {
             let InterPicture { info, recon, .. } = &mut pic;
             sao_picture(&mctx, recon, info, &sps, &pps, &py, cw, &pcb, &pcr, ccw)
         });
+        let mut census = KindCensus::of_inter(&decisions, i32::from(qp));
         {
             let mut e = CabacEncoder::new(&mut w);
+            let mut chain = QpChain::new(i32::from(qp), bit_depth);
             for cy in 0..hc {
                 for cxu in 0..wc {
                     let addr = cy * wc + cxu;
                     let left = (cxu > 0).then(|| skipped[addr - 1]);
                     let above = (cy > 0).then(|| skipped[addr - wc]);
                     write_sao_for(&mut e, &mut cx, plan.as_ref(), addr, cxu, cy, bit_depth, cat);
-                    match &decisions[addr] {
-                        PCuDecision::Inter(d) => write_cu_inter(&mut e, &mut cx, d, left, above, cat, bypass),
-                        PCuDecision::Intra(d) => write_cu_intra_in_p(&mut e, &mut cx, d, left, above, cat, bypass),
+                    let pd = &decisions[addr];
+                    let delta = offsets.is_some().then(|| chain.spell(pd.qp_y(), pd.any_cbf())).flatten();
+                    census.qp_delta += u64::from(delta.is_some());
+                    match pd {
+                        PCuDecision::Inter(d) => write_cu_inter(&mut e, &mut cx, d, left, above, cat, bypass, delta),
+                        PCuDecision::Intra(d) => write_cu_intra_in_p(&mut e, &mut cx, d, left, above, cat, bypass, delta),
                     }
                     e.encode_terminate(u32::from(cy == hc - 1 && cxu == wc - 1));
                 }
@@ -939,7 +1010,211 @@ impl<S: Sample> Core<S> {
             rec,
             frame: pic.recon,
             clears_refs: false,
+            census,
         })
+    }
+
+    /// The per-CTB quantiser offsets adaptive quantisation wants for a
+    /// picture whose padded luma plane is `py` (`cw` by `ch`), or `None`
+    /// when it is off — in which case nothing below varies the quantiser
+    /// and the decisions keep the context's. Reads the configuration
+    /// only: an attempt stays free of writes to `self`.
+    fn aq_offsets(&self, py: &[S], cw: usize, ch: usize) -> Option<Vec<i32>> {
+        (self.cfg.aq_strength > 0.0).then(|| aq::ctb_offsets(py, cw, cw, ch, self.geom.log2_ctb, self.cfg.bit_depth, self.cfg.aq_strength))
+    }
+}
+
+/// The quantiser CTB `addr` codes at: the picture's, plus its offset when
+/// the picture varies it, held to the range the encoder's quantiser
+/// takes.
+fn ctb_qp(pic_qp: u8, offsets: Option<&[i32]>, addr: usize) -> i32 {
+    match offsets {
+        Some(o) => (i32::from(pic_qp) + o[addr]).clamp(0, 51),
+        None => i32::from(pic_qp),
+    }
+}
+
+/// The encoder's mirror of the reader's quantisation-group state, at the
+/// geometry this encoder codes: one CU per CTB and a group per CTB
+/// (`diff_cu_qp_delta_depth` 0).
+///
+/// What the reader does, and what this therefore has to reproduce
+/// (`coding_quadtree` / `transform_unit`, and 8.6.1):
+///
+/// - A group's `qPY_PREV` is `SliceQpY` for the first group of the slice
+///   and the `QpY` of the previous group's last CU after that; its
+///   `qPY_PRED` averages the left and above groups' `QpY` where those lie
+///   inside the same CTB, taking `qPY_PREV` for each that does not. With
+///   a group per CTB neither ever does, so the prediction is `qPY_PREV`
+///   — but the arithmetic is still the reader's own [`qp_y_pred_from`],
+///   called with both neighbours absent, so that the day the group
+///   shrinks this stops being true loudly rather than silently.
+/// - A CU whose tree carries a cbf codes one `cu_qp_delta`, and its
+///   `QpY` is `qPY_PRED + CuQpDeltaVal` wrapped ([`qp_y_from_pred`]).
+/// - A CU with no coded cbf codes no delta and **holds the predicted
+///   quantiser**, whatever the encoder wanted for it. The encoder does
+///   not get to choose there, and its deblocker must filter that CU at
+///   the predicted value because a decoder's will.
+///
+/// Two copies of this run per picture — one while deciding, one while
+/// writing — and both must land on the same numbers; `settle` records
+/// what a decoder will hold and `spell` asserts the writer's view agrees.
+struct QpChain {
+    slice_qp: i32,
+    bit_depth: u32,
+    /// `QpY` of the last CU coded, `None` before the first group.
+    last: Option<i32>,
+}
+
+impl QpChain {
+    fn new(slice_qp: i32, bit_depth: u32) -> Self {
+        QpChain { slice_qp, bit_depth, last: None }
+    }
+
+    /// `qPY_PRED` for the next CTB.
+    fn pred(&self) -> i32 {
+        qp_y_pred_from(None, None, self.last.unwrap_or(self.slice_qp))
+    }
+
+    /// Decision side: the CTB was coded at `want` and carries a cbf or
+    /// not. Returns the `QpY` a decoder will hold for it, which is `want`
+    /// only if a delta can be coded.
+    fn settle(&mut self, want: i32, has_cbf: bool) -> i32 {
+        let pred = self.pred();
+        let qp_y = if has_cbf { qp_y_from_pred(pred, want - pred, self.bit_depth) } else { pred };
+        debug_assert!(!has_cbf || qp_y == want, "a coded delta must land the quantiser where the CTB was coded ({want}), not {qp_y}");
+        self.last = Some(qp_y);
+        qp_y
+    }
+
+    /// Writer side: the `CuQpDeltaVal` to spell for a CTB whose decision
+    /// holds `qp_y`, or `None` when it carries no cbf and a decoder reads
+    /// none — in which case the decision must already hold the
+    /// prediction, and that is checked rather than assumed.
+    fn spell(&mut self, qp_y: i32, has_cbf: bool) -> Option<i32> {
+        let pred = self.pred();
+        debug_assert!(has_cbf || qp_y == pred, "a residual-free CTB must hold the predicted quantiser {pred}, not {qp_y}");
+        self.last = Some(qp_y);
+        has_cbf.then_some(qp_y - pred)
+    }
+}
+
+/// What the H.265 encoder's pictures were made of, by picture kind — the
+/// H.265 twin of the H.264 encoder's shape census, and for the same
+/// reason: a gate row turns a code path on, and only the clip decides
+/// whether anything takes it. A row proves the syntax; this says whether
+/// the feature was exercised, so a green cell over a feature no CU chose
+/// can be told from one that proved something.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Census {
+    /// Indexed by [`Census::slot`]: intra pictures, P, B.
+    pub by_kind: [KindCensus; 3],
+}
+
+impl Census {
+    /// Which of the three tallies a picture kind lands in.
+    pub fn slot(kind: Kind) -> usize {
+        match kind {
+            Kind::Idr | Kind::I => 0,
+            Kind::P => 1,
+            Kind::B => 2,
+        }
+    }
+}
+
+/// The tally for one picture kind. Every field is a count of coding
+/// units.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KindCensus {
+    /// Coding units coded, all kinds.
+    pub cus: u64,
+    /// Skipped.
+    pub skip: u64,
+    /// Merged with residual.
+    pub merge: u64,
+    /// AMVP, either list or both.
+    pub amvp: u64,
+    /// Bi-predicted (both lists), merge or AMVP.
+    pub bi: u64,
+    /// Intra — every CU of an intra picture, and the intra CUs a P or B
+    /// picture chose.
+    pub intra: u64,
+    /// Intra CUs whose transform tree split.
+    pub split_tu: u64,
+    /// CUs that coded a `cu_qp_delta` — carried a cbf under a per-CTB
+    /// quantiser.
+    pub qp_delta: u64,
+    /// CUs whose `QpY` differs from the picture quantiser, which is what
+    /// proves adaptive quantisation moved something rather than coding
+    /// zero deltas.
+    pub qp_moved: u64,
+}
+
+impl KindCensus {
+    fn of_intra(decisions: &[CuDecision], pic_qp: i32) -> Self {
+        let mut c = KindCensus::default();
+        for d in decisions {
+            c.cus += 1;
+            c.intra += 1;
+            c.split_tu += u64::from(d.split_tu);
+            c.qp_moved += u64::from(d.qp_y != pic_qp);
+        }
+        c
+    }
+
+    fn of_inter(decisions: &[PCuDecision], pic_qp: i32) -> Self {
+        let mut c = KindCensus::default();
+        for pd in decisions {
+            c.cus += 1;
+            c.qp_moved += u64::from(pd.qp_y() != pic_qp);
+            match pd {
+                PCuDecision::Intra(d) => {
+                    c.intra += 1;
+                    c.split_tu += u64::from(d.split_tu);
+                }
+                PCuDecision::Inter(d) => {
+                    match d.kind {
+                        InterCuKind::Skip { .. } => c.skip += 1,
+                        InterCuKind::Merge { .. } => c.merge += 1,
+                        InterCuKind::Amvp { .. } | InterCuKind::BAmvp { .. } => c.amvp += 1,
+                        InterCuKind::UseIntra => unreachable!("replaced by the intra decision"),
+                    }
+                    c.bi += u64::from(d.ref_idx >= 0 && d.ref_idx_l1 >= 0);
+                }
+            }
+        }
+        c
+    }
+
+    /// Fold `other` into this tally.
+    fn add(&mut self, other: &KindCensus) {
+        self.cus += other.cus;
+        self.skip += other.skip;
+        self.merge += other.merge;
+        self.amvp += other.amvp;
+        self.bi += other.bi;
+        self.intra += other.intra;
+        self.split_tu += other.split_tu;
+        self.qp_delta += other.qp_delta;
+        self.qp_moved += other.qp_moved;
+    }
+
+    /// The nonzero counters, named, for a census line.
+    pub fn taken(&self) -> Vec<(&'static str, u64)> {
+        [
+            ("cus", self.cus),
+            ("skip", self.skip),
+            ("merge", self.merge),
+            ("amvp", self.amvp),
+            ("bi", self.bi),
+            ("intra", self.intra),
+            ("split_tu", self.split_tu),
+            ("qp_delta", self.qp_delta),
+            ("qp_moved", self.qp_moved),
+        ]
+        .into_iter()
+        .filter(|&(_, n)| n != 0)
+        .collect()
     }
 }
 
@@ -961,10 +1236,11 @@ fn sao_flags(sao: bool, cat: u32) -> Option<syn::SaoFlags> {
 /// filters and the candidate derivations read decoder structures, and
 /// building them from the very bytes the stream carries is what keeps the
 /// encoder's idea of the geometry and the decoder's identical.
-fn parsed_sets(cfg: &Config, g: &syn::Geometry, qp: i32, bypass: bool, deblock: bool, cpb: Option<&Cpb>) -> (crate::hevc::sps::Sps, crate::hevc::pps::Pps) {
+#[allow(clippy::too_many_arguments)]
+fn parsed_sets(cfg: &Config, g: &syn::Geometry, qp: i32, bypass: bool, deblock: bool, cpb: Option<&Cpb>, opts: &PpsOptions) -> (crate::hevc::sps::Sps, crate::hevc::pps::Pps) {
     let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&syn::write_sps(cfg, g, LOG2_MAX_POC_LSB, cpb)))
         .expect("the encoder's own SPS parses");
-    let mut pps = crate::hevc::pps::Pps::parse(&crate::nal::unescape_rbsp(&syn::write_pps(qp, bypass, deblock)))
+    let mut pps = crate::hevc::pps::Pps::parse(&crate::nal::unescape_rbsp(&syn::write_pps_opts(qp, bypass, deblock, opts)))
         .expect("the encoder's own PPS parses");
     pps.resolve_tiles(&sps).expect("one tile covering the picture");
     (sps, pps)
@@ -1024,6 +1300,7 @@ fn write_sao_for(e: &mut CabacEncoder, cx: &mut Contexts, plan: Option<&SaoPlan>
 /// part of this walk that depends on it - see the comments there for the
 /// per-format cbf and residual shapes, which are the inter mirror of what
 /// `write_ctu_intra`'s unsplit branch spells.
+#[allow(clippy::too_many_arguments)]
 fn write_cu_inter(
     e: &mut CabacEncoder,
     cx: &mut Contexts,
@@ -1032,6 +1309,7 @@ fn write_cu_inter(
     above_skip: Option<bool>,
     cat: u32,
     pps_bypass: bool,
+    qp_delta: Option<i32>,
 ) {
     let log2 = d.log2_cu;
     debug_assert!(pps_bypass || !d.bypass, "a bypass CU is unspellable unless the PPS enables the flag");
@@ -1053,6 +1331,10 @@ fn write_cu_inter(
 
     let skip = matches!(d.kind, InterCuKind::Skip { .. });
     write_cu_skip_flag(e, cx, left_skip, above_skip, skip);
+    // A quantiser delta rides in the transform tree, so a CU without one
+    // — skipped, or root cbf 0 below — cannot have been handed a delta:
+    // the reader would take no bin for it.
+    debug_assert!(qp_delta.is_none() || d.rqt_root_cbf, "a quantiser delta was handed to a CU with no transform tree");
     if let InterCuKind::Skip { merge_idx } = d.kind {
         write_merge_idx(e, cx, MAX_MERGE_CAND as u32, u32::from(merge_idx));
         return;
@@ -1137,6 +1419,14 @@ fn write_cu_inter(
     } else {
         debug_assert!(d.cbf_luma, "an inter leaf with no chroma cbf has cbf_luma inferred 1");
     }
+    // cu_qp_delta_abs / sign, where `transform_unit` reads it: after the
+    // cbfs and before any residual. This single depth-0 unit is the first
+    // of its group and carries a cbf whenever the tree exists, so the
+    // reader reads a delta here exactly when the PPS enables one — and
+    // the caller hands one over exactly then.
+    if let Some(v) = qp_delta {
+        write_cu_qp_delta(e, cx, v);
+    }
 
     let n = 1usize << log2;
     // Inter blocks always scan diagonally: the mode-dependent scans are an
@@ -1198,7 +1488,13 @@ fn write_cu_inter(
 /// set, `coding_unit` reads a `cu_transquant_bypass_flag` as its very first
 /// bin, so this writer spells one — the CU's own choice, `d.bypass` — and
 /// when clear, nothing is written and the CU must not claim bypass.
-pub(crate) fn write_ctu_intra(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, ctu_x: usize, ctu_y: usize, pps_bypass: bool, cat: u32) {
+///
+/// `qp_delta` is the `CuQpDeltaVal` to spell inside the transform tree,
+/// `Some` exactly when the PPS enables per-group quantisers *and* this
+/// CU carries a cbf for the reader to read it under — the encoder's
+/// quantiser chain decides both; see [`write_cu_intra_body`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_ctu_intra(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, ctu_x: usize, ctu_y: usize, pps_bypass: bool, cat: u32, qp_delta: Option<i32>) {
     debug_assert!(pps_bypass || !d.bypass, "a bypass CU is unspellable unless the PPS enables the flag");
     // Every coded neighbour has depth 0 (one CU per CTU), and in a single
     // slice availability is picture geometry.
@@ -1213,7 +1509,7 @@ pub(crate) fn write_ctu_intra(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDec
     if pps_bypass {
         write_cu_transquant_bypass_flag(e, cx, d.bypass);
     }
-    write_cu_intra_body(e, cx, d, cat);
+    write_cu_intra_body(e, cx, d, cat, qp_delta);
 }
 
 /// Serialise one intra coding unit inside a **P** slice.
@@ -1237,6 +1533,7 @@ pub(crate) fn write_ctu_intra(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDec
 /// No `cu_transquant_bypass_flag` either: `code_p_picture` writes its PPS
 /// with `transquant_bypass_enabled_flag` clear (lossless inter refuses by
 /// name upstream), so the reader takes no such bin.
+#[allow(clippy::too_many_arguments)]
 fn write_cu_intra_in_p(
     e: &mut CabacEncoder,
     cx: &mut Contexts,
@@ -1245,6 +1542,7 @@ fn write_cu_intra_in_p(
     above_skip: Option<bool>,
     cat: u32,
     pps_bypass: bool,
+    qp_delta: Option<i32>,
 ) {
     debug_assert!(pps_bypass || !d.bypass, "a bypass CU is unspellable unless the PPS enables the flag");
     let nb = SplitCuNb {
@@ -1259,7 +1557,7 @@ fn write_cu_intra_in_p(
     }
     write_cu_skip_flag(e, cx, left_skip, above_skip, false);
     write_pred_mode_flag(e, cx, true);
-    write_cu_intra_body(e, cx, d, cat);
+    write_cu_intra_body(e, cx, d, cat, qp_delta);
 }
 
 /// The intra coding unit proper: everything from `prev_intra_luma_pred_flag`
@@ -1279,10 +1577,18 @@ fn write_cu_intra_in_p(
 /// Anything that stops matching the reader here desyncs the arithmetic
 /// coder and fails SELF wholesale, which is exactly the property the
 /// encode gate checks.
-fn write_cu_intra_body(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, cat: u32) {
+///
+/// `qp_delta`, when given, is spelled in the **first transform unit that
+/// carries a coded cbf** — luma, or the chroma bins that unit holds — and
+/// nowhere else, which is where `transform_unit` reads it
+/// (`IsCuQpDeltaCoded` gates the rest). The caller guarantees such a
+/// unit exists (`CuDecision::any_cbf`); a delta left unspelled at the
+/// end is a caller bug and is asserted.
+fn write_cu_intra_body(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, cat: u32, qp_delta: Option<i32>) {
     let log2 = d.log2_cu;
     debug_assert!((4..=5).contains(&log2), "one CU per CTU wants CTB 16 or 32");
     debug_assert!(!d.nxn, "PART_NxN exists only at the minimum CU size");
+    let mut pending = qp_delta;
 
     let syn0 = d.luma_syntax[0];
     write_prev_intra_luma_pred_flag(e, cx, syn0.prev_flag);
@@ -1364,6 +1670,13 @@ fn write_cu_intra_body(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, 
             // module's layout is positional precisely so no slot depends
             // on a sibling's structure.
             write_cbf_luma(e, cx, 1, d.cbf_luma[4 * i]);
+            // The delta, at the first child with a cbf: its luma bin, or
+            // the chroma bins it coded just above (which exist only under
+            // a set parent bin — the reader infers a clear one otherwise).
+            let child_chroma = cat != 0 && (0..2).any(|comp| d.cbf_chroma[comp] && (d.cbf_chroma_tu[comp][i] || d.cbf_chroma_tu_bot[comp][i]));
+            if pending.is_some() && (d.cbf_luma[4 * i] || child_chroma) {
+                write_cu_qp_delta(e, cx, pending.take().expect("checked"));
+            }
             if d.cbf_luma[4 * i] {
                 write_residual(e, cx, &params(log2 - 1, 0, d.luma_modes[0]), &d.luma[i * q..(i + 1) * q]);
             }
@@ -1391,6 +1704,7 @@ fn write_cu_intra_body(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, 
                 }
             }
         }
+        debug_assert!(pending.is_none(), "a quantiser delta was handed to a split CU with no coded cbf");
         return;
     }
 
@@ -1408,6 +1722,13 @@ fn write_cu_intra_body(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, 
         }
     }
     write_cbf_luma(e, cx, 0, d.cbf_luma[0]);
+    if let Some(v) = pending.take() {
+        debug_assert!(
+            d.cbf_luma[0] || (cat != 0 && (0..2).any(|comp| d.cbf_chroma[comp] || d.cbf_chroma_bot[comp])),
+            "a quantiser delta was handed to a CU with no coded cbf"
+        );
+        write_cu_qp_delta(e, cx, v);
+    }
     if d.cbf_luma[0] {
         write_residual(e, cx, &params(log2, 0, d.luma_modes[0]), &d.luma[..n * n]);
     }
@@ -1454,6 +1775,144 @@ mod tests {
             let e = H265Encoder::new(cfg(64, 64, chroma)).unwrap();
             assert_eq!(e.frame_bytes(), (64.0 * 64.0 * per_px) as usize, "{chroma:?}");
         }
+    }
+
+    /// Pictures whose four CTBs differ sharply in variance — flat, a
+    /// gradient, noise, a checkerboard — so adaptive quantisation has
+    /// something to move, in `chroma` at `bit_depth`, `count` frames
+    /// that drift a little each so inter pictures carry residual.
+    fn aq_frames(chroma: ChromaFormat, bit_depth: u32, count: usize) -> Vec<Vec<u8>> {
+        let (w, h) = (64usize, 64usize);
+        let (sw, sh) = match chroma {
+            ChromaFormat::Yuv420 => (2usize, 2usize),
+            ChromaFormat::Yuv422 => (2, 1),
+            _ => (1, 1),
+        };
+        let (cw, ch) = if chroma == ChromaFormat::Monochrome { (0, 0) } else { (w / sw, h / sh) };
+        let shift = bit_depth - 8;
+        (0..count)
+            .map(|i| {
+                let mut seed = 0x9e37u32.wrapping_add(i as u32 * 7919);
+                let mut samples: Vec<u32> = Vec::with_capacity(w * h + 2 * cw * ch);
+                for y in 0..h {
+                    for x in 0..w {
+                        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                        let v: i32 = match (x >= 32, y >= 32) {
+                            (false, false) => 110 + i as i32,
+                            (true, false) => ((x + y + i) % 96) as i32 + 60,
+                            (false, true) => (seed >> 24) as i32,
+                            (true, true) => if ((x / 4) + (y / 4) + i) % 2 == 0 { 40 } else { 200 },
+                        };
+                        samples.push((v.clamp(0, 255) as u32) << shift);
+                    }
+                }
+                for _ in 0..2 {
+                    for y in 0..ch {
+                        for x in 0..cw {
+                            samples.push((((120 + x / 2 + y / 3 + i) & 0xff) as u32) << shift);
+                        }
+                    }
+                }
+                if shift == 0 {
+                    samples.iter().map(|&v| v as u8).collect()
+                } else {
+                    samples.iter().flat_map(|&v| (v as u16).to_le_bytes()).collect()
+                }
+            })
+            .collect()
+    }
+
+    /// Adaptive quantisation — a quantiser per CTB, carried by
+    /// `cu_qp_delta` — round-trips through the production decoder for
+    /// intra, P and B pictures at every chroma format and at a deep
+    /// depth, and the census proves it moved something: a stream whose
+    /// every delta was zero, or whose every CTB kept the picture
+    /// quantiser, would pass SELF while proving only the syntax.
+    ///
+    /// SELF is the right check here rather than a QP map comparison: a
+    /// residual coded at one quantiser and scaled at another desyncs
+    /// the reconstruction, and a residual-free CTB filtered at the wrong
+    /// quantiser moves the deblocked samples — both surface as a
+    /// picture that differs from the encoder's own.
+    #[test]
+    fn adaptive_quantisation_round_trips_and_moves_the_quantiser() {
+        for (chroma, bit_depth, bframes) in [
+            (ChromaFormat::Yuv420, 8u32, 0u32),
+            (ChromaFormat::Yuv420, 8, 2),
+            (ChromaFormat::Yuv422, 8, 0),
+            (ChromaFormat::Yuv444, 8, 2),
+            (ChromaFormat::Monochrome, 8, 0),
+            (ChromaFormat::Yuv420, 10, 2),
+        ] {
+            let tag = format!("{chroma:?} {bit_depth}-bit bframes={bframes}");
+            let frames = aq_frames(chroma, bit_depth, 6);
+            for qp in [22u8, 40] {
+                let mut e = H265Encoder::new(Config {
+                    gop: 8,
+                    bframes,
+                    bit_depth,
+                    rate: super::super::RateControl::ConstantQp(qp),
+                    aq_strength: 2.0,
+                    ..cfg(64, 64, chroma)
+                })
+                .unwrap();
+                let mut units = Vec::new();
+                for f in &frames {
+                    units.extend(e.push(f).expect("an adaptively quantised picture should code"));
+                }
+                units.extend(e.flush().unwrap());
+                assert_eq!(units.len(), frames.len(), "{tag}");
+
+                let census = e.census();
+                let deltas: u64 = census.by_kind.iter().map(|k| k.qp_delta).sum();
+                let moved: u64 = census.by_kind.iter().map(|k| k.qp_moved).sum();
+                assert!(deltas > 0, "{tag} qp {qp}: no CU coded a cu_qp_delta, so the syntax was never exercised");
+                assert!(moved > 0, "{tag} qp {qp}: no CTB left the picture quantiser, so the feature did nothing");
+                if bframes > 0 {
+                    assert!(census.by_kind[2].cus > 0, "{tag}: no B picture was coded");
+                }
+
+                let mut dec = crate::hevc::HevcDecoder::new();
+                for u in &units {
+                    dec.push_annexb(&u.data).unwrap_or_else(|err| panic!("{tag} qp {qp}: {err}"));
+                }
+                dec.flush().unwrap();
+                for (i, want) in e.reconstructions().iter().enumerate() {
+                    let got = dec.next_picture().unwrap_or_else(|| panic!("{tag} qp {qp}: picture {i} missing"));
+                    assert_eq!(&got.into_packed(), want, "{tag} qp {qp}: picture {i} differs from the reconstruction");
+                }
+            }
+        }
+
+        // Strength 0 is off: the stream is what the encoder writes with
+        // the switch absent — the PPS bit clear and no delta anywhere.
+        let frames = aq_frames(ChromaFormat::Yuv420, 8, 3);
+        let encode = |strength: f32| -> Vec<u8> {
+            let mut e = H265Encoder::new(Config { gop: 8, aq_strength: strength, ..cfg(64, 64, ChromaFormat::Yuv420) }).unwrap();
+            let mut out = Vec::new();
+            for f in &frames {
+                for u in e.push(f).unwrap() {
+                    out.extend_from_slice(&u.data);
+                }
+            }
+            for u in e.flush().unwrap() {
+                out.extend_from_slice(&u.data);
+            }
+            assert_eq!(e.census().by_kind.iter().map(|k| k.qp_delta).sum::<u64>() > 0, strength > 0.0);
+            out
+        };
+        assert_eq!(encode(0.0), encode(Config::default().aq_strength));
+        assert_ne!(encode(0.0), encode(1.0), "strength 1 must change the stream");
+
+        // Lossless has no quantiser to adapt: refused by name.
+        let err = H265Encoder::new(Config {
+            rate: super::super::RateControl::Lossless,
+            aq_strength: 1.0,
+            ..cfg(64, 64, ChromaFormat::Yuv420)
+        })
+        .err()
+        .expect("adaptive quantisation on a lossless stream must refuse");
+        assert!(format!("{err}").contains("adaptive quantisation"), "{err}");
     }
 
     /// Intra 4:2:0 codes for real now; everything else still refuses by
@@ -1645,7 +2104,7 @@ mod tests {
         let emitted = |d: &InterCuDecision, qp: i32| -> f32 {
             let mut cx = Contexts::new(1, qp);
             let mut e = CabacEncoder::counting();
-            write_cu_inter(&mut e, &mut cx, d, None, None, 1, false);
+            write_cu_inter(&mut e, &mut cx, d, None, None, 1, false, None);
             e.fractional_bits() as f32
         };
 
