@@ -20,7 +20,7 @@ use super::residual::{
     transform_skip_residual, transform_skip_residual_i32,
 };
 use crate::dsp::hevc::{HevcDsp, add_residual_wide, idct_wide, idst4_wide};
-use super::slice::{SliceHeader, SliceType};
+use super::slice::{PredWeightTable, SliceHeader, SliceType};
 use super::sps::{ScalingList, Sps};
 
 /// Partition modes.
@@ -847,31 +847,48 @@ impl<'a, S: Sample> SliceDec<'a, S> {
         let Some(t) = (if explicit { self.hdr.pred_weights.as_ref() } else { None }) else {
             return [Weighting::Default; 3];
         };
-        let mut out = [Weighting::Default; 3];
-        for c in 0..3 {
-            // shift1 = Max(2, 14 - bitDepth) of the component (8.5.3.3.4.3).
-            let bd = if c == 0 { self.sps.bit_depth_luma } else { self.sps.bit_depth_chroma };
-            let shift1 = (14 - bd as i32).max(2);
-            let log2_wd = if c == 0 { t.luma_log2_denom as i32 } else { t.chroma_log2_denom as i32 } + shift1;
-            let mut w = [1i32; 2];
-            let mut o = [0i32; 2];
-            for list in 0..2 {
-                if ref_idx[list] < 0 {
-                    continue;
-                }
-                let e = &t.lists[list][ref_idx[list] as usize];
-                if c == 0 {
-                    w[list] = e.luma.0;
-                    o[list] = e.luma.1;
-                } else {
-                    w[list] = e.chroma[c - 1].0;
-                    o[list] = e.chroma[c - 1].1;
-                }
-            }
-            out[c] = Weighting::Explicit { log2_wd, w, o };
-        }
-        out
+        explicit_weighting(t, self.sps.bit_depth_luma, self.sps.bit_depth_chroma, ref_idx)
     }
+}
+
+/// The explicit weighting of a prediction unit's three components from a
+/// slice's `pred_weight_table` and the reference indices it uses
+/// (8.5.3.3.4.3): `log2WD` with `shift1 = Max(2, 14 - bitDepth)` folded
+/// in, and each used list's weight and offset for the entry that
+/// reference names.
+///
+/// The arithmetic behind the reader's `weighting_for`, as a free
+/// function, so the encoder hands its own motion compensation exactly
+/// what a decoder will derive from the table it wrote rather than a
+/// second reading of the same clause.
+pub(crate) fn explicit_weighting(t: &PredWeightTable, bit_depth_luma: u32, bit_depth_chroma: u32, ref_idx: [i8; 2]) -> [Weighting; 3] {
+    let mut out = [Weighting::Default; 3];
+    for (c, slot) in out.iter_mut().enumerate() {
+        // shift1 = Max(2, 14 - bitDepth) of the component (8.5.3.3.4.3).
+        let bd = if c == 0 { bit_depth_luma } else { bit_depth_chroma };
+        let shift1 = (14 - bd as i32).max(2);
+        let log2_wd = if c == 0 { t.luma_log2_denom as i32 } else { t.chroma_log2_denom as i32 } + shift1;
+        let mut w = [1i32; 2];
+        let mut o = [0i32; 2];
+        for list in 0..2 {
+            if ref_idx[list] < 0 {
+                continue;
+            }
+            let e = &t.lists[list][ref_idx[list] as usize];
+            if c == 0 {
+                w[list] = e.luma.0;
+                o[list] = e.luma.1;
+            } else {
+                w[list] = e.chroma[c - 1].0;
+                o[list] = e.chroma[c - 1].1;
+            }
+        }
+        *slot = Weighting::Explicit { log2_wd, w, o };
+    }
+    out
+}
+
+impl<'a, S: Sample> SliceDec<'a, S> {
 
     fn parse_merge_idx(&mut self) -> usize {
         let max = self.hdr.max_num_merge_cand as usize;
@@ -2863,7 +2880,7 @@ mod write_round_trip {
         // Both switches on when SAO is under test, so the reader walks
         // all three components and every inheritance rule is exercised.
         let sao_flags = sao.then_some(crate::encode::h265_syntax::SaoFlags { luma: true, chroma: Some(true) });
-        let eh = EncSliceHeader { kind: Kind::Idr, poc_lsb: 0, qp, log2_max_poc_lsb: 8, ref_deltas: Vec::new(), sao: sao_flags };
+        let eh = EncSliceHeader { kind: Kind::Idr, poc_lsb: 0, qp, log2_max_poc_lsb: 8, ref_deltas: Vec::new(), sao: sao_flags, pred_weights: None };
         write_slice_header(&eh, 26, NAL_IDR_N_LP, false, &mut w);
         w.flag(true); // byte_alignment(): alignment_bit_equal_to_one
         w.align_zero();

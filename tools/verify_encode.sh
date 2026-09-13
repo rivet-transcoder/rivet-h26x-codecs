@@ -289,6 +289,12 @@ hevc-abr-la-96k|--codec h265 --bitrate 96000 --gop 8 --lookahead 8
 hevc-abr-la-ipb-64k|--codec h265 --bitrate 64000 --gop 8 --bframes 2 --lookahead 4
 hevc-vbv-la-125@src_cut|--codec h265 --bitrate 64000 --cpb-ms 125 --gop 8 --lookahead 8
 hevc10-abr-la-96k@p10|--codec h265 --bitrate 96000 --gop 8 --lookahead 8
+hevc-wp-ip|--codec h265 --qp 26 --gop 8 --wpred
+hevc-wp-ipb@fade|--codec h265 --qp 26 --gop 8 --bframes 2 --wpred
+hevc-wp40-ip@fade|--codec h265 --qp 40 --gop 8 --wpred
+hevc-wp-sao-ip@fade|--codec h265 --qp 26 --gop 8 --sao --wpred
+hevc-wp-abr-64k@fade|--codec h265 --bitrate 64000 --gop 8 --wpred
+hevc10-wp-ip@p10|--codec h265 --qp 26 --gop 8 --wpred
 abr-64k-cpb@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8
 abr-64k-cavlc-cpb@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8 --cavlc
 h264-10-lossless-intra@p10|--codec h264 --lossless --gop 0

@@ -25,6 +25,7 @@
 use crate::bitwriter::BitWriter;
 use crate::encode::gop::Kind;
 use crate::encode::Config;
+use crate::hevc::slice::PredWeightTable;
 use crate::picture::ChromaFormat;
 
 /// Video parameter set.
@@ -616,6 +617,84 @@ pub struct SliceHeader {
     /// a bin" — the distinction this header has been bitten by twice, once
     /// in each direction.
     pub sao: Option<SaoFlags>,
+    /// The `pred_weight_table` this slice carries, or `None` when the
+    /// reader reads none — an I slice, or a PPS whose `weighted_pred_flag`
+    /// (P) / `weighted_bipred_flag` (B) is clear. The same `Option`
+    /// discipline as `sao`: the question is whether the reader takes the
+    /// syntax, and a P slice under a set flag must carry a table even when
+    /// every weight in it is the default.
+    pub pred_weights: Option<PredWeights>,
+}
+
+/// A slice's `pred_weight_table`, with what the writer needs to spell it
+/// the way the reader will read it: the reader shifts every offset by
+/// `WpOffsetBdShift` (the depth above 8, or nothing under high-precision
+/// offsets) and takes chroma syntax only when the stream has chroma.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredWeights {
+    /// The table as the reader will hold it — offsets already shifted to
+    /// the sample depth, one entry per active reference per list.
+    pub table: PredWeightTable,
+    /// `ChromaArrayType != 0`: whether the chroma flags and entries exist.
+    pub chroma: bool,
+    /// `BitDepthY` and `BitDepthC`, for the offset shift.
+    pub bit_depth_luma: u32,
+    /// See `bit_depth_luma`.
+    pub bit_depth_chroma: u32,
+}
+
+/// Write `pred_weight_table()`: the exact inverse of
+/// `hevc::slice::parse_pred_weight_table`, for a table the reader will
+/// hold as `t` — one list for a P slice, two for a B.
+///
+/// The reader's shape: `luma_log2_weight_denom`, a chroma delta when
+/// the stream has chroma; then per list every entry's luma flag, every
+/// entry's chroma flag, and then per entry the flagged deltas. A flag is
+/// set exactly when the entry differs from the default `(1 << denom,
+/// 0)`, since an unflagged entry is what the reader infers. Offsets are
+/// spelled in 8-bit units (the reader shifts them up by the depth above
+/// 8; high-precision offsets, which this encoder never declares, would
+/// spell them at the sample depth), and a chroma offset is spelled as
+/// the `delta_chroma_offset` the reader's derivation
+/// `o = Clip(half + delta - ((half * w) >> denom))` inverts to — the
+/// caller keeps `o` inside the reader's clip, or the round trip does
+/// not close.
+pub fn write_pred_weight_table(pw: &PredWeights, b_slice: bool, high_precision: bool, w: &mut BitWriter) {
+    let t = &pw.table;
+    w.ue(t.luma_log2_denom); // luma_log2_weight_denom
+    if pw.chroma {
+        w.se(t.chroma_log2_denom as i32 - t.luma_log2_denom as i32); // delta_chroma_log2_weight_denom
+    }
+    let shift_y = if high_precision { 0 } else { pw.bit_depth_luma as i32 - 8 };
+    let shift_c = if high_precision { 0 } else { pw.bit_depth_chroma as i32 - 8 };
+    let half_c: i32 = 1 << if high_precision { pw.bit_depth_chroma - 1 } else { 7 };
+    let luma_default = (1i32 << t.luma_log2_denom, 0i32);
+    let chroma_default = [(1i32 << t.chroma_log2_denom, 0i32); 2];
+    for list in t.lists.iter().take(if b_slice { 2 } else { 1 }) {
+        for e in list {
+            w.flag(e.luma != luma_default); // luma_weight_lX_flag
+        }
+        if pw.chroma {
+            for e in list {
+                w.flag(e.chroma != chroma_default); // chroma_weight_lX_flag
+            }
+        }
+        for e in list {
+            if e.luma != luma_default {
+                w.se(e.luma.0 - luma_default.0); // delta_luma_weight_lX
+                debug_assert_eq!(e.luma.1 & ((1 << shift_y) - 1), 0, "a luma offset must be a multiple of the shift");
+                w.se(e.luma.1 >> shift_y); // luma_offset_lX
+            }
+            if pw.chroma && e.chroma != chroma_default {
+                for (cw, co) in e.chroma {
+                    w.se(cw - chroma_default[0].0); // delta_chroma_weight_lX
+                    let o = co >> shift_c;
+                    debug_assert!((-half_c..half_c).contains(&o), "a chroma offset outside the reader's clip cannot round-trip");
+                    w.se(o - half_c + ((half_c * cw) >> t.chroma_log2_denom)); // delta_chroma_offset_lX
+                }
+            }
+        }
+    }
 }
 
 /// `slice_sao_luma_flag` and `slice_sao_chroma_flag`.
@@ -714,11 +793,15 @@ pub fn write_slice_header(h: &SliceHeader, pps_qp: i32, nal_type: u8, deblock: b
         // type alone.
         //
         // collocated_from_l0_flag / collocated_ref_idx are absent because
-        // slice_temporal_mvp_enabled is off; the weighted prediction
-        // tables are absent because weighted_pred_flag and
-        // weighted_bipred_flag are both 0 — default weighting is not a
-        // simplification, it is the only combination this bitstream can
-        // ask the reader for.
+        // slice_temporal_mvp_enabled is off. The prediction weight table
+        // is read exactly when the PPS sets `weighted_pred_flag` for a P
+        // slice or `weighted_bipred_flag` for a B — the caller's `Option`
+        // says which, as with SAO — and it sits here, before
+        // `five_minus_max_num_merge_cand`, which is where the reader
+        // takes it.
+        if let Some(pw) = &h.pred_weights {
+            write_pred_weight_table(pw, h.kind == Kind::B, false, w);
+        }
         w.ue(0); // five_minus_max_num_merge_cand -> MaxNumMergeCand 5
     }
     w.se(h.qp - pps_qp); // slice_qp_delta
@@ -899,7 +982,7 @@ mod tests {
                 let mut w = BitWriter::with_capacity(64);
                 w.bits(8, ((NAL_TRAIL_R as u32) & 0x3f) << 1);
                 w.bits(8, 1);
-                let h = SliceHeader { kind: Kind::P, poc_lsb: 2, qp: slice_qp, log2_max_poc_lsb: 16, ref_deltas: vec![-2], sao: None };
+                let h = SliceHeader { kind: Kind::P, poc_lsb: 2, qp: slice_qp, log2_max_poc_lsb: 16, ref_deltas: vec![-2], sao: None, pred_weights: None };
                 write_slice_header(&h, 26, NAL_TRAIL_R, true, &mut w);
                 w.flag(true);
                 w.align_zero();
@@ -987,6 +1070,7 @@ mod tests {
                 log2_max_poc_lsb: 16,
                 ref_deltas: deltas.clone(),
                 sao: None,
+                pred_weights: None,
             };
             let mut w = BitWriter::with_capacity(64);
             w.bits(8, ((NAL_TRAIL_R as u32) & 0x3f) << 1);
@@ -1037,6 +1121,76 @@ mod tests {
             );
             assert_eq!(parsed.max_num_merge_cand, 5, "MaxNumMergeCand");
             assert!(!parsed.mvd_l1_zero, "mvd_l1_zero_flag is written false");
+        }
+    }
+
+    /// `pred_weight_table` round-trips through the production header
+    /// parser in every spelling regime: no weights (a table of defaults
+    /// under a set PPS flag), luma only, luma and chroma, negative and
+    /// large weights, offsets at the edge of their range, a B slice's
+    /// second list, monochrome (no chroma syntax), and 10-bit offsets
+    /// (spelled in 8-bit units, held shifted). The parsed table must
+    /// equal the written one field for field, and everything after it
+    /// in the header — `MaxNumMergeCand`, the slice QP — must still land.
+    #[test]
+    fn a_pred_weight_table_round_trips_through_the_parser() {
+        use crate::hevc::pps::Pps;
+        use crate::hevc::slice::{SliceHeader as ParsedHeader, WeightEntry};
+        use crate::hevc::sps::Sps;
+        use crate::nal::HevcNalHeader;
+
+        let entry = |lw: i32, lo: i32, cw: [i32; 2], co: [i32; 2]| WeightEntry { luma: (lw, lo), chroma: [(cw[0], co[0]), (cw[1], co[1])] };
+        // (chroma format, bit depth, kind, luma denom, chroma denom, list 0, list 1)
+        let cases: Vec<(ChromaFormat, u32, Kind, u32, u32, Vec<WeightEntry>, Vec<WeightEntry>)> = vec![
+            // All defaults: every flag clear, the table still present.
+            (ChromaFormat::Yuv420, 8, Kind::P, 6, 6, vec![entry(64, 0, [64, 64], [0, 0])], vec![]),
+            // Luma only: a fade's gain and a small offset.
+            (ChromaFormat::Yuv420, 8, Kind::P, 6, 6, vec![entry(48, -3, [64, 64], [0, 0])], vec![]),
+            // Luma and chroma, chroma denom differing, negative weight,
+            // offsets at both edges of the 8-bit range.
+            (ChromaFormat::Yuv420, 8, Kind::P, 5, 7, vec![entry(-40, 127, [200, 1], [-128, 127])], vec![]),
+            // Denominator 0 (weights in whole units), 4:4:4, the luma
+            // offset at the floor.
+            (ChromaFormat::Yuv444, 8, Kind::P, 0, 0, vec![entry(3, -128, [2, 0], [5, -6])], vec![]),
+            // A B slice with both lists.
+            (ChromaFormat::Yuv422, 8, Kind::B, 6, 6, vec![entry(70, 2, [64, 64], [0, 0])], vec![entry(58, -2, [60, 68], [3, -3])]),
+            // Monochrome: no chroma syntax at all.
+            (ChromaFormat::Monochrome, 8, Kind::P, 4, 4, vec![entry(12, 9, [16, 16], [0, 0])], vec![]),
+            // Ten bits: offsets held shifted by two, spelled in 8-bit units.
+            (ChromaFormat::Yuv420, 10, Kind::P, 6, 6, vec![entry(50, -12 << 2, [64, 70], [0, 8 << 2])], vec![]),
+        ];
+        for (chroma, bit_depth, kind, ld, cd, l0, l1) in cases {
+            let tag = format!("{chroma:?} {bit_depth}-bit {kind:?} denoms {ld}/{cd} l0 {l0:?} l1 {l1:?}");
+            let cfg = Config { width: 64, height: 64, chroma, bit_depth, max_refs: l0.len() as u32, bframes: 1, ..Config::default() };
+            let g = Geometry::new(&cfg);
+            let sps = Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 16, None))).expect("SPS");
+            let opts = PpsOptions { weighted_pred: kind == Kind::P, weighted_bipred: kind == Kind::B, ..PpsOptions::default() };
+            let mut pps = Pps::parse(&crate::nal::unescape_rbsp(&write_pps_opts(26, false, true, &opts))).expect("PPS");
+            pps.resolve_tiles(&sps).expect("tiles");
+            assert_eq!(pps.weighted_pred, kind == Kind::P, "{tag}: weighted_pred_flag");
+            assert_eq!(pps.weighted_bipred, kind == Kind::B, "{tag}: weighted_bipred_flag");
+
+            let table = PredWeightTable { luma_log2_denom: ld, chroma_log2_denom: if chroma == ChromaFormat::Monochrome { ld } else { cd }, lists: [l0.clone(), l1.clone()] };
+            let pw = PredWeights { table: table.clone(), chroma: chroma != ChromaFormat::Monochrome, bit_depth_luma: bit_depth, bit_depth_chroma: bit_depth };
+            // One past reference per list-0 entry, one future for a B.
+            let mut ref_deltas: Vec<i32> = (1..=l0.len() as i32).map(|d| -2 * d).collect();
+            if kind == Kind::B {
+                ref_deltas.push(2);
+            }
+            let h = SliceHeader { kind, poc_lsb: 8, qp: 31, log2_max_poc_lsb: 16, ref_deltas, sao: None, pred_weights: Some(pw) };
+            let mut w = BitWriter::with_capacity(64);
+            w.bits(8, ((NAL_TRAIL_R as u32) & 0x3f) << 1);
+            w.bits(8, 1);
+            write_slice_header(&h, 26, NAL_TRAIL_R, true, &mut w);
+            w.flag(true); // byte_alignment()
+            w.align_zero();
+            let rbsp = w.into_rbsp();
+            let nal = HevcNalHeader::parse(&rbsp).expect("NAL header");
+            let (parsed, _, _) = ParsedHeader::parse(&rbsp, nal, &|_| Some(pps.clone()), &|_| Some(sps.clone()), None)
+                .unwrap_or_else(|e| panic!("{tag}: the header must parse: {e}"));
+            assert_eq!(parsed.pred_weights.as_ref(), Some(&table), "{tag}: the parsed table differs from the written one");
+            assert_eq!(parsed.max_num_merge_cand, 5, "{tag}: what follows the table did not land");
+            assert_eq!(parsed.slice_qp, 31, "{tag}: the slice QP after the table");
         }
     }
 

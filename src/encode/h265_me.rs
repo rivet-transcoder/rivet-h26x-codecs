@@ -68,8 +68,11 @@
 //! - **P slices, one reference** (list 0, `ref_idx` 0), `PART_2Nx2N`
 //!   whole-CTU CUs, one CU-sized TU (no transform split — the SPS's
 //!   maximum transform size equals the CTB size precisely so this shape is
-//!   representable). Fixed QP, no weighted prediction
-//!   (`Weighting::Default`).
+//!   representable). The quantiser and the weighting are the caller's:
+//!   per-CTB quantisers through `MeCtx::qp`, and list 0's explicit
+//!   weighting through [`InterPicture::wp`] when the slice carries a
+//!   `pred_weight_table` (`Weighting::Default` otherwise; B slices
+//!   always).
 //! - **All four chroma formats.** Monochrome omits every chroma element,
 //!   mirroring the reader's uniform `chroma_array_type != 0` gates in
 //!   `transform_tree` and `transform_unit`; 4:2:0 carries one half-size
@@ -470,6 +473,13 @@ pub struct InterPicture<S: Sample> {
     /// (`satd_bi_at`). Unused by the P path.
     spred14_b: Vec<i16>,
     spred: Vec<S>,
+    /// The explicit weighting this picture's list-0 predictions carry —
+    /// per component, what `hevc::ctu::explicit_weighting` derives from
+    /// the slice's `pred_weight_table` for reference 0 — or the default.
+    /// Read by [`Self::code_ctu`]'s scoring and its final prediction, so
+    /// a vector is chosen for the prediction that will actually be made.
+    /// The B walk ignores it: `weighted_bipred_flag` is never set.
+    pub wp: [Weighting; 3],
 }
 
 impl<S: Sample> InterPicture<S> {
@@ -510,6 +520,7 @@ impl<S: Sample> InterPicture<S> {
             spred14: vec![0; nmax],
             spred14_b: vec![0; nmax],
             spred: vec![S::default(); nmax],
+            wp: [Weighting::Default; 3],
         }
     }
 
@@ -700,8 +711,10 @@ impl<S: Sample> InterPicture<S> {
             return out;
         }
 
-        // The chosen prediction, through the decoder's own MC.
-        predict_block(ctx.dsp, &mut self.scratch, &mut self.recon, x0, y0, n, n, Some((refp, mv)), None, [Weighting::Default; 3]);
+        // The chosen prediction, through the decoder's own MC, weighted
+        // exactly as the slice header says list 0 is.
+        let wp = self.wp;
+        predict_block(ctx.dsp, &mut self.scratch, &mut self.recon, x0, y0, n, n, Some((refp, mv)), None, wp);
 
         let any = self.code_residual_cu(ctx, x0, y0, src, y_stride, src_cb, src_cr, c_stride, &mut out);
         out.kind = match (merge_wins, any) {
@@ -1162,12 +1175,39 @@ impl<S: Sample> InterPicture<S> {
     /// default uni-prediction the decoder applies.
     #[allow(clippy::too_many_arguments)]
     fn satd_at(&mut self, ctx: &MeCtx<'_, S>, refp: &Plane16<S>, x: usize, y: usize, n: usize, src: &[S], src_stride: usize, mv: Mv) -> u32 {
+        let wp = self.wp[0];
+        self.satd_at_weighted(ctx, refp, x, y, n, src, src_stride, mv, wp)
+    }
+
+    /// [`Self::satd_at`] under a given luma weighting: the default
+    /// uni-prediction, or the decoder's `weighted_uni` at the table's
+    /// `log2WD`, weight and offset for list 0 — the same kernel
+    /// `predict_block` will commit the winner through.
+    #[allow(clippy::too_many_arguments)]
+    fn satd_at_weighted(&mut self, ctx: &MeCtx<'_, S>, refp: &Plane16<S>, x: usize, y: usize, n: usize, src: &[S], src_stride: usize, mv: Mv, wp: Weighting) -> u32 {
         let InterPicture { swin, stmp, spred14, spred, .. } = self;
         predict14(ctx, refp, x, y, n, mv, swin, stmp, spred14);
         let bd = ctx.bit_depth;
         let max = (1i32 << bd) - 1;
-        (ctx.dsp.uni)(spred, n, spred14, n, n, 14 - bd as i32, max);
+        match wp {
+            Weighting::Default => (ctx.dsp.uni)(spred, n, spred14, n, n, 14 - bd as i32, max),
+            Weighting::Explicit { log2_wd, w, o } => (ctx.dsp.weighted_uni)(spred, n, spred14, n, n, log2_wd, w[0], o[0], max),
+        }
         (ctx.dist.satd)(src, src_stride, spred, n, n, n)
+    }
+
+    /// The model check for weighted prediction: the luma SATD of the CU
+    /// at `(x0, y0)` predicted from `refp` at `mv` without any weighting
+    /// and with this picture's, so the caller can count whether the
+    /// table's fit helped the vectors the search actually chose.
+    #[allow(clippy::too_many_arguments)]
+    pub fn weighting_gain(&mut self, ctx: &MeCtx<'_, S>, refp: &Frame<S>, x0: usize, y0: usize, src_y: &[S], y_stride: usize, mv: Mv) -> (u32, u32) {
+        let n = 1usize << self.log2_cu;
+        let src = &src_y[y0 * y_stride + x0..];
+        let wp = self.wp[0];
+        let plain = self.satd_at_weighted(ctx, &refp.y, x0, y0, n, src, y_stride, mv, Weighting::Default);
+        let weighted = self.satd_at_weighted(ctx, &refp.y, x0, y0, n, src, y_stride, mv, wp);
+        (plain, weighted)
     }
 
     /// SATD of the *bi-predicted* luma block at `(mv0, mv1)`: the two
