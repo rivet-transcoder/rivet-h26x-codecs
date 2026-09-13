@@ -363,22 +363,13 @@ pub fn write_buffering_period_sei(cpb: &Cpb) -> Vec<u8> {
     p.bits(cpb.initial_delay_length, cpb.initial_removal_delay_90k());
     p.bits(cpb.initial_delay_length, 0); // initial_cpb_removal_offset
     p.rbsp_trailing_bits();
-    let payload = p.into_nal();
-
-    let mut w = BitWriter::with_capacity(payload.len() + 8);
-    w.bits(8, 0); // payload_type: buffering_period
-    // payload_size, in the standard's 255-at-a-time form.
-    let mut n = payload.len();
-    while n >= 255 {
-        w.bits(8, 255);
-        n -= 255;
-    }
-    w.bits(8, n as u32);
-    for b in &payload {
-        w.bits(8, *b as u32);
-    }
-    w.rbsp_trailing_bits();
-    w.into_nal()
+    // The raw payload: `sei_nal` sizes it as RBSP bytes and escapes the
+    // whole NAL once. This wrapped `p.into_nal()` — the payload already
+    // escaped, then sized and escaped again — so a buffering period whose
+    // delay bits held `00 00 00` went out as `00 00 03 03`, one byte
+    // longer than its payload_size said, and h26xhrd read the stray byte
+    // as part of the initial delay.
+    crate::encode::h264_syntax::sei_nal(0, &p.into_rbsp())
 }
 
 /// Video parameter set.
@@ -831,6 +822,28 @@ mod tests {
         assert!(!vui.full_range);
         assert_eq!(vui.timing, Some((1, 30)));
         assert_ne!(write_sps(&base, &g, 8, None), write_sps(&Config { colour: Some(colours[0]), ..base }, &g, 8, None));
+    }
+
+    /// The buffering period SEI is escaped once and sized as RBSP: what a
+    /// reader unescapes is exactly `payload_type, payload_size, payload,
+    /// trailing byte`, with no emulation-prevention byte left inside the
+    /// payload. Before this held the payload went out escaped, then sized
+    /// and escaped again, and a delay whose bits held `00 00 00` reached
+    /// the reader with a `03` inside it (`00 0b 80 00 00 03 03 …`). The
+    /// last assertion keeps the test honest: this buffer's payload does
+    /// contain the zero run that triggers an escape.
+    #[test]
+    fn the_buffering_period_sei_is_escaped_once_and_sized_as_rbsp() {
+        let cpb = Cpb::new(64_000, 125).expect("representable");
+        let nal = write_buffering_period_sei(&cpb);
+        let rbsp = crate::nal::unescape_rbsp(&nal);
+        assert_eq!(rbsp[0], 0, "payload_type buffering_period");
+        let size = rbsp[1] as usize;
+        assert_eq!(rbsp.len(), 2 + size + 1, "type, size, payload, one trailing byte: {rbsp:02x?}");
+        assert_eq!(rbsp[2 + size], 0x80, "rbsp_trailing_bits: {rbsp:02x?}");
+        let payload = &rbsp[2..2 + size];
+        assert!(!payload.windows(3).any(|w| w == [0, 0, 3]), "an escape byte inside the payload: {rbsp:02x?}");
+        assert!(payload.windows(3).any(|w| w == [0, 0, 0]), "the zero run that exercises the escape: {rbsp:02x?}");
     }
 
     /// The declared values are rounded **down** from what was asked for,

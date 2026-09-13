@@ -141,8 +141,15 @@ pub(crate) fn write_video_signal_type(w: &mut BitWriter, colour: Option<&ColourD
 /// is applied once, here, to the whole NAL. A payload that had already
 /// been escaped would be escaped again — a timing SEI is mostly zero
 /// bytes, exactly the pattern the escape targets — and a reader would
-/// find `0x03` where a delay's bits should be.
-fn sei_nal(payload_type: u32, payload: &[u8]) -> Vec<u8> {
+/// find `0x03` where a delay's bits should be. (Which is what the H.265
+/// buffering period did until it was routed through here: its payload
+/// went out escaped and sized as escaped, then the NAL was escaped
+/// again — `00 00 03 03` on the wire, and a checker reading a stray
+/// byte inside the initial delay.)
+///
+/// Shared by both syntaxes: an SEI message is the same bytes in H.264
+/// and H.265, only the NAL header around it differs.
+pub(crate) fn sei_nal(payload_type: u32, payload: &[u8]) -> Vec<u8> {
     let mut w = BitWriter::with_capacity(payload.len() + 8);
     let mut t = payload_type;
     while t >= 255 {
