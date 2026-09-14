@@ -21,7 +21,8 @@
 #   3. QUALITY  PSNR of the reconstruction against the source. The only one of
 #               the three that is a measurement rather than a check — so it is
 #               REPORTED, never gated, except in lossless mode where it must be
-#               infinite and the check becomes exact like the others.
+#               infinite and the check becomes exact like the others — and
+#               against a floor recorded from an earlier run (9).
 #
 #   4. RATE     Only for --bitrate rows, and a different kind of property from
 #               the three above: did the encoder achieve the objective it was
@@ -149,8 +150,51 @@
 #               can recover, so the encoder refuses by name ("picture 0
 #               needs 3432 bits and the declared buffer affords 2893").
 #
-# Usage: verify_encode.sh [encoder] [decoder]
+#   9. QUALITY FLOOR  Only with --quality-baseline FILE, and modelled on
+#               verify.sh --baseline: when FILE does not exist the run
+#               records every cell's luma, Cb and Cr PSNR to it (a red run
+#               records nothing — a floor taken from a red run holds the
+#               red); when it does, a cell fails as QUALITY-FAIL if any plane
+#               lands more than H26X_QUALITY_TOL below the PSNR recorded for
+#               it. Cells more than the tolerance above their floor pass and
+#               are listed, and so are cells FILE does not know and cells it
+#               knows that this run did not measure — listed, not failed,
+#               because a new row or a new clip is not a regression.
+#
+#               Why it exists: SELF and CROSS both compare a bitstream with
+#               itself, and 3 only reports, so an encoder whose pictures got
+#               worse passed every property above. That happened. The H.264
+#               encoder quantised the I_16x16 luma DC one shift short from
+#               its first commit, every I_16x16 DC came back at twice its
+#               coded mean, and at QP 38 — where every intra macroblock is
+#               I_16x16 — luma read 14.6 dB against H.265's 27.3 on the same
+#               clip, with this whole gate green.
+#
+#               PSNR here is per plane and exact (no sampling, which could
+#               step over the region that regressed), over every picture.
+#
+#               The tolerance, 0.30 dB by default, is not for noise: the
+#               encoder is deterministic, and a same-binary rerun holds every
+#               cell exactly. It is what an intended decision change may cost
+#               a plane before its floor has to be recorded again, and it was
+#               chosen on the I_16x16 fix itself, fixed floor against pre-fix
+#               (337 of 754 cells moved, -3% to -24% BD-rate per clip). That
+#               fix lowered 37 planes by more than 0.10 dB, 13 by more than
+#               0.30 and 3 by more than 0.50. The 13 are Cr at -0.35 to -0.46
+#               on ten QP 40 detail cells whose luma rose 11.9 dB (cqp40-ip on
+#               39% fewer bytes), and one rate row, cut abr-128k, that spent
+#               0.88x of its target where the pre-fix run spent 0.98x. At 0.30
+#               the pre-fix encoder fails 248 of the 337 against the fixed
+#               floor: every cell where the bug cost some plane more than
+#               0.30 dB. The 89 it passes lost less than that.
+#
+#               Its mutation: disable the below-the-floor comparison, and
+#               the pre-fix encoder must pass against a floor recorded from
+#               the fixed one.
+#
+# Usage: verify_encode.sh [--quality-baseline FILE] [encoder] [decoder]
 #   H26X_WORK=dir   scratch directory holding the source clips (default: here)
+#   H26X_QUALITY_TOL=dB  how far below its floor a plane may land (see 9)
 #   JOBS=n          configurations in parallel (default 4)
 #   H26X_SPEED_TABLE=file  append a per-cell speed row here (see 7)
 #
@@ -163,6 +207,23 @@
 # and MSYS turned that nothing into `C:\Program Files\Git\param_sets.py` —
 # every cell red on the BOX check with a message that named the wrong bug.
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# --quality-baseline FILE (9), made absolute before the cd below for the
+# same reason.
+QBASE=""
+while :; do
+  case "$1" in
+    --quality-baseline)
+      [ -n "$2" ] || { echo "verify_encode.sh: --quality-baseline needs a file" >&2; exit 2; }
+      QBASE=$2; shift 2 ;;
+    *) break ;;
+  esac
+done
+if [ -n "$QBASE" ]; then
+  qdir=$(cd "$(dirname "$QBASE")" 2>/dev/null && pwd) \
+    || { echo "verify_encode.sh: --quality-baseline: no directory $(dirname "$QBASE")" >&2; exit 2; }
+  QBASE=$qdir/$(basename "$QBASE")
+fi
+QTOL=${H26X_QUALITY_TOL:-0.30}
 cd "${H26X_WORK:-$SCRIPT_DIR}"
 ENC=${1:-../release/examples/h26xenc.exe}
 DEC=${2:-../release/examples/h26xdec.exe}
@@ -725,6 +786,22 @@ one() {
   if [ -n "$H26X_SPEED_TABLE" ]; then
     printf '%s\t%s\t%s\t%s\t%s\n' "$base" "$name" "$size" "$psnr" "$(echo "$speed" | sed 's/ s, /\t/; s/ f\/s//')" >> "$H26X_SPEED_TABLE"
   fi
+  # 9. QUALITY FLOOR. Only with --quality-baseline. Lossless rows are
+  # recorded but held by their exact check below rather than a tolerance.
+  if [ -n "$QBASE" ]; then
+    planes=$(planes_psnr_of "$src" "$rec" "$depth" "$geom" "$chroma")
+    echo "$tag $planes" > "$OUT/$base.$name.quality"
+    floor=""
+    [ -f "$QBASE" ] && floor=$(awk -v t="$tag" '$1 == t { print $2, $3, $4; exit }' "$QBASE")
+    case "$flags" in *--lossless*) floor="" ;; esac
+    if [ -n "$floor" ]; then
+      verdict=$(quality_verdict "$planes" "$floor" "$QTOL")
+      case "$verdict" in
+        below*) echo "QUALITY-FAIL $tag: ${verdict#below }"; return 1 ;;
+        above*) echo "$tag: ${verdict#above }" > "$OUT/$base.$name.improved" ;;
+      esac
+    fi
+  fi
   case "$flags" in
     *--lossless*)
       if ! cmp -s "$src" "$rec"; then
@@ -798,8 +875,68 @@ peak = (1 << depth) - 1
 print("inf" if mse == 0 else f"{10 * math.log10(peak * peak / mse):.2f}")
 PY
 }
-export -f one ffpix psnr_of chroma_of depth_of frame_bytes
-export ENC DEC HRD FFMPEG FFPROBE OUT PARAM_SETS VUI_PROBE H26X_SPEED_TABLE JOBS
+# Property 9's measurement: luma, Cb and Cr PSNR over every picture,
+# exact, "-" for a plane the format does not have and "inf" for one
+# reproduced exactly. Geometry and chroma format give the plane sizes.
+planes_psnr_of() {
+  python - "$1" "$2" "$3" "$4" "$5" <<'PY'
+import sys, math, array
+depth = int(sys.argv[3])
+w, h = (int(v) for v in sys.argv[4].split("x"))
+cw, ch = {"400": (0, 0), "gray": (0, 0), "420": ((w + 1) // 2, (h + 1) // 2),
+          "422": ((w + 1) // 2, h), "444": (w, h)}[sys.argv[5]]
+def samples(path):
+    data = open(path, "rb").read()
+    if depth <= 8:
+        return data
+    s = array.array("H"); s.frombytes(data[:len(data) & ~1])
+    if sys.byteorder != "little":
+        s.byteswap()
+    return s
+a, b = samples(sys.argv[1]), samples(sys.argv[2])
+fs = w * h + 2 * cw * ch
+n = min(len(a), len(b)) // fs
+peak = (1 << depth) - 1
+out = []
+for off, size in ((0, w * h), (w * h, cw * ch), (w * h + cw * ch, cw * ch)):
+    if size == 0 or n == 0:
+        out.append("-")
+        continue
+    se = 0
+    for f in range(n):
+        o = f * fs + off
+        se += sum((x - y) * (x - y) for x, y in zip(a[o:o + size], b[o:o + size]))
+    mse = se / (n * size)
+    out.append("inf" if mse == 0 else f"{10 * math.log10(peak * peak / mse):.2f}")
+print(" ".join(out))
+PY
+}
+
+# Property 9's comparison of a cell's planes against its floor: "below"
+# when any plane fell more than the tolerance under its recorded PSNR,
+# else "above" when any rose more than it, else "held". An exact plane
+# ("inf") ranks above every number.
+quality_verdict() {
+  awk -v got="$1" -v floor="$2" -v tol="$3" 'BEGIN {
+    split(got, g, " "); split(floor, f, " "); split("luma Cb Cr", plane, " ")
+    below = ""; above = ""
+    for (i = 1; i <= 3; i++) {
+      if (g[i] == "" || f[i] == "" || g[i] == "-" || f[i] == "-") continue
+      gv = (g[i] == "inf") ? 1e9 : g[i] + 0
+      fv = (f[i] == "inf") ? 1e9 : f[i] + 0
+      d = gv - fv
+      if (gv == 1e9 || fv == 1e9) note = sprintf("%s %s dB, recorded %s", plane[i], g[i], f[i])
+      else note = sprintf("%s %s dB, recorded %s (%+.2f)", plane[i], g[i], f[i], d)
+      if (d < -tol) below = below (below == "" ? "" : "; ") note
+      else if (d > tol) above = above (above == "" ? "" : "; ") note
+    }
+    if (below != "") print "below " below "; tolerance " tol " dB"
+    else if (above != "") print "above " above
+    else print "held"
+  }'
+}
+export -f one ffpix psnr_of planes_psnr_of quality_verdict chroma_of depth_of frame_bytes
+export ENC DEC HRD FFMPEG FFPROBE OUT PARAM_SETS VUI_PROBE H26X_SPEED_TABLE JOBS QBASE QTOL
 
 echo "== encode verification =="
 results="$OUT/results.txt"
@@ -849,7 +986,7 @@ pass=$(grep -c '^PASS' "$results")
 # failure prefix is missing from this pattern reports its failure and is
 # then counted as green - which is how the RATE rows first shipped, caught
 # only by running the mutation they exist to catch.
-bad=$(grep -cE '^(ENCODE|SELF|CROSS|LOSSLESS|RATE|HRD|PS|VUI)-FAIL' "$results")
+bad=$(grep -cE '^(ENCODE|SELF|CROSS|LOSSLESS|RATE|HRD|PS|VUI|QUALITY)-FAIL' "$results")
 echo
 echo "encode: $pass passed, $bad failed"
 [ "$bad" = 0 ] || fail=1
@@ -858,6 +995,32 @@ echo "encode: $pass passed, $bad failed"
 # the same machine; a per-cell table (H26X_SPEED_TABLE) says where it went.
 sed -n 's/^PASS .*, \([0-9.]*\) s, \([0-9]*\) f\/s)$/\1 \2/p' "$results" \
   | awk -v cells="$pass" -v jobs="$JOBS" '{ s += $1 } END { printf "encode speed: %d cells, %.2f s of encoder wall time (summed over cells, %d in parallel)\n", cells, s, jobs }'
+
+# 9. The quality floor's ledger: record it, or say what moved against it.
+if [ -n "$QBASE" ]; then
+  qrec="$OUT/quality.txt"
+  cat "$OUT"/*.quality 2>/dev/null | sort > "$qrec"
+  cells=$(wc -l < "$qrec")
+  echo
+  if [ "$cells" = 0 ]; then
+    # Zero measured cells is the vacuity the tally above refuses too.
+    echo "quality: no cell was measured"
+    fail=1
+  elif [ -f "$QBASE" ]; then
+    cat "$OUT"/*.improved 2>/dev/null | sort > "$OUT/above.txt"
+    awk 'NR == FNR { seen[$1] = 1; next } !($1 in seen) { print $1 }' "$QBASE" "$qrec" > "$OUT/unrecorded.txt"
+    awk 'NR == FNR { seen[$1] = 1; next } !($1 in seen) { print $1 }' "$qrec" "$QBASE" > "$OUT/unmeasured.txt"
+    echo "quality: $cells cells against $QBASE (tolerance $QTOL dB): $(grep -c '^QUALITY-FAIL' "$results") below the floor, $(wc -l < "$OUT/above.txt") above it, $(wc -l < "$OUT/unrecorded.txt") not recorded, $(wc -l < "$OUT/unmeasured.txt") recorded but not measured"
+    sed 's/^/  above         /' "$OUT/above.txt"
+    sed 's/^/  not recorded  /' "$OUT/unrecorded.txt"
+    sed 's/^/  not measured  /' "$OUT/unmeasured.txt"
+  elif [ "$fail" = 0 ]; then
+    cp "$qrec" "$QBASE"
+    echo "quality: recorded $cells cells to $QBASE"
+  else
+    echo "quality: NOT recorded to $QBASE: a floor recorded from a red run holds the red"
+  fi
+fi
 
 echo
 [ "$fail" = 0 ] && echo "ALL GREEN" || echo "SOMETHING FAILED"
