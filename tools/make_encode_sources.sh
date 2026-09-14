@@ -155,4 +155,4 @@ deep detail12 "testsrc2=size=64x64:rate=25"  8 64x64 420 12
 # identity_encode.sh skip for every row without an `@` (the deep clips'
 # rule), so this clip's arrival changed no existing row's cost — in every
 # checkout of those scripts, including ones older than the clip.
-gen big    "testsrc2=size=128x80:rate=25,format=yuv420p[a];mandelbrot=size=128x80:rate=25,format=yuv420p[b];gradients=size=128x80:rate=25,format=yuv420p[c];smptehdbars=size=128x80:rate=25,format=yuv420p[d];[a][b]hstack=inputs=2[top];[c][d]hstack=inputs=2[bot];[top][bot]vstack=inputs=2" 16 256x160_420p8 yuv420p
+gen big    "testsrc2=size=128x80:rate=25,format=yuv420p[a];mandelbrot=size=128x80:rate=25,format=yuv420p[b];gradients=size=128x80:rate=25:c0=0x2050a0:c1=0xe0b040:x0=0:y0=0:x1=127:y1=79:nb_colors=2:seed=1:speed=0.01:type=linear,format=yuv420p[c];smptehdbars=size=128x80:rate=25,format=yuv420p[d];[a][b]hstack=inputs=2[top];[c][d]hstack=inputs=2[bot];[top][bot]vstack=inputs=2" 16 256x160_420p8 yuv420p
