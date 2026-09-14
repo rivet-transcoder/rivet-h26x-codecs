@@ -40,6 +40,8 @@
 use super::gop::{Coded, Kind, Scheduler};
 use super::rc::{PicKind, RateController};
 use super::h264_syntax as syn;
+use super::h265_wp;
+use crate::h264::slice::{PredWeightTable, WeightEntry};
 use super::{Access, Config, Entropy, RateControl};
 use crate::bitwriter::BitWriter;
 use crate::sample::Sample;
@@ -190,6 +192,16 @@ pub struct ShapeCensus {
     pub qp_delta: [u64; 3],
     /// Pictures with at least one non-zero `mb_qp_delta`, per picture type.
     pub qp_delta_pictures: [u64; 3],
+    /// Pictures whose `pred_weight_table` weights something — weighted
+    /// prediction chosen, not merely enabled — per picture type (only P
+    /// pictures carry a table).
+    pub wp_on: [u64; 3],
+    /// Under a luma weighting, inter macroblocks whose luma SATD at the
+    /// vectors chosen was lower weighted than plain: the fit's model check
+    /// holding.
+    pub wp_won: [u64; 3],
+    /// The same, higher weighted than plain: the fit's model check failing.
+    pub wp_lost: [u64; 3],
 }
 
 impl ShapeCensus {
@@ -203,7 +215,7 @@ impl ShapeCensus {
     /// `pic_qp`: their kinds, and — read off the same committed `MbInfo`
     /// the loop filter reads — how many left that quantiser and how many
     /// coded a delta to do it.
-    fn add(&mut self, kind: Kind, mbs: &[crate::h264::mb::MbInfo], pic_qp: u8) {
+    fn add(&mut self, kind: Kind, mbs: &[crate::h264::mb::MbInfo], pic_qp: u8, weighting: super::h264_pic::WeightCensus) {
         let pic = match kind {
             Kind::Idr | Kind::I => 0,
             Kind::P => 1,
@@ -219,6 +231,9 @@ impl ShapeCensus {
         }
         self.qp_delta[pic] += deltas;
         self.qp_delta_pictures[pic] += u64::from(deltas > 0);
+        self.wp_on[pic] += u64::from(weighting.on);
+        self.wp_won[pic] += weighting.won;
+        self.wp_lost[pic] += weighting.lost;
     }
 
     /// The kinds that occurred in pictures of type `pic` (0 intra, 1 P,
@@ -329,6 +344,14 @@ impl<S: Sample> Core<S> {
             // no quantiser: a per-macroblock one would steer nothing.
             return Err(Error::unsupported(
                 "H.264 encode: adaptive quantisation on a lossless picture (no quantiser to adapt)",
+            ));
+        }
+        if cfg.weighted_pred && cfg.rate == RateControl::Lossless {
+            // A lossless stream's inter pictures are all-skip copies of
+            // their reference (PCM has no inter spelling), and a weighting
+            // would scale the copy away from the source it must reproduce.
+            return Err(Error::unsupported(
+                "H.264 encode: weighted prediction on a lossless stream (its inter pictures are exact copies)",
             ));
         }
         let (sw, sh) = cfg.chroma.subsampling();
@@ -546,7 +569,7 @@ impl<S: Sample> Core<S> {
     fn commit(&mut self, c: &Coded, a: Attempt<S>, qp: u8) -> Access {
         let idr = c.kind == Kind::Idr;
         self.recon.push(a.rec);
-        self.census.add(c.kind, &a.motion.info.mbs, qp);
+        self.census.add(c.kind, &a.motion.info.mbs, qp, a.motion.weighting);
         if idr {
             // The attempt wrote `frame_num` 0 for an IDR; the count
             // restarts from there.
@@ -683,6 +706,36 @@ impl<S: Sample> Core<S> {
         // is PCM or all-skip, where the zero-colocated assumption of the
         // temporal-direct fallback below still holds.
         let transform_b = !idr && c.kind == Kind::B && lossy;
+        // Weighted prediction, for a P picture under the PPS flag: one entry
+        // for list 0's one reference, each component fitted to the source
+        // against that reference's reconstruction over the display area and
+        // kept only where it lowers the zero-motion residual — the H.265
+        // side's fit (`h265_wp`), held to the weights H.264's table carries.
+        // The table travels in the slice header; the walk predicts with what
+        // the reader derives from it.
+        let wp = (self.cfg.weighted_pred && transform_p).then(|| {
+            let rf = &self.refs[past.expect("checked above")].1;
+            let fits: Vec<h265_wp::PlaneFit> = (0..self.plane_dims.len())
+                .map(|p| {
+                    let (pw, ph) = self.plane_dims[p];
+                    let refs = h265_wp::RefSamples { data: &rf[p].data, origin: rf[p].origin(), stride: rf[p].stride };
+                    h265_wp::fit_samples(planes[p].data, planes[p].stride, refs, pw as usize, ph as usize, g.bit_depth, h265_wp::H264_WEIGHTS)
+                })
+                .collect();
+            let default = (1i32 << h265_wp::LOG2_DENOM, 0i32);
+            let comp = |f: &h265_wp::PlaneFit| if f.used() { (f.weight, f.offset) } else { default };
+            let luma = comp(&fits[0]);
+            let chroma = if fits.len() == 3 { [comp(&fits[1]), comp(&fits[2])] } else { [default; 2] };
+            let entry = WeightEntry { luma, chroma, luma_flag: luma != default, chroma_flag: chroma != [default; 2] };
+            syn::PredWeights {
+                table: PredWeightTable {
+                    luma_log2_denom: h265_wp::LOG2_DENOM,
+                    chroma_log2_denom: h265_wp::LOG2_DENOM,
+                    lists: [vec![entry], Vec::new()],
+                },
+                chroma: g.chroma != crate::ChromaFormat::Monochrome,
+            }
+        });
         let mut out = Vec::new();
         out.extend_from_slice(&syn::annexb(
             syn::NAL_SPS,
@@ -750,6 +803,7 @@ impl<S: Sample> Core<S> {
                 deblock: true,
                 cabac,
                 direct_spatial: transform_b,
+                pred_weights: wp.clone(),
             },
             self.pps_qp,
             &mut w,
@@ -838,6 +892,7 @@ impl<S: Sample> Core<S> {
                     &planes,
                     &mut recon,
                     &self.refs[p0].1,
+                    wp.as_ref().map(|p| &p.table),
                 );
             } else {
                 motion = super::h264_cavlc_mb::write_p_picture(
@@ -848,6 +903,7 @@ impl<S: Sample> Core<S> {
                     &planes,
                     &mut recon,
                     &self.refs[p0].1,
+                    wp.as_ref().map(|p| &p.table),
                 );
                 w.rbsp_trailing_bits();
             }
@@ -1381,10 +1437,9 @@ mod tests {
             .collect()
     }
 
-    /// Encode `frames` under `config`, decode the stream with the production
-    /// decoder and hold every picture to the encoder's own reconstruction
-    /// (SELF, in process) — matched through each access unit's POC, as
-    /// `deep_pictures_round_trip_through_the_decoder` matches them.
+    /// Encode `frames` under `config` and hold the stream to the encoder's
+    /// reconstructions with [`self_check`], returning the access units and
+    /// the census.
     fn encode_and_self_check(tag: &str, config: Config, frames: &[Vec<u8>]) -> (Vec<Access>, ShapeCensus) {
         let gop = config.gop;
         let mut e = H264Encoder::new(config).unwrap_or_else(|err| panic!("{tag}: {err}"));
@@ -1394,22 +1449,30 @@ mod tests {
         }
         units.extend(e.flush().unwrap_or_else(|err| panic!("{tag}: {err}")));
         assert_eq!(units.len(), frames.len(), "{tag}: one access unit per picture");
+        self_check(tag, gop, &units, e.reconstructions());
+        (units, e.shape_census().clone())
+    }
+
+    /// Decode `units` with the production decoder and hold every picture to
+    /// the reconstruction the encoder kept for it (SELF, in process) —
+    /// matched through each access unit's POC, as
+    /// `deep_pictures_round_trip_through_the_decoder` matches them.
+    fn self_check(tag: &str, gop: u32, units: &[Access], recons: &[Vec<u8>]) {
         let mut dec = crate::h264::H264Decoder::new();
-        for u in &units {
+        for u in units {
             dec.push_annexb(&u.data).unwrap_or_else(|err| panic!("{tag}: decoder rejected the stream: {err}"));
         }
         dec.flush().unwrap_or_else(|err| panic!("{tag}: decoder failed to flush: {err}"));
         let mut by_display = vec![None; units.len()];
-        for u in &units {
+        for u in units {
             let display = if gop == 0 { u.encode_index as usize } else { (u.poc / 2) as usize };
             by_display[display] = Some(u.encode_index as usize);
         }
         for (i, coded) in by_display.iter().enumerate() {
-            let want = &e.reconstructions()[coded.unwrap_or_else(|| panic!("{tag}: display index {i} never coded"))];
+            let want = &recons[coded.unwrap_or_else(|| panic!("{tag}: display index {i} never coded"))];
             let got = dec.next_picture().unwrap_or_else(|| panic!("{tag}: picture {i} missing")).into_packed();
             assert!(got == *want, "{tag}: picture {i} decoded differently than the encoder reconstructed it");
         }
-        (units, e.shape_census().clone())
     }
 
     /// Adaptive quantisation — a quantiser per macroblock, carried by
@@ -1495,5 +1558,120 @@ mod tests {
             .err()
             .expect("adaptive quantisation on a lossless stream must refuse");
         assert!(format!("{err}").contains("adaptive quantisation"), "{err}");
+    }
+    /// A textured picture fading a step per frame — a gain and an offset
+    /// together, `base * (1 - i/16) - 2i`, chroma untouched — in `chroma` at
+    /// `bit_depth`, `count` frames: a fitted weighting has both halves of
+    /// its table to carry here, which a pure gain would not give it.
+    fn fade_frames(chroma: ChromaFormat, bit_depth: u32, count: usize) -> Vec<Vec<u8>> {
+        let (w, h) = (64usize, 64usize);
+        let (sw, sh) = match chroma {
+            ChromaFormat::Yuv420 => (2usize, 2usize),
+            ChromaFormat::Yuv422 => (2, 1),
+            _ => (1, 1),
+        };
+        let (cw, ch) = if chroma == ChromaFormat::Monochrome { (0, 0) } else { (w / sw, h / sh) };
+        let shift = bit_depth - 8;
+        (0..count)
+            .map(|i| {
+                let gain = 1.0 - i as f64 / 16.0;
+                let mut samples: Vec<u32> = Vec::with_capacity(w * h + 2 * cw * ch);
+                let mut seed = 0x51edu32;
+                for y in 0..h {
+                    for x in 0..w {
+                        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                        let base = 60 + ((x * 3 + y * 5 + (x * y) / 7) % 150) as i32 + ((seed >> 28) as i32 - 8);
+                        let v = (f64::from(base) * gain - 2.0 * i as f64).round().clamp(0.0, 255.0) as u32;
+                        samples.push(v << shift);
+                    }
+                }
+                for _ in 0..2 {
+                    for y in 0..ch {
+                        for x in 0..cw {
+                            samples.push((((110 + x / 3 + y / 2) & 0xff) as u32) << shift);
+                        }
+                    }
+                }
+                if shift == 0 { samples.iter().map(|&v| v as u8).collect() } else { samples.iter().flat_map(|&v| (v as u16).to_le_bytes()).collect() }
+            })
+            .collect()
+    }
+
+    /// Explicit weighted prediction on a fade: the P pictures choose a
+    /// weighting (census `wp_on`), it holds macroblock by macroblock
+    /// (`wp_won` above `wp_lost`, the model check), the stream is markedly
+    /// smaller than the same encode without it, and it round-trips through
+    /// the production decoder — both entropy coders, every chroma format,
+    /// with B pictures (which stay default-weighted) and sub-partitions and
+    /// the 8x8 transform, at 8, 10 and 12 bits. On a held clip nothing is
+    /// chosen and the table of defaults costs its flags. Lossless refuses.
+    #[test]
+    fn weighted_prediction_pays_on_a_fade_and_round_trips() {
+        for (chroma, bit_depth, bframes, entropy, tools) in [
+            (ChromaFormat::Yuv420, 8u32, 0u32, Entropy::Cabac, false),
+            (ChromaFormat::Yuv420, 8, 2, Entropy::Cavlc, false),
+            (ChromaFormat::Yuv422, 8, 0, Entropy::Cavlc, true),
+            (ChromaFormat::Yuv444, 8, 0, Entropy::Cabac, true),
+            (ChromaFormat::Monochrome, 8, 0, Entropy::Cabac, false),
+            (ChromaFormat::Yuv420, 10, 2, Entropy::Cabac, true),
+            (ChromaFormat::Yuv444, 12, 0, Entropy::Cavlc, false),
+        ] {
+            let tag = format!("{chroma:?} {bit_depth}-bit bframes={bframes} {entropy:?} t8x8+subparts={tools}");
+            let frames = fade_frames(chroma, bit_depth, 8);
+            let run = |weighted_pred: bool| -> (Vec<Access>, Vec<Vec<u8>>, ShapeCensus) {
+                let mut e = H264Encoder::new(Config {
+                    gop: 8,
+                    bframes,
+                    entropy,
+                    transform_8x8: tools,
+                    subparts: tools,
+                    weighted_pred,
+                    ..cfg(64, 64, chroma, bit_depth)
+                })
+                .unwrap_or_else(|err| panic!("{tag}: {err}"));
+                let mut units = Vec::new();
+                for f in &frames {
+                    units.extend(e.push(f).unwrap_or_else(|err| panic!("{tag}: {err}")));
+                }
+                units.extend(e.flush().unwrap_or_else(|err| panic!("{tag}: {err}")));
+                (units, e.reconstructions().to_vec(), e.shape_census().clone())
+            };
+            let (with, recon, census) = run(true);
+            let (without, _, plain) = run(false);
+            let bytes = |u: &[Access]| u.iter().map(|a| a.data.len()).sum::<usize>();
+            assert!(census.wp_on[1] > 0, "{tag}: no P picture chose a weighting: {census:?}");
+            assert!(census.wp_won[1] > census.wp_lost[1], "{tag}: the fit lost more macroblocks than it won: {census:?}");
+            assert_eq!(census.wp_on[2], 0, "{tag}: a B picture carries no table");
+            assert_eq!((plain.wp_on, plain.wp_won, plain.wp_lost), ([0; 3], [0; 3], [0; 3]), "{tag}: the census counts nothing with the switch off");
+            assert!(
+                (bytes(&with) as f64) < (bytes(&without) as f64) * 0.9,
+                "{tag}: weighting saved little on a fade: {} against {} bytes",
+                bytes(&with),
+                bytes(&without)
+            );
+            self_check(&tag, 8, &with, &recon);
+        }
+
+        // A held clip: nothing is chosen, and the table of defaults costs its
+        // flags and its denominators, a byte or two per P slice.
+        let held: Vec<Vec<u8>> = std::iter::repeat_n(fade_frames(ChromaFormat::Yuv420, 8, 1).remove(0), 6).collect();
+        let encode = |weighted_pred: bool| -> (usize, ShapeCensus) {
+            let mut e = H264Encoder::new(Config { gop: 8, weighted_pred, ..cfg(64, 64, ChromaFormat::Yuv420, 8) }).unwrap();
+            let mut bytes = 0;
+            for f in &held {
+                bytes += e.push(f).unwrap().iter().map(|a| a.data.len()).sum::<usize>();
+            }
+            bytes += e.flush().unwrap().iter().map(|a| a.data.len()).sum::<usize>();
+            (bytes, e.shape_census().clone())
+        };
+        let (with, census) = encode(true);
+        let (without, _) = encode(false);
+        assert_eq!(census.wp_on[1], 0, "a held clip chose a weighting: {census:?}");
+        assert!(with >= without && with <= without + 2 * held.len(), "the table of defaults should cost bits, not bytes: {with} against {without}");
+
+        let err = H264Encoder::new(Config { rate: RateControl::Lossless, weighted_pred: true, ..cfg(64, 64, ChromaFormat::Yuv420, 8) })
+            .err()
+            .expect("weighted prediction on a lossless stream must refuse");
+        assert!(format!("{err}").contains("weighted prediction"), "{err}");
     }
 }

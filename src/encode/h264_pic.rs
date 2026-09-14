@@ -25,11 +25,14 @@ use crate::encode::aq;
 use crate::encode::h264_deblock::{deblock_recon, nz_mask_of};
 use crate::encode::h264_intra::{IntraCtx, MbAvail, MbDecision, MbKind, code_macroblock};
 use crate::encode::h264_me::{
-    BDecision, BMbKind, InterDecision, InterMbKind, MbMotionState, code_macroblock_b,
-    code_macroblock_p,
+    BDecision, BMbKind, InterDecision, InterMbKind, MbMotionState, PRef, code_macroblock_b,
+    code_macroblock_p, weighted_search_plane, weighting_gain,
 };
 use crate::encode::h264_syntax::{Geometry, Plane, Recon};
 use crate::h264::frame::{BlockMotion, Frame, Mv};
+use crate::h264::inter::Weighting;
+use crate::h264::recon::explicit_weighting;
+use crate::h264::slice::PredWeightTable;
 use crate::h264::mb::{
     MbInfo, MbKind as DecKind, MbMotion, MbNeighbours, PicInfo, chroma_qp, has_residual, next_qp,
     qp_delta_range,
@@ -131,6 +134,22 @@ pub struct PicMotion {
     /// Per-4x4 motion per list, inside a decoder frame so that
     /// `MotionCache::gather` takes it directly.
     pub(crate) frame: Frame<u8>,
+    /// What the picture's weighted prediction did ([`WeightCensus`]) — the
+    /// default for every picture that carried no table.
+    pub(crate) weighting: WeightCensus,
+}
+
+/// What a P picture's explicit weighting did, for the census.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WeightCensus {
+    /// The picture's table weights something: some entry is not the default.
+    pub on: bool,
+    /// Under a luma weighting, inter macroblocks whose luma SATD at the
+    /// chosen vectors was lower weighted than plain — the fit's prediction
+    /// holding, macroblock by macroblock.
+    pub won: u64,
+    /// The same, higher weighted than plain — the fit's prediction failing.
+    pub lost: u64,
 }
 
 impl PicMotion {
@@ -145,7 +164,7 @@ impl PicMotion {
             vec![BlockMotion::default(); n * 16],
         ];
         frame.mb_intra = vec![false; n];
-        PicMotion { info: PicInfo::new(mbs_wide, mbs_high), frame }
+        PicMotion { info: PicInfo::new(mbs_wide, mbs_high), frame, weighting: WeightCensus::default() }
     }
 
     /// Commit one coded macroblock: everything a decoder stores about it
@@ -563,7 +582,10 @@ pub(crate) fn code_intra_picture<S: Sample>(
 ///
 /// `refp` is the reference picture's reconstruction, borders already
 /// replicated ([`crate::encode::h264_me::prepare_reference`]); exactly one
-/// reference is active.
+/// reference is active. `weights` is the slice's `pred_weight_table` when
+/// the PPS sets `weighted_pred_flag`: every prediction from `refp` then
+/// takes the weighting the reader's `explicit_weighting` derives from it,
+/// skips included, and the search scores against the weighted luma.
 ///
 /// Three per-macroblock states walk the picture together, each mirroring
 /// what the reader derives rather than what would be convenient:
@@ -589,12 +611,30 @@ pub(crate) fn code_p_picture<S: Sample>(
     planes: &[Plane<'_, S>],
     rec: &mut [Recon<S>],
     refp: &[Recon<S>],
+    weights: Option<&PredWeightTable>,
     mut emit: impl FnMut(usize, usize, PMb<'_>),
 ) -> PicMotion {
     let pc = PicCoding::new(g, tools, qp, planes);
     let ctx = &pc.ctx;
     let (mbs_wide, mbs_high) = (pc.mbs_wide, pc.mbs_high);
     let (src_y, src_cb, src_cr) = (&pc.src_y[..], &pc.src_cb[..], &pc.src_cr[..]);
+
+    // The reference as the decisions see it: its planes, the weighting its
+    // slice's table gives every prediction — the reader's own derivation,
+    // so the encoder predicts exactly what a decoder will — and the luma
+    // plane the search scores against, weighted when the luma is.
+    let weighting = weights.map_or(Weighting::Default, |t| explicit_weighting(t, g.bit_depth, 0, -1, false));
+    let weighted_luma = match weighting {
+        Weighting::Weighted { log_wd, w, o } if (w[0][0], o[0][0]) != (1 << log_wd[0], 0) => {
+            Some(weighted_search_plane(&refp[0], log_wd[0], w[0][0], o[0][0], ctx.max))
+        }
+        _ => None,
+    };
+    let pref = PRef { planes: refp, search: weighted_luma.as_ref().unwrap_or(&refp[0]), weighting };
+    let mut wstats = WeightCensus {
+        on: weights.is_some_and(|t| t.lists[0].iter().any(|e| e.luma_flag || e.chroma_flag)),
+        ..WeightCensus::default()
+    };
 
     let mut top_modes: Vec<[Option<u8>; 4]> = vec![[None; 4]; mbs_wide];
     // The picture's motion in the decoder's own layout, and the
@@ -613,7 +653,7 @@ pub(crate) fn code_p_picture<S: Sample>(
             let mut dec = code_macroblock_p(
                 ctx,
                 rec,
-                refp,
+                &pref,
                 mb_x,
                 mb_y,
                 src_y,
@@ -622,6 +662,21 @@ pub(crate) fn code_p_picture<S: Sample>(
                 pc.chroma_stride,
                 &mut st,
             );
+            // The weighting's model check, at the vectors this macroblock
+            // chose (a skip's is the derived one, over the whole 16x16).
+            if weighted_luma.is_some() && dec.kind != InterMbKind::UseIntra {
+                let mut rects = [(0usize, 0usize, 0usize, 0usize); 16];
+                let n = if dec.kind == InterMbKind::PSkip {
+                    rects[0] = (0, 0, 16, 16);
+                    1
+                } else {
+                    dec.rects(&mut rects)
+                };
+                let (plain, weighted) =
+                    weighting_gain(ctx, &pref, mb_x * 16, mb_y * 16, src_y, pc.luma_stride, &rects[..n], st.motion());
+                wstats.won += u64::from(weighted < plain);
+                wstats.lost += u64::from(weighted > plain);
+            }
             match dec.kind {
                 InterMbKind::PSkip => {
                     // A skip carries no delta and holds the prediction.
@@ -701,6 +756,7 @@ pub(crate) fn code_p_picture<S: Sample>(
     // the reconstruction becomes the next picture's reference — the
     // decoder's own ordering.
     deblock_recon(&tools.dsp, g, &mut pm, rec);
+    pm.weighting = wstats;
     pm
 }
 

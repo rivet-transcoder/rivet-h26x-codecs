@@ -73,6 +73,7 @@ use crate::encode::h264_intra::{
     IntraCtx, code_block_8x8, quad_rasters, reconstruct_8x8, satd_lambda, ssd_lambda,
 };
 use crate::h264::cavlc::sub_block_counts_8x8;
+use crate::h264::inter::Weighting;
 use crate::encode::h264_syntax::Recon;
 use crate::sample::Sample;
 use crate::h264::frame::{BlockMotion, Frame, Mv, PARITY_FRAME};
@@ -405,6 +406,79 @@ pub fn prepare_reference<S: Sample>(planes: &mut [Recon<S>]) {
     }
 }
 
+/// The list-0 reference a P picture predicts from, with the weighting its
+/// slice's `pred_weight_table` gives every prediction from it.
+pub struct PRef<'a, S: Sample> {
+    /// The reference's reconstructed planes, borders replicated
+    /// ([`prepare_reference`]).
+    pub planes: &'a [Recon<S>],
+    /// The luma plane the motion search scores candidates against:
+    /// `planes[0]` itself, or under a luma weighting a copy with the
+    /// weighting applied sample by sample ([`weighted_search_plane`]). A
+    /// search only ranks candidates, so it may score against the weighted
+    /// *reference* where a decoder weights the interpolated *prediction* —
+    /// the two differ by rounding at fractional positions and not at all at
+    /// whole ones. What is reconstructed never comes from this plane:
+    /// `predict_inter_rect` interpolates `planes` and weights the result
+    /// with the decoder's own kernel.
+    pub search: &'a Recon<S>,
+    /// The weighting every prediction from this reference takes:
+    /// `Weighting::Default` without a table, the reader's own
+    /// `explicit_weighting` of the table with one.
+    pub weighting: Weighting,
+}
+
+/// `refp` with an explicit weighting applied to every sample, border
+/// included: 8.4.2.3.2's uni-directional formula at `log_wd`, `weight` and
+/// `offset` (already at the sample depth), clipped to `max` — the plane a
+/// weighted reference's motion search scores against ([`PRef::search`]).
+pub fn weighted_search_plane<S: Sample>(refp: &Recon<S>, log_wd: i32, weight: i32, offset: i32, max: i32) -> Recon<S> {
+    let mut out = refp.clone();
+    let round = if log_wd >= 1 { 1 << (log_wd - 1) } else { 0 };
+    for v in out.data.iter_mut() {
+        let x = v.to_i32() * weight;
+        let p = if log_wd >= 1 { ((x + round) >> log_wd) + offset } else { x + offset };
+        *v = S::from_i32(p.clamp(0, max));
+    }
+    out
+}
+
+/// Luma SATD of one P macroblock's partitions `rects` (at picture position
+/// `(px, py)`) against their predictions at the list-0 vectors `motion`
+/// holds, plain and under `pref`'s weighting, as `(plain, weighted)` — the
+/// weighting's model check, counted by the picture walk. The fit predicted
+/// that weighting the reference lowers the residual over the whole picture
+/// at zero motion; this says whether it lowered it at the vectors the
+/// search chose. `(0, 0)` without a weighting.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn weighting_gain<S: Sample>(
+    ctx: &MeCtx<S>,
+    pref: &PRef<S>,
+    px: usize,
+    py: usize,
+    src_luma: &[S],
+    luma_stride: usize,
+    rects: &[(usize, usize, usize, usize)],
+    motion: &MbMotion,
+) -> (u64, u64) {
+    let Weighting::Weighted { log_wd, w, o } = pref.weighting else {
+        return (0, 0);
+    };
+    let mut a = [S::default(); 16 * PRED_STRIDE];
+    let mut b = [S::default(); 16 * PRED_STRIDE];
+    let (mut plain, mut weighted) = (0u64, 0u64);
+    for &(x, y, rw, rh) in rects {
+        let (ax, ay) = (px + x, py + y);
+        let mv = motion[0][(y / 4) * 4 + x / 4].mv;
+        let src = &src_luma[ay * luma_stride + ax..];
+        luma_pred_into(ctx, &pref.planes[0], ax as i32, ay as i32, mv, rw, rh, &mut a);
+        plain += u64::from((ctx.dist.satd)(src, luma_stride, &a, PRED_STRIDE, rw, rh));
+        (ctx.dsp.weighted_uni)(&mut b, PRED_STRIDE, &a, rw, rh, log_wd[0], w[0][0], o[0][0], ctx.max);
+        weighted += u64::from((ctx.dist.satd)(src, luma_stride, &b, PRED_STRIDE, rw, rh));
+    }
+    (plain, weighted)
+}
+
 // ---------------------------------------------------------------------------
 // Prediction — the decoder's kernels, the decoder's addressing
 // ---------------------------------------------------------------------------
@@ -673,12 +747,28 @@ fn add_residual_4x4<S: Sample>(ctx: &MeCtx<S>, rec: &mut Recon<S>, off: usize, l
     (ctx.dsp.residual4)(&mut rec.data[off..], rec.stride, &coefs, dc.unwrap_or(NO_DC), ctx.max);
 }
 
+/// Put a one-list prediction `src` into `dst`: a copy under default
+/// weighting, the decoder's `weighted_uni` kernel with component `c`'s
+/// weight and offset for list `list` under an explicit one — the two
+/// uni-directional arms of `predict_partition` (src/h264/inter.rs).
+#[allow(clippy::too_many_arguments)]
+fn put_uni<S: Sample>(ctx: &MeCtx<S>, dst: &mut [S], stride: usize, src: &[S], w: usize, h: usize, weighting: Weighting, c: usize, list: usize) {
+    match weighting {
+        Weighting::Default => (ctx.dsp.copy)(dst, stride, src, w, h),
+        Weighting::Weighted { log_wd, w: wt, o } => {
+            (ctx.dsp.weighted_uni)(dst, stride, src, w, h, log_wd[c], wt[c][list], o[c][list], ctx.max)
+        }
+    }
+}
+
 /// Write one partition's inter prediction for one or two references into
 /// the reconstruction planes, through the decoder's kernels and — when both
 /// lists predict — the decoder's default bi-predictive combine
 /// (`(a + b + 1) >> 1`, the `dsp.avg` kernel `predict_partition` runs for
-/// `Weighting::Default`). What stands in `rec` afterwards is bit-identical
-/// to what a decoder derives for the same vectors.
+/// `Weighting::Default`). A one-list prediction takes `weighting` — a P
+/// slice's explicit table — through [`put_uni`], as `predict_partition`
+/// does. What stands in `rec` afterwards is bit-identical to what a decoder
+/// derives for the same vectors.
 #[allow(clippy::too_many_arguments)]
 fn predict_inter_rect<S: Sample>(
     ctx: &MeCtx<S>,
@@ -690,8 +780,13 @@ fn predict_inter_rect<S: Sample>(
     ph: usize,
     used: [bool; 2],
     mv: [Mv; 2],
+    weighting: Weighting,
 ) {
     debug_assert!(used[0] || used[1]);
+    debug_assert!(
+        !(used[0] && used[1]) || matches!(weighting, Weighting::Default),
+        "explicit bi-prediction is never written: weighted_bipred_idc is 0"
+    );
     let mut a = [S::default(); 16 * PRED_STRIDE];
     let mut b = [S::default(); 16 * PRED_STRIDE];
     // Luma.
@@ -704,7 +799,7 @@ fn predict_inter_rect<S: Sample>(
     } else {
         let l = if used[0] { 0 } else { 1 };
         luma_pred_into(ctx, &refs[l][0], px as i32, py as i32, mv[l], pw, ph, &mut a);
-        (ctx.dsp.copy)(&mut rec[0].data[off..], stride, &a, pw, ph);
+        put_uni(ctx, &mut rec[0].data[off..], stride, &a, pw, ph, weighting, 0, l);
     }
     // Chroma. 4:4:4 interpolates its chroma with the luma six-tap kernel
     // at the unscaled vector (8.4.2.2: mvCLX = mvLX) — the `c444` branch
@@ -726,7 +821,7 @@ fn predict_inter_rect<S: Sample>(
             } else {
                 let l = if used[0] { 0 } else { 1 };
                 luma_pred_into(ctx, &refs[l][comp + 1], px as i32, py as i32, mv[l], pw, ph, &mut a);
-                (ctx.dsp.copy)(&mut plane.data[off..], stride, &a, pw, ph);
+                put_uni(ctx, &mut plane.data[off..], stride, &a, pw, ph, weighting, comp + 1, l);
             }
         }
         return;
@@ -747,7 +842,7 @@ fn predict_inter_rect<S: Sample>(
         } else {
             let l = if used[0] { 0 } else { 1 };
             chroma_pred_into(ctx, &refs[l][comp + 1], cx as i32, cy as i32, mv[l], cw, crh, h, &mut a);
-            (ctx.dsp.copy)(&mut plane.data[off..], stride, &a, cw, crh);
+            put_uni(ctx, &mut plane.data[off..], stride, &a, cw, crh, weighting, comp + 1, l);
         }
     }
 }
@@ -1144,9 +1239,10 @@ pub fn placeholder_inter_or_intra<S: Sample>(dist: &DistortionDsp<S>, inter_satd
 
 /// Decide and code one P macroblock, leaving its reconstruction in `rec`.
 ///
-/// `rec` and `refp` are the current and reference pictures' planes in the
-/// same layout the intra module uses (luma, then Cb, Cr when present);
-/// the reference must have been through [`prepare_reference`]. `nb` is the
+/// `rec` is the current picture's planes in the layout the intra module
+/// uses (luma, then Cb, Cr when present); `refp` is the list-0 reference
+/// ([`PRef`]): its planes, through [`prepare_reference`], the luma plane
+/// the search scores against, and the weighting every prediction takes. `nb` is the
 /// motion state ([`MbMotionState`], gathered from the picture coded so
 /// far); the caller commits the returned `mv` into that state whatever
 /// the kind, because even a skipped macroblock has motion.
@@ -1157,7 +1253,7 @@ pub fn placeholder_inter_or_intra<S: Sample>(dist: &DistortionDsp<S>, inter_satd
 pub fn code_macroblock_p<S: Sample>(
     ctx: &MeCtx<S>,
     rec: &mut [Recon<S>],
-    refp: &[Recon<S>],
+    refp: &PRef<S>,
     mb_x: usize,
     mb_y: usize,
     src_luma: &[S],
@@ -1189,9 +1285,9 @@ pub fn code_macroblock_p<S: Sample>(
             continue;
         }
         let t = if kind == InterMbKind::P8x8 {
-            trial_8x8(ctx, refp, st, px, py, src_luma, luma_stride)
+            trial_8x8(ctx, refp.search, st, px, py, src_luma, luma_stride)
         } else {
-            trial_fixed(ctx, refp, st, kind, px, py, src_luma, luma_stride)
+            trial_fixed(ctx, refp.search, st, kind, px, py, src_luma, luma_stride)
         };
         if best.as_ref().is_none_or(|b| t.cost < b.cost) {
             best = Some(t);
@@ -1217,7 +1313,7 @@ pub fn code_macroblock_p<S: Sample>(
         let (x, y, w, h) = rects[i];
         let mv = mvs[(y / 4) * 4 + x / 4];
         st.commit_part(x, y, w, h, [Some(mv), None]);
-        predict_inter_rect(ctx, rec, [refp, refp], px + x, py + y, w, h, [true, false], [mv, Mv::ZERO]);
+        predict_inter_rect(ctx, rec, [refp.planes, refp.planes], px + x, py + y, w, h, [true, false], [mv, Mv::ZERO], refp.weighting);
     }
     // `transform_size_8x8_flag` is not present when any sub-macroblock
     // partition is smaller than 8x8 (7.3.5's
@@ -1271,7 +1367,7 @@ struct Trial {
 #[allow(clippy::too_many_arguments)]
 fn search_and_commit<S: Sample>(
     ctx: &MeCtx<S>,
-    refp: &[Recon<S>],
+    search: &Recon<S>,
     st: &mut MbMotionState,
     px: usize,
     py: usize,
@@ -1286,7 +1382,7 @@ fn search_and_commit<S: Sample>(
     let pred = st.predict(0, 0, x, y, w, h);
     let (mv, cost) = search_rect(
         ctx,
-        &refp[0],
+        search,
         ax as i32,
         ay as i32,
         w,
@@ -1313,7 +1409,7 @@ fn search_and_commit<S: Sample>(
 #[allow(clippy::too_many_arguments)]
 fn trial_fixed<S: Sample>(
     ctx: &MeCtx<S>,
-    refp: &[Recon<S>],
+    search: &Recon<S>,
     st: &mut MbMotionState,
     kind: InterMbKind,
     px: usize,
@@ -1334,7 +1430,7 @@ fn trial_fixed<S: Sample>(
     };
     for &rect in kind.parts() {
         t.satd += search_and_commit(
-            ctx, refp, st, px, py, rect, src_luma, luma_stride, &mut t.mvs, &mut t.mvds,
+            ctx, search, st, px, py, rect, src_luma, luma_stride, &mut t.mvs, &mut t.mvds,
         );
         t.rects[t.n_rects] = rect;
         t.n_rects += 1;
@@ -1354,7 +1450,7 @@ fn trial_fixed<S: Sample>(
 #[allow(clippy::too_many_arguments)]
 fn trial_8x8<S: Sample>(
     ctx: &MeCtx<S>,
-    refp: &[Recon<S>],
+    search: &Recon<S>,
     st: &mut MbMotionState,
     px: usize,
     py: usize,
@@ -1389,7 +1485,7 @@ fn trial_8x8<S: Sample>(
             for sub in 0..shape.count() {
                 let rect = sub_partition_rect(part, shape, sub);
                 satd += search_and_commit(
-                    ctx, refp, st, px, py, rect, src_luma, luma_stride, &mut mvs, &mut mvds,
+                    ctx, search, st, px, py, rect, src_luma, luma_stride, &mut mvs, &mut mvds,
                 );
             }
             let cost = placeholder_sub_shape_cost(shape, satd, &mvds, part, satd_lambda(ctx));
@@ -2343,7 +2439,7 @@ pub fn code_macroblock_b<S: Sample>(
         let used = out.used(part_index_of(x, y));
         let mv = out.mv[(y / 4) * 4 + x / 4];
         st.commit_part(x, y, w, h, [used[0].then_some(mv[0]), used[1].then_some(mv[1])]);
-        predict_inter_rect(ctx, rec, refs, px + x, py + y, w, h, used, mv);
+        predict_inter_rect(ctx, rec, refs, px + x, py + y, w, h, used, mv, Weighting::Default);
     }
     // `transform_size_8x8_flag` is absent when any sub-macroblock
     // partition is smaller than 8x8 (a direct one is not, under
@@ -2657,7 +2753,8 @@ mod tests {
         srcc: [&[u8]; 2],
         st: &mut MbMotionState,
     ) -> (InterDecision, Mv) {
-        let d = code_macroblock_p(ctx, rec, refp, 1, 1, srcy, 48, srcc, 24, st);
+        let pref = PRef { planes: refp, search: &refp[0], weighting: Weighting::Default };
+        let d = code_macroblock_p(ctx, rec, &pref, 1, 1, srcy, 48, srcc, 24, st);
         let mv = st.motion()[0][0].mv;
         (d, mv)
     }

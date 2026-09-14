@@ -127,7 +127,7 @@ fn main() {
             // H.265 only, with --bitrate: hold this many pictures back and
             // let the rate controller see them.
             "--lookahead" => cfg.lookahead = val(&mut i, &args, "--lookahead").parse().unwrap_or_else(|_| die("--lookahead")),
-            // H.265 only: weighted prediction, a fitted gain and offset per
+            // Both codecs: weighted prediction, a fitted gain and offset per
             // reference in every P slice.
             "--wpred" => cfg.weighted_pred = true,
             // How many past pictures a P slice may choose between. 1 is
@@ -272,6 +272,7 @@ fn main() {
     }
 
     let aq = cfg.aq_strength > 0.0;
+    let wpred = cfg.weighted_pred;
     let mut enc = match h26x::encode::h264::H264Encoder::new(cfg) {
         Ok(e) => e,
         Err(e) => {
@@ -363,6 +364,16 @@ fn main() {
                 c.qp_moved[pic], c.qp_delta[pic], c.qp_delta_pictures[pic], c.pictures[pic]
             );
         }
+    }
+    // The weighting census, when weighted prediction was asked for: how
+    // many P pictures chose a weighting, and whether it lowered the luma
+    // residual at the vectors the search chose, macroblock by macroblock.
+    if wpred {
+        let c = enc.shape_census();
+        eprintln!(
+            "wp P: {} of {} pictures weighted, {} macroblocks won, {} lost",
+            c.wp_on[1], c.pictures[1], c.wp_won[1], c.wp_lost[1]
+        );
     }
 }
 

@@ -23,6 +23,14 @@
 //! table says so in one flag bit. A fit that helps nothing costs the
 //! table's bits and biases the motion search for no return.
 //!
+//! The fit is H.264's too (`encode::h264`'s explicit weighting for P
+//! slices): H.264's table carries the weight itself where H.265's carries a
+//! delta around the identity, so [`fit_samples`] takes the range the
+//! caller's syntax can hold, and the reference as a plain sample layout
+//! ([`RefSamples`]) rather than either decoder's plane type. The weighted
+//! arithmetic the check applies is the same in both standards: H.264's
+//! 8.4.2.3.2 uni-directional formula at `logWD >= 1` is H.265's.
+//!
 //! What this is not: a per-block decision. The table is per slice and
 //! per reference, so a picture whose left half fades and whose right
 //! half does not gets one compromise line. The fit is over the whole
@@ -76,7 +84,38 @@ impl PlaneFit {
 /// Fit one `w` by `h` plane: `cur` at `cur_stride` against the display
 /// area of `refp`, at `bit_depth`.
 pub(crate) fn fit_plane<S: Sample>(cur: &[S], cur_stride: usize, refp: &Plane16<S>, w: usize, h: usize, bit_depth: u32) -> PlaneFit {
-    let o = refp.origin();
+    let refs = RefSamples { data: &refp.data, origin: refp.origin(), stride: refp.stride };
+    fit_samples(cur, cur_stride, refs, w, h, bit_depth, H265_WEIGHTS)
+}
+
+/// A reference plane as the fit reads it: the samples, the index of the
+/// display area's first sample, and the stride — what an H.265 `Plane16`
+/// and an H.264 `PaddedPlane` both are, under different names.
+#[derive(Clone, Copy)]
+pub(crate) struct RefSamples<'a, S: Sample> {
+    /// The plane's samples, border included.
+    pub data: &'a [S],
+    /// Index in `data` of the display area's top-left sample.
+    pub origin: usize,
+    /// Samples per row of `data`.
+    pub stride: usize,
+}
+
+/// The weights H.265's table can carry, `(lowest, highest)` in units of
+/// `1 << LOG2_DENOM`: `delta_luma_weight` spans -128..=127 around the
+/// identity.
+pub(crate) const H265_WEIGHTS: (i32, i32) = ((1 << LOG2_DENOM) - 128, (1 << LOG2_DENOM) + 127);
+
+/// The weights H.264's table can carry: `luma_weight_l0` is the weight
+/// itself, in -128..=127 — which is also what the decoder's SIMD weighting
+/// kernels are built for.
+pub(crate) const H264_WEIGHTS: (i32, i32) = (-128, 127);
+
+/// [`fit_plane`] over any reference layout, with the weight held to
+/// `weights` — the range the caller's table syntax carries.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fit_samples<S: Sample>(cur: &[S], cur_stride: usize, refp: RefSamples<'_, S>, w: usize, h: usize, bit_depth: u32, weights: (i32, i32)) -> PlaneFit {
+    let o = refp.origin;
     let n = (w * h) as f64;
     let (mut sr, mut sc, mut srr, mut src) = (0f64, 0f64, 0f64, 0f64);
     let mut sad_plain = 0u64;
@@ -102,9 +141,9 @@ pub(crate) fn fit_plane<S: Sample>(cur: &[S], cur_stride: usize, refp: &Plane16<
     }
     let gain = (src / n - (sr / n) * (sc / n)) / var;
     let unit = f64::from(1u32 << LOG2_DENOM);
-    // The syntax carries `delta_luma_weight` in -128..=127 around the
-    // identity, and the offset in -128..=127 eight-bit units.
-    let weight = (gain * unit).round().clamp(unit - 128.0, unit + 127.0) as i32;
+    // The weight is held to what the caller's syntax carries, and the
+    // offset to the -128..=127 eight-bit units both standards' tables do.
+    let weight = (gain * unit).round().clamp(f64::from(weights.0), f64::from(weights.1)) as i32;
     let scale = f64::from(1u32 << (bit_depth - 8));
     let offset_samples = sc / n - f64::from(weight) / unit * (sr / n);
     let offset = (offset_samples / scale).round().clamp(-128.0, 127.0) as i32;
@@ -116,8 +155,9 @@ pub(crate) fn fit_plane<S: Sample>(cur: &[S], cur_stride: usize, refp: &Plane16<
 /// Zero-motion SAD of `cur` against `refp` weighted by `(weight,
 /// offset)` — the decoder's `weighted_uni` arithmetic at a whole-sample
 /// vector: `Clip(((r * w + round) >> denom) + (o << (bitDepth - 8)))`.
-fn weighted_sad<S: Sample>(cur: &[S], cur_stride: usize, refp: &Plane16<S>, w: usize, h: usize, bit_depth: u32, weight: i32, offset: i32) -> u64 {
-    let o = refp.origin();
+#[allow(clippy::too_many_arguments)]
+fn weighted_sad<S: Sample>(cur: &[S], cur_stride: usize, refp: RefSamples<'_, S>, w: usize, h: usize, bit_depth: u32, weight: i32, offset: i32) -> u64 {
+    let o = refp.origin;
     let max = (1i32 << bit_depth) - 1;
     let round = 1i32 << (LOG2_DENOM - 1);
     let off = offset << (bit_depth - 8);

@@ -294,21 +294,22 @@ pub struct Config {
     /// output delay and their source samples in memory. Ignored by H.264,
     /// whose rate control does not drive the lookahead path yet.
     pub lookahead: u32,
-    /// Weighted prediction (H.265 only): off by default. On, the PPS sets
+    /// Weighted prediction, both codecs: off by default. On, the PPS sets
     /// `weighted_pred_flag` and every P slice carries a
     /// `pred_weight_table` — a gain and an offset per reference, fitted
     /// per picture to the source against the reference and used only
-    /// where the fit lowers the residual (`encode::h265_wp`), the default
-    /// weights otherwise. What it buys is a fade: motion compensation
-    /// cannot change a reference's brightness, so without this every
-    /// block of a fading picture carries the level change as residual.
+    /// where the fit lowers the residual (`encode::h265_wp`, one fit held
+    /// to the weights each codec's table carries), the default weights
+    /// otherwise. What it buys is a fade: motion compensation cannot
+    /// change a reference's brightness, so without this every block of a
+    /// fading picture carries the level change as residual.
     ///
-    /// B slices keep default weighting (`weighted_bipred_flag` stays 0):
-    /// the two-list decision would need weights per list and its own
-    /// fit, and the P anchors are where a fade's cost is. Off, the stream
-    /// is byte-identical to one from an encoder that never had it.
-    /// Ignored by H.264, whose weighted prediction is a different table
-    /// this encoder does not write yet.
+    /// B slices keep default weighting (H.265's `weighted_bipred_flag`,
+    /// H.264's `weighted_bipred_idc`, both 0): the two-list decision would
+    /// need weights per list and its own fit, and the P anchors are where
+    /// a fade's cost is. A lossless H.264 stream refuses it, its inter
+    /// pictures being exact copies. Off, the stream is byte-identical to
+    /// one from an encoder that never had it.
     pub weighted_pred: bool,
     /// Colour description to write into the SPS VUI, or `None` to write
     /// nothing about colour — which is what every stream this encoder

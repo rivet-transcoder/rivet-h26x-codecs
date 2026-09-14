@@ -139,29 +139,7 @@ impl<'a, S: Sample> SliceRefs<'a, S> {
     /// ones from field POC distances).
     fn weighting(&self, r0: i8, r1: i8, field_mb: bool, mb_parity: u8) -> Weighting {
         if let Some(t) = self.explicit {
-            let mut w = [[1i32; 2]; 3];
-            let mut o = [[0i32; 2]; 3];
-            let log_wd = [
-                t.luma_log2_denom as i32,
-                t.chroma_log2_denom as i32,
-                t.chroma_log2_denom as i32,
-            ];
-            for (list, r) in [(0usize, r0), (1usize, r1)] {
-                if r < 0 {
-                    continue;
-                }
-                let r = if field_mb { r >> 1 } else { r };
-                // Offsets are in 8-bit units in the syntax: `o << (BitDepth - 8)` (8-278).
-                let e = &t.lists[list][r as usize];
-                let sh = self.bit_depth - 8;
-                w[0][list] = e.luma.0;
-                o[0][list] = e.luma.1 << sh;
-                for c in 0..2 {
-                    w[1 + c][list] = e.chroma[c].0;
-                    o[1 + c][list] = e.chroma[c].1 << sh;
-                }
-            }
-            return Weighting::Weighted { log_wd, w, o };
+            return explicit_weighting(t, self.bit_depth, r0, r1, field_mb);
         }
         if self.implicit.is_some() {
             if r0 >= 0 && r1 >= 0 {
@@ -232,6 +210,39 @@ impl<'a, S: Sample> SliceRefs<'a, S> {
         }
         self.implicit = Some(t);
     }
+}
+
+/// The explicit weighting (8.4.2.3.2) of a block predicted from list-0
+/// entry `r0` and/or list-1 entry `r1` (negative: that list is unused) of a
+/// slice's `pred_weight_table`, at `bit_depth`: `logWD` per component, and
+/// each used list's weight and offset, the offset shifted up from the
+/// syntax's 8-bit units (8-278). `field_mb`: an MBAFF field macroblock,
+/// whose indices name the fields of entry `r >> 1`.
+///
+/// The arithmetic of `SliceRefs::weighting`'s explicit arm, as a free
+/// function, so the H.264 encoder hands its own motion compensation exactly
+/// what a decoder derives from the table it wrote — the H.265 reader's
+/// `explicit_weighting`, for the same reason.
+pub(crate) fn explicit_weighting(t: &PredWeightTable, bit_depth: u32, r0: i8, r1: i8, field_mb: bool) -> Weighting {
+    let mut w = [[1i32; 2]; 3];
+    let mut o = [[0i32; 2]; 3];
+    let log_wd = [t.luma_log2_denom as i32, t.chroma_log2_denom as i32, t.chroma_log2_denom as i32];
+    for (list, r) in [(0usize, r0), (1usize, r1)] {
+        if r < 0 {
+            continue;
+        }
+        let r = if field_mb { r >> 1 } else { r };
+        // Offsets are in 8-bit units in the syntax: `o << (BitDepth - 8)` (8-278).
+        let e = &t.lists[list][r as usize];
+        let sh = bit_depth - 8;
+        w[0][list] = e.luma.0;
+        o[0][list] = e.luma.1 << sh;
+        for c in 0..2 {
+            w[1 + c][list] = e.chroma[c].0;
+            o[1 + c][list] = e.chroma[c].1 << sh;
+        }
+    }
+    Weighting::Weighted { log_wd, w, o }
 }
 
 /// Per-slice quantisation state.

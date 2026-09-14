@@ -61,7 +61,7 @@ pub fn deblock_recon<S: Sample>(dsp: &H264Dsp<S>, g: &Geometry, pm: &mut PicMoti
     let (mbw, mbh) = (g.mbs_wide as usize, g.mbs_high as usize);
     debug_assert_eq!(pm.info.mbs.len(), mbw * mbh, "one MbInfo per macroblock");
 
-    let PicMotion { info, frame: src } = pm;
+    let PicMotion { info, frame: src, .. } = pm;
     let mut frame = Frame::<S>::empty();
     frame.mb_width = mbw;
     frame.mb_height = mbh;

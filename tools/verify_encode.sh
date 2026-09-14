@@ -301,6 +301,13 @@ fi
 # h26xenc's `aq` census line says which cells did. One row per entropy
 # coder and prediction mode, one of each above QP 29 (the chroma QP table
 # is indexed per macroblock now), and deep rows at 10 and 12 bits.
+#
+# The h264-wp rows are H.264's explicit weighted prediction for P slices.
+# Only the fade clip changes brightness, so it carries them; the one row over
+# every 8-bit clip is where the fit has to decline (h26xenc's `wp` line counts
+# the P pictures that took a weighting). The corpus has no deep or non-4:2:0
+# fade, so the @p10 rows prove the syntax at depth; a deep, 4:2:2, 4:4:4 and
+# monochrome fade run in the unit test.
 CONFIGS=${CONFIGS:-"
 lossless-intra|--codec h264 --lossless --gop 0
 cqp-intra|--codec h264 --qp 26 --gop 0
@@ -403,6 +410,16 @@ h264-abr-aq-64k|--codec h264 --bitrate 64000 --gop 8 --aq 1.0
 h264-10-aq-ip@p10|--codec h264 --qp 26 --gop 8 --aq 1.0
 h264-10-aq40-cavlc-ipb@p10|--codec h264 --qp 40 --gop 8 --bframes 2 --cavlc --aq 1.0
 h264-12-aq40-ip@p12|--codec h264 --qp 40 --gop 8 --aq 1.0
+h264-wp-ip|--codec h264 --qp 26 --gop 8 --wpred
+h264-wp-cavlc-ip@fade|--codec h264 --qp 26 --gop 8 --cavlc --wpred
+h264-wp-ipb@fade|--codec h264 --qp 26 --gop 8 --bframes 2 --wpred
+h264-wp40-ip@fade|--codec h264 --qp 40 --gop 8 --wpred
+h264-wp40-cavlc-ip@fade|--codec h264 --qp 40 --gop 8 --cavlc --wpred
+h264-wp-t8x8-subparts-ip@fade|--codec h264 --qp 26 --gop 8 --t8x8 --subparts --wpred
+h264-wp-aq-ip@fade|--codec h264 --qp 26 --gop 8 --aq 1.0 --wpred
+h264-wp-abr-64k@fade|--codec h264 --bitrate 64000 --gop 8 --wpred
+h264-10-wp-ip@p10|--codec h264 --qp 26 --gop 8 --wpred
+h264-10-wp-cavlc-ipb@p10|--codec h264 --qp 26 --gop 8 --bframes 2 --cavlc --wpred
 cqp-ip-srgb-pc|--codec h264 --qp 26 --gop 8 --color 1:13:6 --full-range
 abr-64k-cpb-p3@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8 --color 12:17:6 --chroma-loc 1
 hevc-vbv-125-hdr10@src_cut|--codec h265 --bitrate 64000 --cpb-ms 125 --gop 8 --color 9:16:9

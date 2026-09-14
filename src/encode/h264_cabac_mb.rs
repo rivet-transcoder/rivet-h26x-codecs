@@ -299,6 +299,7 @@ pub fn write_intra_picture_cabac<S: Sample>(
 /// codes `mb_skip_flag` per macroblock, the macroblock layers, and the
 /// `end_of_slice_flag`s. The slice header (with `cabac_init_idc` 0) is
 /// already written; the final terminate closes the RBSP.
+#[allow(clippy::too_many_arguments)]
 pub fn write_p_picture_cabac<S: Sample>(
     w: &mut BitWriter,
     g: &Geometry,
@@ -307,6 +308,7 @@ pub fn write_p_picture_cabac<S: Sample>(
     planes: &[Plane<'_, S>],
     rec: &mut [Recon<S>],
     refp: &[Recon<S>],
+    weights: Option<&crate::h264::slice::PredWeightTable>,
 ) -> PicMotion {
     let mbw = g.mbs_wide as usize;
     let total = mbw * g.mbs_high as usize;
@@ -316,7 +318,7 @@ pub fn write_p_picture_cabac<S: Sample>(
     let mut st = CabacState::new(SliceType::P, 0, qp as i32);
     let mut e = CabacEncoder::new(w);
     let mut coded: Vec<Coded> = Vec::with_capacity(total);
-    let fmbs = code_p_picture(g, tools, qp, planes, rec, refp, |mb_x, mb_y, mb| {
+    let fmbs = code_p_picture(g, tools, qp, planes, rec, refp, weights, |mb_x, mb_y, mb| {
         let idx = coded.len();
         let left = (mb_x > 0).then(|| &coded[idx - 1]);
         let above = (mb_y > 0).then(|| &coded[idx - mbw]);
