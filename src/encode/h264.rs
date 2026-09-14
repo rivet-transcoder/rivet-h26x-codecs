@@ -1494,6 +1494,67 @@ mod tests {
         }
     }
 
+    /// An `I_16x16` macroblock's DC comes back at the level of the source.
+    ///
+    /// SELF cannot see a DC quantised at the wrong shift: the decoder
+    /// reproduces whatever level was coded. At one shift too few every
+    /// `I_16x16` DC was reconstructed at twice the coded residual mean,
+    /// and luma fell to 14.6 dB once a high quantiser made every
+    /// macroblock `I_16x16`. A flat picture away from mid-grey makes each
+    /// macroblock's residual pure DC, and at QP 40 the census has to show
+    /// `I_16x16` taken, or this proves nothing; the doubled DC overshoots
+    /// by the whole offset and the macroblocks after it predict from the
+    /// overshoot. Every plane is held, so 4:4:4's chroma planes (the same
+    /// function) and 4:2:0's own chroma DC path are held too.
+    #[test]
+    fn intra_16x16_dc_reconstructs_the_source_level() {
+        for (chroma, bit_depth, entropy) in [
+            (ChromaFormat::Yuv420, 8u32, Entropy::Cabac),
+            (ChromaFormat::Yuv444, 8, Entropy::Cavlc),
+            (ChromaFormat::Yuv420, 10, Entropy::Cavlc),
+        ] {
+            for level in [60u32, 180] {
+                let tag = format!("{chroma:?} {bit_depth}-bit {entropy:?} level {level}");
+                let shift = bit_depth - 8;
+                let config = Config { gop: 0, entropy, rate: RateControl::ConstantQp(40), ..cfg(64, 64, chroma, bit_depth) };
+                let mut e = H264Encoder::new(config).unwrap_or_else(|err| panic!("{tag}: {err}"));
+                let planes = match chroma {
+                    ChromaFormat::Yuv444 => [4096usize, 4096, 4096],
+                    _ => [4096, 1024, 1024],
+                };
+                let samples: Vec<u32> = vec![level << shift; planes.iter().sum()];
+                let frame: Vec<u8> = if shift == 0 {
+                    samples.iter().map(|&v| v as u8).collect()
+                } else {
+                    samples.iter().flat_map(|&v| (v as u16).to_le_bytes()).collect()
+                };
+                let frames = vec![frame; 2];
+                let mut units = Vec::new();
+                for f in &frames {
+                    units.extend(e.push(f).unwrap_or_else(|err| panic!("{tag}: {err}")));
+                }
+                units.extend(e.flush().unwrap_or_else(|err| panic!("{tag}: {err}")));
+                self_check(&tag, 0, &units, e.reconstructions());
+                let i16 = e.shape_census().counts[0][2];
+                assert!(i16 > 0, "{tag}: no macroblock took I_16x16, so the DC path went untested");
+                for rec in e.reconstructions() {
+                    let got: Vec<i64> = if shift == 0 {
+                        rec.iter().map(|&v| v as i64).collect()
+                    } else {
+                        rec.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]]) as i64).collect()
+                    };
+                    let mut start = 0;
+                    for (plane, &n) in planes.iter().enumerate() {
+                        let err: i64 = got[start..start + n].iter().map(|&v| (v - (level << shift) as i64).abs()).sum();
+                        let mean = err as f64 / n as f64 / f64::from(1u32 << shift);
+                        assert!(mean < 3.0, "{tag}: plane {plane} is {mean:.1} levels off a flat {level} ({i16} I_16x16 macroblocks)");
+                        start += n;
+                    }
+                }
+            }
+        }
+    }
+
     /// Adaptive quantisation — a quantiser per macroblock, carried by
     /// `mb_qp_delta` — round-trips through the production decoder for
     /// intra, P and B pictures, both entropy coders, every chroma format,

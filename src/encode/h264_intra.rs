@@ -555,11 +555,18 @@ fn code_i16x16_plane<S: Sample>(
     }
 
     // The DC block: Hadamard, then quantised at the same QP with the
-    // position-0 multiplier, which is what 8.5.10 inverts.
+    // position-0 multiplier, which is what 8.5.10 inverts. The Hadamard
+    // here is unnormalised (a flat residual r leaves 256r at its DC), and
+    // 8.5.10 reconstructs `256r / 2^k` at a shift of `qbits4 + k` where
+    // the 4x4 blocks expect 64r — so k is 2. At k = 1 every I_16x16 DC was
+    // put back at twice the coded residual mean: SELF and CROSS agree with
+    // that (the decoder reproduces it), luma PSNR is what notices, down to
+    // 14.6 dB once high QP makes every macroblock I_16x16. The chroma DCs
+    // (2x2, 2x4) have half the gain and are right at k = 1.
     let mut dc_i32 = dcs;
     (ctx.enc.hadamard4)(&mut dc_i32);
     let m = (qp % 6) as usize;
-    let qbits = qbits4(qp) + 1;
+    let qbits = qbits4(qp) + 2;
     let offset = quant_offset(qbits, true);
     let mut dc_levels = [0i16; 16];
     for i in 0..16 {
