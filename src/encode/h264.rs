@@ -413,6 +413,24 @@ fn ssd_packed<S: Sample>(src: &[S], rec: &[u8]) -> u64 {
         .sum()
 }
 
+/// Whether a frame's luma is two fields that do not belong together: its
+/// neighbouring rows, which belong to opposite fields, differ more in
+/// total than rows two apart, which share one. Progressive content — even
+/// fine detail — is the other way round, because a picture's rows are
+/// correlated with their nearest neighbours first; motion between the
+/// instants of two fields is what reverses it.
+fn combed<S: Sample>(luma: &[S], width: usize, height: usize) -> bool {
+    let row = |y: usize| &luma[y * width..(y + 1) * width];
+    let (mut adjacent, mut same_field) = (0u64, 0u64);
+    for y in 0..height.saturating_sub(2) {
+        for ((a, b), c) in row(y).iter().zip(row(y + 1)).zip(row(y + 2)) {
+            adjacent += u64::from(a.to_i32().abs_diff(b.to_i32()));
+            same_field += u64::from(a.to_i32().abs_diff(c.to_i32()));
+        }
+    }
+    adjacent > same_field
+}
+
 /// One coded picture, before anything about it has been kept — the
 /// H.265 side's own pattern, for the same reason: a picture that will
 /// not fit the declared buffer is coded again, and the attempt that lost
@@ -1888,7 +1906,21 @@ impl<S: Sample> Core<S> {
     /// not (`satd_lambda` records why those stay unscaled).
     ///
     /// Ties go to the frame picture, whose header is the smaller.
+    ///
+    /// Only a [`combed`] frame is offered the field attempt. The comparison
+    /// is greedy — it prices this picture and not the pictures that will
+    /// predict from it — and on progressive content that is where it goes
+    /// wrong: a progressive IDR coded as an intra field plus a P field
+    /// measured cheaper (SSD 37165 + 12288 bits against 48464 + 11536 at
+    /// QP 23), and every frame picture predicting from it then came out
+    /// about 6000 SSD worse at the same bits, the clip 2% larger and
+    /// 0.18 dB down. A source whose fields are one instant gains nothing a
+    /// field picture offers, so it is coded once, as a frame.
     fn code_attempt_paff(&self, c: &Coded, src: &[S], qp: u8) -> Result<Attempt<S>> {
+        let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
+        if !combed(&src[..w * h], w, h) {
+            return self.code_attempt_ilace_frame(c, src, qp);
+        }
         let field = self.code_attempt_fields(c, src, qp)?;
         let frame = self.code_attempt_ilace_frame(c, src, qp)?;
         let scale = f64::from(1u32 << (2 * (self.cfg.bit_depth - 8)));
@@ -2678,6 +2710,24 @@ mod tests {
     /// instants apart, and frames somewhere on progressive content stored
     /// as fields. A decision that always chose one would pass SELF and
     /// prove nothing about the other.
+    /// The PAFF screen tells interlaced capture from a progressive frame
+    /// stored as fields, on the same moving pattern, at 8 and 10 bits.
+    #[test]
+    fn combing_separates_interlaced_from_progressive_content() {
+        for bit_depth in [8u32, 10] {
+            for (gap, want) in [(1usize, true), (0, false)] {
+                let frame = &woven_frames(64, 64, ChromaFormat::Yuv420, bit_depth, 1, gap)[0];
+                let got = if bit_depth == 8 {
+                    combed(&frame[..64 * 64], 64, 64)
+                } else {
+                    let luma: Vec<u16> = frame[..2 * 64 * 64].chunks(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+                    combed(&luma, 64, 64)
+                };
+                assert_eq!(got, want, "{bit_depth}-bit field gap {gap}");
+            }
+        }
+    }
+
     #[test]
     fn picture_adaptive_coding_chooses_both_and_round_trips() {
         use crate::encode::{FieldCoding, FieldOrder};
