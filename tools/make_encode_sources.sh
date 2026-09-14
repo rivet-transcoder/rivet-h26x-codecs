@@ -177,7 +177,17 @@ gen big    "testsrc2=size=128x80:rate=25,format=yuv420p[a];mandelbrot=size=128x8
 # two fields disagree (field coding pays) beside one where they are the
 # same picture (frame coding pays) — which is what a per-picture and a
 # per-macroblock-pair decision need to have something to choose between.
+#
+# The left half scrolls (`scroll`, 6% of its width per source frame, about
+# three samples between a frame's two fields) because testsrc2 alone moves
+# too little to comb: its neighbouring rows still differ less than rows of
+# one field, and the encoder's PAFF screen offers field pictures only to a
+# combed frame — so on that source the PAFF rows coded frame pictures and
+# nothing else, and a broken field decision would have passed them. This
+# one measures 1.5-1.8 (frame / field vertical SAD, every frame), and its
+# PAFF rows code field pictures as well as frame pictures.
+#
 # 96x96 rather than 64x64 so an MBAFF frame has eighteen macroblock pairs,
 # enough for pairs of both kinds to sit beside each other. The `p8` depth
 # suffix keeps every untagged row off it: only `@interlace` rows visit it.
-gen interlace "testsrc2=size=48x96:rate=50[a];testsrc2=size=48x96:rate=50,loop=loop=-1:size=1:start=0[b];[a][b]hstack=inputs=2,tinterlace=mode=interleave_top" 8 96x96_420p8 yuv420p
+gen interlace "testsrc2=size=48x96:rate=50,scroll=horizontal=0.06[a];testsrc2=size=48x96:rate=50,loop=loop=-1:size=1:start=0[b];[a][b]hstack=inputs=2,tinterlace=mode=interleave_top" 8 96x96_420p8 yuv420p
