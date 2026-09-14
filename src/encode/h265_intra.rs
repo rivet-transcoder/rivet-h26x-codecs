@@ -1061,12 +1061,31 @@ fn mode_signalling_cost(qp: i32, signal: ModeSignal) -> f32 {
 /// instead, which is the same comparison and leaves every 8-bit cost
 /// multiplied by exactly `1.0` — the property that keeps the 8-bit
 /// stream byte-identical.
+///
+/// **Measured and kept** (2026-09-13). The H.264 encoder measured the
+/// same textbook scaling as a loss at depth and removed it (its mode
+/// costs are placeholders that price bits as a constant, so a larger
+/// multiplier only amplifies their bias). The same A/B here — one
+/// binary, the scaling switched off by an environment variable, every
+/// lossy deep row of the gate over the five deep clips (43 cells), the
+/// 8-bit rows byte-identical between the two paths (479 of 479) — did
+/// not reproduce that: unscaled came out *worse on both axes on 9 cells,
+/// better on both on 3, and split on 20*, mean +5.6% bytes at +0.10 dB.
+/// The split is the signature of a Lagrangian too small: every intra
+/// cell spent more bits for more PSNR (+1.6..2.1% at +0.14..0.24 dB),
+/// and the SAO rows — whose decision prices a real SSD against real
+/// bits through [`ssd_lambda_scale`] — took nearly every offset,
+/// +31..71% bytes for +0.5..0.9 dB. This encoder's distortion-side
+/// costs are real enough that the textbook multiplier is the consistent
+/// one; the pre-registered rule was to keep the scaling if the axes
+/// disagreed, and they did. Not tuned further.
 pub(crate) fn satd_lambda_scale(bit_depth: u32) -> f32 {
     (1u32 << (bit_depth - 8)) as f32
 }
 
 /// The same for a cost paired with an SSD, which grows by the square:
 /// `2^(2 * (BitDepth - 8))` (HM's shift of `(BitDepth - 8) << 1` on SSE).
+/// Measured with [`satd_lambda_scale`] and kept for the same reason.
 pub(crate) fn ssd_lambda_scale(bit_depth: u32) -> f32 {
     (1u32 << (2 * (bit_depth - 8))) as f32
 }
