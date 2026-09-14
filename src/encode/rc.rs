@@ -1205,34 +1205,52 @@ mod tests {
     }
 
     /// **The misfires, replayed.** Two traces from the gate's cut clip that
-    /// froze the quantiser for the rest of the clip under the one-move rule,
-    /// fed back observation for observation: neither may reach a verdict.
+    /// froze the quantiser for the rest of the clip under the one-move rule
+    /// (h26x d88e24a), fed back verbatim — every picture from the first,
+    /// kind, quantiser and bits, because the old rule's reference point was
+    /// carried across every move smaller than three and an excerpt starts a
+    /// different chain of references. Neither may reach a verdict.
     ///
-    /// - H.265 at 64 kbps with a depth-0 quadtree, inter pictures 45 to 54:
+    /// - H.265 at 64 kbps with a depth-0 quadtree, pictures 0 to 53: at 53,
     ///   41 to 38 while the bits fell 168 to 160, a picture right after the
     ///   cut, cheaper because its reference had just been coded. The old
     ///   rule held 38 for the 37 inter pictures left, on a third of their
     ///   plan.
-    /// - H.264 at 128 kbps, inter pictures 19 to 25: 28 to 32, a *raised*
+    /// - H.264 at 128 kbps, pictures 0 to 25: at 25, 28 to 32, a *raised*
     ///   quantiser, with the bits up 3.6 %. The old rule held 32 for 62
     ///   inter pictures on under half their plan.
     #[test]
     fn a_single_move_after_a_cut_or_a_raised_quantiser_is_not_a_verdict() {
-        let h265: [(u8, usize); 7] = [(36, 1624), (39, 1048), (38, 1416), (38, 3408), (41, 168), (38, 160), (38, 176)];
-        let mut rc = RateController::new(64_000, 30, 64, 64, 8, 0);
-        observe_at(&mut rc, PicKind::Intra, 36, 6760 / 8);
-        for (qp, bits) in h265 {
-            observe_at(&mut rc, PicKind::Inter, qp, bits / 8);
-            assert!(!verdict(&rc, PicKind::Inter), "H.265 cut: a verdict at quantiser {qp}, {bits} bits");
+        const I: PicKind = PicKind::Intra;
+        const P: PicKind = PicKind::Inter;
+        #[rustfmt::skip]
+        let h265: [(PicKind, u8, usize); 54] = [
+            (I, 26, 12440), (P, 32, 1752), (P, 39, 760), (P, 39, 928), (P, 40, 856), (P, 40, 872), (P, 39, 1192), (P, 39, 1096),
+            (I, 33, 8360), (P, 42, 528), (P, 40, 1032), (P, 42, 760), (P, 40, 1240), (P, 40, 576), (P, 37, 1528), (P, 37, 1584),
+            (I, 34, 7632), (P, 40, 760), (P, 40, 904), (P, 39, 1280), (P, 39, 1208), (P, 39, 1288), (P, 38, 1520), (P, 38, 1344),
+            (I, 35, 7432), (P, 41, 1152), (P, 42, 912), (P, 40, 1392), (P, 40, 1256), (P, 40, 1328), (P, 39, 1456), (P, 39, 1432),
+            (I, 36, 6760), (P, 42, 528), (P, 39, 1208), (P, 38, 1240), (P, 37, 1560), (P, 37, 1632), (P, 37, 792), (P, 34, 2232),
+            (I, 36, 6984), (P, 37, 1640), (P, 39, 1072), (P, 38, 1376), (P, 37, 1520), (P, 37, 1584), (P, 37, 1464), (P, 36, 1624),
+            (I, 36, 6584), (P, 39, 1048), (P, 38, 1416), (P, 38, 3408), (P, 41, 168), (P, 38, 160),
+        ];
+        #[rustfmt::skip]
+        let h264: [(PicKind, u8, usize); 26] = [
+            (I, 26, 9552), (P, 28, 2672), (P, 28, 3224), (P, 29, 2560), (P, 28, 3120), (P, 28, 2896), (P, 27, 3416), (P, 27, 3376),
+            (I, 23, 11768), (P, 29, 2672), (P, 29, 3024), (P, 29, 2976), (P, 28, 3448), (P, 28, 2104), (P, 26, 4040), (P, 27, 3560),
+            (I, 23, 12232), (P, 29, 2680), (P, 29, 3000), (P, 29, 3224), (P, 29, 3304), (P, 29, 3224), (P, 29, 3352), (P, 29, 3464),
+            (I, 23, 13144), (P, 32, 2768),
+        ];
+        let mut verdicts = Vec::new();
+        for (name, bps, trace) in [("H.265 64k", 64_000, &h265[..]), ("H.264 128k", 128_000, &h264[..])] {
+            let mut rc = RateController::new(bps, 30, 64, 64, 8, 0);
+            for (i, &(kind, qp, bits)) in trace.iter().enumerate() {
+                observe_at(&mut rc, kind, qp, bits / 8);
+                if verdict(&rc, kind) {
+                    verdicts.push(format!("{name}: picture {i}, {kind:?} quantiser {qp}, {bits} bits"));
+                }
+            }
         }
-
-        let h264: [(u8, usize); 6] = [(29, 3224), (29, 3304), (29, 3224), (29, 3352), (28, 2672), (32, 2768)];
-        let mut rc = RateController::new(128_000, 30, 64, 64, 8, 0);
-        observe_at(&mut rc, PicKind::Intra, 23, 9000);
-        for (qp, bits) in h264 {
-            observe_at(&mut rc, PicKind::Inter, qp, bits / 8);
-            assert!(!verdict(&rc, PicKind::Inter), "H.264: a verdict at quantiser {qp}, {bits} bits");
-        }
+        assert!(verdicts.is_empty(), "the replayed traces reached verdicts: {verdicts:?}");
     }
 
     /// **Bits held flat by improving references are not a verdict.** A
