@@ -83,10 +83,8 @@ fn mask32(n: usize) -> __mmask32 {
 #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
 #[inline]
 unsafe fn pack32(v: __m512i) -> __m256i {
-    unsafe {
-        let idx = _mm512_setr_epi64(0, 2, 4, 6, 1, 3, 5, 7);
-        _mm512_castsi512_si256(_mm512_permutexvar_epi64(idx, _mm512_packus_epi16(v, v)))
-    }
+    let idx = _mm512_setr_epi64(0, 2, 4, 6, 1, 3, 5, 7);
+    _mm512_castsi512_si256(_mm512_permutexvar_epi64(idx, _mm512_packus_epi16(v, v)))
 }
 
 /// Store the first `n` (≤ 32) 16-bit lanes.

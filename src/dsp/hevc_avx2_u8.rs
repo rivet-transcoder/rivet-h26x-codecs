@@ -116,7 +116,7 @@ unsafe fn load_bytes32(src: *const u8, avail: usize) -> __m256i {
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn pack16(v: __m256i) -> __m128i {
-    unsafe { _mm_packus_epi16(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1)) }
+    _mm_packus_epi16(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1))
 }
 
 /// Whether a block of width `w` is handled as one contiguous run of
@@ -883,12 +883,10 @@ unsafe fn add_residual_impl(dst: &mut [u8], stride: usize, res: &[i16], n: usize
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn add_offset_u8(v: __m256i, off: __m256i) -> __m256i {
-    unsafe {
-        let zero = _mm256_setzero_si256();
-        let pos = _mm256_max_epi8(off, zero);
-        let neg = _mm256_max_epi8(_mm256_sub_epi8(zero, off), zero);
-        _mm256_subs_epu8(_mm256_adds_epu8(v, pos), neg)
-    }
+    let zero = _mm256_setzero_si256();
+    let pos = _mm256_max_epi8(off, zero);
+    let neg = _mm256_max_epi8(_mm256_sub_epi8(zero, off), zero);
+    _mm256_subs_epu8(_mm256_adds_epu8(v, pos), neg)
 }
 
 #[allow(clippy::too_many_arguments)]

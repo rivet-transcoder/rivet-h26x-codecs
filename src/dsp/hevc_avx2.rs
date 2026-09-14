@@ -290,7 +290,7 @@ pub(super) fn epel_v2_avx2(dst: &mut [i16], src: &[i16], src_stride: usize, w: u
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn clip_u16(v: __m256i, maxv: __m256i) -> __m256i {
-    unsafe { _mm256_min_epi16(_mm256_max_epi16(v, _mm256_setzero_si256()), maxv) }
+    _mm256_min_epi16(_mm256_max_epi16(v, _mm256_setzero_si256()), maxv)
 }
 
 fn uni_avx2(dst: &mut [u16], stride: usize, src: &[i16], w: usize, h: usize, shift: i32, max: i32) {
@@ -742,60 +742,54 @@ unsafe fn ld8_u16(p: *const u16) -> __m256i {
 #[target_feature(enable = "avx2")]
 #[inline]
 pub(super) unsafe fn pack8_u16(v: __m256i) -> __m128i {
-    unsafe {
-        let p = _mm256_packus_epi32(v, v);
-        _mm256_castsi256_si128(_mm256_permute4x64_epi64(p, 0b11_01_10_00))
-    }
+    let p = _mm256_packus_epi32(v, v);
+    _mm256_castsi256_si128(_mm256_permute4x64_epi64(p, 0b11_01_10_00))
 }
 
 /// Transpose eight 8-lane u16 rows (128-bit each).
 #[target_feature(enable = "avx2")]
 #[inline]
 pub(super) unsafe fn transpose8_u16(r: &mut [__m128i; 8]) {
-    unsafe {
-        let a0 = _mm_unpacklo_epi16(r[0], r[1]);
-        let a1 = _mm_unpackhi_epi16(r[0], r[1]);
-        let a2 = _mm_unpacklo_epi16(r[2], r[3]);
-        let a3 = _mm_unpackhi_epi16(r[2], r[3]);
-        let a4 = _mm_unpacklo_epi16(r[4], r[5]);
-        let a5 = _mm_unpackhi_epi16(r[4], r[5]);
-        let a6 = _mm_unpacklo_epi16(r[6], r[7]);
-        let a7 = _mm_unpackhi_epi16(r[6], r[7]);
-        let b0 = _mm_unpacklo_epi32(a0, a2);
-        let b1 = _mm_unpackhi_epi32(a0, a2);
-        let b2 = _mm_unpacklo_epi32(a1, a3);
-        let b3 = _mm_unpackhi_epi32(a1, a3);
-        let b4 = _mm_unpacklo_epi32(a4, a6);
-        let b5 = _mm_unpackhi_epi32(a4, a6);
-        let b6 = _mm_unpacklo_epi32(a5, a7);
-        let b7 = _mm_unpackhi_epi32(a5, a7);
-        r[0] = _mm_unpacklo_epi64(b0, b4);
-        r[1] = _mm_unpackhi_epi64(b0, b4);
-        r[2] = _mm_unpacklo_epi64(b1, b5);
-        r[3] = _mm_unpackhi_epi64(b1, b5);
-        r[4] = _mm_unpacklo_epi64(b2, b6);
-        r[5] = _mm_unpackhi_epi64(b2, b6);
-        r[6] = _mm_unpacklo_epi64(b3, b7);
-        r[7] = _mm_unpackhi_epi64(b3, b7);
-    }
+    let a0 = _mm_unpacklo_epi16(r[0], r[1]);
+    let a1 = _mm_unpackhi_epi16(r[0], r[1]);
+    let a2 = _mm_unpacklo_epi16(r[2], r[3]);
+    let a3 = _mm_unpackhi_epi16(r[2], r[3]);
+    let a4 = _mm_unpacklo_epi16(r[4], r[5]);
+    let a5 = _mm_unpackhi_epi16(r[4], r[5]);
+    let a6 = _mm_unpacklo_epi16(r[6], r[7]);
+    let a7 = _mm_unpackhi_epi16(r[6], r[7]);
+    let b0 = _mm_unpacklo_epi32(a0, a2);
+    let b1 = _mm_unpackhi_epi32(a0, a2);
+    let b2 = _mm_unpacklo_epi32(a1, a3);
+    let b3 = _mm_unpackhi_epi32(a1, a3);
+    let b4 = _mm_unpacklo_epi32(a4, a6);
+    let b5 = _mm_unpackhi_epi32(a4, a6);
+    let b6 = _mm_unpacklo_epi32(a5, a7);
+    let b7 = _mm_unpackhi_epi32(a5, a7);
+    r[0] = _mm_unpacklo_epi64(b0, b4);
+    r[1] = _mm_unpackhi_epi64(b0, b4);
+    r[2] = _mm_unpacklo_epi64(b1, b5);
+    r[3] = _mm_unpackhi_epi64(b1, b5);
+    r[4] = _mm_unpacklo_epi64(b2, b6);
+    r[5] = _mm_unpackhi_epi64(b2, b6);
+    r[6] = _mm_unpacklo_epi64(b3, b7);
+    r[7] = _mm_unpackhi_epi64(b3, b7);
 }
 
 /// A lane mask from two per-segment booleans (lanes 0..3 / 4..7).
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn seg_mask(a: bool, b: bool) -> __m256i {
-    unsafe {
-        let x = -(a as i32);
-        let y = -(b as i32);
-        _mm256_setr_epi32(x, x, x, x, y, y, y, y)
-    }
+    let x = -(a as i32);
+    let y = -(b as i32);
+    _mm256_setr_epi32(x, x, x, x, y, y, y, y)
 }
 
 /// Per-segment values broadcast to lanes.
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn seg_val(a: i32, b: i32) -> __m256i {
-    unsafe { _mm256_setr_epi32(a, a, a, a, b, b, b, b) }
+    _mm256_setr_epi32(a, a, a, a, b, b, b, b)
 }
 
 /// The luma filter on eight lines (two segments), in place.
@@ -961,28 +955,26 @@ unsafe fn deblock_luma_h_impl(data: *mut u16, stride: usize, beta: [i32; 2], tc:
 #[target_feature(enable = "avx2")]
 #[inline]
 pub(super) unsafe fn chroma_filter8(v: &mut [__m256i; 4], tc: [i32; 4], no_p: [bool; 4], no_q: [bool; 4], max: i32) {
-    unsafe {
-        let [p1, p0, q0, q1] = *v;
-        let tcv = _mm256_setr_epi32(tc[0], tc[0], tc[1], tc[1], tc[2], tc[2], tc[3], tc[3]);
-        let m = |a: [bool; 4]| {
-            let x = |b: bool| -(b as i32);
-            _mm256_setr_epi32(x(a[0]), x(a[0]), x(a[1]), x(a[1]), x(a[2]), x(a[2]), x(a[3]), x(a[3]))
-        };
-        let on = _mm256_cmpgt_epi32(tcv, _mm256_setzero_si256());
-        let wp = _mm256_andnot_si256(m(no_p), on);
-        let wq = _mm256_andnot_si256(m(no_q), on);
-        let zero = _mm256_setzero_si256();
-        let maxv = _mm256_set1_epi32(max);
-        let d = _mm256_srai_epi32(
-            _mm256_add_epi32(_mm256_add_epi32(_mm256_slli_epi32(_mm256_sub_epi32(q0, p0), 2), _mm256_sub_epi32(p1, q1)), _mm256_set1_epi32(4)),
-            3,
-        );
-        let d = _mm256_min_epi32(_mm256_max_epi32(d, _mm256_sub_epi32(zero, tcv)), tcv);
-        let np0 = _mm256_min_epi32(_mm256_max_epi32(_mm256_add_epi32(p0, d), zero), maxv);
-        let nq0 = _mm256_min_epi32(_mm256_max_epi32(_mm256_sub_epi32(q0, d), zero), maxv);
-        v[1] = _mm256_blendv_epi8(p0, np0, wp);
-        v[2] = _mm256_blendv_epi8(q0, nq0, wq);
-    }
+    let [p1, p0, q0, q1] = *v;
+    let tcv = _mm256_setr_epi32(tc[0], tc[0], tc[1], tc[1], tc[2], tc[2], tc[3], tc[3]);
+    let m = |a: [bool; 4]| {
+        let x = |b: bool| -(b as i32);
+        _mm256_setr_epi32(x(a[0]), x(a[0]), x(a[1]), x(a[1]), x(a[2]), x(a[2]), x(a[3]), x(a[3]))
+    };
+    let on = _mm256_cmpgt_epi32(tcv, _mm256_setzero_si256());
+    let wp = _mm256_andnot_si256(m(no_p), on);
+    let wq = _mm256_andnot_si256(m(no_q), on);
+    let zero = _mm256_setzero_si256();
+    let maxv = _mm256_set1_epi32(max);
+    let d = _mm256_srai_epi32(
+        _mm256_add_epi32(_mm256_add_epi32(_mm256_slli_epi32(_mm256_sub_epi32(q0, p0), 2), _mm256_sub_epi32(p1, q1)), _mm256_set1_epi32(4)),
+        3,
+    );
+    let d = _mm256_min_epi32(_mm256_max_epi32(d, _mm256_sub_epi32(zero, tcv)), tcv);
+    let np0 = _mm256_min_epi32(_mm256_max_epi32(_mm256_add_epi32(p0, d), zero), maxv);
+    let nq0 = _mm256_min_epi32(_mm256_max_epi32(_mm256_sub_epi32(q0, d), zero), maxv);
+    v[1] = _mm256_blendv_epi8(p0, np0, wp);
+    v[2] = _mm256_blendv_epi8(q0, nq0, wq);
 }
 
 fn deblock_chroma_v_avx2(data: &mut [u16], off: usize, stride: usize, tc: [i32; 4], no_p: [bool; 4], no_q: [bool; 4], max: i32) {

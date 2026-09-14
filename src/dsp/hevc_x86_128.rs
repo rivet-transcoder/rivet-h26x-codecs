@@ -102,13 +102,11 @@ macro_rules! codec_compat_hevc {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn taps_load(taps: &[i8], n: usize) -> Taps {
-            unsafe {
-                let mut v = [_mm_setzero_si128(); 8];
-                for k in 0..n {
-                    v[k] = _mm_set1_epi16(taps[k] as i16);
-                }
-                Taps(v, n)
+            let mut v = [_mm_setzero_si128(); 8];
+            for k in 0..n {
+                v[k] = _mm_set1_epi16(taps[k] as i16);
             }
+            Taps(v, n)
         }
 
         /// Eight consecutive FIR outputs from the u8 window at `p`, stepping
@@ -152,7 +150,7 @@ macro_rules! codec_compat_hevc {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn edge_tab(off: &[i16; 5]) -> EdgeTab {
-            unsafe { EdgeTab(std::array::from_fn(|i| _mm_set1_epi8(off[i] as i8))) }
+            EdgeTab(std::array::from_fn(|i| _mm_set1_epi8(off[i] as i8)))
         }
 
         /// `off[e]` per byte lane, for `e` in 0..=4.
@@ -186,13 +184,11 @@ macro_rules! codec_compat_hevc {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn taps_load(taps: &[i8], n: usize) -> Taps {
-            unsafe {
-                let mut v = [_mm_setzero_si128(); 4];
-                for k in 0..n / 2 {
-                    v[k] = _mm_set1_epi16(pair8(taps[2 * k], taps[2 * k + 1]));
-                }
-                Taps(v, n / 2)
+            let mut v = [_mm_setzero_si128(); 4];
+            for k in 0..n / 2 {
+                v[k] = _mm_set1_epi16(pair8(taps[2 * k], taps[2 * k + 1]));
             }
+            Taps(v, n / 2)
         }
 
         /// Eight consecutive FIR outputs from the u8 window at `p`, stepping
@@ -237,17 +233,15 @@ macro_rules! codec_compat_hevc {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn edge_tab(off: &[i16; 5]) -> EdgeTab {
-            unsafe {
-                let o = |i: usize| off[i] as i8;
-                EdgeTab(_mm_setr_epi8(o(0), o(1), o(2), o(3), o(4), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
-            }
+            let o = |i: usize| off[i] as i8;
+            EdgeTab(_mm_setr_epi8(o(0), o(1), o(2), o(3), o(4), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
         }
 
         /// `off[e]` per byte lane, for `e` in 0..=4.
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn edge_lut(t: &EdgeTab, e: __m128i) -> __m128i {
-            unsafe { _mm_shuffle_epi8(t.0, e) }
+            _mm_shuffle_epi8(t.0, e)
         }
     };
 }
@@ -373,7 +367,7 @@ macro_rules! kernels_u16 {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn clip_u16(v: __m128i, maxv: __m128i) -> __m128i {
-            unsafe { _mm_min_epi16(_mm_max_epi16(v, _mm_setzero_si128()), maxv) }
+            _mm_min_epi16(_mm_max_epi16(v, _mm_setzero_si128()), maxv)
         }
 
         // ------------------------------------------------------------------
@@ -892,39 +886,37 @@ macro_rules! kernels_u16 {
         #[target_feature(enable = $feat)]
         #[inline]
         pub(super) unsafe fn pack8_u16(lo: __m128i, hi: __m128i) -> __m128i {
-            unsafe { _mm_packs_epi32(lo, hi) }
+            _mm_packs_epi32(lo, hi)
         }
 
         /// Transpose eight 8-lane u16 rows.
         #[target_feature(enable = $feat)]
         #[inline]
         pub(super) unsafe fn transpose8_u16(r: &mut [__m128i; 8]) {
-            unsafe {
-                let a0 = _mm_unpacklo_epi16(r[0], r[1]);
-                let a1 = _mm_unpackhi_epi16(r[0], r[1]);
-                let a2 = _mm_unpacklo_epi16(r[2], r[3]);
-                let a3 = _mm_unpackhi_epi16(r[2], r[3]);
-                let a4 = _mm_unpacklo_epi16(r[4], r[5]);
-                let a5 = _mm_unpackhi_epi16(r[4], r[5]);
-                let a6 = _mm_unpacklo_epi16(r[6], r[7]);
-                let a7 = _mm_unpackhi_epi16(r[6], r[7]);
-                let b0 = _mm_unpacklo_epi32(a0, a2);
-                let b1 = _mm_unpackhi_epi32(a0, a2);
-                let b2 = _mm_unpacklo_epi32(a1, a3);
-                let b3 = _mm_unpackhi_epi32(a1, a3);
-                let b4 = _mm_unpacklo_epi32(a4, a6);
-                let b5 = _mm_unpackhi_epi32(a4, a6);
-                let b6 = _mm_unpacklo_epi32(a5, a7);
-                let b7 = _mm_unpackhi_epi32(a5, a7);
-                r[0] = _mm_unpacklo_epi64(b0, b4);
-                r[1] = _mm_unpackhi_epi64(b0, b4);
-                r[2] = _mm_unpacklo_epi64(b1, b5);
-                r[3] = _mm_unpackhi_epi64(b1, b5);
-                r[4] = _mm_unpacklo_epi64(b2, b6);
-                r[5] = _mm_unpackhi_epi64(b2, b6);
-                r[6] = _mm_unpacklo_epi64(b3, b7);
-                r[7] = _mm_unpackhi_epi64(b3, b7);
-            }
+            let a0 = _mm_unpacklo_epi16(r[0], r[1]);
+            let a1 = _mm_unpackhi_epi16(r[0], r[1]);
+            let a2 = _mm_unpacklo_epi16(r[2], r[3]);
+            let a3 = _mm_unpackhi_epi16(r[2], r[3]);
+            let a4 = _mm_unpacklo_epi16(r[4], r[5]);
+            let a5 = _mm_unpackhi_epi16(r[4], r[5]);
+            let a6 = _mm_unpacklo_epi16(r[6], r[7]);
+            let a7 = _mm_unpackhi_epi16(r[6], r[7]);
+            let b0 = _mm_unpacklo_epi32(a0, a2);
+            let b1 = _mm_unpackhi_epi32(a0, a2);
+            let b2 = _mm_unpacklo_epi32(a1, a3);
+            let b3 = _mm_unpackhi_epi32(a1, a3);
+            let b4 = _mm_unpacklo_epi32(a4, a6);
+            let b5 = _mm_unpackhi_epi32(a4, a6);
+            let b6 = _mm_unpacklo_epi32(a5, a7);
+            let b7 = _mm_unpackhi_epi32(a5, a7);
+            r[0] = _mm_unpacklo_epi64(b0, b4);
+            r[1] = _mm_unpackhi_epi64(b0, b4);
+            r[2] = _mm_unpacklo_epi64(b1, b5);
+            r[3] = _mm_unpackhi_epi64(b1, b5);
+            r[4] = _mm_unpacklo_epi64(b2, b6);
+            r[5] = _mm_unpackhi_epi64(b2, b6);
+            r[6] = _mm_unpacklo_epi64(b3, b7);
+            r[7] = _mm_unpackhi_epi64(b3, b7);
         }
 
         /// The luma filter on one four-line segment, in place.
@@ -1307,7 +1299,7 @@ macro_rules! kernels_u8 {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn pack8(v: __m128i) -> __m128i {
-            unsafe { _mm_packus_epi16(v, v) }
+            _mm_packus_epi16(v, v)
         }
 
         /// Whether a block of width `w` is handled as one contiguous run of
