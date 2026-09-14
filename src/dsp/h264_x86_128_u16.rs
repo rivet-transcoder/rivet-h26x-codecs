@@ -1597,16 +1597,32 @@ pub(crate) mod tests {
         let s = H264Dsp::<u16>::SCALAR;
         let mut tabs = vec![("scalar", s), ("scalar-again", s)];
         tabs.extend(tables());
+        // Every table back to back within a round, seven rounds: whatever
+        // else the machine does drifts across all of them, and the ratio to
+        // scalar is taken per round and its median reported.
+        const ROUNDS: usize = 7;
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.total_cmp(b));
+            v[v.len() / 2]
+        };
         for (label, iters, f) in &families {
-            for (name, d) in &tabs {
-                let mut buf = smooth.clone();
-                let mut sink = 0u64;
-                let t = Instant::now();
-                for _ in 0..*iters {
-                    sink = sink.wrapping_add(f(d, &mut buf));
+            let per = (*iters as usize / ROUNDS).max(1);
+            let mut ns = vec![[0f64; ROUNDS]; tabs.len()];
+            let mut bufs: Vec<Vec<u16>> = tabs.iter().map(|_| smooth.clone()).collect();
+            let mut sink = 0u64;
+            for r in 0..ROUNDS {
+                for (t, (_, d)) in tabs.iter().enumerate() {
+                    let start = Instant::now();
+                    for _ in 0..per {
+                        sink = sink.wrapping_add(f(d, &mut bufs[t]));
+                    }
+                    ns[t][r] = start.elapsed().as_nanos() as f64 / per as f64;
                 }
-                let ns = t.elapsed().as_nanos() as f64 / *iters as f64;
-                println!("{label:26} {name:13} {ns:9.1} ns/call [{}]", sink & 1);
+            }
+            for (t, (name, _)) in tabs.iter().enumerate() {
+                let own = median(ns[t].to_vec());
+                let ratio = median((0..ROUNDS).map(|r| ns[0][r] / ns[t][r]).collect());
+                println!("{label:26} {name:13} {own:9.1} ns/call  {ratio:6.2}x scalar (median of {ROUNDS} paired rounds) [{}]", sink & 1);
             }
         }
     }

@@ -684,21 +684,35 @@ mod tests {
             let a: Vec<u16> = (0..96 * 96).map(|_| (lcg() % (m + 1)) as u16).collect();
             let b: Vec<u16> = a.iter().map(|&v| (v as i32 + (lcg() % 33) as i32 - 16).clamp(0, m as i32) as u16).collect();
             for &(w, h) in &[(4, 4), (8, 8), (16, 16), (32, 32), (64, 64)] {
-                let iters = (2_000_000 / (w * h) * 16) as u32;
-                for (name, d) in &tables {
-                    for (metric, f) in [("sad", 0), ("satd", 1), ("ssd", 2)] {
-                        let mut sink = 0u64;
-                        let t = Instant::now();
-                        for i in 0..iters as usize {
-                            let o = (i & 31) * 3;
-                            sink = sink.wrapping_add(match f {
-                                0 => (d.sad)(&a[o..], 96, &b[o..], 96, w, h) as u64,
-                                1 => (d.satd)(&a[o..], 96, &b[o..], 96, w, h) as u64,
-                                _ => (d.ssd)(&a[o..], 96, &b[o..], 96, w, h),
-                            });
+                // Every table back to back within a round, seven rounds, the
+                // ratio to scalar taken per round and its median reported.
+                const ROUNDS: usize = 7;
+                let per = (2_000_000 / (w * h) * 16 / ROUNDS).max(1);
+                let median = |mut v: Vec<f64>| {
+                    v.sort_by(|x, y| x.total_cmp(y));
+                    v[v.len() / 2]
+                };
+                for (metric, f) in [("sad", 0), ("satd", 1), ("ssd", 2)] {
+                    let mut ns = vec![[0f64; ROUNDS]; tables.len()];
+                    let mut sink = 0u64;
+                    for r in 0..ROUNDS {
+                        for (t, (_, d)) in tables.iter().enumerate() {
+                            let start = Instant::now();
+                            for i in 0..per {
+                                let o = (i & 31) * 3;
+                                sink = sink.wrapping_add(match f {
+                                    0 => (d.sad)(&a[o..], 96, &b[o..], 96, w, h) as u64,
+                                    1 => (d.satd)(&a[o..], 96, &b[o..], 96, w, h) as u64,
+                                    _ => (d.ssd)(&a[o..], 96, &b[o..], 96, w, h),
+                                });
+                            }
+                            ns[t][r] = start.elapsed().as_nanos() as f64 / per as f64;
                         }
-                        let ns = t.elapsed().as_nanos() as f64 / iters as f64;
-                        println!("{bits}-bit {w}x{h} {metric:4} {name:13} {ns:8.1} ns/call [{}]", sink & 1);
+                    }
+                    for (t, (name, _)) in tables.iter().enumerate() {
+                        let own = median(ns[t].to_vec());
+                        let ratio = median((0..ROUNDS).map(|r| ns[0][r] / ns[t][r]).collect());
+                        println!("{bits}-bit {w}x{h} {metric:4} {name:13} {own:8.1} ns/call  {ratio:6.2}x scalar (median of {ROUNDS} paired rounds) [{}]", sink & 1);
                     }
                 }
             }
