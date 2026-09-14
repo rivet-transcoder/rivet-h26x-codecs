@@ -73,17 +73,19 @@ impl<S: Sample> DistortionDsp<S> {
     }
 }
 
-/// The SIMD kernels exist for 8-bit samples, which is what both encoders
-/// work in today; a 16-bit table keeps the scalar reference. Dispatched on
-/// the sample type here rather than through a method on [`Sample`], so
-/// this table's ladder does not touch the trait the decoders share.
+/// The SIMD kernels, for 8-bit samples and for 16-bit ones (which the deep
+/// encoders use at 9 to 14 bits; the 16-bit kernels are told no depth and
+/// are exact for any `u16`). Dispatched on the sample type here rather than
+/// through a method on [`Sample`], so this table's ladder does not touch the
+/// trait the decoders share.
 #[allow(unused_variables)]
 fn install_simd<S: Sample>(d: &mut DistortionDsp<S>, cpu: Cpu) {
     use std::any::Any;
     if super::enc_simd_disabled("distortion") {
         return;
     }
-    if let Some(d) = (d as &mut dyn Any).downcast_mut::<DistortionDsp<u8>>() {
+    let d = d as &mut dyn Any;
+    if let Some(d) = d.downcast_mut::<DistortionDsp<u8>>() {
         #[cfg(target_arch = "x86_64")]
         super::distortion_x86::install(d, cpu);
         #[cfg(target_arch = "aarch64")]
@@ -91,6 +93,15 @@ fn install_simd<S: Sample>(d: &mut DistortionDsp<S>, cpu: Cpu) {
         #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
         if cpu.simd128 {
             super::distortion_wasm128::install(d);
+        }
+    } else if let Some(d) = d.downcast_mut::<DistortionDsp<u16>>() {
+        #[cfg(target_arch = "x86_64")]
+        super::distortion_x86_u16::install(d, cpu);
+        #[cfg(target_arch = "aarch64")]
+        super::distortion_neon_u16::install(d, cpu);
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        if cpu.simd128 {
+            super::distortion_wasm128_u16::install(d);
         }
     }
 }

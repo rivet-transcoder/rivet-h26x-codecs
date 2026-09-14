@@ -8,17 +8,18 @@
 # different decision anywhere — a SATD off by one in a mode search, a
 # quantiser that rounds a level differently — writes a different stream,
 # whatever its own reconstruction says. For each rung the host can take,
-# every 8-bit cell of verify_encode.sh's configuration list is encoded by
-# one binary twice, with the scalar reference (H26X_NO_SIMD=1) and with the
+# every cell of verify_encode.sh's configuration list is encoded by one
+# binary twice, with the scalar reference (H26X_NO_SIMD=1) and with the
 # rung, and the two bitstreams and reconstructions are compared byte for
 # byte (identity_encode.sh does the cell work). The rung caps *every* table
 # the encoder builds — the encode-only ones and the interpolation, inverse
 # transform and loop filter it shares with the decoder — so a green ladder
 # says the whole encoder is rung-independent, not just its own kernels.
 #
-# 8-bit cells only: the encode-side SIMD kernels exist for 8-bit samples
-# and the 16-bit tables keep the scalar reference, so a 10/12-bit cell
-# exercises only the shared decoder kernels, which verify.sh already covers.
+# Every clip, the 10- and 12-bit ones included: the 16-bit tables have SIMD
+# tiers of their own (the distortion metrics, and the H.264 kernels the deep
+# encoder reconstructs with), and a deep cell exercises them in decisions
+# no decode sweep reaches.
 #
 # Usage: verify_enc_ladder.sh [encoder] [decoder]
 #   H26X_WORK=dir   scratch directory holding the source clips
@@ -41,9 +42,10 @@ cd "$WORK" || { echo "no such H26X_WORK: $WORK" >&2; exit 2; }
 [ -f "$ENC" ] || ENC=${ENC%.exe}
 [ -f "$ENC" ] || { echo "no such encoder: $ENC" >&2; exit 2; }
 
-# The 8-bit clips: everything not named with a depth suffix.
-SOURCES=$(ls src_*.yuv 2>/dev/null | grep -Ev '_[0-9]+p1[0-9]\.yuv$')
-[ -n "$SOURCES" ] || { echo "no 8-bit source clips (src_*.yuv) in $WORK" >&2; exit 2; }
+# Every clip; identity_encode.sh visits a deep one only with the rows that
+# name it (`@p10`, `@p12`).
+SOURCES=$(ls src_*.yuv 2>/dev/null)
+[ -n "$SOURCES" ] || { echo "no source clips (src_*.yuv) in $WORK" >&2; exit 2; }
 export SOURCES
 
 echo "== encode ladder: scalar reference vs each rung, $(echo $SOURCES | wc -w) clips =="
