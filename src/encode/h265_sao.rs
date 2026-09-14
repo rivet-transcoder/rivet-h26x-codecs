@@ -56,8 +56,10 @@
 //! rounded mean of `src - rec` over its samples, clamped to the syntax's
 //! range (cMax, and to the sign the syntax forces in edge mode). The
 //! change in SSD from applying offset `o` to a category is then
-//! `count * o^2 - 2 * o * sum`, exactly, so no filtering is needed to
-//! score a candidate.
+//! `count * o^2 - 2 * o * sum` for the samples the offset moves in full,
+//! and a smaller, fixed amount for each one the filter's clip stops at a
+//! rail (see [`Cat`]) — exactly, so no filtering is needed to score a
+//! candidate.
 //!
 //! The winner is the smallest `distortion + lambda * bins`, with `lambda`
 //! and the bin counts the same placeholder policy the other decision
@@ -94,33 +96,166 @@ pub struct SaoPlan {
     /// `params` entry equals the neighbour's, because that is what the
     /// reader will copy.
     pub merges: Vec<Option<SaoMerge>>,
+    /// Per component, the SSD against the source the decision predicted
+    /// the filtered picture would have — the number every choice above was
+    /// made on. The model check holds it to what the filter then produced.
+    pub predicted: [i64; 3],
 }
 
-/// Per-category statistics for one candidate: how many samples fell into
-/// each category, and the total error `src - rec` over them.
+/// How close to a rail a sample can be and still be clipped by an offset
+/// this encoder can spell: `cMax` of `sao_offset_abs` is 31 from ten bits
+/// up (7 at eight), so a sample with 31 or more of room to the rail is
+/// moved by any legal offset in full, and only the ones nearer than that
+/// need telling apart.
+const CLIP_REACH: usize = 31;
+
+/// A count of samples and the total error `src - rec` over them.
 #[derive(Clone, Copy, Default)]
-struct Cat {
+struct Tally {
     count: i64,
     sum: i64,
 }
 
+/// Per-category statistics for one candidate: the samples that fell into
+/// the category, and — kept apart from the rest — the ones near enough to
+/// a rail that the filter's clip would move them by less than the offset.
+///
+/// The filter writes `clip(rec + o)`, not `rec + o`. A sample with `h`
+/// of room to the rail the offset pushes towards is moved by `min(o, h)`,
+/// so its share of the SSD change is `h^2 - 2*h*e` rather than
+/// `o^2 - 2*o*e`, and a model that adds `count*o^2 - 2*o*sum` over the
+/// whole category is wrong by exactly that difference. It was: on content
+/// that touches black or white — a full-range gradient, a chroma plane
+/// with lanczos ringing at zero — the model check caught the decision
+/// predicting tens to hundreds more units of error than the filter
+/// produced: a legal stream chosen against a filter that does not exist.
+/// The buckets below make the score exact for those samples too, and
+/// cost nothing on video-range content, whose samples never come within
+/// an offset of a rail.
+///
+/// A `Cat` is a kilobyte, nearly all of it buckets, and a pass fills 32
+/// of them (band) or five (edge), seven or more passes per CTB component.
+/// Zeroing that on the stack for every pass was a measurable share of the
+/// encode, so the arrays live in [`Stats`] for the whole picture and
+/// [`Cat::clear`] touches the buckets only where the previous pass did.
+#[derive(Clone, Copy, Default)]
+struct Cat {
+    all: Tally,
+    /// Whether any bucket below holds a sample — set by `add`, cleared by
+    /// `clear`, and the only thing `clear` needs to look at.
+    dirty: bool,
+    /// `up[h]`: the samples exactly `h` below the top rail (`max - rec ==
+    /// h`), for `h < CLIP_REACH`. A positive offset `o > h` moves them by
+    /// `h`, not `o`.
+    up: [Tally; CLIP_REACH],
+    /// `down[h]`: the samples exactly `h` above zero (`rec == h`). A
+    /// negative offset `-o` with `o > h` moves them by `-h`.
+    down: [Tally; CLIP_REACH],
+}
+
 impl Cat {
-    /// The change in SSD from adding `o` to every sample of this category:
-    /// `sum((r + o) - s)^2 - sum(r - s)^2` = `count*o^2 - 2*o*sum`, where
-    /// `sum` is `sum(s - r)`. Negative is an improvement.
-    fn delta(&self, o: i64) -> i64 {
-        self.count * o * o - 2 * o * self.sum
+    /// Record one sample: its reconstruction `r`, its error `e = src -
+    /// rec`, and the top rail `max` of its bit depth.
+    #[inline]
+    fn add(&mut self, r: i32, e: i64, max: i32) {
+        self.all.count += 1;
+        self.all.sum += e;
+        let up = (max - r) as usize;
+        if up < CLIP_REACH {
+            self.up[up].count += 1;
+            self.up[up].sum += e;
+            self.dirty = true;
+        }
+        let down = r as usize;
+        if down < CLIP_REACH {
+            self.down[down].count += 1;
+            self.down[down].sum += e;
+            self.dirty = true;
+        }
     }
 
-    /// The offset this category would like, before the syntax's limits:
-    /// the rounded mean error, which is the minimiser of `delta`.
-    fn best(&self) -> i64 {
-        if self.count == 0 {
+    /// Back to empty, at the cost of what the last pass put here: the
+    /// count and sum always, the buckets only if one was used.
+    #[inline]
+    fn clear(&mut self) {
+        self.all = Tally::default();
+        if self.dirty {
+            self.up = [Tally::default(); CLIP_REACH];
+            self.down = [Tally::default(); CLIP_REACH];
+            self.dirty = false;
+        }
+    }
+
+    /// The change in SSD from the filter adding `o` to every sample of
+    /// this category and clipping: `sum(clip(r + o) - s)^2 - sum(r - s)^2`.
+    /// For a sample moved in full that is `o^2 - 2*o*e`; for one with only
+    /// `h < |o|` of room it is `h^2 - 2*h*e` in the offset's direction.
+    /// Negative is an improvement.
+    fn delta(&self, o: i64) -> i64 {
+        if o == 0 {
             return 0;
         }
-        let (n, s) = (self.count, self.sum);
+        let m = o.unsigned_abs() as usize;
+        debug_assert!(m <= CLIP_REACH, "SAO offset {o} is beyond what the syntax can spell");
+        let (side, sign) = if o > 0 { (&self.up, 1i64) } else { (&self.down, -1i64) };
+        let (mut n, mut s, mut d) = (self.all.count, self.all.sum, 0i64);
+        for (h, t) in side[..m.min(CLIP_REACH)].iter().enumerate() {
+            n -= t.count;
+            s -= t.sum;
+            let oe = sign * h as i64;
+            d += t.count * oe * oe - 2 * oe * t.sum;
+        }
+        d + n * o * o - 2 * o * s
+    }
+
+    /// The offset this category would like, before the syntax's limits
+    /// and before clipping: the rounded mean error, which is the
+    /// minimiser of the unclipped `count*o^2 - 2*o*sum`.
+    fn best(&self) -> i64 {
+        if self.all.count == 0 {
+            return 0;
+        }
+        let (n, s) = (self.all.count, self.all.sum);
         if s >= 0 { (2 * s + n) / (2 * n) } else { -((-2 * s + n) / (2 * n)) }
     }
+
+    /// Whether any sample of this category is near enough to a rail for
+    /// some spellable offset to clip it.
+    fn near_a_rail(&self) -> bool {
+        self.dirty
+    }
+
+    /// The offset to take within `[lo, hi]`, and its exact `delta`.
+    ///
+    /// Where nothing clips, `delta` is the quadratic `best` minimises and
+    /// the rounded mean is taken outright, so the choice on such content
+    /// is unchanged by the clipping model. Where a sample could clip, the
+    /// quadratic is not the score any more and its minimiser is only a
+    /// starting point: every spellable offset is scored exactly and the
+    /// mean is kept unless one is strictly better.
+    fn choose(&self, lo: i64, hi: i64) -> (i64, i64) {
+        let mut o = self.best().clamp(lo, hi);
+        let mut d = self.delta(o);
+        if self.near_a_rail() {
+            for cand in lo..=hi {
+                let dc = self.delta(cand);
+                if dc < d {
+                    (o, d) = (cand, dc);
+                }
+            }
+        }
+        (o, d)
+    }
+}
+
+/// The category statistics of one pass — 32 bands, or the five edge
+/// categories of one class — owned by `sao_picture` for the whole picture
+/// and refilled by every pass, so that a `Cat`'s rail buckets are cleared
+/// only after a pass that used them (see [`Cat`]).
+#[derive(Default)]
+struct Stats {
+    bands: [Cat; 32],
+    edge: [Cat; 5],
 }
 
 /// The Lagrangian the SAO decision prices bins with — the intra module's
@@ -223,32 +358,30 @@ impl<S: Sample> Comp<'_, S> {
         d
     }
 
-    /// Band statistics: one bucket per band, `v >> shift` exactly as
-    /// `sao_ctb`'s table lookup indexes it.
-    fn band_stats(&self) -> [Cat; 32] {
-        let mut cats = [Cat::default(); 32];
+    /// Band statistics into `cats`: one bucket per band, `v >> shift`
+    /// exactly as `sao_ctb`'s table lookup indexes it.
+    fn band_stats(&self, cats: &mut [Cat; 32]) {
+        cats.iter_mut().for_each(Cat::clear);
         for y in self.y0..self.y0 + self.h {
             for x in self.x0..self.x0 + self.w {
-                let b = (self.rec_at(x, y) >> self.shift) as usize;
-                let c = &mut cats[b & 31];
-                c.count += 1;
-                c.sum += self.err_at(x, y);
+                let v = self.rec_at(x, y);
+                cats[((v >> self.shift) & 31) as usize].add(v, self.err_at(x, y), self.max);
             }
         }
-        cats
     }
 
-    /// Edge statistics for one class: five buckets by `edgeIdx`, skipping
-    /// samples the filter will not touch because a classifying neighbour
-    /// is unusable. `usable` is the caller's mirror of the filter's own.
-    fn edge_stats(&self, class: u8, usable: &dyn Fn(usize, usize, i32, i32) -> bool) -> [Cat; 5] {
+    /// Edge statistics for one class into `cats`: five buckets by
+    /// `edgeIdx`, skipping samples the filter will not touch because a
+    /// classifying neighbour is unusable. `usable` is the caller's mirror
+    /// of the filter's own.
+    fn edge_stats(&self, class: u8, usable: &dyn Fn(usize, usize, i32, i32) -> bool, cats: &mut [Cat; 5]) {
         let (hp, vp): ([i32; 2], [i32; 2]) = match class {
             0 => ([-1, 1], [0, 0]),
             1 => ([0, 0], [-1, 1]),
             2 => ([-1, 1], [-1, 1]),
             _ => ([1, -1], [-1, 1]),
         };
-        let mut cats = [Cat::default(); 5];
+        cats.iter_mut().for_each(Cat::clear);
         for y in self.y0..self.y0 + self.h {
             for x in self.x0..self.x0 + self.w {
                 let (xa, ya) = (x as i32 + hp[0], y as i32 + vp[0]);
@@ -260,27 +393,24 @@ impl<S: Sample> Comp<'_, S> {
                 let a = self.rec_at(xa as usize, ya as usize);
                 let b = self.rec_at(xb as usize, yb as usize);
                 let e = (2 + (v - a).signum() + (v - b).signum()) as usize;
-                cats[e].count += 1;
-                cats[e].sum += self.err_at(x, y);
+                cats[e].add(v, self.err_at(x, y), self.max);
             }
         }
-        cats
     }
 
     /// The best parameters for this component, and the SSD they achieve —
     /// against `ssd_off` as the do-nothing baseline.
-    fn decide(&self, cmax: i64, lam: f32, first_two: bool, usable: &dyn Fn(usize, usize, i32, i32) -> bool) -> (SaoParams, f32, i64) {
+    fn decide(&self, cmax: i64, lam: f32, first_two: bool, usable: &dyn Fn(usize, usize, i32, i32) -> bool, stats: &mut Stats) -> (SaoParams, f32, i64) {
         let base = self.ssd_off();
         let mut best = SaoParams::default();
         let mut best_cost = base as f32 + lam * bins_of(&best, cmax as u32, first_two) as f32;
         let mut best_dist = base;
 
         // Band: every one of the 32 wrapping four-band windows.
-        let bands = self.band_stats();
+        self.band_stats(&mut stats.bands);
         let mut per_band = [(0i64, 0i64); 32]; // (offset, delta)
-        for (b, c) in bands.iter().enumerate() {
-            let o = c.best().clamp(-cmax, cmax);
-            per_band[b] = (o, c.delta(o));
+        for (b, c) in stats.bands.iter().enumerate() {
+            per_band[b] = c.choose(-cmax, cmax);
         }
         for pos in 0..32usize {
             let mut p = SaoParams { type_idx: 1, band_or_class: pos as u8, offsets: [0; 4] };
@@ -309,17 +439,15 @@ impl<S: Sample> Comp<'_, S> {
         // so the clamp is one-sided and a category that wants the other
         // direction simply takes zero.
         for class in 0..4u8 {
-            let cats = self.edge_stats(class, usable);
+            self.edge_stats(class, usable, &mut stats.edge);
             let mut p = SaoParams { type_idx: 2, band_or_class: class, offsets: [0; 4] };
             let mut delta = 0i64;
             // off_tab order: categories 0, 1 take offsets 0, 1 (positive);
             // categories 3, 4 take offsets 2, 3 (negative). Category 2 has
             // no offset in the syntax at all.
             for (slot, cat) in [(0usize, 0usize), (1, 1), (2, 3), (3, 4)] {
-                let c = &cats[cat];
-                let want = c.best();
-                let o = if slot < 2 { want.clamp(0, cmax) } else { want.clamp(-cmax, 0) };
-                let d = c.delta(o);
+                let c = &stats.edge[cat];
+                let (o, d) = if slot < 2 { c.choose(0, cmax) } else { c.choose(-cmax, 0) };
                 if o != 0 && d < 0 {
                     p.offsets[slot] = o as i16;
                     delta += d;
@@ -341,7 +469,7 @@ impl<S: Sample> Comp<'_, S> {
     /// The SSD this component would have under someone else's parameters —
     /// what a merge candidate has to be scored on, since a merged CTB
     /// applies the neighbour's offsets to its own samples.
-    fn ssd_under(&self, p: &SaoParams, usable: &dyn Fn(usize, usize, i32, i32) -> bool) -> i64 {
+    fn ssd_under(&self, p: &SaoParams, usable: &dyn Fn(usize, usize, i32, i32) -> bool, stats: &mut Stats) -> i64 {
         let base = self.ssd_off();
         match p.type_idx {
             0 => base,
@@ -350,18 +478,18 @@ impl<S: Sample> Comp<'_, S> {
                 for k in 0..4 {
                     table[(k + p.band_or_class as usize) & 31] = p.offsets[k];
                 }
-                let bands = self.band_stats();
+                self.band_stats(&mut stats.bands);
                 let mut d = 0i64;
-                for (b, c) in bands.iter().enumerate() {
+                for (b, c) in stats.bands.iter().enumerate() {
                     d += c.delta(table[b] as i64);
                 }
                 base + d
             }
             _ => {
-                let cats = self.edge_stats(p.band_or_class, usable);
+                self.edge_stats(p.band_or_class, usable, &mut stats.edge);
                 let tab = [p.offsets[0] as i64, p.offsets[1] as i64, 0, p.offsets[2] as i64, p.offsets[3] as i64];
                 let mut d = 0i64;
-                for (i, c) in cats.iter().enumerate() {
+                for (i, c) in stats.edge.iter().enumerate() {
                     d += c.delta(tab[i]);
                 }
                 base + d
@@ -418,11 +546,12 @@ pub fn sao_picture<S: Sample>(
     let mut merges: Vec<Option<SaoMerge>> = vec![None; wc * hc];
     // What the decision believes the filtered picture's error will be,
     // per component. Every candidate is scored analytically, per category,
-    // and never by filtering — which is sound only if this module
-    // classifies samples exactly as `hevc::sao` does. The debug check at
-    // the end holds it to that.
-    #[cfg_attr(not(debug_assertions), allow(unused_mut, unused_variables))]
+    // and never by filtering — which is sound only if this module models
+    // `hevc::sao` exactly. The check at the end holds it to that.
     let mut predicted = [0i64; 3];
+    // The statistics of whichever pass ran last; boxed because it is most
+    // of a wasm page.
+    let mut stats = Box::new(Stats::default());
 
     for ry in 0..hc {
         for rx in 0..wc {
@@ -473,13 +602,13 @@ pub fn sao_picture<S: Sample>(
                     // constraint rather than picking a shape it cannot
                     // spell.
                     let fixed = own[1];
-                    let (p, cost, dist) = comp.decide_constrained(fixed.type_idx, fixed.band_or_class, cmax, lam, &u);
+                    let (p, cost, dist) = comp.decide_constrained(fixed.type_idx, fixed.band_or_class, cmax, lam, &u, &mut stats);
                     own[2] = p;
                     own_cost += cost;
                     own_dist[2] = dist;
                     continue;
                 }
-                let (p, cost, dist) = comp.decide(cmax, lam, true, &u);
+                let (p, cost, dist) = comp.decide(cmax, lam, true, &u, &mut stats);
                 own[c] = p;
                 own_cost += cost;
                 own_dist[c] = dist;
@@ -495,7 +624,7 @@ pub fn sao_picture<S: Sample>(
                 for (c, comp) in comps.iter().enumerate() {
                     let (pw, ph) = (comp.pw, comp.ph);
                     let u = move |x: usize, y: usize, xn: i32, yn: i32| usable(x, y, xn, yn, pw, ph);
-                    dist[c] = comp.ssd_under(&cand[c], &u);
+                    dist[c] = comp.ssd_under(&cand[c], &u, &mut stats);
                 }
                 // One or two merge bins, and nothing else.
                 let cost = dist.iter().sum::<i64>() as f32 + lam * if which == SaoMerge::Left { 1.0 } else { 2.0 };
@@ -523,49 +652,52 @@ pub fn sao_picture<S: Sample>(
         sao_ctb_row(ctx.dsp, recon, &src, &band, info, sps, pps, ry);
     }
 
+    let plan = SaoPlan { params, merges, predicted };
+
     // The decision scored every candidate analytically, never by
-    // filtering. That is only sound if this module classifies samples
-    // exactly as the filter above does, so in a debug build the two are
-    // compared for real: one pass over the picture, against the very
-    // prediction the choices were made on. A mismatch means the decision
-    // is choosing against a model of a filter that does not exist — a bug
-    // that produces legal streams and worse pictures, and that nothing
-    // else here would notice.
-    #[cfg(debug_assertions)]
-    {
-        let mut actual = [0i64; 3];
-        for c in 0..ncomp {
-            let (csw, csh) = if c == 0 { (1, 1) } else { (sw, sh) };
-            let (plane, src, stride) = match c {
-                0 => (&recon.y, src_y, y_stride),
-                1 => (&recon.cb, src_cb, c_stride),
-                _ => (&recon.cr, src_cr, c_stride),
-            };
-            let (pw, ph) = (recon.width / csw, recon.height / csh);
-            for y in 0..ph {
-                for x in 0..pw {
-                    let e = plane.data[plane.offset(x as isize, y as isize)].to_i32() as i64 - src[y * stride + x].to_i32() as i64;
-                    actual[c] += e * e;
-                }
+    // filtering. That is only sound if this module models the filter
+    // above exactly — classifies samples as it does, moves them as it
+    // does — so the two are compared for real, in every build: one pass
+    // over the picture, against the very prediction the choices were made
+    // on. A mismatch means the decision is choosing against a model of a
+    // filter that does not exist — a bug that produces legal streams and
+    // worse pictures, and that nothing else here would notice. The pass
+    // is a few operations per sample, one picture per picture, against
+    // the hundreds the coding decisions spend on each.
+    let mut actual = [0i64; 3];
+    for c in 0..ncomp {
+        let (csw, csh) = if c == 0 { (1, 1) } else { (sw, sh) };
+        let (plane, src, stride) = match c {
+            0 => (&recon.y, src_y, y_stride),
+            1 => (&recon.cb, src_cb, c_stride),
+            _ => (&recon.cr, src_cr, c_stride),
+        };
+        let (pw, ph) = (recon.width / csw, recon.height / csh);
+        for y in 0..ph {
+            let row = &plane.data[plane.offset(0, y as isize)..][..pw];
+            let src = &src[y * stride..][..pw];
+            for (r, s) in row.iter().zip(src) {
+                let e = r.to_i32() as i64 - s.to_i32() as i64;
+                actual[c] += e * e;
             }
         }
-        for c in 0..ncomp {
-            debug_assert_eq!(
-                actual[c], predicted[c],
-                "SAO component {c}: the decision predicted {} and the filter produced {} - the two classify samples differently",
-                predicted[c], actual[c]
-            );
-        }
+    }
+    for c in 0..ncomp {
+        assert_eq!(
+            actual[c], plan.predicted[c],
+            "SAO component {c}: the decision predicted {} and the filter produced {} - the two model the filter differently",
+            plan.predicted[c], actual[c]
+        );
     }
 
-    SaoPlan { params, merges }
+    plan
 }
 
 impl<S: Sample> Comp<'_, S> {
     /// [`Comp::decide`] with the type and class already fixed by another
     /// component — the Cr case, whose `sao_type_idx` and `sao_eo_class`
     /// come from Cb and whose four offsets are its own.
-    fn decide_constrained(&self, type_idx: u8, class: u8, cmax: i64, lam: f32, usable: &dyn Fn(usize, usize, i32, i32) -> bool) -> (SaoParams, f32, i64) {
+    fn decide_constrained(&self, type_idx: u8, class: u8, cmax: i64, lam: f32, usable: &dyn Fn(usize, usize, i32, i32) -> bool, stats: &mut Stats) -> (SaoParams, f32, i64) {
         let base = self.ssd_off();
         if type_idx == 0 {
             return (SaoParams::default(), base as f32, base);
@@ -573,23 +705,20 @@ impl<S: Sample> Comp<'_, S> {
         let mut p = SaoParams { type_idx, band_or_class: class, offsets: [0; 4] };
         let mut delta = 0i64;
         if type_idx == 1 {
-            let bands = self.band_stats();
+            self.band_stats(&mut stats.bands);
             for k in 0..4 {
-                let c = &bands[(class as usize + k) & 31];
-                let o = c.best().clamp(-cmax, cmax);
-                let d = c.delta(o);
+                let c = &stats.bands[(class as usize + k) & 31];
+                let (o, d) = c.choose(-cmax, cmax);
                 if o != 0 && d < 0 {
                     p.offsets[k] = o as i16;
                     delta += d;
                 }
             }
         } else {
-            let cats = self.edge_stats(class, usable);
+            self.edge_stats(class, usable, &mut stats.edge);
             for (slot, cat) in [(0usize, 0usize), (1, 1), (2, 3), (3, 4)] {
-                let c = &cats[cat];
-                let want = c.best();
-                let o = if slot < 2 { want.clamp(0, cmax) } else { want.clamp(-cmax, 0) };
-                let d = c.delta(o);
+                let c = &stats.edge[cat];
+                let (o, d) = if slot < 2 { c.choose(0, cmax) } else { c.choose(-cmax, 0) };
                 if o != 0 && d < 0 {
                     p.offsets[slot] = o as i16;
                     delta += d;
@@ -672,6 +801,14 @@ mod tests {
         /// window, which is what a band offset can undo and an edge offset
         /// cannot see at all.
         BandShift,
+        /// Errors of two sizes on a white picture: most samples come back
+        /// `amount` too low, every eighth on a diagonal lattice only two
+        /// too low. All of them share the top band, so the one band offset
+        /// that fixes the many overshoots the few — and the filter's clip
+        /// stops those at the rail. This is the content the model check
+        /// fired on: an offset model without the clip predicts an error
+        /// for the few that the filter never produces.
+        Rail,
     }
 
     fn scene(w: usize, h: usize, kind: Err_, amount: i32) -> Scene {
@@ -690,6 +827,7 @@ mod tests {
             match kind {
                 Err_::Ringing => (60 + ((x % 5) as i32 - 2) * 18 + ((y % 7) as i32 - 3) * 9).clamp(10, 245) as u8,
                 Err_::BandShift => (96 + ((x / 8 + y / 8) % 32) as i32 % 32).clamp(96, 127) as u8,
+                Err_::Rail => 255,
             }
         };
         let mut src_y = vec![0u8; w * h];
@@ -736,6 +874,9 @@ mod tests {
                         Err_::BandShift => {
                             if (96..=127).contains(&v) { amount } else { 0 }
                         }
+                        Err_::Rail => {
+                            if (x + y) % 8 == 0 { -2 } else { -amount }
+                        }
                     };
                     plane.data[o + y * stride + x] = (v + e).clamp(0, 255) as u8;
                 }
@@ -755,16 +896,99 @@ mod tests {
         }
         /// Luma SSD against the source, over the whole picture.
         fn ssd(&self) -> i64 {
-            let (o, stride) = (self.recon.y.origin(), self.recon.y.stride);
-            let mut d = 0i64;
-            for y in 0..self.h {
-                for x in 0..self.w {
-                    let e = self.recon.y.data[o + y * stride + x] as i64 - self.src_y[y * self.w + x] as i64;
-                    d += e * e;
-                }
-            }
-            d
+            self.ssd_all()[0]
         }
+        /// SSD against the source per component, over the whole picture —
+        /// the number `SaoPlan::predicted` claims to be.
+        fn ssd_all(&self) -> [i64; 3] {
+            let plane_ssd = |plane: &Plane16<u8>, src: &[u8], w: usize, h: usize| {
+                let (o, stride) = (plane.origin(), plane.stride);
+                let mut d = 0i64;
+                for y in 0..h {
+                    for x in 0..w {
+                        let e = plane.data[o + y * stride + x] as i64 - src[y * w + x] as i64;
+                        d += e * e;
+                    }
+                }
+                d
+            };
+            let (w, h) = (self.w, self.h);
+            [
+                plane_ssd(&self.recon.y, &self.src_y, w, h),
+                plane_ssd(&self.recon.cb, &self.src_cb, w / 2, h / 2),
+                plane_ssd(&self.recon.cr, &self.src_cr, w / 2, h / 2),
+            ]
+        }
+    }
+
+    /// `Cat::delta` must be the filter's arithmetic, clip included: the
+    /// change in SSD from writing `clip(r + o)` over every sample of the
+    /// category, computed here the slow way, one sample at a time, at
+    /// every depth the encoder writes and every offset the syntax spells.
+    /// The model this replaced scored `count*o^2 - 2*o*sum`, which is the
+    /// same number only while no sample sits within `|o|` of a rail; here
+    /// a quarter of the samples hug each rail, so any offset beyond the
+    /// nearest of them clips and the two part company.
+    #[test]
+    fn the_category_model_is_the_clipped_filter_exactly() {
+        for max in [255i32, 1023, 4095] {
+            // Fixed pseudo-random content, so a failure names one case.
+            let mut seed = 0x2545_F491u32;
+            let mut next = || {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                (seed >> 8) as i32
+            };
+            let mut cat = Cat::default();
+            let mut samples = Vec::new();
+            for i in 0..400 {
+                let r = match i % 4 {
+                    0 => next().rem_euclid(40),
+                    1 => max - next().rem_euclid(40),
+                    _ => next().rem_euclid(max + 1),
+                };
+                let s = (r + next().rem_euclid(81) - 40).clamp(0, max);
+                cat.add(r, (s - r) as i64, max);
+                samples.push((r as i64, s as i64));
+            }
+            let mut clipped = 0usize;
+            for o in -(CLIP_REACH as i64)..=CLIP_REACH as i64 {
+                let slow: i64 = samples
+                    .iter()
+                    .map(|&(r, s)| {
+                        let f = (r + o).clamp(0, max as i64);
+                        clipped += usize::from(f != r + o);
+                        (f - s) * (f - s) - (r - s) * (r - s)
+                    })
+                    .sum();
+                assert_eq!(cat.delta(o), slow, "max {max}, offset {o}");
+            }
+            assert!(clipped > 0, "max {max}: no sample was ever clipped, so the agreement above is the old model's too");
+        }
+    }
+
+    /// The model check on content at the rails, in both build profiles:
+    /// `SaoPlan::predicted` is the SSD every choice was priced on, and it
+    /// must be what the filter then produced. The scene puts every sample
+    /// within seven of white and rewards an offset that pushes some of
+    /// them past it; a category model without the clip — the one this
+    /// replaced — predicts sixteen units of error for each of those where
+    /// the filter leaves zero, and this fails (at `sao_picture`'s own
+    /// check first, which runs in every build).
+    #[test]
+    fn the_prediction_survives_the_filters_clip_at_the_rail() {
+        let kit = Kit::new();
+        let ctx = kit.ctx(30);
+        let mut sc = scene(64, 64, Err_::Rail, 7);
+        let before = sc.ssd();
+        let plan = sc.run(&ctx);
+        assert!(sc.ssd() < before, "SAO made the white picture worse ({before} -> {})", sc.ssd());
+        assert_eq!(plan.predicted, sc.ssd_all(), "the decision's predicted SSD is not what the filter produced");
+        // The guard against a vacuous agreement: the scene is only a test
+        // of the clip if an offset that reaches past the rail was taken —
+        // three or more on band 31, where every sample of the picture sits
+        // and the lattice samples have two of room.
+        let clipping = plan.params.iter().any(|p| p[0].type_idx == 1 && (0..4).any(|k| (p[0].band_or_class as usize + k) & 31 == 31 && p[0].offsets[k] >= 3));
+        assert!(clipping, "no luma band offset of three or more reached band 31, so nothing was clipped");
     }
 
     /// The property that matters: SAO must leave the picture closer to the
