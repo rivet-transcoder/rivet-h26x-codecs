@@ -605,12 +605,6 @@ fn spawn_substream<S: Sample>(pic: &Arc<PicShared<S>>, seg: &Arc<Segment>, sub: 
         return;
     }
     pic.tasks_submitted.fetch_add(1, Ordering::AcqRel);
-    // Queued in order: FIFO position = dependency order (see Pool).
-    seg.spawned.fetch_add(1, Ordering::AcqRel);
-    {
-        let _g = pic.lock.lock().unwrap();
-        pic.cv.notify_all();
-    }
     let pic_arc = pic.clone();
     let seg_arc = seg.clone();
     let last = sub + 1 == seg.substreams.len();
@@ -636,9 +630,28 @@ fn spawn_substream<S: Sample>(pic: &Arc<PicShared<S>>, seg: &Arc<Segment>, sub: 
             pic_arc.warnings.fetch_add(1, Ordering::Relaxed);
         }
     };
+    #[cfg(test)]
+    {
+        let us = hang_hook::STALL_US.load(Ordering::Relaxed);
+        if us > 0 {
+            std::thread::sleep(std::time::Duration::from_micros(us));
+        }
+    }
     match &pic.pool {
         Some(pool) => pool.spawn(Box::new(job)),
         None => pic.inline_queue.lock().unwrap().push_back(Box::new(job)),
+    }
+    // Counted only once the job is in the queue. `slice_nal` reads `spawned`
+    // to know the whole segment is queued before it queues the next one, and
+    // that FIFO position is what puts a task's dependencies ahead of it.
+    // Counting before the push let the main thread, woken by this notify,
+    // queue every following segment ahead of this row while the worker was
+    // preempted between the count and the push; every worker then blocked on
+    // a CTB whose task sat at the back of the queue (WPP_C under load).
+    seg.spawned.fetch_add(1, Ordering::AcqRel);
+    {
+        let _g = pic.lock.lock().unwrap();
+        pic.cv.notify_all();
     }
 }
 
@@ -1514,6 +1527,98 @@ impl HevcDecoder {
         match &mut self.inner {
             Some(inner) => with_inner!(inner, d => d.try_next_picture()),
             None => None,
+        }
+    }
+}
+
+/// Test-only: widens the window between a worker pushing a substream's job
+/// and the count `slice_nal`'s FIFO gate reads, so `wpp_gate_tests` meets the
+/// ordering every run instead of once in a few hundred loaded runs.
+#[cfg(test)]
+pub(crate) mod hang_hook {
+    /// Microseconds `spawn_substream` sleeps before pushing a job (0 = off).
+    pub static STALL_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+}
+
+#[cfg(test)]
+mod wpp_gate_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// WPP_C_ericsson_MAIN10_2 (JCT-VC HEVC_v1): wavefront rows plus the
+    /// maximum number of one- and two-CTU slice segments per picture — the
+    /// stream that hung `verify.sh` under load. The suites are fetched, not
+    /// vendored (see tests/decode.rs), so this looks under `H26X_WORK` and
+    /// the fetcher's own directory, and skips when neither has it.
+    fn wpp_c() -> Option<Arc<Vec<u8>>> {
+        let rel = "WPP_C_ericsson_MAIN10_2/WPP_C_ericsson_MAIN10_2.bit";
+        let mut paths = Vec::new();
+        if let Ok(w) = std::env::var("H26X_WORK") {
+            paths.push(format!("{w}/conf/hevc/streams/{rel}"));
+        }
+        paths.push(format!("{}/tools/conformance/hevc/streams/{rel}", env!("CARGO_MANIFEST_DIR")));
+        for p in &paths {
+            if let Ok(d) = std::fs::read(p) {
+                return Some(Arc::new(d));
+            }
+        }
+        eprintln!("skipped: {rel} not found (set H26X_WORK to the directory holding conf/)");
+        None
+    }
+
+    fn fold(pic: Picture, frames: &mut usize, hash: &mut u64) {
+        for b in pic.into_packed() {
+            *hash ^= b as u64;
+            *hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+        *frames += 1;
+    }
+
+    /// Decode on another thread: (frames, hash of every output byte,
+    /// warnings), or `None` when it has not finished within `limit` — a hang,
+    /// not a wait, since the stream decodes in well under a second.
+    fn decode_or_hang(data: &Arc<Vec<u8>>, threads: usize, limit: Duration) -> Option<(usize, u64, u64)> {
+        let data = data.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut dec = HevcDecoder::with_threads(threads);
+            let (mut frames, mut hash) = (0usize, 0xcbf2_9ce4_8422_2325u64);
+            for nal in annexb_nals(&data) {
+                dec.push_nal(nal).expect("conformance stream");
+                while let Some(p) = dec.try_next_picture() {
+                    fold(p, &mut frames, &mut hash);
+                }
+            }
+            dec.flush().expect("flush");
+            while let Some(p) = dec.next_picture() {
+                fold(p, &mut frames, &mut hash);
+            }
+            let _ = tx.send((frames, hash, dec.warnings()));
+        });
+        rx.recv_timeout(limit).ok()
+    }
+
+    /// A segment's tasks must sit behind every row of the segment before it
+    /// in the pool's FIFO: the gate in `slice_nal` waits for the previous
+    /// segment's rows to be *counted*, and a row counted before it was
+    /// pushed let the main thread queue the fifteen one-CTU segments of the
+    /// next rows ahead of it — every worker then waited on a CTB whose task
+    /// was last in the queue. With the stall widening that window the old
+    /// order hangs on the first such picture, every run.
+    #[test]
+    fn a_segment_is_queued_only_behind_every_row_of_the_one_before() {
+        let Some(data) = wpp_c() else { return };
+        let limit = Duration::from_secs(120);
+        let reference = decode_or_hang(&data, 1, limit).expect("single-threaded decode finished");
+        assert_eq!((reference.0, reference.2), (48, 0));
+        hang_hook::STALL_US.store(2000, Ordering::Relaxed);
+        let widened = decode_or_hang(&data, 4, limit);
+        hang_hook::STALL_US.store(0, Ordering::Relaxed);
+        assert_eq!(widened, Some(reference), "hung or differed with the spawn window widened: a later segment's task ran ahead of the row it waits on");
+        // The bare race, at the runner's worker counts.
+        for (i, threads) in [4, 12, 4, 12, 4, 12, 4, 12].into_iter().enumerate() {
+            assert_eq!(decode_or_hang(&data, threads, limit), Some(reference), "run {i} at {threads} threads");
         }
     }
 }
