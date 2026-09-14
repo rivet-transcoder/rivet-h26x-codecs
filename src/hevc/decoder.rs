@@ -68,6 +68,15 @@ struct Segment {
     finished: AtomicBool,
 }
 
+/// What a blocked task waits for.
+#[derive(Clone)]
+enum WaitOn {
+    /// A CTB (raster address) of this picture to be decoded.
+    Ctb(usize),
+    /// A slice segment to have run to its end.
+    Segment(Arc<Segment>),
+}
+
 /// The state of a picture being decoded, shared by its tasks.
 struct PicShared<S: Sample> {
     frame: Arc<SharedFrame<S>>,
@@ -93,6 +102,10 @@ struct PicShared<S: Sample> {
     parallel: bool,
     /// The main thread has sent everything.
     closed: AtomicBool,
+    /// A task of the closed picture has waited on lost data (see
+    /// `blocking_wait`): every further wait on something not yet decoded
+    /// fails at once instead of re-establishing the same verdict.
+    lost: AtomicBool,
     /// The tail (last filter rows, completion) has been run.
     tail_done: AtomicBool,
     /// Per CTB row: contexts after its second CTB (WPP storage).
@@ -132,6 +145,9 @@ struct PicShared<S: Sample> {
     created: prof::At,
     /// When its first CTB was decoded (profiling).
     first_ctb: Mutex<prof::At>,
+    /// Test-only: the hooks may act on this picture (see `hang_hook::ARMED`).
+    #[cfg(test)]
+    hang_hooks: bool,
 }
 
 // SAFETY: `info` and the frame are written by tasks in disjoint CTB regions
@@ -184,9 +200,11 @@ impl<S: Sample> PicShared<S> {
         }
     }
 
-    fn wait_ctb(&self, addr: usize) {
-        if self.ctb_done[addr].load(Ordering::Acquire) || !self.parallel {
-            return;
+    /// Wait for CTB `addr` of this picture. An error means it will never be
+    /// decoded (lost data): nothing that could produce it can run.
+    fn wait_ctb(pic: &Arc<Self>, addr: usize) -> Result<()> {
+        if pic.ctb_done[addr].load(Ordering::Acquire) || !pic.parallel {
+            return Ok(());
         }
         struct T(prof::At);
         impl Drop for T {
@@ -195,80 +213,143 @@ impl<S: Sample> PicShared<S> {
             }
         }
         let _t = T(prof::at());
+        // Test-only: the stalled-sleeper test wants the last rows' waits
+        // (on the row above them) to block instead of spinning.
+        #[cfg(test)]
+        let spin = !pic.hang_hooks || hang_hook::WAKE_STALL_US.load(Ordering::Relaxed) == 0 || addr / pic.wc + 3 < pic.row_ctbs.len();
+        #[cfg(not(test))]
+        let spin = true;
         // Spin briefly: the producer is usually one CTB away.
         let start = std::time::Instant::now();
-        loop {
+        while spin {
             for _ in 0..64 {
                 std::hint::spin_loop();
             }
-            if self.ctb_done[addr].load(Ordering::Acquire) {
-                return;
+            if pic.ctb_done[addr].load(Ordering::Acquire) {
+                return Ok(());
             }
             if start.elapsed() > std::time::Duration::from_micros(15) {
                 break;
             }
         }
-        self.blocking_wait(|| self.ctb_done[addr].load(Ordering::Acquire));
+        if Self::blocking_wait(pic, WaitOn::Ctb(addr)) {
+            Ok(())
+        } else {
+            Err(Error::bitstream(format!("CTB {addr} (row {}, column {}) was never decoded: nothing that could produce it can run (lost data)", addr / pic.wc, addr % pic.wc)))
+        }
     }
 
-    /// Block until `ready()`, or until the picture is closed and every
-    /// remaining task is blocked too (lost data: nobody will produce what we
-    /// wait for — proceed, the missing blocks read as undecoded).
-    fn blocking_wait(&self, ready: impl Fn() -> bool) {
-        let mut g = self.lock.lock().unwrap();
-        self.tasks_waiting.fetch_add(1, Ordering::AcqRel);
-        // A waiter that has just been satisfied is still counted until it
-        // wakes, so "everyone is blocked" is only believed after it has held
-        // continuously for a while (real progress satisfies someone quickly).
-        let mut stuck_since: Option<std::time::Instant> = None;
-        loop {
-            if ready() {
-                break;
+    fn satisfied(&self, on: &WaitOn) -> bool {
+        match on {
+            WaitOn::Ctb(addr) => self.ctb_done[*addr].load(Ordering::Acquire),
+            WaitOn::Segment(seg) => seg.finished.load(Ordering::Acquire),
+        }
+    }
+
+    /// Block until `on` is satisfied (true), or until nothing can ever
+    /// satisfy it (false: lost data — the caller fails rather than decode
+    /// from blocks that were never written).
+    ///
+    /// That verdict needs the picture closed, no task able to run — every
+    /// unfinished task of the picture blocked, or every worker of the pool
+    /// blocked so that queued tasks never start — and no blocked task's
+    /// wait satisfiable. The last is read from what each waits for, not
+    /// from how long it has been counted as blocked: a task that was
+    /// satisfied but not yet scheduled stays counted, and under a heavily
+    /// oversubscribed machine that lasts longer than any timer — a waiter
+    /// that gave up on it would decode from blocks it was about to write.
+    fn blocking_wait(pic: &Arc<Self>, on: WaitOn) -> bool {
+        let pool = pic.pool.as_ref().expect("blocking waits happen on the pool");
+        let mut g = pic.lock.lock().unwrap();
+        pic.tasks_waiting.fetch_add(1, Ordering::AcqRel);
+        let id = pool.register_wait(Box::new({
+            let (p, on) = (pic.clone(), on.clone());
+            move || p.satisfied(&on)
+        }));
+        #[cfg(test)]
+        {
+            // Test-only: a task on the picture's second-to-last row, waiting
+            // on the row above it, that the scheduler leaves asleep — counted,
+            // its dependency arriving meanwhile — for longer than the
+            // lost-data verdict takes, while the last row's tasks, waiting on
+            // it, judge (`wpp_gate_tests`).
+            let us = hang_hook::WAKE_STALL_US.load(Ordering::Relaxed);
+            let stall_row = matches!(on, WaitOn::Ctb(a) if a / pic.wc + 3 == pic.row_ctbs.len());
+            if pic.hang_hooks && us > 0 && stall_row && hang_hook::WAKE_STALL_BUDGET.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| b.checked_sub(1)).is_ok() {
+                drop(g);
+                std::thread::sleep(std::time::Duration::from_micros(us));
+                g = pic.lock.lock().unwrap();
             }
-            let closed = self.closed.load(Ordering::Acquire);
-            let submitted = self.tasks_submitted.load(Ordering::Acquire);
-            let finished = self.tasks_finished.load(Ordering::Acquire);
-            let waiting = self.tasks_waiting.load(Ordering::Acquire);
-            if closed && finished + waiting >= submitted {
-                let since = *stuck_since.get_or_insert_with(std::time::Instant::now);
-                if since.elapsed() > std::time::Duration::from_millis(200) {
-                    break;
-                }
-                let (g2, _) = self.cv.wait_timeout(g, std::time::Duration::from_millis(50)).unwrap();
-                g = g2;
+        }
+        // Held for a moment before it is believed: a task between being
+        // counted and being queued, or between finishing and its successor
+        // starting, looks like nothing running.
+        let mut stuck_since: Option<std::time::Instant> = None;
+        let satisfied = loop {
+            if pic.satisfied(&on) {
+                break true;
+            }
+            let closed = pic.closed.load(Ordering::Acquire);
+            let submitted = pic.tasks_submitted.load(Ordering::Acquire);
+            let finished = pic.tasks_finished.load(Ordering::Acquire);
+            let waiting = pic.tasks_waiting.load(Ordering::Acquire);
+            let nothing_runs = finished + waiting >= submitted || pool.blocked() >= pool.threads();
+            if !closed {
+                // Open: whatever we wait for is produced by this picture's
+                // own tasks, which announce it on this condvar.
+                stuck_since = None;
+                g = pic.cv.wait(g).unwrap();
                 continue;
             }
-            stuck_since = None;
-            g = self.cv.wait(g).unwrap();
-        }
-        self.tasks_waiting.fetch_sub(1, Ordering::AcqRel);
-        self.cv.notify_all();
+            if pic.lost.load(Ordering::Acquire) {
+                break false;
+            }
+            if nothing_runs && !pool.any_wait_satisfiable() {
+                let since = *stuck_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() > std::time::Duration::from_millis(200) {
+                    pic.lost.store(true, Ordering::Release);
+                    break false;
+                }
+            } else {
+                stuck_since = None;
+            }
+            // Closed: the verdict also depends on the pool and on other
+            // pictures' tasks, whose changes are not announced here — poll.
+            let (g2, _) = pic.cv.wait_timeout(g, std::time::Duration::from_millis(50)).unwrap();
+            g = g2;
+        };
+        pool.unregister_wait(id);
+        pic.tasks_waiting.fetch_sub(1, Ordering::AcqRel);
+        pic.cv.notify_all();
+        satisfied
     }
 
     /// Wait for the CTBs a CTB at `(rx, ry)` may read: left, above,
     /// above-right, above-left — when they are in the same tile.
-    fn wait_neighbours(&self, rx: usize, ry: usize) {
-        let info = unsafe { self.info() };
+    fn wait_neighbours(pic: &Arc<Self>, rx: usize, ry: usize) -> Result<()> {
+        let info = unsafe { pic.info() };
         let wc = info.wc;
         let addr = ry * wc + rx;
         let tile = info.ctb_tile[addr];
-        let need = |a: usize| {
+        let need = |a: usize| -> Result<()> {
             if info.ctb_tile[a] == tile {
-                self.wait_ctb(a);
+                Self::wait_ctb(pic, a)?;
             }
+            Ok(())
         };
         if ry > 0 {
             if rx + 1 < wc {
-                need(addr - wc + 1);
+                need(addr - wc + 1)?;
             }
-            need(addr - wc);
+            need(addr - wc)?;
             if rx > 0 {
-                need(addr - wc - 1);
+                need(addr - wc - 1)?;
             }
         }
         if rx > 0 {
-            need(addr - 1);
+            need(addr - 1)?;
         }
+        Ok(())
     }
 
     /// A row completed: filter every complete row in order, unless another
@@ -369,6 +450,10 @@ fn run_substream<S: Sample>(pic_arc: &Arc<PicShared<S>>, seg_arc: &Arc<Segment>,
     let Some(&(start_rs, _)) = seg.starts.get(sub) else {
         return Err(Error::bitstream("entry point beyond the picture"));
     };
+    #[cfg(test)]
+    if pic.hang_hooks && start_rs == hang_hook::FAIL_SUBSTREAM_AT.load(Ordering::Relaxed) {
+        return Err(Error::bitstream("test: injected substream failure"));
+    }
     let mut ctb_addr_rs = start_rs;
     let mut ctb_addr_ts = info.ctb_rs_to_ts[ctb_addr_rs] as usize;
     let Some(&data_start) = seg.substreams.get(sub) else {
@@ -437,7 +522,7 @@ fn run_substream<S: Sample>(pic_arc: &Arc<PicShared<S>>, seg_arc: &Arc<Segment>,
         // WPP: the row above must have passed its second CTB (we wait for
         // above-right anyway before the first CTB; do it now to read the
         // stored contexts).
-        if let Some(saved) = wpp_sync_source(pic, info, ctb_addr_rs, slice_addr) {
+        if let Some(saved) = wpp_sync_source(pic_arc, info, ctb_addr_rs, slice_addr)? {
             cx = saved;
         }
     } else if hdr.dependent && sub == 0 {
@@ -448,7 +533,7 @@ fn run_substream<S: Sample>(pic_arc: &Arc<PicShared<S>>, seg_arc: &Arc<Segment>,
             if idx > 0 { Some(segs[idx - 1].clone()) } else { None }
         };
         if let Some(prev) = prev {
-            wait_segment(pic, &prev);
+            wait_segment(pic_arc, &prev)?;
             if let Some((c, q)) = prev.end_state.lock().unwrap().clone() {
                 cx = c;
                 qp_prev_init = q;
@@ -507,7 +592,7 @@ fn run_substream<S: Sample>(pic_arc: &Arc<PicShared<S>>, seg_arc: &Arc<Segment>,
         loop {
             let rx = ctb_addr_rs % wc;
             let ry = ctb_addr_rs / wc;
-            pic.wait_neighbours(rx, ry);
+            PicShared::wait_neighbours(pic_arc, rx, ry)?;
             let t_dec = prof::at();
             if t_dec.is_some() {
                 let mut f = pic.first_ctb.lock().unwrap();
@@ -628,12 +713,21 @@ fn spawn_substream<S: Sample>(pic: &Arc<PicShared<S>>, seg: &Arc<Segment>, sub: 
             }
             pic_arc.frame.progress.error.store(true, Ordering::Relaxed);
             pic_arc.warnings.fetch_add(1, Ordering::Relaxed);
+            // Queue the rest of the segment: its rows block on CTBs that
+            // will never come and fail the same way once the picture is
+            // closed. Redundant with the gate in `slice_nal`, which stops
+            // waiting for rows that are never queued on the same lost-data
+            // verdict: the failed-substream test passes without this loop
+            // (measured 2026-09-13: 17.6 s without it, 20.8 s with it).
+            for s in sub + 1..seg_arc.submitted.len() {
+                spawn_substream(&pic_arc, &seg_arc, s);
+            }
         }
     };
     #[cfg(test)]
     {
         let us = hang_hook::STALL_US.load(Ordering::Relaxed);
-        if us > 0 {
+        if pic.hang_hooks && us > 0 {
             std::thread::sleep(std::time::Duration::from_micros(us));
         }
     }
@@ -694,27 +788,27 @@ fn drain_inline<S: Sample>(pic: &PicShared<S>) {
 /// The WPP synchronisation source for the first CTB of a row: the contexts
 /// stored after the second CTB of the row above, if that CTB is in the same
 /// slice and tile.
-fn wpp_sync_source<S: Sample>(pic: &PicShared<S>, info: &PicInfo, ctb_addr_rs: usize, slice_addr: u32) -> Option<Contexts> {
+fn wpp_sync_source<S: Sample>(pic: &Arc<PicShared<S>>, info: &PicInfo, ctb_addr_rs: usize, slice_addr: u32) -> Result<Option<Contexts>> {
     let wc = info.wc;
     let row = ctb_addr_rs / wc;
     if row == 0 {
-        return None;
+        return Ok(None);
     }
     let above_right = ctb_addr_rs + 1 - wc;
     if above_right / wc != row - 1 {
-        return None;
+        return Ok(None);
     }
     // Availability needs the CTB decoded; wait for it (it precedes us).
     if info.ctb_tile[above_right] != info.ctb_tile[ctb_addr_rs] {
-        return None;
+        return Ok(None);
     }
-    pic.wait_ctb(above_right);
+    PicShared::wait_ctb(pic, above_right)?;
     if info.ctb_slice_addr[above_right] != slice_addr {
-        return None;
+        return Ok(None);
     }
     // SAFETY: written by the row above before it published that CTB.
     let col = tile_col_idx(&pic.pps, ctb_addr_rs % wc);
-    unsafe { (*pic.wpp_ctx[(row - 1) * pic.wpp_cols + col].get()).clone() }
+    Ok(unsafe { (*pic.wpp_ctx[(row - 1) * pic.wpp_cols + col].get()).clone() })
 }
 
 /// The tile column holding CTB column `rx`.
@@ -728,11 +822,17 @@ fn tile_col_idx(pps: &Pps, rx: usize) -> usize {
     idx
 }
 
-fn wait_segment<S: Sample>(pic: &PicShared<S>, seg: &Segment) {
+/// Wait for `seg` to run to its end (a dependent segment continues its
+/// state); an error means it never will (lost data).
+fn wait_segment<S: Sample>(pic: &Arc<PicShared<S>>, seg: &Arc<Segment>) -> Result<()> {
     if seg.finished.load(Ordering::Acquire) || !pic.parallel {
-        return;
+        return Ok(());
     }
-    pic.blocking_wait(|| seg.finished.load(Ordering::Acquire));
+    if PicShared::blocking_wait(pic, WaitOn::Segment(seg.clone())) {
+        Ok(())
+    } else {
+        Err(Error::bitstream(format!("slice segment at CTB {} never ran to its end: nothing that could finish it can run (lost data)", seg.hdr.segment_address)))
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -914,6 +1014,9 @@ pub(crate) struct HevcDecoderImpl<S: Sample> {
     output_pool: crate::picture::OutputPool,
     /// Recycled per-picture side data.
     info_pool: PicInfoPool,
+    /// Test-only: created on a thread with `hang_hook::ARMED` set.
+    #[cfg(test)]
+    hang_hooks: bool,
 }
 
 /// What the geometry tables depend on.
@@ -961,6 +1064,8 @@ impl<S: Sample> HevcDecoderImpl<S> {
             max_in_flight: std::env::var("H26X_INFLIGHT").ok().and_then(|v| v.parse().ok()).unwrap_or(threads.clamp(2, 16)),
             output_pool: crate::picture::OutputPool::default(),
             info_pool: PicInfoPool::default(),
+            #[cfg(test)]
+            hang_hooks: hang_hook::ARMED.with(|a| a.get()),
         }
     }
 
@@ -1183,11 +1288,30 @@ impl<S: Sample> HevcDecoderImpl<S> {
             let n = prev_seg.substreams.len().min(prev_seg.starts.len());
             if prev_seg.spawned.load(Ordering::Acquire) < n {
                 let mut g = prev_pic.lock.lock().unwrap();
+                let mut stuck_since: Option<std::time::Instant> = None;
                 while prev_seg.spawned.load(Ordering::Acquire) < n {
                     // If its rows can no longer be spawned (lost data), stop
                     // waiting once the picture is finished.
                     if prev_pic.frame.progress.is_complete() {
                         break;
+                    }
+                    // Its rows are queued by the rows above as those decode.
+                    // When every task of the picture is finished or blocked
+                    // (or every worker is) and nothing any blocked task waits
+                    // for can be produced, they never will be — and the
+                    // picture cannot be closed from here, so its blocked tasks
+                    // cannot even fail. Stop waiting: the picture completes
+                    // without those rows, its blocked tasks fail once it is
+                    // closed, and the failures are counted.
+                    let all_blocked = prev_pic.tasks_finished.load(Ordering::Acquire) + prev_pic.tasks_waiting.load(Ordering::Acquire) >= prev_pic.tasks_submitted.load(Ordering::Acquire);
+                    let nothing_runs = self.tasks.as_ref().is_some_and(|p| (all_blocked || p.blocked() >= p.threads()) && !p.any_wait_satisfiable());
+                    if nothing_runs {
+                        let since = *stuck_since.get_or_insert_with(std::time::Instant::now);
+                        if since.elapsed() > std::time::Duration::from_millis(200) {
+                            break;
+                        }
+                    } else {
+                        stuck_since = None;
                     }
                     let (g2, _) = prev_pic.cv.wait_timeout(g, std::time::Duration::from_millis(5)).unwrap();
                     g = g2;
@@ -1320,6 +1444,7 @@ impl<S: Sample> HevcDecoderImpl<S> {
             tasks_waiting: AtomicUsize::new(0),
             parallel: self.tasks.is_some(),
             closed: AtomicBool::new(false),
+            lost: AtomicBool::new(false),
             tail_done: AtomicBool::new(false),
             wpp_cols,
             wpp_ctx: (0..hc * wpp_cols).map(|_| UnsafeCell::new(None)).collect(),
@@ -1341,6 +1466,8 @@ impl<S: Sample> HevcDecoderImpl<S> {
             warnings: self.warnings.clone(),
             created: prof::at(),
             first_ctb: Mutex::new(None),
+            #[cfg(test)]
+            hang_hooks: self.hang_hooks,
         });
         self.cur = Some(Current { id, pic_output, shared: pic, independent: None, slice_count: 0, buffers_ready: false });
         self.decode_index += 1;
@@ -1534,10 +1661,34 @@ impl HevcDecoder {
 /// Test-only: widens the window between a worker pushing a substream's job
 /// and the count `slice_nal`'s FIFO gate reads, so `wpp_gate_tests` meets the
 /// ordering every run instead of once in a few hundred loaded runs.
+///
+/// The hooks act only on decoders created on a thread that set `ARMED`.
+/// The test binary runs every other test beside `wpp_gate_tests`: while
+/// they were process-wide, an encoder round trip whose substream at CTB 0
+/// failed on the failed-substream test's injection decoded to zeros.
 #[cfg(test)]
 pub(crate) mod hang_hook {
     /// Microseconds `spawn_substream` sleeps before pushing a job (0 = off).
     pub static STALL_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// Microseconds a second-to-last-row task's `blocking_wait` on the row
+    /// above sleeps on entry — counted as waiting, its dependency free to
+    /// arrive — while the last row's tasks, waiting on it, judge whether
+    /// everyone is stuck (0 = off; the last rows' waits also skip their spin
+    /// so that they block).
+    pub static WAKE_STALL_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// How many such stalls remain (each costs `WAKE_STALL_US`).
+    pub static WAKE_STALL_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// Raster address at which every substream starting there fails before
+    /// decoding anything (`usize::MAX` = off): lost data, injected.
+    pub static FAIL_SUBSTREAM_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+    /// Every armed decoder in the process reads the same values: tests that
+    /// set them run one at a time.
+    pub static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    thread_local! {
+        /// Set on a thread before it creates a decoder the hooks may act on
+        /// (`wpp_gate_tests`' decode threads); every other decoder ignores them.
+        pub static ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
 }
 
 #[cfg(test)]
@@ -1582,6 +1733,7 @@ mod wpp_gate_tests {
         let data = data.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
+            hang_hook::ARMED.with(|a| a.set(true));
             let mut dec = HevcDecoder::with_threads(threads);
             let (mut frames, mut hash) = (0usize, 0xcbf2_9ce4_8422_2325u64);
             for nal in annexb_nals(&data) {
@@ -1609,6 +1761,7 @@ mod wpp_gate_tests {
     #[test]
     fn a_segment_is_queued_only_behind_every_row_of_the_one_before() {
         let Some(data) = wpp_c() else { return };
+        let _serial = hang_hook::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let limit = Duration::from_secs(120);
         let reference = decode_or_hang(&data, 1, limit).expect("single-threaded decode finished");
         assert_eq!((reference.0, reference.2), (48, 0));
@@ -1620,5 +1773,48 @@ mod wpp_gate_tests {
         for (i, threads) in [4, 12, 4, 12, 4, 12, 4, 12].into_iter().enumerate() {
             assert_eq!(decode_or_hang(&data, threads, limit), Some(reference), "run {i} at {threads} threads");
         }
+    }
+
+    /// The lost-data verdict must not be reached while a waiter is satisfied
+    /// but not yet awake. A timer cannot tell that apart from "nobody will
+    /// ever produce it" — under an oversubscribed machine the sleeper stays
+    /// counted as waiting for longer than any timer, and a neighbour that
+    /// gave up would decode from blocks the sleeper was about to write. With
+    /// wake-ups in the last rows stalled well past the 200 ms the verdict
+    /// takes, the output must still match the single-threaded decode
+    /// exactly, with no warning.
+    #[test]
+    fn a_satisfied_sleeper_is_not_mistaken_for_lost_data() {
+        let Some(data) = wpp_c() else { return };
+        let _serial = hang_hook::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let limit = Duration::from_secs(120);
+        let reference = decode_or_hang(&data, 1, limit).expect("single-threaded decode finished");
+        assert_eq!((reference.0, reference.2), (48, 0));
+        hang_hook::WAKE_STALL_BUDGET.store(40, Ordering::Relaxed);
+        hang_hook::WAKE_STALL_US.store(1_000_000, Ordering::Relaxed);
+        let stalled = decode_or_hang(&data, 4, limit);
+        hang_hook::WAKE_STALL_US.store(0, Ordering::Relaxed);
+        let stalls = 40 - hang_hook::WAKE_STALL_BUDGET.swap(0, Ordering::Relaxed);
+        assert!(stalls >= 8, "only {stalls} stalls happened: the hook no longer reaches the blocking waits");
+        assert_eq!(stalled, Some(reference), "a waiter gave up on a CTB its sleeping neighbour was about to decode");
+    }
+
+    /// Lost data must end in errors, never in a hang: when every substream
+    /// starting at CTB 0 fails before decoding, the rows it would have queued
+    /// still have to reach the pool (or `slice_nal` waits forever for the
+    /// segment to be fully queued, with the picture still open), and their
+    /// waits on CTBs nobody will decode must give up once the picture is
+    /// closed. The decode then finishes with every picture output and the
+    /// failures counted.
+    #[test]
+    fn a_failed_substream_never_hangs_the_decoder() {
+        let Some(data) = wpp_c() else { return };
+        let _serial = hang_hook::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        hang_hook::FAIL_SUBSTREAM_AT.store(0, Ordering::Relaxed);
+        let r = decode_or_hang(&data, 4, Duration::from_secs(120));
+        hang_hook::FAIL_SUBSTREAM_AT.store(usize::MAX, Ordering::Relaxed);
+        let (frames, _, warnings) = r.expect("the decoder hung on a failed substream");
+        assert_eq!(frames, 48);
+        assert!(warnings >= 48, "every picture's first substream failed, {warnings} warnings");
     }
 }

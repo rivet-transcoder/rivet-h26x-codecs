@@ -8,7 +8,7 @@
 //! in decode order, which started earlier, so nothing can wait in a cycle.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
@@ -171,7 +171,15 @@ pub struct Pool {
     state: Arc<(Mutex<PoolState>, Condvar, Condvar)>,
     workers: Vec<JoinHandle<()>>,
     capacity: usize,
+    threads: usize,
+    /// What every worker blocked inside a task is waiting for (see
+    /// [`Pool::register_wait`]).
+    waits: Mutex<Vec<(u64, WaitCheck)>>,
+    wait_seq: AtomicU64,
 }
+
+/// Whether a registered wait is satisfied now.
+pub type WaitCheck = Box<dyn Fn() -> bool + Send + Sync>;
 
 impl Pool {
     /// `threads` workers; `capacity` jobs may be outstanding (`usize::MAX`
@@ -209,7 +217,38 @@ impl Pool {
                 .expect("spawn h26x worker");
             workers.push(h);
         }
-        Arc::new(Pool { state, workers, capacity: capacity.max(1) })
+        Arc::new(Pool { state, workers, capacity: capacity.max(1), threads: threads.max(1), waits: Mutex::new(Vec::new()), wait_seq: AtomicU64::new(0) })
+    }
+
+    /// A task blocked inside a job says what would let it continue, so a
+    /// task deciding whether the pool is deadlocked can see whether anyone
+    /// is about to wake — from what they wait for, not from how long they
+    /// have been blocked. Returns the id for [`Pool::unregister_wait`].
+    pub fn register_wait(&self, satisfiable: WaitCheck) -> u64 {
+        let id = self.wait_seq.fetch_add(1, Ordering::Relaxed);
+        self.waits.lock().unwrap().push((id, satisfiable));
+        id
+    }
+
+    /// The task continues (or gave up).
+    pub fn unregister_wait(&self, id: u64) {
+        self.waits.lock().unwrap().retain(|(i, _)| *i != id);
+    }
+
+    /// Workers blocked in a registered wait.
+    pub fn blocked(&self) -> usize {
+        self.waits.lock().unwrap().len()
+    }
+
+    /// Worker threads.
+    pub fn threads(&self) -> usize {
+        self.threads
+    }
+
+    /// Whether some blocked task's wait is satisfied now: it will wake and
+    /// run, so nothing is deadlocked yet.
+    pub fn any_wait_satisfiable(&self) -> bool {
+        self.waits.lock().unwrap().iter().any(|(_, w)| w())
     }
 
     /// Queue `job`, waiting while the pool is at capacity. Never call this
