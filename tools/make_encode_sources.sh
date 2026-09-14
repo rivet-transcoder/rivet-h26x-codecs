@@ -199,3 +199,14 @@ gen interlace "testsrc2=size=48x96:rate=50,scroll=horizontal=0.06[a];testsrc2=si
 # EXCLUSIVE_TOKENS, so only `@ilace10` rows visit it: its `420p10` token
 # alone would have put it under every `@p10` row.
 deep ilace10 "testsrc2=size=48x96:rate=50,scroll=horizontal=0.06[a];testsrc2=size=48x96:rate=50,loop=loop=-1:size=1:start=0[b];[a][b]hstack=inputs=2,tinterlace=mode=interleave_top" 8 96x96 420 10
+
+# The gain-and-offset fade at 10 bits: the wpoff fade above with its offset
+# at the depth, luma of picture N `p * (1 - N/16) - 12N` (clipped at 0),
+# chroma untouched, and two bits of noise on every plane after the
+# conversion, as `deep` adds them — written out rather than through `deep`
+# so the fade and the noise are one expression. The corpus had no deep fade,
+# so H.265's weighted rows at 10 bits proved the syntax and little else.
+# Its name carries `fdeep`, one of the EXCLUSIVE_TOKENS, so only `@fdeep10`
+# rows visit it: its `420p10` token alone would have put it under every
+# `@p10` row. md5 6c22ac2b899b2fb3980c54b401463779, generated twice.
+gen fdeep10 "testsrc2=size=32x64:rate=25,format=yuv420p[a];color=c=0x808080:size=32x64:rate=25,format=yuv420p[b];[a][b]hstack=inputs=2,format=yuv420p10le,geq=lum='min(1023,max(0,p(X,Y)*(1-N/16)-12*N)+floor(random(0)*4))':cb='min(1023,p(X,Y)+floor(random(1)*4))':cr='min(1023,p(X,Y)+floor(random(2)*4))'" 12 64x64_420p10 yuv420p10le

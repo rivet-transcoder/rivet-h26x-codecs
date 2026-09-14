@@ -288,9 +288,11 @@ fi
 # every row whose tag happens to occur in its name — a 10-bit clip is spelled
 # `..._420p10` and would join every `@p10` row — and its arrival would change
 # the cost of rows that never asked for it. `ilace`: the 10-bit interlaced
-# clip, src_ilace10_96x96_420p10, visited only by `@ilace10` rows.
+# clip, src_ilace10_96x96_420p10, visited only by `@ilace10` rows. `fdeep`:
+# the 10-bit gain-and-offset fade, src_fdeep10_64x64_420p10, visited only by
+# `@fdeep10` rows.
 # Defined identically in identity_encode.sh, whose cells must be these.
-EXCLUSIVE_TOKENS="ilace"
+EXCLUSIVE_TOKENS="ilace fdeep"
 
 # A configuration's name may carry an `@substring` suffix, which restricts
 # it to sources whose filename contains that substring. Rows are not all
@@ -433,6 +435,14 @@ EXCLUSIVE_TOKENS="ilace"
 # a B picture, and a 10-bit fade with B pictures runs in the unit test; the
 # @wpoff rows put an offset in both lists; refs2 mixes a two-entry P table
 # with one-entry B lists; the ABR row runs the fit under a lookahead.
+# The `@fdeep10` rows are that fade at 10 bits: src_fdeep10_64x64_420p10, the
+# gain-and-offset fade with its offset at the depth (luma p * (1 - N/16) -
+# 12N, two bits of noise; see make_encode_sources.sh), where the weighted
+# rows at 10 bits get a table that weights something in both lists rather
+# than the syntax alone. Its name carries `fdeep`, one of EXCLUSIVE_TOKENS,
+# so no `@p10` or `@420p10` row visits it and its arrival changed no other
+# cell. h26xenc's `shapes B` census line says whether each cell's B pictures
+# took a table (wp_on), and how many kept the defaults (wp_rd_default).
 # The h264-paff / h264-mbaff rows are H.264 interlaced coding. They visit the
 # two interlaced clips: src_interlace_96x96_420p8 (`@interlace`: fields 20 ms
 # apart, a scrolling half beside a held one, combed so that PAFF has field
@@ -625,6 +635,10 @@ h264-10-mbaff-ipb@420p10|--codec h264 --qp 26 --gop 8 --bframes 2 --interlace tf
 h264-10-paff-cavlc-ip@ilace10|--codec h264 --qp 26 --gop 8 --cavlc --interlace tff --field-coding paff
 h264-10-mbaff-ip@ilace10|--codec h264 --qp 26 --gop 8 --interlace tff --field-coding mbaff
 h264-10-mbaff-cavlc-ipb@ilace10|--codec h264 --qp 26 --gop 8 --bframes 2 --cavlc --interlace bff --field-coding mbaff
+hevc10-wp-ipb@fdeep10|--codec h265 --qp 26 --gop 8 --bframes 2 --wpred
+hevc10-wp40-ipb@fdeep10|--codec h265 --qp 40 --gop 8 --bframes 2 --wpred
+hevc10-wp-sao-ipb@fdeep10|--codec h265 --qp 26 --gop 8 --bframes 2 --sao --wpred
+hevc10-wp-ip@fdeep10|--codec h265 --qp 26 --gop 8 --wpred
 "}
 
 # Split a clip's format token into its chroma format and sample depth:
