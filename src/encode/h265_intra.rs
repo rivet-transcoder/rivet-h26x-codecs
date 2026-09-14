@@ -33,22 +33,21 @@
 //! This is a first cut with a deliberately fixed geometry, and every one of
 //! these is a simplification to be lifted, not a design position:
 //!
-//! - **One CU per CTU, no coding quadtree.** The CU size *is* the CTB
-//!   size, `log2_cu` in 3..=5. Pictures must be whole multiples of it.
+//! - **The coding quadtree is the caller's choice.** `IntraPicture::code_ctu`
+//!   codes a CTB as one unit; `IntraPicture::code_ctu_tree` splits it by
+//!   rate-distortion cost down to the 8x8 minimum coding block, where
+//!   `PART_NxN` competes with `PART_2Nx2N`. Pictures must be whole
+//!   multiples of the CTB.
 //! - **Partitioning per size, one transform-split level.** `log2_cu` 4 or
 //!   5 codes `PART_2Nx2N`, and when [`IntraPicture::split_depth`] allows the
 //!   decision tries one level of transform split — four quarter-size TUs
 //!   against the single CU-sized one, chroma splitting alongside as the
-//!   decoder's `transform_tree` dictates. The split search is **off by
-//!   default** because the coding-tree writer does not spell the split
-//!   shape yet; producing it into today's serialiser would desync the
-//!   stream. One level from a 16/32 CTB bottoms out at 8x8/16x16 luma, so
-//!   the 4x4 DST is *still* only reached by `log2_cu` 3's `PART_NxN`
-//!   (four 4x4 luma TUs); the second split level, which the SPS's
-//!   `max_transform_hierarchy_depth_intra` of 2 already permits, is what
-//!   will make it reachable from production geometry — and brings the
-//!   chroma-at-the-parent rule (`transform_unit`'s `blk_idx == 3` case)
-//!   that one level never triggers.
+//!   decoder's `transform_tree` dictates. The picture loops set
+//!   `split_depth` 1, and the writer spells both shapes. The 4x4 DST is
+//!   reached from production geometry by the coding quadtree's 8x8 units,
+//!   as `PART_NxN` (four 4x4 luma TUs, with 4:2:0 / 4:2:2 chroma once at
+//!   the parent — `transform_unit`'s `blk_idx == 3` case); an 8x8
+//!   `PART_2Nx2N` unit does not split its transform.
 //! - **All four chroma formats** ([`IntraPicture::new_with_chroma`];
 //!   plain `new` stays 4:2:0). Monochrome simply omits every chroma
 //!   element, mirroring the reader's `chroma_array_type == 0` gates.
@@ -106,16 +105,19 @@ use crate::sample::Sample;
 ///   intra CU scan vertically for modes 6..=14 and horizontally for
 ///   22..=30, diagonally otherwise), so the writer derives `scanIdx` from
 ///   the modes stored here rather than this side pre-scanning.
-/// - **No QP delta.** QP is fixed per picture (no `cu_qp_delta_enabled`).
+/// - **No QP delta.** The unit's quantiser is `qp_y`; the `cu_qp_delta`
+///   that carries it is the encoder's quantiser chain's to derive.
 /// - **No `transform_skip_flag` / RDPCM / rotation fields.** Never emitted
 ///   under the current SPS/PPS; add them beside `bypass` when they are.
-/// - **No split flags.** The coding-tree geometry is fixed (CU == CTB;
-///   `PART_NxN` implies the forced transform split, `PART_2Nx2N` a single
-///   TU), so the writer derives `split_cu_flag` / `split_transform_flag`
-///   from `log2_cu` and `nxn` against the SPS it wrote.
+/// - **No `split_cu_flag`.** A decision is one coding unit; where it sits
+///   in the coding quadtree travels beside it (`TreeCu`), and the tree walk
+///   derives every `split_cu_flag` from the placements. Inside the unit the
+///   writer derives `split_transform_flag` from `split_tu`, `split_child`
+///   and `nxn` against the SPS it wrote.
 #[derive(Clone)]
 pub struct CuDecision {
-    /// log2 of the CU (== CTB) size this decision describes: 3, 4 or 5.
+    /// log2 of the CU size this decision describes: 3, 4 or 5 — the CTB's,
+    /// or smaller under the coding quadtree.
     pub log2_cu: u32,
     /// `part_mode`: true is `PART_NxN` (four 4x4 luma PBs/TUs, only ever
     /// produced at `log2_cu == 3`), false is `PART_2Nx2N` (one luma PB and

@@ -69,8 +69,10 @@
 //! before deciding not to build them. The numbers are here so the next
 //! reader decides against a bigger corpus rather than re-deriving them.
 //!
-//! - **Prediction-unit partitions, symmetric and AMP.** The encoder codes
-//!   one `PART_2Nx2N` unit per CTB. `tools/partition_opportunity.py`
+//! - **Prediction-unit partitions, symmetric and AMP.** Measured while the
+//!   encoder coded one `PART_2Nx2N` unit per CTB; the coding quadtree now
+//!   splits CTBs into smaller `PART_2Nx2N` units, which takes part of the
+//!   same opportunity by another road. `tools/partition_opportunity.py`
 //!   (integer-sample SAD, ±4, a split must beat the whole block by 5%)
 //!   over the seven 8-bit 4:2:0 clips: 16.2% of blocks would take a
 //!   symmetric split and 13.3% an AMP shape beyond it — but 7.1% and
@@ -108,11 +110,13 @@
 //!
 //! # Scope (v1) — the same deliberately fixed geometry as the intra module
 //!
-//! - **P slices, one reference** (list 0, `ref_idx` 0), `PART_2Nx2N`
-//!   whole-CTU CUs, one CU-sized TU (no transform split — the SPS's
+//! - **P slices, one reference** (list 0, `ref_idx` 0), `PART_2Nx2N` CUs
+//!   — a whole CTB, or a quadtree leaf down to 8x8 through
+//!   `InterPicture::code_ctu_tree` — each with one CU-sized TU (no transform
+//!   split — the SPS's
 //!   maximum transform size equals the CTB size precisely so this shape is
 //!   representable). The quantiser and the weighting are the caller's:
-//!   per-CTB quantisers through `MeCtx::qp`, and list 0's explicit
+//!   per-unit quantisers through `MeCtx::qp`, and list 0's explicit
 //!   weighting through [`InterPicture::wp`] when the slice carries a
 //!   `pred_weight_table` (`Weighting::Default` otherwise; B slices
 //!   always).
@@ -628,7 +632,7 @@ impl<S: Sample> InterPicture<S> {
         }
     }
 
-    /// Decide and code one CTU (== one 2Nx2N CU) against the references
+    /// Decide and code one CTU as a single 2Nx2N CU against the references
     /// of `RefPicList0`, `refs_l0`, nearest first (borders extended —
     /// `Frame::extend_rows` — exactly as the decoder pads references
     /// before MC reads them).
@@ -727,15 +731,15 @@ impl<S: Sample> InterPicture<S> {
         // choice is not free and the cost below counts it.
         //
         // The default is ONE reference, and that is a measured choice.
-        // On this encoder's geometry the choice never has a better
-        // answer: whole-CTU 32x32 coding units average over enough
+        // On whole-CTB units (`max_cu_depth` 0) the choice never has a
+        // better answer: 32x32 coding units average over enough
         // content that one reference always serves them (0 of 140 blocks
         // across the corpus, where the same probe at 16x16 said 6.9% and
         // was answering about a block size this encoder does not code),
         // and two references measured 0.80% worse on every clip, better
-        // on none. `Config::max_refs` opts in; re-run
-        // `tools/multiref_opportunity.py` at the new size the day sub-CU
-        // partitioning lands.
+        // on none. `Config::max_refs` opts in. The coding quadtree now codes
+        // the 16x16 and 8x8 units that probe answered about; it has not
+        // been re-run against them.
         //
         // Full-sample descent from every distinct seed's best, then the
         // two sub-sample rings, per reference.
@@ -852,7 +856,7 @@ impl<S: Sample> InterPicture<S> {
         out
     }
 
-    /// Decide and code one CTU (== one 2Nx2N CU) of a **B** picture
+    /// Decide and code one CTU as a single 2Nx2N CU of a **B** picture
     /// against `ref0` (list 0) and `ref1` (list 1), whose borders must be
     /// extended as the decoder pads references before MC reads them.
     ///
@@ -1102,7 +1106,7 @@ impl<S: Sample> InterPicture<S> {
         out
     }
 
-    /// The residual of one whole-CTU CU, luma then every chroma TB this
+    /// The residual of one 2Nx2N CU, luma then every chroma TB this
     /// format carries, each reconstructed in place through the decoder's
     /// inverse path. Fills `cbf_luma`, `cbf_chroma`, `cbf_chroma_bot`,
     /// `rqt_root_cbf` and the coefficient arrays; returns `rqt_root_cbf`.

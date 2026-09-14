@@ -16,6 +16,21 @@
 //! already needs the coding-tree writer, and this module refuses at exactly
 //! that point until it exists. The parameter sets above it are written and
 //! proven against the crate's own conformance-tested parsers.
+//!
+//! # The coding quadtree
+//!
+//! `Config::max_cu_depth` (0 by default) lets a CTB split into smaller
+//! coding units, down to the 8x8 minimum coding block. Every node is a
+//! rate-distortion decision — the node coded whole against the node coded
+//! as four children, each side's cost its reconstruction's SSD plus the
+//! Lagrangian times the bits the production writer counts for its syntax
+//! (`IntraPicture::code_ctu_tree`, `InterPicture::code_ctu_tree`) — and at
+//! 8x8 an intra unit also weighs `PART_NxN`. The units are kept placed, in
+//! decode order (`TreeCu`); the quadtree is read back from the placements
+//! to be written (`write_tree`) and walked by the quantiser chain
+//! (`QgChain`), which follows the reader's quantisation groups at any group
+//! and unit size. At 0 every CTB is one unit, and the stream is the one this
+//! encoder wrote before the quadtree existed.
 
 use super::gop::{Coded, Kind, Scheduler};
 use super::h265_deblock::{deblock_inter_picture, deblock_picture};
@@ -506,12 +521,6 @@ impl<S: Sample> Core<S> {
         Ok(out)
     }
 
-    /// Code one picture.
-    ///
-    /// The real path is all-intra 4:2:0 at a constant QP: one CU per CTU
-    /// (the geometry guarantees whole CTUs of 16 or 32), decided by the
-    /// intra machinery and serialised through the coding-tree writers that
-    /// live beside their readers. Everything else refuses by name.
     /// Code one picture, re-coding it at a higher quantiser if it will not
     /// fit the buffer this stream declares.
     ///
@@ -910,8 +919,9 @@ impl<S: Sample> Core<S> {
         }
     }
 
-    /// Code one inter picture — P or B: every CTU one inter CU, decided against the
-    /// single stored reference and serialised through the coding-tree
+    /// Code one inter picture — P or B: every CTU one coding unit, or a
+    /// coding quadtree of them under `max_cu_depth`, decided against the
+    /// references and serialised through the coding-tree
     /// writers that live beside their readers.
     ///
     /// The two halves meet here and nowhere else. The decision module
@@ -2019,7 +2029,8 @@ fn write_sao_for(e: &mut CabacEncoder, cx: &mut Contexts, plan: Option<&SaoPlan>
     write_sao(e, cx, &sctx, &nb, plan.merges[addr], &plan.params[addr]);
 }
 
-/// Serialise one inter coding unit - one whole-CTU `PART_2Nx2N` CU, in the
+/// Serialise one inter coding unit - a `PART_2Nx2N` CU of whatever size the
+/// coding quadtree gave it - in the
 /// reader's element order (`coding_unit` / `prediction_unit`).
 ///
 /// Which elements exist depends on the shape, and two of them the decoder
@@ -2245,8 +2256,9 @@ fn write_cu_inter(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_ctu_intra(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, ctu_x: usize, ctu_y: usize, pps_bypass: bool, cat: u32, qp_delta: Option<i32>) {
     debug_assert!(pps_bypass || !d.bypass, "a bypass CU is unspellable unless the PPS enables the flag");
-    // Every coded neighbour has depth 0 (one CU per CTU), and in a single
-    // slice availability is picture geometry.
+    // A whole-CTB unit: every coded neighbour has depth 0, and in a single
+    // slice availability is picture geometry. (The quadtree walk writes its
+    // own flags with the real neighbour depths; this serves the rate model.)
     let nb = SplitCuNb {
         left_depth: (ctu_x > 0).then_some(0),
         above_depth: (ctu_y > 0).then_some(0),
@@ -2917,7 +2929,7 @@ mod tests {
     /// stay one each), under weighted prediction (an entry per
     /// reference), and at 10 bits. The census says how often the older
     /// reference was chosen, which is reported rather than asserted:
-    /// at this encoder's block size the honest answer is usually zero.
+    /// on whole-CTB units the honest answer is usually zero.
     /// At the default of one reference the stream is what it always was.
     #[test]
     fn two_references_round_trip_and_the_default_is_unchanged() {
