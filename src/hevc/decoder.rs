@@ -713,15 +713,9 @@ fn spawn_substream<S: Sample>(pic: &Arc<PicShared<S>>, seg: &Arc<Segment>, sub: 
             }
             pic_arc.frame.progress.error.store(true, Ordering::Relaxed);
             pic_arc.warnings.fetch_add(1, Ordering::Relaxed);
-            // Queue the rest of the segment: its rows block on CTBs that
-            // will never come and fail the same way once the picture is
-            // closed. Redundant with the gate in `slice_nal`, which stops
-            // waiting for rows that are never queued on the same lost-data
-            // verdict: the failed-substream test passes without this loop
-            // (measured 2026-09-13: 17.6 s without it, 20.8 s with it).
-            for s in sub + 1..seg_arc.submitted.len() {
-                spawn_substream(&pic_arc, &seg_arc, s);
-            }
+            // The rows this substream would have queued never are: the gate
+            // in `slice_nal` stops waiting for them on the lost-data verdict,
+            // and tasks waiting on their CTBs fail once the picture is closed.
         }
     };
     #[cfg(test)]
@@ -1801,11 +1795,11 @@ mod wpp_gate_tests {
 
     /// Lost data must end in errors, never in a hang: when every substream
     /// starting at CTB 0 fails before decoding, the rows it would have queued
-    /// still have to reach the pool (or `slice_nal` waits forever for the
-    /// segment to be fully queued, with the picture still open), and their
-    /// waits on CTBs nobody will decode must give up once the picture is
-    /// closed. The decode then finishes with every picture output and the
-    /// failures counted.
+    /// never reach the pool, so `slice_nal` must stop waiting for the segment
+    /// to be fully queued (the picture is still open and could never be
+    /// closed otherwise), and the waits on CTBs nobody will decode must give
+    /// up once it is closed. The decode then finishes with every picture
+    /// output and the failures counted.
     #[test]
     fn a_failed_substream_never_hangs_the_decoder() {
         let Some(data) = wpp_c() else { return };
