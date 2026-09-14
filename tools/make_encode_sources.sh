@@ -166,3 +166,18 @@ deep detail12 "testsrc2=size=64x64:rate=25"  8 64x64 420 12
 # rule), so this clip's arrival changed no existing row's cost — in every
 # checkout of those scripts, including ones older than the clip.
 gen big    "testsrc2=size=128x80:rate=25,format=yuv420p[a];mandelbrot=size=128x80:rate=25,format=yuv420p[b];gradients=size=128x80:rate=25:c0=0x2050a0:c1=0xe0b040:x0=0:y0=0:x1=127:y1=79:nb_colors=2:seed=1:speed=0.01:type=linear,format=yuv420p[c];smptehdbars=size=128x80:rate=25,format=yuv420p[d];[a][b]hstack=inputs=2[top];[c][d]hstack=inputs=2[bot];[top][bot]vstack=inputs=2" 16 256x160_420p8 yuv420p
+
+# The interlaced clip. Every clip above is progressive — each frame one
+# instant — so an interlaced encode of them has fields that agree and a
+# frame/field decision with nothing to decide. This one is 16 progressive
+# frames at 50 per second woven into 8 interlaced ones (`tinterlace`
+# interleave: the top field from one instant, the bottom from the next), so
+# its fields really are 20 ms apart. Its left half moves and its right half
+# is one picture held (`loop`), so the same frame holds a region where the
+# two fields disagree (field coding pays) beside one where they are the
+# same picture (frame coding pays) — which is what a per-picture and a
+# per-macroblock-pair decision need to have something to choose between.
+# 96x96 rather than 64x64 so an MBAFF frame has eighteen macroblock pairs,
+# enough for pairs of both kinds to sit beside each other. The `p8` depth
+# suffix keeps every untagged row off it: only `@interlace` rows visit it.
+gen interlace "testsrc2=size=48x96:rate=50[a];testsrc2=size=48x96:rate=50,loop=loop=-1:size=1:start=0[b];[a][b]hstack=inputs=2,tinterlace=mode=interleave_top" 8 96x96_420p8 yuv420p

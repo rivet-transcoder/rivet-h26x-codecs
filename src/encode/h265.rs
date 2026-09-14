@@ -380,6 +380,15 @@ fn pad_plane<S: Sample>(src: &[S], sw: usize, sh: usize, tw: usize, th: usize) -
 
 impl<S: Sample> Core<S> {
     fn new(cfg: Config) -> Result<Self> {
+        if cfg.interlace.is_some() {
+            // Not "in progress": H.265 has no interlaced coding tools. What
+            // it has is signalling — field_seq_flag and a pic_struct SEI
+            // over pictures that are each one field — which this encoder
+            // does not write.
+            return Err(Error::unsupported(
+                "H.265 encode: interlaced coding (H.265 has no field or MBAFF tools; field_seq_flag / pic_struct signalling is not written)",
+            ));
+        }
         if cfg.sao && matches!(cfg.rate, RateControl::Lossless) {
             // Every CU of a lossless picture is transquant-bypass, every
             // bypass sample is exempt from both loop filters, and SAO

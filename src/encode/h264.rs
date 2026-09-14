@@ -365,6 +365,23 @@ impl<S: Sample> Core<S> {
                 "H.264 encode: rate lookahead is not calibrated for H.264 (the past-only controller is used; see Config::lookahead)",
             ));
         }
+        if cfg.interlace.is_some() {
+            // An interlaced stream crops in field rows: `CropUnitY` doubles
+            // (7.4.2.1.1), so the displayed height has to be a whole number
+            // of them — and each field is half the frame, so it has to be
+            // even at the very least.
+            let unit = match cfg.chroma {
+                crate::ChromaFormat::Yuv420 => 4,
+                _ => 2,
+            };
+            if !cfg.height.is_multiple_of(unit) {
+                return Err(Error::unsupported(format!(
+                    "H.264 encode: an interlaced height of {} rows (an interlaced {:?} stream crops in units of {unit} rows)",
+                    cfg.height, cfg.chroma
+                )));
+            }
+            return Err(Error::unsupported("H.264 encode: interlaced coding (encoder in progress)"));
+        }
         if cfg.weighted_pred && cfg.rate == RateControl::Lossless {
             // A lossless stream's inter pictures are all-skip copies of
             // their reference (PCM has no inter spelling), and a weighting
@@ -823,6 +840,9 @@ impl<S: Sample> Core<S> {
                 cabac,
                 direct_spatial: transform_b,
                 pred_weights: wp.clone(),
+                interlaced: false,
+                bottom_field: None,
+                delta_poc_bottom: 0,
             },
             self.pps_qp,
             &mut w,
@@ -1693,6 +1713,33 @@ mod tests {
             .expect("weighted prediction on a lossless stream must refuse");
         assert!(format!("{err}").contains("weighted prediction"), "{err}");
     }
+    /// Interlaced coding refuses by name what it cannot deliver: a height
+    /// an interlaced crop cannot reach (four rows at a time in 4:2:0, two
+    /// otherwise), and on H.265 — which has no interlaced coding tools —
+    /// the switch itself. A progressive configuration is untouched by the
+    /// new fields' defaults.
+    #[test]
+    fn interlaced_configurations_refuse_by_name() {
+        use crate::encode::{FieldCoding, FieldOrder};
+        for (chroma, height, ok) in [
+            (ChromaFormat::Yuv420, 62u32, false),
+            (ChromaFormat::Yuv420, 63, false),
+            (ChromaFormat::Yuv422, 63, false),
+            (ChromaFormat::Monochrome, 33, false),
+            (ChromaFormat::Yuv420, 60, true),
+            (ChromaFormat::Yuv444, 62, true),
+        ] {
+            let c = Config { interlace: Some(FieldOrder::TopFirst), field_coding: FieldCoding::Field, ..cfg(64, height, chroma, 8) };
+            let err = H264Encoder::new(c).err().map(|e| format!("{e}")).unwrap_or_default();
+            assert_eq!(!err.contains("crops in units of"), ok, "{chroma:?} height {height}: {err}");
+        }
+        let err = crate::encode::h265::H265Encoder::new(Config { interlace: Some(FieldOrder::BottomFirst), ..cfg(64, 64, ChromaFormat::Yuv420, 8) })
+            .err()
+            .expect("H.265 has no interlaced tools");
+        assert!(format!("{err}").contains("H.265 encode: interlaced coding"), "{err}");
+        assert_eq!(Config::default().interlace, None, "progressive by default");
+    }
+
     /// A lookahead is refused by name on H.264, with a bitrate target (where
     /// it would otherwise mean something) as without one (where the
     /// configuration's own check names the missing target first).
