@@ -121,14 +121,16 @@
 //!
 //! ## What is deliberately not here
 //!
-//! - **No lookahead.** Every decision is made from the past only. A
-//!   controller that has seen the next second of video can place bits far
-//!   better; this one cannot see them.
-//! - **No per-CTB adaptation.** The quantiser is picture-wide.
-//!   `cu_qp_delta_enabled_flag` is 0 in our PPS, so per-CTB QP needs new
-//!   syntax, a new writer and the reader's QP-prediction machinery — and it
-//!   would stack a second control loop on top of this one before this one
-//!   is proven. It is a follow-up, not an omission.
+//! - **Lookahead only where the encoder offers it.** By itself every
+//!   decision here is made from the past only. The H.265 encoder can hold
+//!   pictures back and hand this controller a cost per picture — see
+//!   [`RateController::pick_qp_ahead`] and the *lookahead* section below —
+//!   and with that the controller places bits by what is coming rather
+//!   than by what came. H.264 does not drive that path yet.
+//! - **Per-CTB adaptation lives beside this, not in it.** The quantiser
+//!   this module chooses is picture-wide; the H.265 encoder's adaptive
+//!   quantisation (`encode::aq`) redistributes it across coding tree
+//!   blocks zero-mean, so the two do not steer the same number.
 //! - **No guarantee of buffer conformance, only aim.** The controller
 //!   knows the coded picture buffer when one is declared and caps each
 //!   picture's target at [`CPB_AIM`] of what the buffer can afford, which
@@ -166,6 +168,52 @@
 //! [`MAX_QP_STEP`] per picture so quality does not visibly pulse, and the
 //! bucket's correction is spread over [`CORRECTION_PICTURES`] rather than
 //! taken out of the next picture alone.
+//!
+//! # Lookahead: the same law, with a cost in it
+//!
+//! An encoder that has measured the pictures it is holding can hand this
+//! controller a **cost** per picture — the H.265 encoder's is a sum of
+//! 8x8 SATDs, intra against each block's own mean and inter against the
+//! previous source picture at zero motion (`encode::h265::PicCost`) — and
+//! the law grows one factor:
+//!
+//! ```text
+//!     bits(qp) ≈ k * cost * 2^(-qp / 6)
+//! ```
+//!
+//! `k` is then **bits per unit of cost** rather than bits per picture,
+//! which is a far more stable number: it is a property of how the codec
+//! prices a unit of residual energy, not of the content, so one
+//! observation of it transfers to the next picture whatever that picture
+//! shows. Three things follow, each of them a mechanism the past-only
+//! controller lacks:
+//!
+//! - **The share is measured, not assumed.** Without lookahead an intra
+//!   picture is given [`INTRA_WEIGHT`] times an inter picture's bits, a
+//!   round number. With it, each picture's share of the window's budget is
+//!   its predicted bits at a common quantiser over the window's mean —
+//!   `k(kind) * cost`, so a keyframe of flat content is not overpaid and a
+//!   scene cut's first inter picture, whose cost is a keyframe's, is not
+//!   starved. The ratio is bounded to `[1 / MAX_K_RATIO, MAX_K_RATIO]`
+//!   so that a single wild picture cannot take the whole window.
+//! - **The model sees the change before coding it.** `k * cost` predicts
+//!   a picture's bits from its own samples, so the quantiser moves *with*
+//!   the content rather than one picture after it — and the step limit,
+//!   which exists to stop pulsing between similar pictures, is widened by
+//!   exactly the measured cost ratio (`6 * log2(cost / last cost)`) so a
+//!   measured change is not throttled as if it were noise.
+//! - **A kind that has not been measured borrows from one that has.**
+//!   The first P picture of a stream no longer starts from the bits-per-
+//!   pixel seed: it takes the keyframe's observed `k` and its own cost.
+//!   Before any observation at all the seed is [`SEED_BITS_PER_COST`],
+//!   a calibration, clamped through the same [`SEED_QP_MIN`] and
+//!   [`SEED_QP_MAX`] a past-only seed is.
+//!
+//! What lookahead does **not** change: the ledger, the bucket, the buffer
+//! cap, and every check above. A cost of one and an empty window is the
+//! past-only controller exactly, which is what [`RateController::pick_qp`]
+//! passes — so a stream that does not ask for lookahead is coded by the
+//! same arithmetic it always was.
 
 /// The largest quantiser change between consecutive pictures. Rate control
 /// that lurches is worse to watch than rate control that misses: a picture
@@ -311,6 +359,27 @@ const SEED_QP_MIN: f64 = 26.0;
 /// See [`SEED_QP_MIN`].
 const SEED_QP_MAX: f64 = 45.0;
 
+/// The seed for `k` when a lookahead cost is available and nothing has
+/// been observed yet: bits per unit of cost at quantiser 0, before the
+/// `2^(-qp/6)` factor.
+///
+/// A calibration, taken on this project's corpus (2026-09-13, the four
+/// `--bitrate` rows over every clip under `--lookahead 8`, 75 keyframes,
+/// cost measured as `encode::h265::PicCost` measures it): the median of
+/// `bits * 2^(qp/6) / cost` was 4.23 at the seed's own operating point
+/// (quartiles 3.64 and 4.79, extremes 1.16 and 7.20). A first pass with a
+/// placeholder of 40 — eight times too high — put every keyframe at the
+/// clamp's ceiling and measured 4.76 there; the law is approximate
+/// enough over twenty quantiser steps that the number at the operating
+/// point is the one to keep. Inter pictures came out at a median of 3.55
+/// over 417, the same order, which is what lets a keyframe's observed
+/// value stand in for the first P. It replaces the bits-per-pixel anchor
+/// only for the very first picture of a stream; every picture after that
+/// is pinned by an observation, and the [`SEED_QP_MIN`] / [`SEED_QP_MAX`]
+/// clamp bounds how wrong this constant is allowed to be — it is what
+/// kept the placeholder from being worse than a seed.
+const SEED_BITS_PER_COST: f64 = 4.2;
+
 /// Which complexity estimate a picture draws on, and what share of the
 /// budget it is given.
 ///
@@ -409,9 +478,26 @@ pub struct RateController {
     /// checker measuring one cannot disagree about what the buffer is.
     cpb: Option<(f64, f64)>,
     /// What [`RateController::pick_qp`] chose for the picture currently
-    /// being coded, so [`RateController::account`] can pin the model
-    /// against the quantiser that actually produced the bits.
-    pending: Option<(PicKind, u8)>,
+    /// being coded — kind, quantiser and lookahead cost (1 without one) —
+    /// so [`RateController::account`] can pin the model against the
+    /// quantiser and cost that actually produced the bits.
+    pending: Option<(PicKind, u8, f64)>,
+    /// The lookahead cost of the last picture *picked* for each kind, so
+    /// the step limit can be widened by a measured change in content
+    /// rather than throttle it. `None` until a kind has been picked with
+    /// a cost.
+    last_cost: [Option<f64>; 3],
+    /// The kind most recently pinned by an observation, which an
+    /// unobserved kind borrows its bits-per-cost from under lookahead.
+    last_observed: Option<PicKind>,
+    /// The bits the picture being coded was planned at, for the plan
+    /// error below. 0 before the first pick.
+    planned: f64,
+    /// Accumulated `6 * |log2(actual / planned)|` over accounted
+    /// pictures, and how many — the model check
+    /// [`RateController::plan_error`] reports.
+    plan_error: f64,
+    plan_count: u64,
 }
 
 impl RateController {
@@ -471,7 +557,23 @@ impl RateController {
             bits_spent: 0,
             pictures: 0,
             pending: None,
+            last_cost: [None; 3],
+            last_observed: None,
+            planned: 0.0,
+            plan_error: 0.0,
+            plan_count: 0,
         }
+    }
+
+    /// How far pictures landed from their plan, on average, in quantiser
+    /// steps of the law: `6 * |log2(actual bits / planned bits)|` per
+    /// picture, meaned. The controller's model check — it chooses a
+    /// quantiser to land a target, and this is how wrong that choice was,
+    /// reported so a change to the model can be measured against the
+    /// pictures it planned rather than only against the band. `None`
+    /// before any picture has been accounted.
+    pub fn plan_error(&self) -> Option<f64> {
+        (self.plan_count > 0).then(|| self.plan_error / self.plan_count as f64)
     }
 
     /// The bits this picture is aiming for: its share by kind, plus a
@@ -525,15 +627,67 @@ impl RateController {
     /// no picture in the stream was ever coded at, and every later decision
     /// would inherit the error.
     pub fn note_recode(&mut self, qp: u8) {
-        if let Some((kind, _)) = self.pending {
-            self.pending = Some((kind, qp));
+        if let Some((kind, _, cost)) = self.pending {
+            self.pending = Some((kind, qp, cost));
         }
     }
 
     /// Choose the quantiser for the next picture. Call once per picture,
     /// in coding order, before coding it.
+    ///
+    /// The past-only controller: [`RateController::pick_qp_ahead`] with a
+    /// cost of one and nothing in the window, which is the same
+    /// arithmetic it has always been.
     pub fn pick_qp(&mut self, kind: PicKind) -> u8 {
-        let mut target = self.target_for(kind);
+        self.pick_qp_ahead(kind, 1.0, &[])
+    }
+
+    /// The bits this picture is aiming for under lookahead: its share of
+    /// the window's budget by predicted bits at a common quantiser —
+    /// `k(kind) * cost` for it and for every picture in `window` (which
+    /// includes it) — bounded so one picture cannot take the whole window,
+    /// plus the same bucket correction [`RateController::target_for`]
+    /// applies. See the module documentation's lookahead section.
+    fn target_ahead(&self, kind: PicKind, cost: f64, window: &[(PicKind, f64)]) -> f64 {
+        let mean = window.iter().map(|&(k, c)| self.k_for(k) * c).sum::<f64>() / window.len() as f64;
+        let mine = self.k_for(kind) * cost;
+        let share = if mean > 0.0 { (mine / mean).clamp(1.0 / MAX_K_RATIO, MAX_K_RATIO) } else { 1.0 };
+        let base = self.per_picture * share;
+        let correction = (self.budget / CORRECTION_PICTURES).clamp(-0.5 * base, 0.5 * base);
+        (base + correction).max(16.0)
+    }
+
+    /// The bits-per-unit-cost estimate to plan a picture of `kind` with
+    /// under lookahead: the kind's own once it has been observed, the most
+    /// recently observed kind's before that — a keyframe's price per unit
+    /// of residual energy is the best available guess for the first P —
+    /// and the calibrated seed when nothing has been observed at all.
+    fn k_for(&self, kind: PicKind) -> f64 {
+        let c = self.complexity[kind as usize];
+        if c.observed {
+            return c.k;
+        }
+        match self.last_observed {
+            Some(other) => self.complexity[other as usize].k,
+            None => SEED_BITS_PER_COST,
+        }
+    }
+
+    /// [`RateController::pick_qp`] informed by a lookahead: `cost` is this
+    /// picture's complexity in the caller's units and `window` is every
+    /// picture the caller holds — this one included — with the kind it
+    /// expects to code each as. An empty window means no lookahead, in
+    /// which case `cost` must be one and the kind weights allocate the
+    /// budget as they always have.
+    ///
+    /// The calibration run behind [`SEED_BITS_PER_COST`]: `tools/verify_encode.sh`'s
+    /// corpus under `--lookahead 8`, keyframes only, `bits * 2^(qp/6) /
+    /// cost` — recorded on the constant.
+    pub fn pick_qp_ahead(&mut self, kind: PicKind, cost: f64, window: &[(PicKind, f64)]) -> u8 {
+        let ahead = !window.is_empty();
+        debug_assert!(ahead || cost == 1.0, "a past-only pick has no cost to scale by");
+        debug_assert!(cost > 0.0, "a lookahead cost must be positive");
+        let mut target = if ahead { self.target_ahead(kind, cost, window) } else { self.target_for(kind) };
         // What the buffer can hand over at this picture's removal time.
         // The rate target says what the picture is *worth*; this says what
         // it can *have*, and the smaller of the two wins.
@@ -552,8 +706,18 @@ impl RateController {
             target = target.min(available * aim).max(16.0);
         }
         let c = self.complexity[kind as usize];
-        // Invert bits(qp) = k * 2^(-qp/6).
-        let want = 6.0 * (c.k / target).log2();
+        // Invert bits(qp) = k * cost * 2^(-qp/6). Under lookahead `k` is
+        // bits per unit of cost and may be borrowed from another kind or
+        // seeded from the calibration; either way a pick for a kind that
+        // has not been observed is a guess about that kind, and it is
+        // bounded the way every other seed is. The past-only path seeds
+        // through the same clamp inside `seed_k`. Without it a P picture
+        // whose cost the lookahead put near zero — a held frame, whose
+        // residual is really the reference's quantisation noise — was
+        // planned at quantiser 0 and cost twelve times its keyframe.
+        let (k_eff, guess) = if ahead { (self.k_for(kind) * cost, !c.observed) } else { (c.k, false) };
+        let want = 6.0 * (k_eff / target).log2();
+        let want = if guess { want.clamp(SEED_QP_MIN, SEED_QP_MAX) } else { want };
         let mut qp = want.round().clamp(QP_MIN as f64, QP_MAX as f64) as i32;
         // The step limit stops the quantiser pulsing between *considered*
         // choices, so it applies only between two of them — see
@@ -564,11 +728,22 @@ impl RateController {
         // all for the very first picture of a kind, a wide one for its
         // first measured correction, and the ordinary step limit forever
         // after.
+        //
+        // Under lookahead the limit is widened by the measured change in
+        // cost since this kind was last picked, in the direction the cost
+        // moved: the limit exists to stop the quantiser chasing noise
+        // between similar pictures, and a picture four times the cost of
+        // the last is not noise — holding it to three steps is what
+        // spends a scene cut's whole budget on its first picture.
+        let widen = match (ahead, self.last_cost[kind as usize]) {
+            (true, Some(last)) if last > 0.0 => (6.0 * (cost / last).log2()).round() as i32,
+            _ => 0,
+        };
         let informed = c.observed;
         match (informed, self.last_informed[kind as usize], self.last_any[kind as usize]) {
             (true, Some(last), _) => {
                 let last = last as i32;
-                qp = qp.clamp(last - MAX_QP_STEP, last + MAX_QP_STEP);
+                qp = qp.clamp(last - MAX_QP_STEP + widen.min(0), last + MAX_QP_STEP + widen.max(0));
             }
             (_, None, Some(any)) => {
                 let any = any as i32;
@@ -589,7 +764,11 @@ impl RateController {
             self.last_informed[kind as usize] = Some(qp);
         }
         self.last_any[kind as usize] = Some(qp);
-        self.pending = Some((kind, qp));
+        if ahead {
+            self.last_cost[kind as usize] = Some(cost);
+        }
+        self.pending = Some((kind, qp, cost));
+        self.planned = target;
         qp
     }
 
@@ -604,7 +783,7 @@ impl RateController {
         let bits = (bytes as u64) * 8;
         self.bits_spent += bits;
         self.pictures += 1;
-        let Some((kind, qp)) = self.pending.take() else {
+        let Some((kind, qp, cost)) = self.pending.take() else {
             debug_assert!(false, "account() without a matching pick_qp()");
             return;
         };
@@ -625,8 +804,17 @@ impl RateController {
         // quantiser that produced it. A picture that coded to nothing says
         // nothing about complexity, so it is not allowed to zero the
         // estimate.
+        // The model check, reported never gated: how far the picture
+        // landed from what it was planned at, in quantiser steps of the
+        // law (six per doubling). Zero would mean the model was exact.
+        if bits > 0 && self.planned > 0.0 {
+            self.plan_error += (bits as f64 / self.planned).log2().abs() * 6.0;
+            self.plan_count += 1;
+        }
         if bits > 0 {
-            let k_obs = bits as f64 * 2f64.powf(qp as f64 / 6.0);
+            // Per unit of lookahead cost, which is one without a lookahead.
+            let k_obs = bits as f64 * 2f64.powf(qp as f64 / 6.0) / cost;
+            self.last_observed = Some(kind);
             let c = &mut self.complexity[kind as usize];
             if c.observed {
                 // Bound the excursion before blending: see MAX_K_RATIO.
@@ -661,6 +849,29 @@ impl RateController {
                 _ => {}
             }
             c.observed = true;
+        }
+    }
+
+    /// A copy of the controller's whole state, for tests that branch one
+    /// history two ways.
+    #[cfg(test)]
+    fn clone_for_test(&self) -> Self {
+        RateController {
+            per_picture: self.per_picture,
+            avg_weight: self.avg_weight,
+            budget: self.budget,
+            complexity: self.complexity,
+            last_informed: self.last_informed,
+            last_any: self.last_any,
+            bits_spent: self.bits_spent,
+            pictures: self.pictures,
+            cpb: self.cpb,
+            pending: self.pending,
+            last_cost: self.last_cost,
+            last_observed: self.last_observed,
+            planned: self.planned,
+            plan_error: self.plan_error,
+            plan_count: self.plan_count,
         }
     }
 
@@ -872,6 +1083,118 @@ mod tests {
             (total - plain).abs() < plain * 0.01,
             "the weights changed the GOP's total: {total:.0} against {plain:.0}"
         );
+    }
+
+    /// A cost of one and an empty window is the past-only controller,
+    /// pick for pick: the lookahead path may not move a stream that did
+    /// not ask for it.
+    #[test]
+    fn a_cost_of_one_and_no_window_is_the_past_only_controller() {
+        let mut a = RateController::new(600_000, 30, W, H, 8, 2);
+        let mut b = RateController::new(600_000, 30, W, H, 8, 2);
+        for i in 0..24 {
+            let kind = match i % 8 {
+                0 => PicKind::Intra,
+                1 | 4 | 7 => PicKind::Inter,
+                _ => PicKind::B,
+            };
+            let qa = a.pick_qp(kind);
+            let qb = b.pick_qp_ahead(kind, 1.0, &[]);
+            assert_eq!(qa, qb, "picture {i}: the two paths chose different quantisers");
+            let bytes = synth_bits(if kind == PicKind::Intra { K_INTRA } else { K_INTER }, qa);
+            a.account(bytes);
+            b.account(bytes);
+        }
+        assert_eq!(a.bits_spent, b.bits_spent);
+    }
+
+    /// Under lookahead the window's budget is split by predicted bits: the
+    /// costlier picture is given more, and the shares only redistribute —
+    /// two pictures' targets sum to two pictures' worth.
+    #[test]
+    fn lookahead_gives_the_costlier_picture_the_larger_share_and_redistributes() {
+        let rc = RateController::new(600_000, 30, W, H, 8, 0);
+        let window = [(PicKind::Inter, 1000.0), (PicKind::Inter, 3000.0)];
+        let cheap = rc.target_ahead(PicKind::Inter, 1000.0, &window);
+        let dear = rc.target_ahead(PicKind::Inter, 3000.0, &window);
+        assert!(dear > cheap * 2.5, "the picture at three times the cost was given {dear:.0} against {cheap:.0}");
+        let plain = rc.per_picture * 2.0;
+        assert!(((cheap + dear) - plain).abs() < plain * 0.01, "the shares changed the window's total: {:.0} against {plain:.0}", cheap + dear);
+        // Bounded: a picture a hundred times the cost of the rest cannot
+        // take more than MAX_K_RATIO pictures' worth.
+        let wild = rc.target_ahead(PicKind::Inter, 100_000.0, &[(PicKind::Inter, 100_000.0), (PicKind::Inter, 1000.0), (PicKind::Inter, 1000.0)]);
+        assert!(wild <= rc.per_picture * MAX_K_RATIO * 1.01, "{wild:.0}");
+    }
+
+    /// The first P picture of a stream under lookahead is planned from
+    /// the keyframe's measured bits per unit of cost, not from the
+    /// bits-per-pixel seed: four times the cost asks for twelve more
+    /// quantiser steps, the law's own slope — inside the seed clamp,
+    /// which a guess about an unobserved kind never escapes, whether the
+    /// guess is the calibration or a borrowed measurement.
+    #[test]
+    fn an_unmeasured_kind_borrows_the_measured_bits_per_cost() {
+        // Nothing observed: the calibration alone, clamped like a seed at
+        // both ends — an absurd cost either way cannot run away.
+        let mut fresh = RateController::new(600_000, 30, W, H, 8, 0);
+        let huge = fresh.pick_qp_ahead(PicKind::Intra, 1e12, &[(PicKind::Intra, 1e12)]);
+        assert_eq!(f64::from(huge), SEED_QP_MAX, "an absurd cost against the calibration must hit the seed clamp, not run away");
+        let mut fresh = RateController::new(600_000, 30, W, H, 8, 0);
+        let tiny = fresh.pick_qp_ahead(PicKind::Intra, 1e-3, &[(PicKind::Intra, 1e-3)]);
+        assert_eq!(f64::from(tiny), SEED_QP_MIN, "a negligible cost must be held at the seed floor");
+
+        // One keyframe observed at a plausible cost; its k per unit cost
+        // is then what plans the first P, so a P at cost c and a P at
+        // cost 4c on two copies of the same state differ by the law's own
+        // slope, twelve steps, when both land inside the clamp.
+        let mut rc = RateController::new(600_000, 30, W, H, 8, 0);
+        let cost_i = 1e6;
+        let first = rc.pick_qp_ahead(PicKind::Intra, cost_i, &[(PicKind::Intra, cost_i)]);
+        rc.account(synth_bits(K_INTRA, first));
+        let mut lo = rc.clone_for_test();
+        let mut hi = rc.clone_for_test();
+        let q_lo = lo.pick_qp_ahead(PicKind::Inter, 4e5, &[(PicKind::Inter, 4e5)]);
+        let q_hi = hi.pick_qp_ahead(PicKind::Inter, 1.6e6, &[(PicKind::Inter, 1.6e6)]);
+        assert!(f64::from(q_lo) > SEED_QP_MIN && f64::from(q_hi) < SEED_QP_MAX, "the picks must sit inside the clamp for the slope to show: {q_lo}, {q_hi}");
+        assert!((i32::from(q_hi) - i32::from(q_lo) - 12).abs() <= 1, "cost x4 moved the quantiser from {q_lo} to {q_hi}, not by twelve");
+        // A borrowed measurement is still a guess about this kind: a
+        // negligible cost is held at the seed floor rather than planned
+        // at quantiser 0 — the held-frame case, whose true residual is
+        // the reference's quantisation noise.
+        let mut held = rc.clone_for_test();
+        let q_held = held.pick_qp_ahead(PicKind::Inter, 1.0, &[(PicKind::Inter, 1.0)]);
+        assert_eq!(f64::from(q_held), SEED_QP_MIN, "a borrowed pick at a negligible cost escaped the seed clamp: {q_held}");
+        // And it was the keyframe's measurement that planned it, not the
+        // calibration: the same P on a controller that observed nothing
+        // lands elsewhere.
+        let mut blind = RateController::new(600_000, 30, W, H, 8, 0);
+        let q_blind = blind.pick_qp_ahead(PicKind::Inter, 4e5, &[(PicKind::Inter, 4e5)]);
+        assert_ne!(q_blind, q_lo, "the borrowed k made no difference to the first P");
+    }
+
+    /// A measured jump in cost widens the step limit in the direction of
+    /// the jump; the same jump unmeasured is held to the limit. This is
+    /// what lets a scene cut's first picture be coded at the quantiser it
+    /// needs rather than three steps from the one before it.
+    #[test]
+    fn a_measured_cost_jump_widens_the_step_limit() {
+        let mut ahead = RateController::new(600_000, 30, W, H, 8, 0);
+        let mut past = RateController::new(600_000, 30, W, H, 8, 0);
+        let window = |c: f64| [(PicKind::Inter, c)];
+        // Two settled inter pictures at a steady cost, then one at eight
+        // times the cost.
+        let mut last_a = 0u8;
+        let mut last_p = 0u8;
+        for _ in 0..3 {
+            last_a = ahead.pick_qp_ahead(PicKind::Inter, 1000.0, &window(1000.0));
+            ahead.account(synth_bits(K_INTER, last_a));
+            last_p = past.pick_qp(PicKind::Inter);
+            past.account(synth_bits(K_INTER, last_p));
+        }
+        let jump_a = ahead.pick_qp_ahead(PicKind::Inter, 8000.0, &window(8000.0));
+        let jump_p = past.pick_qp(PicKind::Inter);
+        assert!(i32::from(jump_a) - i32::from(last_a) > MAX_QP_STEP, "lookahead held the cut to {last_a} -> {jump_a}");
+        assert!(i32::from(jump_p) - i32::from(last_p) <= MAX_QP_STEP, "the past-only path exceeded its limit: {last_p} -> {jump_p}");
     }
 
     /// An intra picture gets a larger share than an inter one at the same

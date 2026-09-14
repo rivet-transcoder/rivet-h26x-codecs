@@ -63,13 +63,59 @@
 //! no collocated picture), which makes the spatial + zero candidate set
 //! the *complete* derivation for these streams, not a subset.
 //!
+//! # Priced, not built (2026-09-13)
+//!
+//! Three of the standard's inter tools were costed against this corpus
+//! before deciding not to build them. The numbers are here so the next
+//! reader decides against a bigger corpus rather than re-deriving them.
+//!
+//! - **Prediction-unit partitions, symmetric and AMP.** The encoder codes
+//!   one `PART_2Nx2N` unit per CTB. `tools/partition_opportunity.py`
+//!   (integer-sample SAD, ±4, a split must beat the whole block by 5%)
+//!   over the seven 8-bit 4:2:0 clips: 16.2% of blocks would take a
+//!   symmetric split and 13.3% an AMP shape beyond it — but 7.1% and
+//!   less once the smooth-gradient clip is set aside (an integer search
+//!   approximates a fractional pan with two offsets, which quarter-sample
+//!   refinement does without a split), and the AMP count lives in the
+//!   fractal half of the cut clip, where a 32x8 strip overfits. The
+//!   clips with real uniform motion and the held frame come out at 0.0%.
+//!   Against that: a second vector and `part_mode` on every split unit,
+//!   and under this SPS's `max_transform_hierarchy_depth_inter` an
+//!   inferred transform split (`interSplitFlag`) the inter writer would
+//!   have to learn to spell. The symmetric shapes are the prerequisite
+//!   for AMP, and AMP's own value sits inside the probe's bias.
+//! - **Temporal merge / AMVP candidates (TMVP).** The SPS disables it;
+//!   the decoder's derivation is complete and the motion grid the
+//!   collocated picture would need is already kept in `Frame`. What a
+//!   temporal candidate can buy is turning an AMVP unit into a merge
+//!   (its `mvd` and `mvp_l0_flag` for a `merge_idx`), so the ceiling is
+//!   bounded by the AMVP share: on the corpus's census at QP 26 that is
+//!   56 of 336 P CUs on the cut clip and 0–1 of 28–60 on every other,
+//!   about 12% corpus-wide and nearly all on one clip. At ten to twenty
+//!   bits per unit that is under half a percent of the cut stream and
+//!   nothing elsewhere, for `slice_temporal_mvp_enabled_flag`,
+//!   `collocated_ref_idx` and a second reader-derivation to mirror.
+//! - **WPP / tile-parallel coding.** A speed tool, not a compression
+//!   one, and the corpus cannot measure it: every clip is two CTB rows.
+//!   The ceiling is rows over two (entropy sync lets a row start when
+//!   the row above is two CTBs ahead) — nothing at 64x64, up to ~17x on
+//!   1080p at CTB 32 in the limit — bought with `entry_point_offset`s in
+//!   the slice header, a context save after the second CTB of each row,
+//!   and a decision walk that runs per row behind the same lag. rivet
+//!   already parallelises across pictures and chunks, so this would buy
+//!   latency rather than throughput there; the timing that would justify
+//!   it needs a clip with seconds and rows, which the corpus lacks.
+//!
 //! # Scope (v1) — the same deliberately fixed geometry as the intra module
 //!
 //! - **P slices, one reference** (list 0, `ref_idx` 0), `PART_2Nx2N`
 //!   whole-CTU CUs, one CU-sized TU (no transform split — the SPS's
 //!   maximum transform size equals the CTB size precisely so this shape is
-//!   representable). Fixed QP, no weighted prediction
-//!   (`Weighting::Default`).
+//!   representable). The quantiser and the weighting are the caller's:
+//!   per-CTB quantisers through `MeCtx::qp`, and list 0's explicit
+//!   weighting through [`InterPicture::wp`] when the slice carries a
+//!   `pred_weight_table` (`Weighting::Default` otherwise; B slices
+//!   always).
 //! - **All four chroma formats.** Monochrome omits every chroma element,
 //!   mirroring the reader's uniform `chroma_array_type != 0` gates in
 //!   `transform_tree` and `transform_unit`; 4:2:0 carries one half-size
@@ -169,7 +215,7 @@ use crate::cabac_enc::CabacEncoder;
 use crate::hevc::ctu::{
     PartMode, SplitCuNb, chroma_qp, write_cu_skip_flag, write_inter_pred_idc, write_merge_flag,
     write_merge_idx, write_mvd, write_mvp_flag, write_part_mode_inter, write_pred_mode_flag,
-    write_rqt_root_cbf, write_split_cu_flag,
+    write_ref_idx, write_rqt_root_cbf, write_split_cu_flag,
 };
 use crate::hevc::ctx::Contexts;
 use crate::hevc::frame::{Frame, MotionInfo, Mv, Plane16, fill_motion};
@@ -269,6 +315,13 @@ pub struct InterCuDecision {
     /// CU is exempt from the in-loop filters sample for sample, which is
     /// what keeps a lossless stream lossless once deblocking is on.
     pub bypass: bool,
+    /// `QpY` of this CU as a decoder will hold it: the context quantiser
+    /// when the CU carries residual, the *predicted* one when it does not
+    /// — a skip or a root-cbf-0 CU codes no `cu_qp_delta`. Filled with
+    /// the context quantiser here; the encoder's quantiser chain
+    /// overwrites it when the picture varies the quantiser per CTB. Read
+    /// by the deblocker. See `CuDecision::qp_y`.
+    pub qp_y: i32,
     /// The choice, with its signalling payload.
     pub kind: InterCuKind,
     /// The chosen motion vector, quarter luma samples, list 0. Filled for
@@ -338,6 +391,7 @@ impl Default for InterCuDecision {
         InterCuDecision {
             log2_cu: 0,
             bypass: false,
+            qp_y: 26,
             kind: InterCuKind::Skip { merge_idx: 0 },
             mv: Mv::ZERO,
             ref_idx: 0,
@@ -375,6 +429,36 @@ pub enum PCuDecision {
     /// An intra CU inside the P slice, decided by the intra module over
     /// this same picture's reconstruction.
     Intra(Box<CuDecision>),
+}
+
+impl PCuDecision {
+    /// The `QpY` a decoder holds for this CU — see `InterCuDecision::qp_y`.
+    pub fn qp_y(&self) -> i32 {
+        match self {
+            PCuDecision::Inter(d) => d.qp_y,
+            PCuDecision::Intra(d) => d.qp_y,
+        }
+    }
+
+    /// Store the `QpY` the encoder's quantiser chain settled on.
+    pub fn set_qp_y(&mut self, qp_y: i32) {
+        match self {
+            PCuDecision::Inter(d) => d.qp_y = qp_y,
+            PCuDecision::Intra(d) => d.qp_y = qp_y,
+        }
+    }
+
+    /// Whether the CU carries any coded cbf, which is when — and only
+    /// when — a decoder reads a `cu_qp_delta` inside it. An inter CU's
+    /// tree exists exactly when `rqt_root_cbf` is set, and a tree at
+    /// this geometry always carries a cbf (the decision spells a
+    /// residual-free tree as a skip or a root cbf of 0).
+    pub fn any_cbf(&self) -> bool {
+        match self {
+            PCuDecision::Inter(d) => d.rqt_root_cbf,
+            PCuDecision::Intra(d) => d.any_cbf(),
+        }
+    }
 }
 
 /// Per-picture state of the P-picture walk: the reconstruction the next
@@ -432,6 +516,15 @@ pub struct InterPicture<S: Sample> {
     /// (`satd_bi_at`). Unused by the P path.
     spred14_b: Vec<i16>,
     spred: Vec<S>,
+    /// The explicit weighting this picture's list-0 predictions carry,
+    /// one per reference in `RefPicList0` — per component, what
+    /// `hevc::ctu::explicit_weighting` derives from the slice's
+    /// `pred_weight_table` for that reference. Empty when the slice
+    /// carries no table (every reference default). Read by
+    /// [`Self::code_ctu`]'s scoring and its final prediction, so a
+    /// vector is chosen for the prediction that will actually be made.
+    /// The B walk ignores it: `weighted_bipred_flag` is never set.
+    pub wp: Vec<[Weighting; 3]>,
 }
 
 impl<S: Sample> InterPicture<S> {
@@ -472,17 +565,24 @@ impl<S: Sample> InterPicture<S> {
             spred14: vec![0; nmax],
             spred14_b: vec![0; nmax],
             spred: vec![S::default(); nmax],
+            wp: Vec::new(),
         }
     }
 
+    /// The weighting list-0 reference `r` carries: the table's, or the
+    /// default when the slice has no table.
+    fn wp_for(&self, r: usize) -> [Weighting; 3] {
+        self.wp.get(r).copied().unwrap_or([Weighting::Default; 3])
+    }
+
     /// The reference-list context the decoder's candidate derivation
-    /// takes, for a P slice referencing exactly `ref_poc`. `tmvp` false
-    /// and no collocated picture: the SPS this stream carries disables
-    /// temporal MVP (see the module header).
-    fn ref_ctx<'a>(&self, ref_poc: i32) -> RefCtx<'a, S> {
+    /// takes, for a P slice whose `RefPicList0` holds `pocs0`, nearest
+    /// first. `tmvp` false and no collocated picture: the SPS this
+    /// stream carries disables temporal MVP (see the module header).
+    fn ref_ctx<'a>(&self, pocs0: &[i32]) -> RefCtx<'a, S> {
         RefCtx {
-            pocs: [vec![ref_poc], Vec::new()],
-            long_term: [vec![false], Vec::new()],
+            pocs: [pocs0.to_vec(), Vec::new()],
+            long_term: [vec![false; pocs0.len()], Vec::new()],
             col: None,
             cur_poc: self.cur_poc,
             no_backward_pred: true,
@@ -490,7 +590,7 @@ impl<S: Sample> InterPicture<S> {
             max_merge_cand: MAX_MERGE_CAND,
             log2_par_mrg_level: 2,
             is_b: false,
-            num_ref_idx: [1, 0],
+            num_ref_idx: [pocs0.len(), 0],
             col_from_l0: true,
         }
     }
@@ -523,9 +623,10 @@ impl<S: Sample> InterPicture<S> {
         }
     }
 
-    /// Decide and code one CTU (== one 2Nx2N CU) against reference
-    /// `refp` (whose borders must be extended — `Frame::extend_rows` —
-    /// exactly as the decoder pads references before MC reads them).
+    /// Decide and code one CTU (== one 2Nx2N CU) against the references
+    /// of `RefPicList0`, `refs_l0`, nearest first (borders extended —
+    /// `Frame::extend_rows` — exactly as the decoder pads references
+    /// before MC reads them).
     ///
     /// On [`InterCuKind::UseIntra`] the reconstruction planes are
     /// untouched and the motion grid holds `MotionInfo::INTRA`: the
@@ -540,7 +641,7 @@ impl<S: Sample> InterPicture<S> {
     pub fn code_ctu(
         &mut self,
         ctx: &MeCtx<'_, S>,
-        refp: &Frame<S>,
+        refs_l0: &[&Frame<S>],
         cu_x: usize,
         cu_y: usize,
         src_y: &[S],
@@ -551,7 +652,7 @@ impl<S: Sample> InterPicture<S> {
     ) -> InterCuDecision {
         let n = 1usize << self.log2_cu;
         let (x0, y0) = (cu_x * n, cu_y * n);
-        let mut out = InterCuDecision { log2_cu: self.log2_cu, bypass: ctx.bypass, ..InterCuDecision::default() };
+        let mut out = InterCuDecision { log2_cu: self.log2_cu, bypass: ctx.bypass, qp_y: ctx.qp, ..InterCuDecision::default() };
 
         // Mark the CTB as this (single) slice's, as the decoder does at CTB
         // start: `avail_ctx` reads the current CTB's slice address, and
@@ -560,7 +661,9 @@ impl<S: Sample> InterPicture<S> {
         self.info.ctb_slice_addr[ctb] = 0;
         self.info.ctb_slice[ctb] = 0;
 
-        let refs = self.ref_ctx(refp.poc);
+        debug_assert!(!refs_l0.is_empty(), "a P CU needs at least one reference");
+        let pocs: Vec<i32> = refs_l0.iter().map(|f| f.poc).collect();
+        let refs = self.ref_ctx(&pocs);
         let pu = PuPos {
             x_cb: x0 as i32,
             y_cb: y0 as i32,
@@ -572,51 +675,64 @@ impl<S: Sample> InterPicture<S> {
             part_idx: 0,
         };
 
-        // The decoder's own candidate lists (see the module header).
+        // The decoder's own candidate lists (see the module header). The
+        // AMVP predictors depend on the reference index — the derivation
+        // scales a neighbour's vector by the POC-distance ratio between
+        // its reference and this one — so they are derived per
+        // reference by calling `amvp` once for each.
         let merge: Vec<Cand> = (0..MAX_MERGE_CAND).map(|i| merge_candidate(&self.info, &self.recon, &refs, &pu, i)).collect();
-        let mvp = [amvp(&self.info, &self.recon, &refs, &pu, 0, 0, 0), amvp(&self.info, &self.recon, &refs, &pu, 0, 0, 1)];
+        let mvp: Vec<[Mv; 2]> = (0..refs_l0.len())
+            .map(|r| [amvp(&self.info, &self.recon, &refs, &pu, 0, r as i8, 0), amvp(&self.info, &self.recon, &refs, &pu, 0, r as i8, 1)])
+            .collect();
 
         let soff = y0 * y_stride + x0;
         let src = &src_y[soff..];
 
-        // One reference, and that is a measured choice rather than a
-        // simplification. Multi-reference is a choice BETWEEN pictures:
-        // a block uncovered by motion, or one whose match is periodic,
-        // can be predicted better from an older frame than the newest.
-        // On this encoder's geometry it never is. Whole-CTU 32x32 coding
-        // units average over enough content that one reference always
-        // serves them — measured at 0 of 140 blocks across the corpus,
-        // where the same probe at 16x16 said 6.9% and was answering
-        // about a block size this encoder does not code. Two references
-        // were built and measured anyway: 0.80% worse, every clip, none
-        // better, which is `ref_idx` signalled per prediction unit for a
-        // choice that never has a better answer.
+        // One search per reference. Multi-reference is not a wider search
+        // of the same picture but a CHOICE between pictures: a block
+        // uncovered by motion, or one whose match is periodic, can be
+        // predicted better from an older frame than the newest one, and
+        // the only way to know which is to search each and price the
+        // answer — `ref_idx` is signalled per prediction unit, so the
+        // choice is not free and the cost below counts it.
         //
-        // The opportunity is gated on partition size, so re-run
-        // `tools/multiref_opportunity.py` at the new size the day
-        // sub-CU partitioning lands; its docstring says where the
-        // implementation is kept.
+        // The default is ONE reference, and that is a measured choice.
+        // On this encoder's geometry the choice never has a better
+        // answer: whole-CTU 32x32 coding units average over enough
+        // content that one reference always serves them (0 of 140 blocks
+        // across the corpus, where the same probe at 16x16 said 6.9% and
+        // was answering about a block size this encoder does not code),
+        // and two references measured 0.80% worse on every clip, better
+        // on none. `Config::max_refs` opts in; re-run
+        // `tools/multiref_opportunity.py` at the new size the day sub-CU
+        // partitioning lands.
+        //
         // Full-sample descent from every distinct seed's best, then the
-        // two sub-sample rings.
-        let mut seeds: Vec<Mv> = vec![Mv::ZERO, mvp[0], mvp[1]];
-        seeds.extend(merge.iter().filter(|c| c.ref_idx[0] == 0).map(|c| c.mv[0]));
-        let full = self.search_full(ctx, &refp.y, x0, y0, n, src, y_stride, &seeds);
-        let (mv_me, satd_me) = self.refine_subpel(ctx, &refp.y, x0, y0, n, src, y_stride, full);
+        // two sub-sample rings, per reference.
+        let mut per_ref: Vec<(Mv, u32)> = Vec::with_capacity(refs_l0.len());
+        for (r, rf) in refs_l0.iter().enumerate() {
+            let mut seeds: Vec<Mv> = vec![Mv::ZERO, mvp[r][0], mvp[r][1]];
+            seeds.extend(merge.iter().filter(|c| c.ref_idx[0] == r as i8).map(|c| c.mv[0]));
+            let full = self.search_full(ctx, &rf.y, x0, y0, n, src, y_stride, &seeds);
+            per_ref.push(self.refine_subpel(ctx, &rf.y, r, x0, y0, n, src, y_stride, full));
+        }
 
         // Cost the shapes. Merge candidates are scored at their exact
-        // vectors; only the first occurrence of a vector matters (a later
-        // duplicate signals strictly more bins for the same prediction).
+        // vectors against the picture they actually name; only the first
+        // occurrence of a (vector, reference) matters (a later duplicate
+        // signals strictly more bins for the same prediction).
         let lam = lambda(ctx.qp) * satd_lambda_scale(ctx.bit_depth);
         let rate = Rate::new(ctx.qp, false, self.log2_cu);
         let mut best_merge: Option<(usize, u32)> = None; // (idx, satd)
         let mut best_merge_cost = f32::INFINITY;
-        let mut seen: Vec<Mv> = Vec::with_capacity(MAX_MERGE_CAND);
+        let mut seen: Vec<(Mv, i8)> = Vec::with_capacity(MAX_MERGE_CAND);
         for (idx, cand) in merge.iter().enumerate() {
-            if cand.ref_idx[0] != 0 || seen.contains(&cand.mv[0]) {
+            let ri = cand.ref_idx[0];
+            if ri < 0 || ri as usize >= refs_l0.len() || seen.contains(&(cand.mv[0], ri)) {
                 continue;
             }
-            seen.push(cand.mv[0]);
-            let satd = self.satd_at(ctx, &refp.y, x0, y0, n, src, y_stride, cand.mv[0]);
+            seen.push((cand.mv[0], ri));
+            let satd = self.satd_at(ctx, &refs_l0[ri as usize].y, ri as usize, x0, y0, n, src, y_stride, cand.mv[0]);
             // cu_skip_flag or merge_flag, plus the TR-coded index.
             // Skip and merge differ in signalling, and a zero-residual
             // candidate becomes a skip, so price each at the shape it
@@ -628,24 +744,42 @@ impl<S: Sample> InterPicture<S> {
                 best_merge = Some((idx, satd));
             }
         }
-        // AMVP: the searched vector against the cheaper of the two
-        // predictors (the reader's uLX sum is a wrapping add, so the mvd
-        // is a wrapping difference).
-        let mvd_for = |p: Mv| Mv::new(mv_me.x.wrapping_sub(p.x), mv_me.y.wrapping_sub(p.y));
-        let amvp_flag = if rate.amvp(mvd_for(mvp[1]), 1, true) < rate.amvp(mvd_for(mvp[0]), 0, true) { 1u8 } else { 0 };
-        let mvd = mvd_for(mvp[amvp_flag as usize]);
-        // merge_flag 0, mvp_l0_flag, rqt_root_cbf, plus the mvd bins
-        // (cu_skip_flag and pred_mode/part_mode surround both shapes).
-        let amvp_cost = satd_me as f32 + lam * rate.amvp(mvd, amvp_flag, true);
+        // AMVP, over every reference: its searched vector against the
+        // cheaper of its own two predictors (the reader's uLX sum is a
+        // wrapping add, so the mvd is a wrapping difference), plus what
+        // it costs to say WHICH picture — `ref_idx` is truncated unary
+        // over the active count and absent entirely at one reference,
+        // so a single-reference stream prices exactly as it always did.
+        let nref = refs_l0.len() as u32;
+        let mut best_amvp: Option<(usize, u8, Mv, u32)> = None; // (ref, flag, mvd, satd)
+        let mut amvp_cost = f32::INFINITY;
+        for (r, &(mv_r, satd_r)) in per_ref.iter().enumerate() {
+            let mvd_for = |p: Mv| Mv::new(mv_r.x.wrapping_sub(p.x), mv_r.y.wrapping_sub(p.y));
+            let (d0, d1) = (mvd_for(mvp[r][0]), mvd_for(mvp[r][1]));
+            let c0 = rate.amvp_ref(d0, 0, true, nref, r as u32);
+            let c1 = rate.amvp_ref(d1, 1, true, nref, r as u32);
+            let (flag, mvd, bits) = if c1 < c0 { (1u8, d1, c1) } else { (0u8, d0, c0) };
+            // merge_flag 0, ref_idx, mvp_l0_flag, rqt_root_cbf, plus the
+            // mvd bins (cu_skip_flag and pred_mode/part_mode surround
+            // both shapes).
+            let cost = satd_r as f32 + lam * bits;
+            if cost < amvp_cost {
+                amvp_cost = cost;
+                best_amvp = Some((r, flag, mvd, satd_r));
+            }
+        }
+        let (amvp_ref, amvp_flag, mvd, amvp_satd) = best_amvp.expect("at least one reference");
 
         let merge_wins = best_merge.is_some_and(|_| best_merge_cost <= amvp_cost);
-        let (mv, inter_satd) = if merge_wins {
+        let (mv, chosen_ref, inter_satd) = if merge_wins {
             let (idx, satd) = best_merge.expect("merge_wins implies a candidate");
-            (merge[idx].mv[0], satd)
+            (merge[idx].mv[0], merge[idx].ref_idx[0].max(0) as usize, satd)
         } else {
-            (mv_me, satd_me)
+            (per_ref[amvp_ref].0, amvp_ref, amvp_satd)
         };
+        let refp: &Frame<S> = refs_l0[chosen_ref];
         out.mv = mv;
+        out.ref_idx = chosen_ref as i8;
 
         if prefer_intra(ctx, inter_satd, src, y_stride, n) {
             out.kind = InterCuKind::UseIntra;
@@ -662,8 +796,10 @@ impl<S: Sample> InterPicture<S> {
             return out;
         }
 
-        // The chosen prediction, through the decoder's own MC.
-        predict_block(ctx.dsp, &mut self.scratch, &mut self.recon, x0, y0, n, n, Some((refp, mv)), None, [Weighting::Default; 3]);
+        // The chosen prediction, through the decoder's own MC, weighted
+        // exactly as the slice header says this reference is.
+        let wp = self.wp_for(chosen_ref);
+        predict_block(ctx.dsp, &mut self.scratch, &mut self.recon, x0, y0, n, n, Some((refp, mv)), None, wp);
 
         let any = self.code_residual_cu(ctx, x0, y0, src, y_stride, src_cb, src_cr, c_stride, &mut out);
         out.kind = match (merge_wins, any) {
@@ -674,8 +810,10 @@ impl<S: Sample> InterPicture<S> {
 
         // Store motion and marks exactly as the decoder's `prediction_unit`
         // does after parsing ("Store motion", src/hevc/ctu.rs): the next
-        // CUs' candidate lists read them.
-        let mut mi = MotionInfo { mv: [mv, Mv::ZERO], ref_delta: [0; 2], ref_idx: [0, -1], flags: 0, pad: 0 };
+        // CUs' candidate lists read them — the reference index included,
+        // which is what makes a neighbour's vector scale by the right
+        // POC distance.
+        let mut mi = MotionInfo { mv: [mv, Mv::ZERO], ref_delta: [0; 2], ref_idx: [chosen_ref as i8, -1], flags: 0, pad: 0 };
         mi.ref_delta[0] = (self.cur_poc - refp.poc).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
         fill_motion(&mut self.recon.motion, self.recon.w4, x0, y0, n, n, mi);
         let w4 = self.info.w4;
@@ -729,7 +867,7 @@ impl<S: Sample> InterPicture<S> {
     ) -> InterCuDecision {
         let n = 1usize << self.log2_cu;
         let (x0, y0) = (cu_x * n, cu_y * n);
-        let mut out = InterCuDecision { log2_cu: self.log2_cu, bypass: ctx.bypass, ..InterCuDecision::default() };
+        let mut out = InterCuDecision { log2_cu: self.log2_cu, bypass: ctx.bypass, qp_y: ctx.qp, ..InterCuDecision::default() };
 
         let ctb = self.info.ctb_of(x0, y0);
         self.info.ctb_slice_addr[ctb] = 0;
@@ -764,7 +902,9 @@ impl<S: Sample> InterPicture<S> {
             let mut seeds: Vec<Mv> = vec![Mv::ZERO, mvp[list][0], mvp[list][1]];
             seeds.extend(merge.iter().filter(|c| c.ref_idx[list] == 0).map(|c| c.mv[list]));
             let full = self.search_full(ctx, plane, x0, y0, n, src, y_stride, &seeds);
-            uni[list] = self.refine_subpel(ctx, plane, x0, y0, n, src, y_stride, full);
+            // Reference 0 of either list: a B slice carries no weights,
+            // so the index only names the default.
+            uni[list] = self.refine_subpel(ctx, plane, 0, x0, y0, n, src, y_stride, full);
         }
 
         let lam = lambda(ctx.qp) * satd_lambda_scale(ctx.bit_depth);
@@ -833,8 +973,8 @@ impl<S: Sample> InterPicture<S> {
             seen.push(key);
             let satd = match (cand.ref_idx[0] >= 0, cand.ref_idx[1] >= 0) {
                 (true, true) => self.satd_bi_at(ctx, &ref0.y, &ref1.y, x0, y0, n, src, y_stride, cand.mv[0], cand.mv[1]),
-                (true, false) => self.satd_at(ctx, &ref0.y, x0, y0, n, src, y_stride, cand.mv[0]),
-                (false, true) => self.satd_at(ctx, &ref1.y, x0, y0, n, src, y_stride, cand.mv[1]),
+                (true, false) => self.satd_at(ctx, &ref0.y, 0, x0, y0, n, src, y_stride, cand.mv[0]),
+                (false, true) => self.satd_at(ctx, &ref1.y, 0, x0, y0, n, src, y_stride, cand.mv[1]),
                 (false, false) => unreachable!("filtered above"),
             };
             let bits = rate.skip(idx as u8).min(rate.merge(idx as u8));
@@ -1096,9 +1236,9 @@ impl<S: Sample> InterPicture<S> {
     /// SATD refinement: the eight half-sample neighbours of `start`, then
     /// the eight quarter-sample neighbours of that winner.
     #[allow(clippy::too_many_arguments)]
-    fn refine_subpel(&mut self, ctx: &MeCtx<'_, S>, refp: &Plane16<S>, x: usize, y: usize, n: usize, src: &[S], src_stride: usize, start: Mv) -> (Mv, u32) {
+    fn refine_subpel(&mut self, ctx: &MeCtx<'_, S>, refp: &Plane16<S>, r: usize, x: usize, y: usize, n: usize, src: &[S], src_stride: usize, start: Mv) -> (Mv, u32) {
         let mut best = start;
-        let mut best_satd = self.satd_at(ctx, refp, x, y, n, src, src_stride, start);
+        let mut best_satd = self.satd_at(ctx, refp, r, x, y, n, src, src_stride, start);
         for step in [2i16, 1] {
             let centre = best;
             for dy in [-step, 0, step] {
@@ -1107,7 +1247,7 @@ impl<S: Sample> InterPicture<S> {
                         continue;
                     }
                     let mv = Mv::new(centre.x.wrapping_add(dx), centre.y.wrapping_add(dy));
-                    let satd = self.satd_at(ctx, refp, x, y, n, src, src_stride, mv);
+                    let satd = self.satd_at(ctx, refp, r, x, y, n, src, src_stride, mv);
                     if satd < best_satd {
                         best_satd = satd;
                         best = mv;
@@ -1123,13 +1263,40 @@ impl<S: Sample> InterPicture<S> {
     /// `source` in `src/hevc/inter.rs`, and the sample-domain stage is the
     /// default uni-prediction the decoder applies.
     #[allow(clippy::too_many_arguments)]
-    fn satd_at(&mut self, ctx: &MeCtx<'_, S>, refp: &Plane16<S>, x: usize, y: usize, n: usize, src: &[S], src_stride: usize, mv: Mv) -> u32 {
+    fn satd_at(&mut self, ctx: &MeCtx<'_, S>, refp: &Plane16<S>, r: usize, x: usize, y: usize, n: usize, src: &[S], src_stride: usize, mv: Mv) -> u32 {
+        let wp = self.wp_for(r)[0];
+        self.satd_at_weighted(ctx, refp, x, y, n, src, src_stride, mv, wp)
+    }
+
+    /// [`Self::satd_at`] under a given luma weighting: the default
+    /// uni-prediction, or the decoder's `weighted_uni` at the table's
+    /// `log2WD`, weight and offset for list 0 — the same kernel
+    /// `predict_block` will commit the winner through.
+    #[allow(clippy::too_many_arguments)]
+    fn satd_at_weighted(&mut self, ctx: &MeCtx<'_, S>, refp: &Plane16<S>, x: usize, y: usize, n: usize, src: &[S], src_stride: usize, mv: Mv, wp: Weighting) -> u32 {
         let InterPicture { swin, stmp, spred14, spred, .. } = self;
         predict14(ctx, refp, x, y, n, mv, swin, stmp, spred14);
         let bd = ctx.bit_depth;
         let max = (1i32 << bd) - 1;
-        (ctx.dsp.uni)(spred, n, spred14, n, n, 14 - bd as i32, max);
+        match wp {
+            Weighting::Default => (ctx.dsp.uni)(spred, n, spred14, n, n, 14 - bd as i32, max),
+            Weighting::Explicit { log2_wd, w, o } => (ctx.dsp.weighted_uni)(spred, n, spred14, n, n, log2_wd, w[0], o[0], max),
+        }
         (ctx.dist.satd)(src, src_stride, spred, n, n, n)
+    }
+
+    /// The model check for weighted prediction: the luma SATD of the CU
+    /// at `(x0, y0)` predicted from `refp` at `mv` without any weighting
+    /// and with this picture's, so the caller can count whether the
+    /// table's fit helped the vectors the search actually chose.
+    #[allow(clippy::too_many_arguments)]
+    pub fn weighting_gain(&mut self, ctx: &MeCtx<'_, S>, refp: &Frame<S>, r: usize, x0: usize, y0: usize, src_y: &[S], y_stride: usize, mv: Mv) -> (u32, u32) {
+        let n = 1usize << self.log2_cu;
+        let src = &src_y[y0 * y_stride + x0..];
+        let wp = self.wp_for(r)[0];
+        let plain = self.satd_at_weighted(ctx, &refp.y, x0, y0, n, src, y_stride, mv, Weighting::Default);
+        let weighted = self.satd_at_weighted(ctx, &refp.y, x0, y0, n, src, y_stride, mv, wp);
+        (plain, weighted)
     }
 
     /// SATD of the *bi-predicted* luma block at `(mv0, mv1)`: the two
@@ -1319,16 +1486,31 @@ impl Rate {
         })
     }
 
-    /// P-slice AMVP: one list, its `mvd` and `mvp_l0_flag`, then
-    /// `rqt_root_cbf` — whose value is a parameter because it is a coded
-    /// bin with a cost, and because it is what lets a test price exactly
-    /// the shape `write_cu_inter` emits.
+    /// P-slice AMVP at one reference: one list, its `mvd` and
+    /// `mvp_l0_flag`, then `rqt_root_cbf` — whose value is a parameter
+    /// because it is a coded bin with a cost, and because it is what lets
+    /// a test price exactly the shape `write_cu_inter` emits.
+    /// [`Rate::amvp_ref`] with a single active reference, which spells no
+    /// `ref_idx` — kept for the test that prices the shape by hand.
+    #[cfg(test)]
     pub(crate) fn amvp(&self, mvd: Mv, mvp_flag: u8, root_cbf: bool) -> f32 {
+        self.amvp_ref(mvd, mvp_flag, root_cbf, 1, 0)
+    }
+
+    /// [`Rate::amvp`] plus what it costs to name the reference: `ref_idx`
+    /// is truncated unary over the active count `nref`, and absent
+    /// entirely when the list has one entry — so at one reference this
+    /// prices identically to a stream that never had the choice, which
+    /// is what keeps single-reference streams byte-identical.
+    pub(crate) fn amvp_ref(&self, mvd: Mv, mvp_flag: u8, root_cbf: bool, nref: u32, ref_idx: u32) -> f32 {
         self.count(|e, cx| {
             Self::prefix(e, cx, false);
             write_pred_mode_flag(e, cx, false);
             write_part_mode_inter(e, cx, PartMode::P2Nx2N);
             write_merge_flag(e, cx, false);
+            if nref > 1 {
+                write_ref_idx(e, cx, nref, ref_idx);
+            }
             write_mvd(e, cx, mvd);
             write_mvp_flag(e, cx, mvp_flag != 0);
             write_rqt_root_cbf(e, cx, root_cbf);
@@ -1645,7 +1827,7 @@ mod tests {
         let mut decisions = Vec::new();
         for cy in 0..h / n {
             for cx in 0..w / n {
-                decisions.push(pic.code_ctu(ctx, refp, cx, cy, src_y, w, src_cb, src_cr, c_stride));
+                decisions.push(pic.code_ctu(ctx, &[refp], cx, cy, src_y, w, src_cb, src_cr, c_stride));
             }
         }
         (pic, decisions)

@@ -94,6 +94,22 @@ gen static "testsrc2=size=64x64:rate=25,loop=loop=-1:size=1:start=0" 8 64x64_420
 # unrelated one, spliced with no transition. `trim` takes the head of each
 # and `setpts` restarts the timestamps so `concat` joins them cleanly.
 gen cut    "testsrc2=size=64x64:rate=25,trim=end_frame=51,setpts=PTS-STARTPTS[a];mandelbrot=size=64x64:rate=25,trim=end_frame=45,setpts=PTS-STARTPTS[b];[a][b]concat=n=2:v=1:a=0" 96 64x64_420 yuv420p
+# The fade: every picture is the one before it at a lower luma gain,
+# `Y * (1 - N/16)` over twelve frames, chroma untouched. Nothing above
+# changes brightness between pictures, so weighted prediction — a gain and
+# an offset applied to the reference before it predicts — had no clip on
+# which it could win, and a gate row for it would have proved the syntax
+# and nothing else. This is the clip where a picture predicted from an
+# unweighted reference always carries residual and one predicted from a
+# scaled reference need not.
+#
+# Its left half is testsrc2 and its right half a flat grey, deliberately:
+# the four 32x32 coding tree blocks of the 64x64 clips above all have about
+# the same luma variance, so a zero-mean per-block quantiser offset rounds
+# to zero on every one of them and adaptive quantisation moved nothing on
+# this corpus except the odd-sized clip. Two busy blocks beside two flat
+# ones is the smallest picture on which it has something to move.
+gen fade   "testsrc2=size=32x64:rate=25,format=yuv420p[a];color=c=0x808080:size=32x64:rate=25,format=yuv420p[b];[a][b]hstack=inputs=2,geq=lum='p(X,Y)*(1-N/16)':cb='p(X,Y)':cr='p(X,Y)'" 12 64x64_420 yuv420p
 
 # Deep samples. The format token grows a depth suffix — `420p10` — which
 # verify_encode.sh splits into `--format 420 --depth 10` and maps to

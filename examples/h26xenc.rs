@@ -22,7 +22,7 @@ fn die(msg: &str) -> ! {
          \x20      [--recon F] [--codec h264|h265] [--qp N | --lossless | --bitrate BPS]\n\
          \x20      [--fps N] [--cpb-ms N]\n\
          \x20      [--gop N] [--bframes N] [--cavlc] [--t8x8] [--subparts] [--sao]\n\
-         \x20      [--depth N] [--threads N]"
+         \x20      [--aq STRENGTH] [--lookahead N] [--wpred] [--refs N] [--depth N] [--threads N]"
     );
     std::process::exit(2);
 }
@@ -84,6 +84,18 @@ fn main() {
             "--sao" => cfg.sao = true,
             // H.264 only: offer inter partitions below 16x16.
             "--subparts" => cfg.subparts = true,
+            // H.265 only: adaptive quantisation at this strength (0 off).
+            "--aq" => cfg.aq_strength = val(&mut i, &args, "--aq").parse().unwrap_or_else(|_| die("--aq")),
+            // H.265 only, with --bitrate: hold this many pictures back and
+            // let the rate controller see them.
+            "--lookahead" => cfg.lookahead = val(&mut i, &args, "--lookahead").parse().unwrap_or_else(|_| die("--lookahead")),
+            // H.265 only: weighted prediction, a fitted gain and offset per
+            // reference in every P slice.
+            "--wpred" => cfg.weighted_pred = true,
+            // How many past pictures a P slice may choose between. 1 is
+            // the default and every stream written with it is
+            // byte-identical to before multiple references existed.
+            "--refs" => cfg.max_refs = val(&mut i, &args, "--refs").parse().unwrap_or_else(|_| die("--refs")),
             other => die(&format!("unknown argument {other}")),
         }
         i += 1;
@@ -157,6 +169,22 @@ fn main() {
         }
         if enc.recodes() != 0 {
             eprintln!("rate: {} extra codings to fit the declared buffer", enc.recodes());
+        }
+        // The controller's model check: how far, in quantiser steps of
+        // its law, the pictures landed from where they were planned.
+        if let Some(err) = enc.plan_error() {
+            eprintln!("rate: plan error {err:.2} steps per picture");
+        }
+        // The coding-unit census, the H.265 twin of the H.264 shape line
+        // below: a row turns a feature on, this says whether the clip
+        // took it.
+        for (slot, name) in ["I", "P", "B"].iter().enumerate() {
+            let taken = enc.census().by_kind[slot].taken();
+            if taken.is_empty() {
+                continue;
+            }
+            let list: Vec<String> = taken.iter().map(|(k, n)| format!("{k} {n}")).collect();
+            eprintln!("shapes {name}: {}", list.join(", "));
         }
         return;
     }

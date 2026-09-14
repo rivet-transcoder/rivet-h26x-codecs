@@ -23,7 +23,10 @@ use super::h265_intra::{CuDecision, IntraCtx, IntraPicture};
 use super::h265_me::{InterCuDecision, InterCuKind, InterPicture, PCuDecision, MAX_MERGE_CAND};
 use super::rc::{PicKind, RateController};
 use super::h265_sao::{SaoPlan, sao_picture};
-use super::h265_syntax::{self as syn, Cpb};
+use super::aq;
+use super::h265_wp;
+use super::h265_syntax::{self as syn, Cpb, PpsOptions};
+use crate::hevc::ctu::explicit_weighting;
 use super::{Access, Config, RateControl};
 use crate::bitwriter::BitWriter;
 use crate::cabac_enc::CabacEncoder;
@@ -34,10 +37,11 @@ use crate::dsp::Cpu;
 use crate::hevc::ctx::Contexts;
 use crate::sample::Sample;
 use crate::hevc::ctu::{
-    SaoCtx, SaoMergeNb, SplitCuNb, write_cbf_chroma, write_cbf_luma, write_cu_skip_flag, write_sao,
+    SaoCtx, SaoMergeNb, SplitCuNb, qp_y_from_pred, qp_y_pred_from, write_cbf_chroma, write_cbf_luma, write_cu_qp_delta,
+    write_cu_skip_flag, write_sao,
     write_cu_transquant_bypass_flag, write_merge_flag, write_merge_idx, write_mvd,
     write_inter_pred_idc, write_mvp_flag, write_part_mode_inter, write_pred_mode_flag,
-    write_rqt_root_cbf,
+    write_ref_idx, write_rqt_root_cbf,
     write_intra_chroma_pred_mode, write_mpm_idx, write_prev_intra_luma_pred_flag,
     write_rem_intra_luma_pred_mode, write_split_cu_flag, write_split_transform_flag,
 };
@@ -99,6 +103,24 @@ struct Core<S: Sample> {
     /// code, so inferring the index from it fails the moment the scheduler
     /// releases pictures as fast as they arrive.
     next_display: u64,
+    /// Display index of the next picture to offer the *scheduler*. Equal
+    /// to `next_display` without a lookahead — every picture is offered
+    /// as it arrives — and behind it by up to `cfg.lookahead` with one,
+    /// which is what holds pictures back for the rate controller to see.
+    offered: u64,
+    /// Each held picture's lookahead cost by display index, measured once
+    /// when it was pushed and dropped when it is coded. Empty without a
+    /// lookahead.
+    costs: std::collections::BTreeMap<u64, PicCost>,
+    /// The display-size luma of the last picture pushed, which the next
+    /// one's inter cost is measured against. `None` without a lookahead.
+    last_luma: Option<Vec<S>>,
+    /// The quantiser the last kept picture was coded at, which is what
+    /// the lookahead's inter-cost floor ([`PicCost::inter_floor`]) is
+    /// scaled by: a picture predicted from a reference carries that
+    /// reference's quantisation noise as residual however still the
+    /// content is. `None` before the first picture.
+    last_qp: Option<u8>,
     geom: syn::Geometry,
     /// Reference pictures as the decoder holds them — full `Frame`s with
     /// their motion grids and extended borders, not cropped bytes: the
@@ -134,6 +156,13 @@ struct Core<S: Sample> {
     /// controller is handed these rather than the caller's request, so what
     /// it aims at and what the stream promises are one number.
     cpb: Option<Cpb>,
+    /// The PPS switches this stream declares beyond the quantiser and the
+    /// two flags `write_pps` takes by position: per-CTB quantiser deltas
+    /// when adaptive quantisation is on. Fixed for the stream, like the
+    /// PPS itself.
+    pps_opts: PpsOptions,
+    /// What every kept picture coded, by picture kind. See [`Census`].
+    census: Census,
 }
 
 /// One coded picture, before anything about it has been kept.
@@ -168,6 +197,9 @@ struct Attempt<S: Sample> {
     /// Whether this picture empties the reference buffer first, which is
     /// what makes an IDR a random access point.
     clears_refs: bool,
+    /// What this picture's CUs were coded as, added to the encoder's
+    /// census only if the attempt is kept.
+    census: KindCensus,
 }
 
 /// The POC LSB width the SPS declares. Fixed and generous, as on the H.264
@@ -216,10 +248,25 @@ impl H265Encoder {
         with_core!(&self.inner, e => e.recoded)
     }
 
+    /// The rate controller's model check: the mean distance, in quantiser
+    /// steps of its law, between what each picture was planned at and
+    /// what it cost — see `RateController::plan_error`. `None` at a
+    /// constant quantiser, where nothing was planned.
+    pub fn plan_error(&self) -> Option<f64> {
+        with_core!(&self.inner, e => e.plan_error())
+    }
+
     /// The reconstructions produced so far, in coding order, packed as
     /// the source pictures were handed in (see [`H265Encoder`]).
     pub fn reconstructions(&self) -> &[Vec<u8>] {
         with_core!(&self.inner, e => &e.recon)
+    }
+
+    /// What the pictures coded so far were made of — see [`Census`]. A
+    /// configuration row turns a code path on; this is what says whether
+    /// the clip took it.
+    pub fn census(&self) -> &Census {
+        with_core!(&self.inner, e => &e.census)
     }
 
     /// Offer the next picture in display order.
@@ -269,6 +316,24 @@ impl<S: Sample> Core<S> {
                 "H.265 encode: sample adaptive offset on a lossless picture (every sample is filter-exempt)",
             ));
         }
+        if cfg.aq_strength > 0.0 && matches!(cfg.rate, RateControl::Lossless) {
+            // Every CU of a lossless picture is transquant-bypass and
+            // scaling never runs, so a per-CTB quantiser would be a
+            // `cu_qp_delta` in every coded CU steering nothing.
+            return Err(Error::unsupported(
+                "H.265 encode: adaptive quantisation on a lossless picture (no quantiser to adapt)",
+            ));
+        }
+        // Adaptive quantisation is the one thing that varies the
+        // quantiser below the slice, so it is what turns the PPS switch
+        // on; the group is the CTB, the granularity the decision makes.
+        // Weighted prediction sets the P-slice flag and no other: every
+        // P slice then carries a table, B slices stay default.
+        let pps_opts = PpsOptions {
+            cu_qp_delta_depth: (cfg.aq_strength > 0.0).then_some(0),
+            weighted_pred: cfg.weighted_pred,
+            ..PpsOptions::default()
+        };
         let (sw, sh) = cfg.chroma.subsampling();
         let luma = cfg.width as usize * cfg.height as usize;
         let chroma = if cfg.chroma == crate::ChromaFormat::Monochrome {
@@ -316,6 +381,8 @@ impl<S: Sample> Core<S> {
         Ok(Self {
             geom: g,
             cpb,
+            pps_opts,
+            census: Census::default(),
             sched: Scheduler::new(cfg.gop, cfg.bframes),
             rc,
             pps_qp,
@@ -326,8 +393,17 @@ impl<S: Sample> Core<S> {
             recon: Vec::new(),
             frame_bytes: (luma + chroma) * S::BYTES,
             next_display: 0,
+            offered: 0,
+            costs: std::collections::BTreeMap::new(),
+            last_luma: None,
+            last_qp: None,
             refs: Vec::new(),
         })
+    }
+
+    /// See [`H265Encoder::plan_error`].
+    fn plan_error(&self) -> Option<f64> {
+        self.rc.as_ref()?.plan_error()
     }
 
     /// See [`H265Encoder::rate_report`].
@@ -352,24 +428,53 @@ impl<S: Sample> Core<S> {
         let samples = unpack_samples::<S>(picture, self.cfg.bit_depth, "H.265")?;
         let display = self.next_display;
         self.next_display += 1;
+        if self.cfg.lookahead > 0 {
+            // Measured once, here, against the picture pushed before it —
+            // which may already have been coded and left `held`, so its
+            // luma is kept aside for exactly this.
+            let (dw, dh) = (self.cfg.width as usize, self.cfg.height as usize);
+            let cost = PicCost::measure(&samples[..dw * dh], dw, dh, self.last_luma.as_deref());
+            self.costs.insert(display, cost);
+            self.last_luma = Some(samples[..dw * dh].to_vec());
+        }
         self.held.insert(display, samples);
-        let ready = self.sched.push();
-        self.code(ready)
+        // Offer the scheduler everything but the last `lookahead` pictures.
+        // Without a lookahead that is the picture just pushed, once, which
+        // is the path every stream took before one existed.
+        let mut out = Vec::new();
+        while self.next_display - self.offered > u64::from(self.cfg.lookahead) {
+            self.offered += 1;
+            let ready = self.sched.push();
+            out.extend(self.code(ready)?);
+        }
+        Ok(out)
     }
 
     /// See [`H265Encoder::flush`].
     fn flush(&mut self) -> Result<Vec<Access>> {
+        let mut out = Vec::new();
+        // Whatever the lookahead was still holding back goes to the
+        // scheduler first, in order, so it types them as it would have.
+        while self.offered < self.next_display {
+            self.offered += 1;
+            let ready = self.sched.push();
+            out.extend(self.code(ready)?);
+        }
         let ready = self.sched.flush();
-        self.code(ready)
+        out.extend(self.code(ready)?);
+        Ok(out)
     }
 
     fn code(&mut self, ready: Vec<Coded>) -> Result<Vec<Access>> {
         let mut out = Vec::with_capacity(ready.len());
-        for c in ready {
+        for (i, &c) in ready.iter().enumerate() {
             let src = self.held.remove(&c.display).ok_or_else(|| {
                 Error::bitstream("H.265 encode: scheduler released an absent picture")
             })?;
-            let access = self.code_picture(c, &src)?;
+            // The pictures released alongside this one and not yet coded
+            // are part of what a lookahead can see.
+            let access = self.code_picture(c, &src, &ready[i + 1..])?;
+            self.costs.remove(&c.display);
             // The ledger closes here, at the one place every picture of
             // every kind passes through — an accounting call inside each
             // coding path could be forgotten in one of them, and the
@@ -415,8 +520,8 @@ impl<S: Sample> Core<S> {
     /// Without a declared buffer there is nothing to fit and the loop runs
     /// exactly once, which is why every stream that does not ask for a
     /// buffer is byte-identical to what it was before this existed.
-    fn code_picture(&mut self, c: Coded, src: &[S]) -> Result<Access> {
-        let mut qp = self.pick_picture_qp(&c)?;
+    fn code_picture(&mut self, c: Coded, src: &[S], upcoming: &[Coded]) -> Result<Access> {
+        let mut qp = self.pick_picture_qp(&c, upcoming)?;
         let bypass = matches!(self.cfg.rate, RateControl::Lossless);
         for attempt in 0..super::rc::MAX_ATTEMPTS {
             let a = self.code_attempt(c, src, qp, bypass)?;
@@ -425,13 +530,13 @@ impl<S: Sample> Core<S> {
             // `None` means no buffer was declared and nothing can fail.
             let affordable = self.rc.as_ref().and_then(|rc| rc.affordable_bits());
             let Some(afford) = affordable else {
-                return Ok(self.commit(&c, a));
+                return Ok(self.commit(&c, a, qp));
             };
             if bits <= afford {
                 if let Some(rc) = self.rc.as_mut() {
                     rc.note_recode(qp);
                 }
-                return Ok(self.commit(&c, a));
+                return Ok(self.commit(&c, a, qp));
             }
             if attempt + 1 == super::rc::MAX_ATTEMPTS || qp >= 51 {
                 // The declared buffer is smaller than this content can be
@@ -452,8 +557,10 @@ impl<S: Sample> Core<S> {
 
     /// Keep what an attempt made: the reconstruction the SELF check reads,
     /// and the reference the next picture predicts from.
-    fn commit(&mut self, c: &Coded, a: Attempt<S>) -> Access {
+    fn commit(&mut self, c: &Coded, a: Attempt<S>, qp: u8) -> Access {
         self.recon.push(a.rec);
+        self.last_qp = Some(qp);
+        self.census.by_kind[Census::slot(c.kind)].add(&a.census);
         if a.clears_refs {
             self.refs.clear();
         }
@@ -462,19 +569,46 @@ impl<S: Sample> Core<S> {
     }
 
     /// The quantiser this picture starts at, before any buffer escalation.
-    fn pick_picture_qp(&mut self, c: &Coded) -> Result<u8> {
+    /// `upcoming` is what was released with it and is still to code.
+    fn pick_picture_qp(&mut self, c: &Coded, upcoming: &[Coded]) -> Result<u8> {
         Ok(match self.cfg.rate {
             RateControl::Lossless => 26,
             RateControl::ConstantQp(q) => q.min(51),
             RateControl::Bitrate { .. } => {
-                let kind = match c.kind {
-                    Kind::Idr | Kind::I => PicKind::Intra,
-                    Kind::P => PicKind::Inter,
-                    Kind::B => PicKind::B,
-                };
-                self.rc.as_mut().expect("a bitrate configuration builds a controller").pick_qp(kind)
+                let kind = pic_kind(c.kind);
+                if self.cfg.lookahead == 0 {
+                    self.rc.as_mut().expect("a bitrate configuration builds a controller").pick_qp(kind)
+                } else {
+                    let (cost, window) = self.lookahead_window(c, upcoming);
+                    self.rc.as_mut().expect("a bitrate configuration builds a controller").pick_qp_ahead(kind, cost, &window)
+                }
             }
         })
+    }
+
+    /// What the rate controller may plan this picture against: its own
+    /// cost and the window — this picture, the ones released with it and
+    /// still to code, and everything the scheduler has not released yet,
+    /// each with the kind it will be coded as ([`Scheduler::preview`])
+    /// and the cost that kind pays: an intra picture its intra cost, an
+    /// inter picture the cheaper of the two, since a block the previous
+    /// picture predicts badly is still coded intra — with the inter cost
+    /// held above the reference's quantisation noise
+    /// ([`PicCost::inter_floor`]) at the quantiser the last picture was
+    /// coded at.
+    fn lookahead_window(&self, c: &Coded, upcoming: &[Coded]) -> (f64, Vec<(PicKind, f64)>) {
+        let qp_ref = self.last_qp.map_or(26, i32::from);
+        let cost_of = |kind: Kind, display: u64| -> f64 {
+            let pc = self.costs.get(&display).copied().unwrap_or_default();
+            let cost = if kind.is_intra() { pc.intra } else { pc.intra.min(pc.inter.max(pc.inter_floor(qp_ref))) };
+            (cost as f64).max(1.0)
+        };
+        let mine = cost_of(c.kind, c.display);
+        let mut window = vec![(pic_kind(c.kind), mine)];
+        window.extend(upcoming.iter().map(|u| (pic_kind(u.kind), cost_of(u.kind, u.display))));
+        let ahead = self.next_display - self.offered;
+        window.extend(self.sched.preview(ahead).iter().map(|p| (pic_kind(p.kind), cost_of(p.kind, p.display))));
+        (mine, window)
     }
 
     /// Code one picture at a given quantiser, keeping nothing.
@@ -575,7 +709,7 @@ impl<S: Sample> Core<S> {
         // does not, SELF fails on every coded edge while CROSS stays
         // green.
         let deblock = true;
-        out.extend_from_slice(&syn::annexb(syn::NAL_PPS, &syn::write_pps(self.pps_qp, bypass, deblock)));
+        out.extend_from_slice(&syn::annexb(syn::NAL_PPS, &syn::write_pps_opts(self.pps_qp, bypass, deblock, &self.pps_opts)));
         // A buffering period may begin at any IRAP, and this encoder makes
         // every one of them one: the message carries the initial removal
         // delay, which is the single number the schedule cannot derive
@@ -597,6 +731,9 @@ impl<S: Sample> Core<S> {
                 // Present exactly when the SPS enabled SAO, and the chroma
                 // flag only outside monochrome - the reader's two gates.
                 sao: sao_flags(self.cfg.sao, cat),
+                // An I slice carries no prediction weights whatever the
+                // PPS says.
+                pred_weights: None,
             },
             pps_qp,
             syn::NAL_IDR_N_LP,
@@ -620,9 +757,21 @@ impl<S: Sample> Core<S> {
         // derives its boundary strengths from them exactly as a decoder
         // derives them from what it just parsed.
         let mut decisions = Vec::with_capacity(wc * hc);
+        // Per-CTB quantisers, when adaptive quantisation asks for them:
+        // each CTB codes at the picture quantiser plus its offset, and
+        // the chain settles what a decoder will actually hold for it —
+        // the offset only if the CTB carries a cbf to hang the delta on.
+        let offsets = self.aq_offsets(&py, cw, ch);
+        let mut chain = QpChain::new(i32::from(qp), bit_depth);
         for cy in 0..hc {
             for cxu in 0..wc {
-                decisions.push(pic.code_ctu(&ictx, cxu, cy, &py, cw, &pcb, &pcr, ccw));
+                let want = ctb_qp(qp, offsets.as_deref(), cy * wc + cxu);
+                let cctx = IntraCtx { qp: want, ..ictx };
+                let mut d = pic.code_ctu(&cctx, cxu, cy, &py, cw, &pcb, &pcr, ccw);
+                if offsets.is_some() {
+                    d.qp_y = chain.settle(want, d.any_cbf());
+                }
+                decisions.push(d);
             }
         }
         // After the whole picture reconstructs — intra prediction reads
@@ -634,16 +783,25 @@ impl<S: Sample> Core<S> {
         // Then SAO, over the deblocked samples, which is the order 8.7
         // fixes and the order `decoder.rs` applies them in.
         let plan = self.cfg.sao.then(|| {
-            let (sps, pps) = parsed_sets(&self.cfg, &g, i32::from(qp), bypass, deblock, self.cpb.as_ref());
+            let (sps, pps) = parsed_sets(&self.cfg, &g, i32::from(qp), bypass, deblock, self.cpb.as_ref(), &self.pps_opts);
             sao_picture(&ictx, &mut pic.recon, &mut info, &sps, &pps, &py, cw, &pcb, &pcr, ccw)
         });
+        let mut census = KindCensus::of_intra(&decisions, i32::from(qp));
         {
             let mut e = CabacEncoder::new(&mut w);
+            // The writer's own copy of the quantiser chain: it must spell
+            // the delta against the same prediction the decision pass
+            // settled with, and a decoder derives that prediction from
+            // the stream alone.
+            let mut chain = QpChain::new(i32::from(qp), bit_depth);
             for cy in 0..hc {
                 for cxu in 0..wc {
                     let addr = cy * wc + cxu;
                     write_sao_for(&mut e, &mut cx, plan.as_ref(), addr, cxu, cy, bit_depth, cat);
-                    write_ctu_intra(&mut e, &mut cx, &decisions[addr], cxu, cy, bypass, cat);
+                    let d = &decisions[addr];
+                    let delta = offsets.is_some().then(|| chain.spell(d.qp_y, d.any_cbf())).flatten();
+                    census.qp_delta += u64::from(delta.is_some());
+                    write_ctu_intra(&mut e, &mut cx, d, cxu, cy, bypass, cat, delta);
                     e.encode_terminate(u32::from(cy == hc - 1 && cxu == wc - 1));
                 }
             }
@@ -677,6 +835,7 @@ impl<S: Sample> Core<S> {
             rec,
             frame: pic.recon,
             clears_refs: true,
+            census,
         })
     }
 
@@ -703,7 +862,10 @@ impl<S: Sample> Core<S> {
         frame.poc = c.poc as i32;
         frame.extend_rows(0, frame.height);
         self.refs.push(frame);
-        while self.refs.len() > 2 {
+        // Two for the B geometry above, or as many past pictures as
+        // `max_refs` lets a P picture choose between — whichever is more.
+        let keep = (self.cfg.max_refs as usize).max(2);
+        while self.refs.len() > keep {
             self.refs.remove(0);
         }
     }
@@ -772,7 +934,7 @@ impl<S: Sample> Core<S> {
         // downstream reads `init_qp_minus26` out of it, so it was never
         // going to break — it was going to sit here being wrong, which is
         // how the last two stale comments started.
-        let pps_rbsp = syn::write_pps(self.pps_qp, bypass, true);
+        let pps_rbsp = syn::write_pps_opts(self.pps_qp, bypass, true, &self.pps_opts);
         let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&sps_rbsp))?;
         let mut pps = crate::hevc::pps::Pps::parse(&crate::nal::unescape_rbsp(&pps_rbsp))?;
         pps.resolve_tiles(&sps)?;
@@ -783,19 +945,23 @@ impl<S: Sample> Core<S> {
         // the time one of those codes — and the retention below keeps them
         // until the last picture that can reference them has been coded.
         let cur = c.poc as i32;
-        let past = self
-            .refs
-            .iter()
-            .filter(|f| f.poc < cur)
-            .max_by_key(|f| f.poc)
-            .ok_or_else(|| Error::bitstream("H.265 encode: an inter picture with no past reference"))?;
+        // RefPicList0: the past references, nearest first, capped by what
+        // the configuration asks for (`max_refs`, 1 by default) and what
+        // the SPS sized the decoded picture buffer to hold. Nearest first
+        // is not cosmetic — it is the order the reader builds the list in
+        // from the reference picture set, so index 0 must be the nearest.
+        // A B picture takes one past reference: its second list is the
+        // future anchor, and `max_refs` names the P choice only.
+        let mut l0: Vec<&crate::hevc::frame::Frame<S>> = self.refs.iter().filter(|f| f.poc < cur).collect();
+        l0.sort_by_key(|f| -f.poc);
+        l0.truncate(if c.kind == Kind::B { 1 } else { (self.cfg.max_refs.max(1) as usize).min(l0.len()) });
+        let past = *l0.first().ok_or_else(|| Error::bitstream("H.265 encode: an inter picture with no past reference"))?;
         let future = self.refs.iter().filter(|f| f.poc > cur).min_by_key(|f| f.poc);
         if c.kind == Kind::B && future.is_none() {
             return Err(Error::bitstream(
                 "H.265 encode: a B picture with no future reference",
             ));
         }
-        let ref_poc = past.poc;
         let future_poc = future.map(|f| f.poc);
 
         let cpu = Cpu::detect_honouring_env();
@@ -819,6 +985,38 @@ impl<S: Sample> Core<S> {
         // the same field a decoder of this stream sizes its frames by.
         let mut pic = InterPicture::<S>::new(&sps, &pps, c.poc as i32);
 
+        // Weighted prediction, for a P slice under the PPS flag: one
+        // entry for list 0's one reference, each component fitted to the
+        // source against the reference's reconstruction and kept only
+        // where it lowers the zero-motion residual (`h265_wp`). The
+        // table travels in the slice header; the walk predicts with
+        // exactly what a decoder derives from that table, through the
+        // reader's own `explicit_weighting`.
+        let wp = (self.cfg.weighted_pred && c.kind == Kind::P).then(|| {
+            let identity = h265_wp::PlaneFit::identity(0);
+            // One entry per reference in the list, each its own fit: an
+            // older reference of a fade is further down the ramp and
+            // wants a different gain.
+            let fits: Vec<[h265_wp::PlaneFit; 3]> = l0
+                .iter()
+                .map(|rf| {
+                    let luma = h265_wp::fit_plane(&src[..dw * dh], dw, &rf.y, dw, dh, bit_depth);
+                    let (cb, cr) = if cat != 0 {
+                        (
+                            h265_wp::fit_plane(&src[dw * dh..dw * dh + cdw * cdh], cdw, &rf.cb, cdw, cdh, bit_depth),
+                            h265_wp::fit_plane(&src[dw * dh + cdw * cdh..], cdw, &rf.cr, cdw, cdh, bit_depth),
+                        )
+                    } else {
+                        (identity, identity)
+                    };
+                    [luma, cb, cr]
+                })
+                .collect();
+            let entries = fits.iter().map(|f| h265_wp::entry_for(*f, bit_depth, bit_depth)).collect();
+            (h265_wp::table_for(entries), fits)
+        });
+        pic.wp = wp.as_ref().map_or(Vec::new(), |(t, _)| (0..l0.len()).map(|r| explicit_weighting(t, bit_depth, bit_depth, [r as i8, -1])).collect());
+
         let mut w = BitWriter::with_capacity(cw * ch / 4);
         syn::write_slice_header(
             &syn::SliceHeader {
@@ -826,15 +1024,30 @@ impl<S: Sample> Core<S> {
                 poc_lsb: (c.poc as u32) & ((1 << LOG2_MAX_POC_LSB) - 1),
                 qp: i32::from(qp),
                 log2_max_poc_lsb: LOG2_MAX_POC_LSB,
-                // The inline short term reference picture set: one past
-                // entry, which becomes RefPicList0, and for a B picture one
-                // future entry, which becomes RefPicList1.
-                ref_deltas: match future_poc {
-                    Some(f) if c.kind == Kind::B => vec![ref_poc - cur, f - cur],
-                    _ => vec![ref_poc - cur],
+                // The inline short term reference picture set: one entry
+                // per reference this slice will use — every picture in
+                // RefPicList0, and for a B picture the future anchor. The
+                // header writer counts these to decide
+                // `num_ref_idx_active_override_flag`, so the set and the
+                // declared counts cannot disagree.
+                ref_deltas: {
+                    let mut d: Vec<i32> = l0.iter().map(|f| f.poc - cur).collect();
+                    if let (Some(f), Kind::B) = (future_poc, c.kind) {
+                        d.push(f - cur);
+                    }
+                    d
                 },
                 // As in `code_picture`, and from the same switch.
                 sao: sao_flags(self.cfg.sao, cat),
+                // The table a P slice must carry under `weighted_pred_flag`
+                // — defaults and all — and a B slice never does, since
+                // `weighted_bipred_flag` is never set.
+                pred_weights: wp.as_ref().map(|(t, _)| syn::PredWeights {
+                    table: t.clone(),
+                    chroma: cat != 0,
+                    bit_depth_luma: bit_depth,
+                    bit_depth_chroma: bit_depth,
+                }),
             },
             pps_qp,
             syn::NAL_TRAIL_R,
@@ -859,13 +1072,19 @@ impl<S: Sample> Core<S> {
         let mut decisions = Vec::with_capacity(wc * hc);
         // Decide and reconstruct first; serialise below. See the same
         // split in `code_picture` for why SAO forces it.
+        // Per-CTB quantisers, exactly as the intra path derives and
+        // settles them.
+        let offsets = self.aq_offsets(&py, cw, ch);
+        let mut chain = QpChain::new(i32::from(qp), bit_depth);
         for cy in 0..hc {
             for cxu in 0..wc {
+                let want = ctb_qp(qp, offsets.as_deref(), cy * wc + cxu);
+                let cctx = IntraCtx { qp: want, ..mctx };
                 let d = match future {
                     Some(r1) if c.kind == Kind::B => {
-                        pic.code_ctu_b(&mctx, past, r1, cxu, cy, &py, cw, &pcb, &pcr, ccw)
+                        pic.code_ctu_b(&cctx, past, r1, cxu, cy, &py, cw, &pcb, &pcr, ccw)
                     }
-                    _ => pic.code_ctu(&mctx, past, cxu, cy, &py, cw, &pcb, &pcr, ccw),
+                    _ => pic.code_ctu(&cctx, &l0, cxu, cy, &py, cw, &pcb, &pcr, ccw),
                 };
                 // The decision module answers `UseIntra` when its
                 // flatness proxy says inter has lost. The CU is then
@@ -874,13 +1093,42 @@ impl<S: Sample> Core<S> {
                 // I slice runs, reading the inter neighbours already
                 // reconstructed beside it, which the PPS's
                 // `constrained_intra_pred_flag` 0 makes references.
-                let coded = if matches!(d.kind, InterCuKind::UseIntra) {
-                    PCuDecision::Intra(Box::new(pic.code_ctu_intra(&mctx, cxu, cy, &py, cw, &pcb, &pcr, ccw)))
+                let mut coded = if matches!(d.kind, InterCuKind::UseIntra) {
+                    PCuDecision::Intra(Box::new(pic.code_ctu_intra(&cctx, cxu, cy, &py, cw, &pcb, &pcr, ccw)))
                 } else {
                     PCuDecision::Inter(d)
                 };
+                if offsets.is_some() {
+                    let q = chain.settle(want, coded.any_cbf());
+                    coded.set_qp_y(q);
+                }
                 skipped[cy * wc + cxu] = matches!(&coded, PCuDecision::Inter(d) if matches!(d.kind, InterCuKind::Skip { .. }));
                 decisions.push(coded);
+            }
+        }
+        // The weighting's model check, counted rather than asserted: the
+        // fit predicted that scaling the reference lowers the residual
+        // over the picture at zero motion; here is whether it lowered the
+        // luma SATD of the vectors the search actually chose, CU by CU.
+        // `wp_lost` above `wp_won` on a picture says the fit was wrong
+        // for it — a test holds that on a fade, and the census line
+        // reports it on every clip.
+        let mut wp_stats = (0u64, 0u64, 0u64);
+        if let Some((_, fits)) = &wp {
+            if fits.iter().any(|f| f[0].used()) {
+                wp_stats.0 = 1;
+                let n = 1usize << g.log2_ctb;
+                for (addr, d) in decisions.iter().enumerate() {
+                    let PCuDecision::Inter(d) = d else { continue };
+                    if d.ref_idx < 0 || !fits[d.ref_idx as usize][0].used() {
+                        continue;
+                    }
+                    let (x0, y0) = ((addr % wc) * n, (addr / wc) * n);
+                    let r = d.ref_idx as usize;
+                    let (plain, weighted) = pic.weighting_gain(&mctx, l0[r], r, x0, y0, &py, cw, d.mv);
+                    wp_stats.1 += u64::from(weighted < plain);
+                    wp_stats.2 += u64::from(weighted > plain);
+                }
             }
         }
         // After the whole picture reconstructs and before the crop, for
@@ -897,17 +1145,25 @@ impl<S: Sample> Core<S> {
             let InterPicture { info, recon, .. } = &mut pic;
             sao_picture(&mctx, recon, info, &sps, &pps, &py, cw, &pcb, &pcr, ccw)
         });
+        let mut census = KindCensus::of_inter(&decisions, i32::from(qp));
+        census.wp_on += wp_stats.0;
+        census.wp_won += wp_stats.1;
+        census.wp_lost += wp_stats.2;
         {
             let mut e = CabacEncoder::new(&mut w);
+            let mut chain = QpChain::new(i32::from(qp), bit_depth);
             for cy in 0..hc {
                 for cxu in 0..wc {
                     let addr = cy * wc + cxu;
                     let left = (cxu > 0).then(|| skipped[addr - 1]);
                     let above = (cy > 0).then(|| skipped[addr - wc]);
                     write_sao_for(&mut e, &mut cx, plan.as_ref(), addr, cxu, cy, bit_depth, cat);
-                    match &decisions[addr] {
-                        PCuDecision::Inter(d) => write_cu_inter(&mut e, &mut cx, d, left, above, cat, bypass),
-                        PCuDecision::Intra(d) => write_cu_intra_in_p(&mut e, &mut cx, d, left, above, cat, bypass),
+                    let pd = &decisions[addr];
+                    let delta = offsets.is_some().then(|| chain.spell(pd.qp_y(), pd.any_cbf())).flatten();
+                    census.qp_delta += u64::from(delta.is_some());
+                    match pd {
+                        PCuDecision::Inter(d) => write_cu_inter(&mut e, &mut cx, d, left, above, cat, bypass, delta, l0.len() as u32),
+                        PCuDecision::Intra(d) => write_cu_intra_in_p(&mut e, &mut cx, d, left, above, cat, bypass, delta),
                     }
                     e.encode_terminate(u32::from(cy == hc - 1 && cxu == wc - 1));
                 }
@@ -939,7 +1195,334 @@ impl<S: Sample> Core<S> {
             rec,
             frame: pic.recon,
             clears_refs: false,
+            census,
         })
+    }
+
+    /// The per-CTB quantiser offsets adaptive quantisation wants for a
+    /// picture whose padded luma plane is `py` (`cw` by `ch`), or `None`
+    /// when it is off — in which case nothing below varies the quantiser
+    /// and the decisions keep the context's. Reads the configuration
+    /// only: an attempt stays free of writes to `self`.
+    fn aq_offsets(&self, py: &[S], cw: usize, ch: usize) -> Option<Vec<i32>> {
+        (self.cfg.aq_strength > 0.0).then(|| aq::ctb_offsets(py, cw, cw, ch, self.geom.log2_ctb, self.cfg.bit_depth, self.cfg.aq_strength))
+    }
+}
+
+/// The rate controller's kind for a scheduled picture.
+fn pic_kind(kind: Kind) -> PicKind {
+    match kind {
+        Kind::Idr | Kind::I => PicKind::Intra,
+        Kind::P => PicKind::Inter,
+        Kind::B => PicKind::B,
+    }
+}
+
+/// One source picture's lookahead cost: what the rate controller plans
+/// its bits by before it is coded. See `encode::rc`'s lookahead section
+/// for what the controller does with it.
+///
+/// Both are sums of 8x8 luma SATDs over the display-size picture (whole
+/// blocks only; a partial edge block is not counted, which biases every
+/// picture of a stream identically). `intra` is each block against its
+/// own mean — the residual the DC predictor would leave, a bound on
+/// what any intra mode leaves. `inter` is each block against the same
+/// block of the previous source picture at zero motion — the residual
+/// a skip would leave, a bound on what a motion search leaves. Bounds
+/// rather than the encoder's real costs, deliberately: a lookahead that
+/// ran the decision machinery would cost as much as coding, and what
+/// the controller needs is a number that moves *with* the content,
+/// which is calibrated once ([`SEED_BITS_PER_COST`](super::rc)) and
+/// then pinned by every observation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PicCost {
+    /// Sum of 8x8 SATDs against each block's mean.
+    pub intra: u64,
+    /// Sum of 8x8 SATDs against the previous source picture; equal to
+    /// `intra` for the first picture, which has none.
+    pub inter: u64,
+}
+
+/// The share of a picture's intra cost that predicting it from a
+/// reference coded at quantiser 45 leaves as residual, however still the
+/// content — the reference's own quantisation noise, which the
+/// source-against-source inter cost cannot see.
+///
+/// Measured once: on the corpus's held-frame clip, whose inter cost is
+/// exactly zero, the first P picture after a keyframe coded at 45 cost
+/// 41928 bits at quantiser 0 against the keyframe's 85600 units of intra
+/// cost — 41928 / 3.55 (the inter bits-per-cost median of the same run)
+/// is 11.8k units, 0.14 of the intra cost. Without the floor that
+/// picture was planned as free and coded at quantiser 0, twelve times
+/// the keyframe; with it the plan sees what a decoder's reference
+/// actually holds.
+const REF_NOISE_AT_45: f64 = 0.14;
+
+/// Quantiser steps per halving of the reference-noise floor as the
+/// reference's quantiser falls. The step size itself halves every six,
+/// and the first version of the floor followed it — which planned the
+/// odd-sized clip's P pictures (reference at 28) from a floor three
+/// times too low (0.02 of the intra cost predicted, 0.058 measured from
+/// the bits a P at 26 actually cost) and walked their quantiser to 0
+/// chasing bits the model said were not there. Twelve fits the two
+/// points measured (0.14 at 45, 0.058 at 28: `0.14 * 2^(-17/12)` is
+/// 0.052), and on the corpus took the odd clip's ABR ratio from 1.45 to
+/// 1.16 and the held clip's from 1.21 to 0.78 with every other clip
+/// unchanged. Two points is a fit, not a law; the plan error the
+/// controller reports is where a third point would show.
+const REF_NOISE_HALVING: f64 = 12.0;
+
+impl PicCost {
+    /// The least an inter picture predicted from a reference coded at
+    /// `qp_ref` can cost: [`REF_NOISE_AT_45`] of the intra cost, scaled
+    /// by the reference's step size.
+    fn inter_floor(&self, qp_ref: i32) -> u64 {
+        (self.intra as f64 * REF_NOISE_AT_45 * 2f64.powf((qp_ref - 45) as f64 / REF_NOISE_HALVING)) as u64
+    }
+
+    /// Measure a `w` by `h` luma plane (stride `w`), and `prev` — the
+    /// picture pushed before it at the same size — when there is one.
+    fn measure<S: Sample>(luma: &[S], w: usize, h: usize, prev: Option<&[S]>) -> Self {
+        let dist = DistortionDsp::<S>::new(Cpu::detect_honouring_env());
+        let (bw, bh) = (w / 8, h / 8);
+        let mut flat = [S::default(); 64];
+        let (mut intra, mut inter) = (0u64, 0u64);
+        for by in 0..bh {
+            for bx in 0..bw {
+                let at = by * 8 * w + bx * 8;
+                let block = &luma[at..];
+                let mut sum = 0i32;
+                for y in 0..8 {
+                    for x in 0..8 {
+                        sum += block[y * w + x].to_i32();
+                    }
+                }
+                flat.fill(S::from_i32((sum + 32) >> 6));
+                intra += u64::from((dist.satd)(block, w, &flat, 8, 8, 8));
+                if let Some(p) = prev {
+                    inter += u64::from((dist.satd)(block, w, &p[at..], w, 8, 8));
+                }
+            }
+        }
+        PicCost { intra, inter: if prev.is_some() { inter } else { intra } }
+    }
+}
+
+/// The quantiser CTB `addr` codes at: the picture's, plus its offset when
+/// the picture varies it, held to the range the encoder's quantiser
+/// takes.
+fn ctb_qp(pic_qp: u8, offsets: Option<&[i32]>, addr: usize) -> i32 {
+    match offsets {
+        Some(o) => (i32::from(pic_qp) + o[addr]).clamp(0, 51),
+        None => i32::from(pic_qp),
+    }
+}
+
+/// The encoder's mirror of the reader's quantisation-group state, at the
+/// geometry this encoder codes: one CU per CTB and a group per CTB
+/// (`diff_cu_qp_delta_depth` 0).
+///
+/// What the reader does, and what this therefore has to reproduce
+/// (`coding_quadtree` / `transform_unit`, and 8.6.1):
+///
+/// - A group's `qPY_PREV` is `SliceQpY` for the first group of the slice
+///   and the `QpY` of the previous group's last CU after that; its
+///   `qPY_PRED` averages the left and above groups' `QpY` where those lie
+///   inside the same CTB, taking `qPY_PREV` for each that does not. With
+///   a group per CTB neither ever does, so the prediction is `qPY_PREV`
+///   — but the arithmetic is still the reader's own [`qp_y_pred_from`],
+///   called with both neighbours absent, so that the day the group
+///   shrinks this stops being true loudly rather than silently.
+/// - A CU whose tree carries a cbf codes one `cu_qp_delta`, and its
+///   `QpY` is `qPY_PRED + CuQpDeltaVal` wrapped ([`qp_y_from_pred`]).
+/// - A CU with no coded cbf codes no delta and **holds the predicted
+///   quantiser**, whatever the encoder wanted for it. The encoder does
+///   not get to choose there, and its deblocker must filter that CU at
+///   the predicted value because a decoder's will.
+///
+/// Two copies of this run per picture — one while deciding, one while
+/// writing — and both must land on the same numbers; `settle` records
+/// what a decoder will hold and `spell` asserts the writer's view agrees.
+struct QpChain {
+    slice_qp: i32,
+    bit_depth: u32,
+    /// `QpY` of the last CU coded, `None` before the first group.
+    last: Option<i32>,
+}
+
+impl QpChain {
+    fn new(slice_qp: i32, bit_depth: u32) -> Self {
+        QpChain { slice_qp, bit_depth, last: None }
+    }
+
+    /// `qPY_PRED` for the next CTB.
+    fn pred(&self) -> i32 {
+        qp_y_pred_from(None, None, self.last.unwrap_or(self.slice_qp))
+    }
+
+    /// Decision side: the CTB was coded at `want` and carries a cbf or
+    /// not. Returns the `QpY` a decoder will hold for it, which is `want`
+    /// only if a delta can be coded.
+    fn settle(&mut self, want: i32, has_cbf: bool) -> i32 {
+        let pred = self.pred();
+        let qp_y = if has_cbf { qp_y_from_pred(pred, want - pred, self.bit_depth) } else { pred };
+        debug_assert!(!has_cbf || qp_y == want, "a coded delta must land the quantiser where the CTB was coded ({want}), not {qp_y}");
+        self.last = Some(qp_y);
+        qp_y
+    }
+
+    /// Writer side: the `CuQpDeltaVal` to spell for a CTB whose decision
+    /// holds `qp_y`, or `None` when it carries no cbf and a decoder reads
+    /// none — in which case the decision must already hold the
+    /// prediction, and that is checked rather than assumed.
+    fn spell(&mut self, qp_y: i32, has_cbf: bool) -> Option<i32> {
+        let pred = self.pred();
+        debug_assert!(has_cbf || qp_y == pred, "a residual-free CTB must hold the predicted quantiser {pred}, not {qp_y}");
+        self.last = Some(qp_y);
+        has_cbf.then_some(qp_y - pred)
+    }
+}
+
+/// What the H.265 encoder's pictures were made of, by picture kind — the
+/// H.265 twin of the H.264 encoder's shape census, and for the same
+/// reason: a gate row turns a code path on, and only the clip decides
+/// whether anything takes it. A row proves the syntax; this says whether
+/// the feature was exercised, so a green cell over a feature no CU chose
+/// can be told from one that proved something.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Census {
+    /// Indexed by [`Census::slot`]: intra pictures, P, B.
+    pub by_kind: [KindCensus; 3],
+}
+
+impl Census {
+    /// Which of the three tallies a picture kind lands in.
+    pub fn slot(kind: Kind) -> usize {
+        match kind {
+            Kind::Idr | Kind::I => 0,
+            Kind::P => 1,
+            Kind::B => 2,
+        }
+    }
+}
+
+/// The tally for one picture kind. Every field is a count of coding
+/// units.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KindCensus {
+    /// Coding units coded, all kinds.
+    pub cus: u64,
+    /// Skipped.
+    pub skip: u64,
+    /// Merged with residual.
+    pub merge: u64,
+    /// AMVP, either list or both.
+    pub amvp: u64,
+    /// Bi-predicted (both lists), merge or AMVP.
+    pub bi: u64,
+    /// Intra — every CU of an intra picture, and the intra CUs a P or B
+    /// picture chose.
+    pub intra: u64,
+    /// Intra CUs whose transform tree split.
+    pub split_tu: u64,
+    /// CUs that coded a `cu_qp_delta` — carried a cbf under a per-CTB
+    /// quantiser.
+    pub qp_delta: u64,
+    /// CUs whose `QpY` differs from the picture quantiser, which is what
+    /// proves adaptive quantisation moved something rather than coding
+    /// zero deltas.
+    pub qp_moved: u64,
+    /// Pictures whose `pred_weight_table` carried a luma weighting other
+    /// than the default — weighted prediction chosen, not merely
+    /// enabled. (A picture, not a CU: the table is per slice.)
+    pub wp_on: u64,
+    /// Under a chosen weighting, inter CUs whose luma SATD at the chosen
+    /// vector was lower weighted than plain — the fit's prediction
+    /// holding, CU by CU.
+    pub wp_won: u64,
+    /// The same, higher weighted than plain — the fit's prediction
+    /// failing.
+    pub wp_lost: u64,
+    /// Inter CUs predicted from a list-0 reference other than the
+    /// nearest (`ref_idx` 1 or more) — the choice multi-reference
+    /// prediction exists for, taken.
+    pub ref_older: u64,
+}
+
+impl KindCensus {
+    fn of_intra(decisions: &[CuDecision], pic_qp: i32) -> Self {
+        let mut c = KindCensus::default();
+        for d in decisions {
+            c.cus += 1;
+            c.intra += 1;
+            c.split_tu += u64::from(d.split_tu);
+            c.qp_moved += u64::from(d.qp_y != pic_qp);
+        }
+        c
+    }
+
+    fn of_inter(decisions: &[PCuDecision], pic_qp: i32) -> Self {
+        let mut c = KindCensus::default();
+        for pd in decisions {
+            c.cus += 1;
+            c.qp_moved += u64::from(pd.qp_y() != pic_qp);
+            match pd {
+                PCuDecision::Intra(d) => {
+                    c.intra += 1;
+                    c.split_tu += u64::from(d.split_tu);
+                }
+                PCuDecision::Inter(d) => {
+                    match d.kind {
+                        InterCuKind::Skip { .. } => c.skip += 1,
+                        InterCuKind::Merge { .. } => c.merge += 1,
+                        InterCuKind::Amvp { .. } | InterCuKind::BAmvp { .. } => c.amvp += 1,
+                        InterCuKind::UseIntra => unreachable!("replaced by the intra decision"),
+                    }
+                    c.bi += u64::from(d.ref_idx >= 0 && d.ref_idx_l1 >= 0);
+                    c.ref_older += u64::from(d.ref_idx >= 1);
+                }
+            }
+        }
+        c
+    }
+
+    /// Fold `other` into this tally.
+    fn add(&mut self, other: &KindCensus) {
+        self.cus += other.cus;
+        self.skip += other.skip;
+        self.merge += other.merge;
+        self.amvp += other.amvp;
+        self.bi += other.bi;
+        self.intra += other.intra;
+        self.split_tu += other.split_tu;
+        self.qp_delta += other.qp_delta;
+        self.qp_moved += other.qp_moved;
+        self.wp_on += other.wp_on;
+        self.wp_won += other.wp_won;
+        self.wp_lost += other.wp_lost;
+        self.ref_older += other.ref_older;
+    }
+
+    /// The nonzero counters, named, for a census line.
+    pub fn taken(&self) -> Vec<(&'static str, u64)> {
+        [
+            ("cus", self.cus),
+            ("skip", self.skip),
+            ("merge", self.merge),
+            ("amvp", self.amvp),
+            ("bi", self.bi),
+            ("intra", self.intra),
+            ("split_tu", self.split_tu),
+            ("qp_delta", self.qp_delta),
+            ("qp_moved", self.qp_moved),
+            ("wp_on", self.wp_on),
+            ("wp_won", self.wp_won),
+            ("wp_lost", self.wp_lost),
+            ("ref_older", self.ref_older),
+        ]
+        .into_iter()
+        .filter(|&(_, n)| n != 0)
+        .collect()
     }
 }
 
@@ -961,10 +1544,11 @@ fn sao_flags(sao: bool, cat: u32) -> Option<syn::SaoFlags> {
 /// filters and the candidate derivations read decoder structures, and
 /// building them from the very bytes the stream carries is what keeps the
 /// encoder's idea of the geometry and the decoder's identical.
-fn parsed_sets(cfg: &Config, g: &syn::Geometry, qp: i32, bypass: bool, deblock: bool, cpb: Option<&Cpb>) -> (crate::hevc::sps::Sps, crate::hevc::pps::Pps) {
+#[allow(clippy::too_many_arguments)]
+fn parsed_sets(cfg: &Config, g: &syn::Geometry, qp: i32, bypass: bool, deblock: bool, cpb: Option<&Cpb>, opts: &PpsOptions) -> (crate::hevc::sps::Sps, crate::hevc::pps::Pps) {
     let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&syn::write_sps(cfg, g, LOG2_MAX_POC_LSB, cpb)))
         .expect("the encoder's own SPS parses");
-    let mut pps = crate::hevc::pps::Pps::parse(&crate::nal::unescape_rbsp(&syn::write_pps(qp, bypass, deblock)))
+    let mut pps = crate::hevc::pps::Pps::parse(&crate::nal::unescape_rbsp(&syn::write_pps_opts(qp, bypass, deblock, opts)))
         .expect("the encoder's own PPS parses");
     pps.resolve_tiles(&sps).expect("one tile covering the picture");
     (sps, pps)
@@ -1024,6 +1608,7 @@ fn write_sao_for(e: &mut CabacEncoder, cx: &mut Contexts, plan: Option<&SaoPlan>
 /// part of this walk that depends on it - see the comments there for the
 /// per-format cbf and residual shapes, which are the inter mirror of what
 /// `write_ctu_intra`'s unsplit branch spells.
+#[allow(clippy::too_many_arguments)]
 fn write_cu_inter(
     e: &mut CabacEncoder,
     cx: &mut Contexts,
@@ -1032,9 +1617,12 @@ fn write_cu_inter(
     above_skip: Option<bool>,
     cat: u32,
     pps_bypass: bool,
+    qp_delta: Option<i32>,
+    nref: u32,
 ) {
     let log2 = d.log2_cu;
     debug_assert!(pps_bypass || !d.bypass, "a bypass CU is unspellable unless the PPS enables the flag");
+    debug_assert!(u32::from(d.ref_idx.max(0) as u8) < nref.max(1), "a CU naming a reference beyond the active list");
     // One CU per CTU, so the coding quadtree never splits and the flag is
     // coded exactly once, false - the same shape the intra writer spells.
     let nb = SplitCuNb {
@@ -1053,6 +1641,10 @@ fn write_cu_inter(
 
     let skip = matches!(d.kind, InterCuKind::Skip { .. });
     write_cu_skip_flag(e, cx, left_skip, above_skip, skip);
+    // A quantiser delta rides in the transform tree, so a CU without one
+    // — skipped, or root cbf 0 below — cannot have been handed a delta:
+    // the reader would take no bin for it.
+    debug_assert!(qp_delta.is_none() || d.rqt_root_cbf, "a quantiser delta was handed to a CU with no transform tree");
     if let InterCuKind::Skip { merge_idx } = d.kind {
         write_merge_idx(e, cx, MAX_MERGE_CAND as u32, u32::from(merge_idx));
         return;
@@ -1070,6 +1662,14 @@ fn write_cu_inter(
         }
         InterCuKind::Amvp { mvp_flag, mvd } => {
             write_merge_flag(e, cx, false);
+            // `ref_idx_l0` exists only when the slice declares more than
+            // one active reference — the reader's `if nref > 1` — so a
+            // single-reference stream writes nothing here and is
+            // unchanged. `nref` is the count the slice header derived
+            // from its own reference picture set.
+            if nref > 1 {
+                write_ref_idx(e, cx, nref, u32::from(d.ref_idx.max(0) as u8));
+            }
             write_mvd(e, cx, mvd);
             write_mvp_flag(e, cx, mvp_flag != 0);
             write_rqt_root_cbf(e, cx, d.rqt_root_cbf);
@@ -1137,6 +1737,14 @@ fn write_cu_inter(
     } else {
         debug_assert!(d.cbf_luma, "an inter leaf with no chroma cbf has cbf_luma inferred 1");
     }
+    // cu_qp_delta_abs / sign, where `transform_unit` reads it: after the
+    // cbfs and before any residual. This single depth-0 unit is the first
+    // of its group and carries a cbf whenever the tree exists, so the
+    // reader reads a delta here exactly when the PPS enables one — and
+    // the caller hands one over exactly then.
+    if let Some(v) = qp_delta {
+        write_cu_qp_delta(e, cx, v);
+    }
 
     let n = 1usize << log2;
     // Inter blocks always scan diagonally: the mode-dependent scans are an
@@ -1198,7 +1806,13 @@ fn write_cu_inter(
 /// set, `coding_unit` reads a `cu_transquant_bypass_flag` as its very first
 /// bin, so this writer spells one — the CU's own choice, `d.bypass` — and
 /// when clear, nothing is written and the CU must not claim bypass.
-pub(crate) fn write_ctu_intra(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, ctu_x: usize, ctu_y: usize, pps_bypass: bool, cat: u32) {
+///
+/// `qp_delta` is the `CuQpDeltaVal` to spell inside the transform tree,
+/// `Some` exactly when the PPS enables per-group quantisers *and* this
+/// CU carries a cbf for the reader to read it under — the encoder's
+/// quantiser chain decides both; see [`write_cu_intra_body`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_ctu_intra(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, ctu_x: usize, ctu_y: usize, pps_bypass: bool, cat: u32, qp_delta: Option<i32>) {
     debug_assert!(pps_bypass || !d.bypass, "a bypass CU is unspellable unless the PPS enables the flag");
     // Every coded neighbour has depth 0 (one CU per CTU), and in a single
     // slice availability is picture geometry.
@@ -1213,7 +1827,7 @@ pub(crate) fn write_ctu_intra(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDec
     if pps_bypass {
         write_cu_transquant_bypass_flag(e, cx, d.bypass);
     }
-    write_cu_intra_body(e, cx, d, cat);
+    write_cu_intra_body(e, cx, d, cat, qp_delta);
 }
 
 /// Serialise one intra coding unit inside a **P** slice.
@@ -1237,6 +1851,7 @@ pub(crate) fn write_ctu_intra(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDec
 /// No `cu_transquant_bypass_flag` either: `code_p_picture` writes its PPS
 /// with `transquant_bypass_enabled_flag` clear (lossless inter refuses by
 /// name upstream), so the reader takes no such bin.
+#[allow(clippy::too_many_arguments)]
 fn write_cu_intra_in_p(
     e: &mut CabacEncoder,
     cx: &mut Contexts,
@@ -1245,6 +1860,7 @@ fn write_cu_intra_in_p(
     above_skip: Option<bool>,
     cat: u32,
     pps_bypass: bool,
+    qp_delta: Option<i32>,
 ) {
     debug_assert!(pps_bypass || !d.bypass, "a bypass CU is unspellable unless the PPS enables the flag");
     let nb = SplitCuNb {
@@ -1259,7 +1875,7 @@ fn write_cu_intra_in_p(
     }
     write_cu_skip_flag(e, cx, left_skip, above_skip, false);
     write_pred_mode_flag(e, cx, true);
-    write_cu_intra_body(e, cx, d, cat);
+    write_cu_intra_body(e, cx, d, cat, qp_delta);
 }
 
 /// The intra coding unit proper: everything from `prev_intra_luma_pred_flag`
@@ -1279,10 +1895,18 @@ fn write_cu_intra_in_p(
 /// Anything that stops matching the reader here desyncs the arithmetic
 /// coder and fails SELF wholesale, which is exactly the property the
 /// encode gate checks.
-fn write_cu_intra_body(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, cat: u32) {
+///
+/// `qp_delta`, when given, is spelled in the **first transform unit that
+/// carries a coded cbf** — luma, or the chroma bins that unit holds — and
+/// nowhere else, which is where `transform_unit` reads it
+/// (`IsCuQpDeltaCoded` gates the rest). The caller guarantees such a
+/// unit exists (`CuDecision::any_cbf`); a delta left unspelled at the
+/// end is a caller bug and is asserted.
+fn write_cu_intra_body(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, cat: u32, qp_delta: Option<i32>) {
     let log2 = d.log2_cu;
     debug_assert!((4..=5).contains(&log2), "one CU per CTU wants CTB 16 or 32");
     debug_assert!(!d.nxn, "PART_NxN exists only at the minimum CU size");
+    let mut pending = qp_delta;
 
     let syn0 = d.luma_syntax[0];
     write_prev_intra_luma_pred_flag(e, cx, syn0.prev_flag);
@@ -1364,6 +1988,13 @@ fn write_cu_intra_body(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, 
             // module's layout is positional precisely so no slot depends
             // on a sibling's structure.
             write_cbf_luma(e, cx, 1, d.cbf_luma[4 * i]);
+            // The delta, at the first child with a cbf: its luma bin, or
+            // the chroma bins it coded just above (which exist only under
+            // a set parent bin — the reader infers a clear one otherwise).
+            let child_chroma = cat != 0 && (0..2).any(|comp| d.cbf_chroma[comp] && (d.cbf_chroma_tu[comp][i] || d.cbf_chroma_tu_bot[comp][i]));
+            if pending.is_some() && (d.cbf_luma[4 * i] || child_chroma) {
+                write_cu_qp_delta(e, cx, pending.take().expect("checked"));
+            }
             if d.cbf_luma[4 * i] {
                 write_residual(e, cx, &params(log2 - 1, 0, d.luma_modes[0]), &d.luma[i * q..(i + 1) * q]);
             }
@@ -1391,6 +2022,7 @@ fn write_cu_intra_body(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, 
                 }
             }
         }
+        debug_assert!(pending.is_none(), "a quantiser delta was handed to a split CU with no coded cbf");
         return;
     }
 
@@ -1408,6 +2040,13 @@ fn write_cu_intra_body(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, 
         }
     }
     write_cbf_luma(e, cx, 0, d.cbf_luma[0]);
+    if let Some(v) = pending.take() {
+        debug_assert!(
+            d.cbf_luma[0] || (cat != 0 && (0..2).any(|comp| d.cbf_chroma[comp] || d.cbf_chroma_bot[comp])),
+            "a quantiser delta was handed to a CU with no coded cbf"
+        );
+        write_cu_qp_delta(e, cx, v);
+    }
     if d.cbf_luma[0] {
         write_residual(e, cx, &params(log2, 0, d.luma_modes[0]), &d.luma[..n * n]);
     }
@@ -1454,6 +2093,394 @@ mod tests {
             let e = H265Encoder::new(cfg(64, 64, chroma)).unwrap();
             assert_eq!(e.frame_bytes(), (64.0 * 64.0 * per_px) as usize, "{chroma:?}");
         }
+    }
+
+    /// Pictures whose four CTBs differ sharply in variance — flat, a
+    /// gradient, noise, a checkerboard — so adaptive quantisation has
+    /// something to move, in `chroma` at `bit_depth`, `count` frames
+    /// that drift a little each so inter pictures carry residual.
+    fn aq_frames(chroma: ChromaFormat, bit_depth: u32, count: usize) -> Vec<Vec<u8>> {
+        let (w, h) = (64usize, 64usize);
+        let (sw, sh) = match chroma {
+            ChromaFormat::Yuv420 => (2usize, 2usize),
+            ChromaFormat::Yuv422 => (2, 1),
+            _ => (1, 1),
+        };
+        let (cw, ch) = if chroma == ChromaFormat::Monochrome { (0, 0) } else { (w / sw, h / sh) };
+        let shift = bit_depth - 8;
+        (0..count)
+            .map(|i| {
+                let mut seed = 0x9e37u32.wrapping_add(i as u32 * 7919);
+                let mut samples: Vec<u32> = Vec::with_capacity(w * h + 2 * cw * ch);
+                for y in 0..h {
+                    for x in 0..w {
+                        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                        let v: i32 = match (x >= 32, y >= 32) {
+                            (false, false) => 110 + i as i32,
+                            (true, false) => ((x + y + i) % 96) as i32 + 60,
+                            (false, true) => (seed >> 24) as i32,
+                            (true, true) => if ((x / 4) + (y / 4) + i) % 2 == 0 { 40 } else { 200 },
+                        };
+                        samples.push((v.clamp(0, 255) as u32) << shift);
+                    }
+                }
+                for _ in 0..2 {
+                    for y in 0..ch {
+                        for x in 0..cw {
+                            samples.push((((120 + x / 2 + y / 3 + i) & 0xff) as u32) << shift);
+                        }
+                    }
+                }
+                if shift == 0 {
+                    samples.iter().map(|&v| v as u8).collect()
+                } else {
+                    samples.iter().flat_map(|&v| (v as u16).to_le_bytes()).collect()
+                }
+            })
+            .collect()
+    }
+
+    /// Adaptive quantisation — a quantiser per CTB, carried by
+    /// `cu_qp_delta` — round-trips through the production decoder for
+    /// intra, P and B pictures at every chroma format and at a deep
+    /// depth, and the census proves it moved something: a stream whose
+    /// every delta was zero, or whose every CTB kept the picture
+    /// quantiser, would pass SELF while proving only the syntax.
+    ///
+    /// SELF is the right check here rather than a QP map comparison: a
+    /// residual coded at one quantiser and scaled at another desyncs
+    /// the reconstruction, and a residual-free CTB filtered at the wrong
+    /// quantiser moves the deblocked samples — both surface as a
+    /// picture that differs from the encoder's own.
+    #[test]
+    fn adaptive_quantisation_round_trips_and_moves_the_quantiser() {
+        for (chroma, bit_depth, bframes) in [
+            (ChromaFormat::Yuv420, 8u32, 0u32),
+            (ChromaFormat::Yuv420, 8, 2),
+            (ChromaFormat::Yuv422, 8, 0),
+            (ChromaFormat::Yuv444, 8, 2),
+            (ChromaFormat::Monochrome, 8, 0),
+            (ChromaFormat::Yuv420, 10, 2),
+        ] {
+            let tag = format!("{chroma:?} {bit_depth}-bit bframes={bframes}");
+            let frames = aq_frames(chroma, bit_depth, 6);
+            for qp in [22u8, 40] {
+                let mut e = H265Encoder::new(Config {
+                    gop: 8,
+                    bframes,
+                    bit_depth,
+                    rate: super::super::RateControl::ConstantQp(qp),
+                    aq_strength: 2.0,
+                    ..cfg(64, 64, chroma)
+                })
+                .unwrap();
+                let mut units = Vec::new();
+                for f in &frames {
+                    units.extend(e.push(f).expect("an adaptively quantised picture should code"));
+                }
+                units.extend(e.flush().unwrap());
+                assert_eq!(units.len(), frames.len(), "{tag}");
+
+                let census = e.census();
+                let deltas: u64 = census.by_kind.iter().map(|k| k.qp_delta).sum();
+                let moved: u64 = census.by_kind.iter().map(|k| k.qp_moved).sum();
+                assert!(deltas > 0, "{tag} qp {qp}: no CU coded a cu_qp_delta, so the syntax was never exercised");
+                assert!(moved > 0, "{tag} qp {qp}: no CTB left the picture quantiser, so the feature did nothing");
+                if bframes > 0 {
+                    assert!(census.by_kind[2].cus > 0, "{tag}: no B picture was coded");
+                }
+
+                // The decoder emits display order; the reconstructions
+                // are in coding order, matched through each access unit's
+                // POC as `deep_pictures_round_trip_through_the_decoder`
+                // does.
+                let mut dec = crate::hevc::HevcDecoder::new();
+                for u in &units {
+                    dec.push_annexb(&u.data).unwrap_or_else(|err| panic!("{tag} qp {qp}: {err}"));
+                }
+                dec.flush().unwrap();
+                let mut by_display = vec![None; units.len()];
+                for u in &units {
+                    by_display[(u.poc / 2) as usize] = Some(u.encode_index as usize);
+                }
+                for (i, coded) in by_display.iter().enumerate() {
+                    let want = &e.reconstructions()[coded.unwrap_or_else(|| panic!("{tag} qp {qp}: display index {i} never coded"))];
+                    let got = dec.next_picture().unwrap_or_else(|| panic!("{tag} qp {qp}: picture {i} missing"));
+                    assert!(got.into_packed() == *want, "{tag} qp {qp}: picture {i} differs from the reconstruction");
+                }
+            }
+        }
+
+        // Strength 0 is off: the stream is what the encoder writes with
+        // the switch absent — the PPS bit clear and no delta anywhere.
+        let frames = aq_frames(ChromaFormat::Yuv420, 8, 3);
+        let encode = |strength: f32| -> Vec<u8> {
+            let mut e = H265Encoder::new(Config { gop: 8, aq_strength: strength, ..cfg(64, 64, ChromaFormat::Yuv420) }).unwrap();
+            let mut out = Vec::new();
+            for f in &frames {
+                for u in e.push(f).unwrap() {
+                    out.extend_from_slice(&u.data);
+                }
+            }
+            for u in e.flush().unwrap() {
+                out.extend_from_slice(&u.data);
+            }
+            assert_eq!(e.census().by_kind.iter().map(|k| k.qp_delta).sum::<u64>() > 0, strength > 0.0);
+            out
+        };
+        assert_eq!(encode(0.0), encode(Config::default().aq_strength));
+        assert_ne!(encode(0.0), encode(1.0), "strength 1 must change the stream");
+
+        // Lossless has no quantiser to adapt: refused by name.
+        let err = H265Encoder::new(Config {
+            rate: super::super::RateControl::Lossless,
+            aq_strength: 1.0,
+            ..cfg(64, 64, ChromaFormat::Yuv420)
+        })
+        .err()
+        .expect("adaptive quantisation on a lossless stream must refuse");
+        assert!(format!("{err}").contains("adaptive quantisation"), "{err}");
+    }
+
+    /// A busy picture scaled down a step per frame — a luma gain fade,
+    /// chroma untouched — in `chroma` at `bit_depth`, `count` frames.
+    fn fade_frames(chroma: ChromaFormat, bit_depth: u32, count: usize) -> Vec<Vec<u8>> {
+        let (w, h) = (64usize, 64usize);
+        let (sw, sh) = match chroma {
+            ChromaFormat::Yuv420 => (2usize, 2usize),
+            ChromaFormat::Yuv422 => (2, 1),
+            _ => (1, 1),
+        };
+        let (cw, ch) = if chroma == ChromaFormat::Monochrome { (0, 0) } else { (w / sw, h / sh) };
+        let shift = bit_depth - 8;
+        (0..count)
+            .map(|i| {
+                let gain = 1.0 - i as f64 / 16.0;
+                let mut samples: Vec<u32> = Vec::with_capacity(w * h + 2 * cw * ch);
+                let mut seed = 0x51edu32;
+                for y in 0..h {
+                    for x in 0..w {
+                        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                        // Texture with structure and a little noise, so the
+                        // search has something to match and the fit has
+                        // variance to work with.
+                        let base = 40 + ((x * 3 + y * 5 + (x * y) / 7) % 150) as i32 + ((seed >> 28) as i32 - 8);
+                        let v = (f64::from(base) * gain).round().clamp(0.0, 255.0) as u32;
+                        samples.push(v << shift);
+                    }
+                }
+                for _ in 0..2 {
+                    for y in 0..ch {
+                        for x in 0..cw {
+                            samples.push((((110 + x / 3 + y / 2) & 0xff) as u32) << shift);
+                        }
+                    }
+                }
+                if shift == 0 { samples.iter().map(|&v| v as u8).collect() } else { samples.iter().flat_map(|&v| (v as u16).to_le_bytes()).collect() }
+            })
+            .collect()
+    }
+
+    /// Weighted prediction on a fade: every P slice carries a
+    /// `pred_weight_table`, the fit is chosen (census `wp_on`), it holds
+    /// CU by CU (`wp_won` above `wp_lost`, the model check), the stream
+    /// is markedly smaller than the same encode without it, and it
+    /// round-trips through the decoder — at every chroma format, with B
+    /// pictures (which stay default-weighted), and at 10 bits. On a held
+    /// clip the fit is the identity: the table is all defaults, `wp_on`
+    /// is 0, and the stream is the unweighted one plus a few table bits
+    /// per slice.
+    #[test]
+    fn weighted_prediction_pays_on_a_fade_and_round_trips() {
+        for (chroma, bit_depth, bframes) in [
+            (ChromaFormat::Yuv420, 8u32, 0u32),
+            (ChromaFormat::Yuv420, 8, 2),
+            (ChromaFormat::Yuv422, 8, 0),
+            (ChromaFormat::Yuv444, 8, 0),
+            (ChromaFormat::Monochrome, 8, 0),
+            (ChromaFormat::Yuv420, 10, 2),
+        ] {
+            let tag = format!("{chroma:?} {bit_depth}-bit bframes={bframes}");
+            let frames = fade_frames(chroma, bit_depth, 8);
+            let encode = |weighted_pred: bool| -> (Vec<Access>, Vec<Vec<u8>>, Census) {
+                let mut e = H265Encoder::new(Config { gop: 8, bframes, bit_depth, weighted_pred, ..cfg(64, 64, chroma) })
+                    .unwrap_or_else(|err| panic!("{tag}: {err}"));
+                let mut units = Vec::new();
+                for f in &frames {
+                    units.extend(e.push(f).unwrap_or_else(|err| panic!("{tag}: {err}")));
+                }
+                units.extend(e.flush().unwrap());
+                (units, e.reconstructions().to_vec(), *e.census())
+            };
+            let (with, recon, census) = encode(true);
+            let (without, _, _) = encode(false);
+            let bytes = |u: &[Access]| u.iter().map(|a| a.data.len()).sum::<usize>();
+            let p = &census.by_kind[1];
+            assert!(p.wp_on > 0, "{tag}: no P picture chose a weighting: {p:?}");
+            assert!(p.wp_won > p.wp_lost, "{tag}: the fit lost more CUs than it won: {p:?}");
+            assert!(
+                (bytes(&with) as f64) < (bytes(&without) as f64) * 0.9,
+                "{tag}: weighting saved little on a fade: {} against {} bytes",
+                bytes(&with),
+                bytes(&without)
+            );
+            let mut dec = crate::hevc::HevcDecoder::new();
+            for u in &with {
+                dec.push_annexb(&u.data).unwrap_or_else(|err| panic!("{tag}: {err}"));
+            }
+            dec.flush().unwrap();
+            let mut by_display = vec![None; with.len()];
+            for u in &with {
+                by_display[(u.poc / 2) as usize] = Some(u.encode_index as usize);
+            }
+            for (i, coded) in by_display.iter().enumerate() {
+                let want = &recon[coded.unwrap_or_else(|| panic!("{tag}: display index {i} never coded"))];
+                let got = dec.next_picture().unwrap_or_else(|| panic!("{tag}: picture {i} missing"));
+                assert!(got.into_packed() == *want, "{tag}: picture {i} differs from the reconstruction");
+            }
+        }
+
+        // A held clip: the identity fits, nothing is chosen, and the
+        // table costs its flags and nothing more.
+        let held: Vec<Vec<u8>> = std::iter::repeat_n(fade_frames(ChromaFormat::Yuv420, 8, 1).remove(0), 6).collect();
+        let encode = |weighted_pred: bool| -> (usize, Census) {
+            let mut e = H265Encoder::new(Config { gop: 8, weighted_pred, ..cfg(64, 64, ChromaFormat::Yuv420) }).unwrap();
+            let mut bytes = 0;
+            for f in &held {
+                bytes += e.push(f).unwrap().iter().map(|a| a.data.len()).sum::<usize>();
+            }
+            bytes += e.flush().unwrap().iter().map(|a| a.data.len()).sum::<usize>();
+            (bytes, *e.census())
+        };
+        let (with, census) = encode(true);
+        let (without, _) = encode(false);
+        assert_eq!(census.by_kind[1].wp_on, 0, "a held clip chose a weighting: {:?}", census.by_kind[1]);
+        assert!(with >= without && with <= without + 2 * held.len(), "the table of defaults should cost bits, not bytes: {with} against {without}");
+    }
+
+    /// Two references: every P slice declares two active references in
+    /// list 0, `ref_idx` is coded on every AMVP unit, and the stream
+    /// round-trips through the decoder — with B pictures (whose lists
+    /// stay one each), under weighted prediction (an entry per
+    /// reference), and at 10 bits. The census says how often the older
+    /// reference was chosen, which is reported rather than asserted:
+    /// at this encoder's block size the honest answer is usually zero.
+    /// At the default of one reference the stream is what it always was.
+    #[test]
+    fn two_references_round_trip_and_the_default_is_unchanged() {
+        for (chroma, bit_depth, bframes, weighted_pred) in [
+            (ChromaFormat::Yuv420, 8u32, 0u32, false),
+            (ChromaFormat::Yuv420, 8, 2, false),
+            (ChromaFormat::Yuv444, 8, 0, true),
+            (ChromaFormat::Yuv420, 10, 0, false),
+        ] {
+            let tag = format!("{chroma:?} {bit_depth}-bit bframes={bframes} wp={weighted_pred}");
+            // Drifting content, so the older reference is a genuinely
+            // different picture; a fade under weighting, so each
+            // reference wants its own gain.
+            let frames = if weighted_pred { fade_frames(chroma, bit_depth, 8) } else { aq_frames(chroma, bit_depth, 8) };
+            let encode = |max_refs: u32| -> (Vec<Access>, Vec<Vec<u8>>, Census) {
+                let mut e = H265Encoder::new(Config { gop: 8, bframes, bit_depth, max_refs, weighted_pred, ..cfg(64, 64, chroma) })
+                    .unwrap_or_else(|err| panic!("{tag}: {err}"));
+                let mut units = Vec::new();
+                for f in &frames {
+                    units.extend(e.push(f).unwrap_or_else(|err| panic!("{tag}: {err}")));
+                }
+                units.extend(e.flush().unwrap());
+                (units, e.reconstructions().to_vec(), *e.census())
+            };
+            let (two, recon, census) = encode(2);
+            let (one, _, _) = encode(1);
+            assert_eq!(two.len(), frames.len(), "{tag}");
+            let bytes = |u: &[Access]| u.iter().flat_map(|a| a.data.iter().copied()).collect::<Vec<u8>>();
+            assert_ne!(bytes(&two), bytes(&one), "{tag}: a second reference changed nothing — the header must at least declare it");
+            let p = &census.by_kind[1];
+            assert!(p.cus > 0, "{tag}: no P picture");
+            // Reported, not required: `ref_older` is how many CUs took
+            // the older picture.
+            eprintln!("{tag}: {} of {} P CUs chose the older reference", p.ref_older, p.cus);
+
+            let mut dec = crate::hevc::HevcDecoder::new();
+            for u in &two {
+                dec.push_annexb(&u.data).unwrap_or_else(|err| panic!("{tag}: {err}"));
+            }
+            dec.flush().unwrap();
+            let mut by_display = vec![None; two.len()];
+            for u in &two {
+                by_display[(u.poc / 2) as usize] = Some(u.encode_index as usize);
+            }
+            for (i, coded) in by_display.iter().enumerate() {
+                let want = &recon[coded.unwrap_or_else(|| panic!("{tag}: display index {i} never coded"))];
+                let got = dec.next_picture().unwrap_or_else(|| panic!("{tag}: picture {i} missing"));
+                assert!(got.into_packed() == *want, "{tag}: picture {i} differs from the reconstruction");
+            }
+        }
+    }
+
+    /// A lookahead holds pictures back and hands the controller their
+    /// costs: the first `lookahead` pushes return nothing, every picture
+    /// is still coded exactly once with the typing and order it would
+    /// have had without one, the stream round-trips through the decoder,
+    /// the ledger holds — and the stream *differs* from the one coded
+    /// without a lookahead, or the feature was inert. A lookahead without
+    /// a bitrate target refuses by name.
+    #[test]
+    fn a_lookahead_delays_output_and_codes_every_picture_once() {
+        // One GOP exactly, so that `poc / 2` is the display index — a
+        // second IDR would restart POC and alias display 0.
+        let frames = aq_frames(ChromaFormat::Yuv420, 8, 8);
+        for (bframes, lookahead) in [(0u32, 3u32), (2, 2), (2, 8), (0, 12)] {
+            let tag = format!("bframes={bframes} lookahead={lookahead}");
+            let run = |lookahead: u32| -> (Vec<Access>, Vec<Vec<u8>>) {
+                let mut e = H265Encoder::new(Config {
+                    gop: 8,
+                    bframes,
+                    lookahead,
+                    fps: 25,
+                    rate: super::super::RateControl::Bitrate { bps: 400_000 },
+                    ..cfg(64, 64, ChromaFormat::Yuv420)
+                })
+                .unwrap_or_else(|err| panic!("{tag}: {err}"));
+                let mut units = Vec::new();
+                for (i, f) in frames.iter().enumerate() {
+                    let out = e.push(f).unwrap_or_else(|err| panic!("{tag}: {err}"));
+                    if (i as u32) < lookahead {
+                        assert!(out.is_empty(), "{tag}: picture {i} was released before the lookahead filled");
+                    }
+                    units.extend(out);
+                }
+                units.extend(e.flush().unwrap());
+                assert!(e.rate_report().is_some(), "{tag}: no rate report");
+                (units, e.reconstructions().to_vec())
+            };
+            let (with, recon) = run(lookahead);
+            let (without, _) = run(0);
+            assert_eq!(with.len(), frames.len(), "{tag}: one access unit per picture");
+            let typing = |u: &[Access]| u.iter().map(|a| (a.poc, a.keyframe, a.encode_index)).collect::<Vec<_>>();
+            assert_eq!(typing(&with), typing(&without), "{tag}: the lookahead changed the picture typing or order");
+            let bytes = |u: &[Access]| u.iter().flat_map(|a| a.data.iter().copied()).collect::<Vec<u8>>();
+            assert_ne!(bytes(&with), bytes(&without), "{tag}: the lookahead changed nothing about the stream");
+
+            let mut dec = crate::hevc::HevcDecoder::new();
+            for u in &with {
+                dec.push_annexb(&u.data).unwrap_or_else(|err| panic!("{tag}: {err}"));
+            }
+            dec.flush().unwrap();
+            let mut by_display = vec![None; with.len()];
+            for u in &with {
+                by_display[(u.poc / 2) as usize] = Some(u.encode_index as usize);
+            }
+            for (i, coded) in by_display.iter().enumerate() {
+                let want = &recon[coded.unwrap_or_else(|| panic!("{tag}: display index {i} never coded"))];
+                let got = dec.next_picture().unwrap_or_else(|| panic!("{tag}: picture {i} missing"));
+                assert!(got.into_packed() == *want, "{tag}: picture {i} differs from the reconstruction");
+            }
+        }
+
+        let err = H265Encoder::new(Config { lookahead: 4, ..cfg(64, 64, ChromaFormat::Yuv420) })
+            .err()
+            .expect("a lookahead at a constant quantiser must refuse");
+        assert!(format!("{err}").contains("lookahead"), "{err}");
     }
 
     /// Intra 4:2:0 codes for real now; everything else still refuses by
@@ -1645,7 +2672,7 @@ mod tests {
         let emitted = |d: &InterCuDecision, qp: i32| -> f32 {
             let mut cx = Contexts::new(1, qp);
             let mut e = CabacEncoder::counting();
-            write_cu_inter(&mut e, &mut cx, d, None, None, 1, false);
+            write_cu_inter(&mut e, &mut cx, d, None, None, 1, false, None, 1);
             e.fractional_bits() as f32
         };
 
@@ -1824,7 +2851,7 @@ mod tests {
         let mut any_skip = false;
         for cy in 0..hc {
             for cx in 0..wc {
-                let d = pic.code_ctu(&ctx, &refp, cx, cy, &py, w, &pcb, &pcr, cw);
+                let d = pic.code_ctu(&ctx, &[&refp], cx, cy, &py, w, &pcb, &pcr, cw);
                 any_skip |= matches!(d.kind, InterCuKind::Skip { .. });
             }
         }
@@ -2024,7 +3051,7 @@ mod tests {
         let (mut luma, mut chr) = (false, false);
         for cy in 0..hc {
             for cx in 0..wc {
-                let d = pic.code_ctu(&ctx, &refp, cx, cy, &py, w, &pcb, &pcr, cw);
+                let d = pic.code_ctu(&ctx, &[&refp], cx, cy, &py, w, &pcb, &pcr, cw);
                 luma |= d.cbf_luma && d.rqt_root_cbf;
                 chr |= d.cbf_chroma[0] || d.cbf_chroma[1] || d.cbf_chroma_bot[0] || d.cbf_chroma_bot[1];
             }
@@ -2199,7 +3226,7 @@ mod tests {
         let mut intra_cus = 0usize;
         for cy in 0..2 {
             for cx in 0..2 {
-                let d = pic.code_ctu(&ctx, &refp, cx, cy, py, w, pcb, pcr, w / 2);
+                let d = pic.code_ctu(&ctx, &[&refp], cx, cy, py, w, pcb, pcr, w / 2);
                 if matches!(d.kind, InterCuKind::UseIntra) {
                     intra_cus += 1;
                     // The marks `coding_unit` records before it parses any
@@ -2318,7 +3345,7 @@ mod tests {
         let (mut intra_cus, mut split_cus) = (0usize, 0usize);
         for cy in 0..2 {
             for cx in 0..2 {
-                let d = pic.code_ctu(&ctx, &refp, cx, cy, py, w, pcb, pcr, w / 2);
+                let d = pic.code_ctu(&ctx, &[&refp], cx, cy, py, w, pcb, pcr, w / 2);
                 if matches!(d.kind, InterCuKind::UseIntra) {
                     intra_cus += 1;
                     let id = pic.code_ctu_intra(&ctx, cx, cy, py, w, pcb, pcr, w / 2);

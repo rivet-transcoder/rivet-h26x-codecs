@@ -62,12 +62,31 @@
 //!   `c_idx == 0 || cat == 3`). One 4:4:4 corner is refused by name:
 //!   `PART_NxN` (8x8 CTUs, test-only geometry) would need four chroma
 //!   modes and per-4x4 chroma TBs.
+//!
+//!   Priced rather than built (2026-09-13): `PART_NxN` exists only at
+//!   the minimum coding block, 8x8, and the production encoder codes one
+//!   CU per 16 or 32 CTB — so no gate row can take the corner until the
+//!   coding quadtree splits (`split_cu_flag` decisions at every depth,
+//!   per-size decisions and writers, the deblocker's and the quantiser
+//!   chain's per-CU geometry), and a census of it today is zero by
+//!   construction. The one number this corpus offers is the transform
+//!   split census on intra pictures at QP 26 — 3 of 4 CTBs on detail,
+//!   32 of 48 on cut, 3 of 4 on static already take four quarter-size
+//!   TUs under the one mode the CU chose — which says smaller blocks
+//!   want different transforms and hints, without showing, that they
+//!   would want different modes. The instrument that would show it is
+//!   an intra twin of `tools/partition_opportunity.py` (best-of-35 SATD
+//!   per 8x8 against one mode per 32x32); it was not written, and the
+//!   corner stays refused by name with that as its price tag.
 //! - **One slice, one tile, raster CTU order.** Availability reduces to
 //!   picture geometry plus z-scan order, mirrored from the decoder.
 //! - **Flat scaling lists, no transform skip, no RDPCM, no rotation** —
 //!   matching what `write_sps` / `write_pps` currently emit (no scaling
 //!   lists, `transform_skip_enabled_flag` 0, no range extensions).
-//! - **Fixed QP** — no `cu_qp_delta`, so a decision carries no QP field.
+//! - **One quantiser per CU, the caller's** — `IntraCtx::qp`, which the
+//!   picture loop varies per CTB under adaptive quantisation; the
+//!   decision records the `QpY` a decoder will hold in
+//!   [`CuDecision::qp_y`] and never chooses it.
 //! - **Lossless is a whole-picture switch** (`IntraCtx::bypass`): every CU
 //!   gets `cu_transquant_bypass_flag`, the residual is carried raw, and the
 //!   PPS must set `transquant_bypass_enabled_flag` to match.
@@ -156,6 +175,15 @@ pub struct CuDecision {
     /// entry is a raw spatial residual sample (source minus prediction,
     /// raster), not a transform level.
     pub bypass: bool,
+    /// `QpY` of this CU as a decoder will hold it — the quantiser the
+    /// residual was coded at when the CU carries a cbf, and the
+    /// *predicted* quantiser when it carries none: a residual-free CU
+    /// codes no `cu_qp_delta`, so whatever the encoder wanted for it, the
+    /// reader derives `qPY_PRED` and so must every consumer here — the
+    /// deblocker reads this for its `QpY` average. The decision modules
+    /// fill it with the context quantiser; the encoder's quantiser chain
+    /// overwrites it when the picture varies the quantiser per CTB.
+    pub qp_y: i32,
     /// Chosen luma prediction modes (0 planar, 1 DC, 2..=34 angular), one
     /// per prediction block in z-order. `PART_2Nx2N` has one prediction
     /// block; its mode is replicated across all four entries so a reader
@@ -268,6 +296,23 @@ pub struct CuDecision {
     pub chroma: [[i16; 1024]; 2],
 }
 
+impl CuDecision {
+    /// Whether any transform block of this CU carries coefficients — the
+    /// condition under which a decoder reads a `cu_qp_delta` somewhere in
+    /// the CU's tree (`transform_unit`: the first unit with a coded luma
+    /// or chroma cbf), and therefore whether the CU can carry a
+    /// quantiser of its own at all.
+    pub fn any_cbf(&self) -> bool {
+        self.cbf_luma.iter().any(|&f| f)
+            || self.cbf_chroma.iter().any(|&f| f)
+            || self.cbf_chroma_bot.iter().any(|&f| f)
+            || self.cbf_chroma_tu.iter().flatten().any(|&f| f)
+            || self.cbf_chroma_tu_bot.iter().flatten().any(|&f| f)
+            || self.cbf_chroma_leaf.iter().flatten().any(|&f| f)
+            || self.cbf_chroma_leaf_bot.iter().flatten().any(|&f| f)
+    }
+}
+
 impl Default for CuDecision {
     fn default() -> Self {
         CuDecision {
@@ -276,6 +321,7 @@ impl Default for CuDecision {
             split_tu: false,
             split_child: [false; 4],
             bypass: false,
+            qp_y: 26,
             luma_modes: [1; 4],
             luma_syntax: [LumaModeSyntax::default(); 4],
             chroma_syntax: 4,
@@ -495,7 +541,7 @@ impl<S: Sample> IntraPicture<S> {
         } else {
             (&src_cb[..0], &src_cr[..0])
         };
-        let mut out = CuDecision { log2_cu: geo.log2_cu, bypass: ctx.bypass, ..CuDecision::default() };
+        let mut out = CuDecision { log2_cu: geo.log2_cu, bypass: ctx.bypass, qp_y: ctx.qp, ..CuDecision::default() };
 
         let IntraPicture { recon, modes, scratch, .. } = self;
         if geo.log2_cu == 3 {
@@ -641,7 +687,7 @@ pub(crate) fn code_cu_2nx2n_intra<S: Sample>(
     } else {
         (&src_cb[..0], &src_cr[..0])
     };
-    let mut out = CuDecision { log2_cu: geo.log2_cu, bypass: ctx.bypass, ..CuDecision::default() };
+    let mut out = CuDecision { log2_cu: geo.log2_cu, bypass: ctx.bypass, qp_y: ctx.qp, ..CuDecision::default() };
     // PART_2Nx2N. The luma mode is chosen once, by SATD on the
     // unsplit CU-sized prediction, and both transform structures
     // reuse it — a per-structure mode search would be fairer and
@@ -1015,12 +1061,31 @@ fn mode_signalling_cost(qp: i32, signal: ModeSignal) -> f32 {
 /// instead, which is the same comparison and leaves every 8-bit cost
 /// multiplied by exactly `1.0` — the property that keeps the 8-bit
 /// stream byte-identical.
+///
+/// **Measured and kept** (2026-09-13). The H.264 encoder measured the
+/// same textbook scaling as a loss at depth and removed it (its mode
+/// costs are placeholders that price bits as a constant, so a larger
+/// multiplier only amplifies their bias). The same A/B here — one
+/// binary, the scaling switched off by an environment variable, every
+/// lossy deep row of the gate over the five deep clips (43 cells), the
+/// 8-bit rows byte-identical between the two paths (479 of 479) — did
+/// not reproduce that: unscaled came out *worse on both axes on 9 cells,
+/// better on both on 3, and split on 20*, mean +5.6% bytes at +0.10 dB.
+/// The split is the signature of a Lagrangian too small: every intra
+/// cell spent more bits for more PSNR (+1.6..2.1% at +0.14..0.24 dB),
+/// and the SAO rows — whose decision prices a real SSD against real
+/// bits through [`ssd_lambda_scale`] — took nearly every offset,
+/// +31..71% bytes for +0.5..0.9 dB. This encoder's distortion-side
+/// costs are real enough that the textbook multiplier is the consistent
+/// one; the pre-registered rule was to keep the scaling if the axes
+/// disagreed, and they did. Not tuned further.
 pub(crate) fn satd_lambda_scale(bit_depth: u32) -> f32 {
     (1u32 << (bit_depth - 8)) as f32
 }
 
 /// The same for a cost paired with an SSD, which grows by the square:
 /// `2^(2 * (BitDepth - 8))` (HM's shift of `(BitDepth - 8) << 1` on SSE).
+/// Measured with [`satd_lambda_scale`] and kept for the same reason.
 pub(crate) fn ssd_lambda_scale(bit_depth: u32) -> f32 {
     (1u32 << (2 * (bit_depth - 8))) as f32
 }
@@ -1839,7 +1904,7 @@ fn cu_bits(d: &CuDecision, cat: u32, qp: i32, bypass: bool) -> f32 {
     // other counted costs use. Two structures of the same CU carry the
     // same mode syntax and the same neighbours, so everything shared
     // cancels in the difference that decides between them.
-    crate::encode::h265::write_ctu_intra(&mut e, &mut cx, d, 1, 1, bypass, cat);
+    crate::encode::h265::write_ctu_intra(&mut e, &mut cx, d, 1, 1, bypass, cat, None);
     e.fractional_bits() as f32
 }
 

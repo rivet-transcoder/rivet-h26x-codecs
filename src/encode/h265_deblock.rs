@@ -74,7 +74,7 @@ use crate::sample::Sample;
 /// the geometry — so handing them on is what keeps the two filters
 /// agreeing about the picture rather than each building its own idea of it.
 pub fn deblock_picture<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &mut IntraPicture<S>, decisions: &[CuDecision]) -> PicInfo {
-    let mut info = build_info(ctx, pic, decisions);
+    let mut info = build_info(pic, decisions);
     run_filter(ctx, &mut pic.recon, &info);
     info.sao.fill([crate::hevc::pic::SaoParams::default(); 3]);
     info
@@ -115,9 +115,11 @@ pub fn deblock_inter_picture<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &mut InterPi
             di += 1;
             let (x0, y0) = (cx * n, cy * n);
             // The mirror of coding_unit's bookkeeping block for one
-            // 2Nx2N CU: the QP over the CU, then the edge flags and the
-            // cbf, which is where the two kinds part company.
-            PicInfo::fill4(&mut pic.info.qp_y, w4, x0, y0, n, n, ctx.qp as i8);
+            // 2Nx2N CU: the QP over the CU — the decision's `QpY`, which
+            // is the picture quantiser unless the picture varies it per
+            // CTB — then the edge flags and the cbf, which is where the
+            // two kinds part company.
+            PicInfo::fill4(&mut pic.info.qp_y, w4, x0, y0, n, n, d.qp_y() as i8);
             // The prediction-block edge bits — 2 down the PU's left
             // column, 8 along its top row. One PU per CU of either kind,
             // so its boundary is the CU's.
@@ -255,7 +257,7 @@ fn run_filter<S: Sample>(ctx: &IntraCtx<'_, S>, recon: &mut Frame<S>, info: &Pic
 /// encoder does — identity CTB scan, single tile, and `min_tb_addr_zs`
 /// from [`z_within_ctb`], the interleave the availability tests hold
 /// against `Geometry`'s own construction.
-fn build_info<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &IntraPicture<S>, decisions: &[CuDecision]) -> PicInfo {
+fn build_info<S: Sample>(pic: &IntraPicture<S>, decisions: &[CuDecision]) -> PicInfo {
     let (w, h) = (pic.recon.width, pic.recon.height);
     let log2 = pic.log2_cu;
     let n = 1usize << log2;
@@ -295,7 +297,7 @@ fn build_info<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &IntraPicture<S>, decisions
             di += 1;
             let (x0, y0) = (cx * n, cy * n);
             PicInfo::fill4(&mut info.pred_mode, w4, x0, y0, n, n, 1u8);
-            PicInfo::fill4(&mut info.qp_y, w4, x0, y0, n, n, ctx.qp as i8);
+            PicInfo::fill4(&mut info.qp_y, w4, x0, y0, n, n, d.qp_y as i8);
             if d.bypass {
                 PicInfo::fill4(&mut info.filter_exempt, w4, x0, y0, n, n, 3u8);
             }
@@ -707,7 +709,7 @@ mod tests {
         let mut decisions = Vec::new();
         for cy in 0..h / n {
             for cx in 0..w / n {
-                decisions.push(PCuDecision::Inter(pic.code_ctu(&ctx, &refp, cx, cy, &src_y, w, &src_cb, &src_cr, w / 2)));
+                decisions.push(PCuDecision::Inter(pic.code_ctu(&ctx, &[&refp], cx, cy, &src_y, w, &src_cb, &src_cr, w / 2)));
             }
         }
         assert!(

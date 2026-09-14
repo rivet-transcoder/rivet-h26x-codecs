@@ -65,7 +65,7 @@ pub struct Coded {
 }
 
 /// Turns a display-order stream of pictures into a coding-order one.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Scheduler {
     gop: u32,
     bframes: u32,
@@ -191,6 +191,30 @@ impl Scheduler {
     pub fn flush(&mut self) -> Vec<Coded> {
         let held = std::mem::take(&mut self.pending);
         held.into_iter().map(|d| self.emit(d, Kind::P, true)).collect()
+    }
+
+    /// What the pictures not yet released would be coded as if the next
+    /// `ahead` were offered now: the B pictures held back and the `ahead`
+    /// displays after them, each with the kind [`Scheduler::push`] would
+    /// give it. For a rate controller that has those pictures in hand and
+    /// wants to plan across them.
+    ///
+    /// Not a second copy of the cadence: it *runs* `push` on a copy of
+    /// this scheduler. The copy is pushed `bframes` pictures past the
+    /// horizon so that a B picture just inside it is released by the
+    /// anchor that would follow rather than left held; those phantom
+    /// pictures are then dropped from the answer. The one thing this
+    /// cannot know is whether the stream ends inside the horizon — a B
+    /// picture the caller will flush is previewed as the B it would have
+    /// been, not the P it becomes.
+    pub fn preview(&self, ahead: u64) -> Vec<Coded> {
+        let mut sim = self.clone();
+        let horizon = self.display + ahead;
+        let mut out = Vec::new();
+        for _ in 0..ahead + u64::from(self.bframes) {
+            out.extend(sim.push().into_iter().filter(|c| c.display < horizon));
+        }
+        out
     }
 }
 
@@ -338,6 +362,56 @@ mod tests {
             // linger and turn the picture after it into a second IDR.
             let after = coded.iter().find(|c| c.display == 6).unwrap();
             assert_ne!(after.kind, Kind::Idr, "bframes={b}: {after:?}");
+        }
+    }
+
+    /// A preview taken at any point of a stream names every picture inside
+    /// its horizon exactly as the real run later codes it — the IDR
+    /// positions, the B pictures, the ones a forced IDR turns into P — up
+    /// to the stream's end, where a flushed B is the one thing it cannot
+    /// foresee.
+    #[test]
+    fn preview_matches_push() {
+        for &(gop, b) in &[(0u32, 0u32), (8, 0), (8, 1), (8, 2), (8, 3), (250, 2)] {
+            for n in [1u64, 5, 8, 9, 20, 33] {
+                for ahead in [1u64, 2, 4, 8] {
+                    let mut s = Scheduler::new(gop, b);
+                    let mut real = Vec::new();
+                    // (time, what was previewed then, how many pictures
+                    // the real run had released by then).
+                    let mut previews = Vec::new();
+                    for t in 0..n {
+                        if t == 7 {
+                            s.force_idr();
+                        }
+                        previews.push((t, s.preview(ahead.min(n - t)), real.len() as u64));
+                        real.extend(s.push());
+                    }
+                    real.extend(s.flush());
+                    for (t, preview, released) in previews {
+                        let horizon = (t + ahead).min(n);
+                        // Every unreleased picture inside the horizon
+                        // appears exactly once, and none from outside it.
+                        let mut seen: Vec<u64> = preview.iter().map(|c| c.display).collect();
+                        seen.sort_unstable();
+                        assert!(seen.iter().all(|d| *d < horizon), "gop={gop} b={b} n={n} t={t}: {seen:?} past the horizon {horizon}");
+                        assert!(seen.windows(2).all(|w| w[0] != w[1]), "gop={gop} b={b} n={n} t={t}: a display previewed twice: {seen:?}");
+                        for r in real.iter().filter(|r| r.display < horizon && r.encode >= released) {
+                            assert!(seen.contains(&r.display), "gop={gop} b={b} n={n} t={t}: display {} was unreleased inside the horizon and not previewed: {seen:?}", r.display);
+                        }
+                        for p in &preview {
+                            let r = real.iter().find(|c| c.display == p.display).expect("previewed a picture the run never coded");
+                            // The kinds agree except at the stream's end,
+                            // where flush makes a P of a held B, and past
+                            // an IDR forced *after* the preview was taken,
+                            // which nothing could have foreseen.
+                            let flushed_b = p.kind == Kind::B && r.kind == Kind::P && p.display + u64::from(b) >= n;
+                            let forced_later = t < 7 && p.display >= 7;
+                            assert!(p.kind == r.kind || flushed_b || forced_later, "gop={gop} b={b} n={n} t={t}: display {} previewed as {:?}, coded as {:?}", p.display, p.kind, r.kind);
+                        }
+                    }
+                }
+            }
         }
     }
 

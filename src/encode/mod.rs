@@ -77,7 +77,9 @@ pub mod h265_deblock;
 pub mod h265_intra;
 pub mod h265_me;
 pub(crate) mod rc;
+pub(crate) mod aq;
 pub(crate) mod h265_sao;
+pub(crate) mod h265_wp;
 pub mod hrd;
 pub mod h265_syntax;
 
@@ -182,6 +184,54 @@ pub struct Config {
     /// `sample_adaptive_offset_enabled_flag` in the SPS, which makes one
     /// or two more flags appear in *every* slice header.
     pub sao: bool,
+    /// Adaptive quantisation strength (H.265 only): 0 is off, which is
+    /// the default. Above 0 the PPS sets `cu_qp_delta_enabled_flag` and
+    /// every coding tree block is quantised at its own offset from the
+    /// picture quantiser, chosen from its luma variance — flat blocks
+    /// finer, textured blocks coarser, zero-mean over the picture, and at
+    /// most six steps either way. 1.0 is the strength the
+    /// measurements in `encode::aq` were taken at.
+    ///
+    /// A switch rather than always-on for the reason SAO is: it costs a
+    /// `cu_qp_delta` per coded block and it trades global PSNR for a
+    /// more even distribution of error, which a caller measuring PSNR
+    /// does not want. Off, the stream is byte-identical to one from an
+    /// encoder that never had it. Ignored by H.264, whose per-macroblock
+    /// `mb_qp_delta` is a different mechanism this encoder does not
+    /// drive yet.
+    pub aq_strength: f32,
+    /// Rate-control lookahead (H.265 only): how many pictures the encoder
+    /// holds back before coding one, so the controller can place bits by
+    /// what is coming. 0 is off, which is the default; every picture is
+    /// then coded as soon as the picture typing allows, and the stream is
+    /// byte-identical to one from an encoder that never had it.
+    ///
+    /// Only meaningful with [`RateControl::Bitrate`]: a lookahead informs
+    /// a rate controller, and a fixed quantiser has none to inform, so
+    /// asking for one anyway refuses by name — as a coded picture buffer
+    /// does. Each held picture is measured once (an 8x8 SATD sum, intra
+    /// and against the previous picture) and the controller allocates the
+    /// window's budget by those measurements; see `encode::rc`'s lookahead
+    /// section for exactly what changes. Costs `lookahead` pictures of
+    /// output delay and their source samples in memory. Ignored by H.264,
+    /// whose rate control does not drive the lookahead path yet.
+    pub lookahead: u32,
+    /// Weighted prediction (H.265 only): off by default. On, the PPS sets
+    /// `weighted_pred_flag` and every P slice carries a
+    /// `pred_weight_table` — a gain and an offset per reference, fitted
+    /// per picture to the source against the reference and used only
+    /// where the fit lowers the residual (`encode::h265_wp`), the default
+    /// weights otherwise. What it buys is a fade: motion compensation
+    /// cannot change a reference's brightness, so without this every
+    /// block of a fading picture carries the level change as residual.
+    ///
+    /// B slices keep default weighting (`weighted_bipred_flag` stays 0):
+    /// the two-list decision would need weights per list and its own
+    /// fit, and the P anchors are where a fade's cost is. Off, the stream
+    /// is byte-identical to one from an encoder that never had it.
+    /// Ignored by H.264, whose weighted prediction is a different table
+    /// this encoder does not write yet.
+    pub weighted_pred: bool,
 }
 
 impl Default for Config {
@@ -202,6 +252,9 @@ impl Default for Config {
             sao: false,
             fps: 30,
             cpb_ms: 0,
+            aq_strength: 0.0,
+            lookahead: 0,
+            weighted_pred: false,
         }
     }
 }
@@ -219,6 +272,17 @@ impl Config {
         }
         if self.max_refs == 0 {
             return Err(crate::Error::unsupported("encode: max_refs must be at least 1"));
+        }
+        if !(self.aq_strength >= 0.0) || self.aq_strength > 4.0 {
+            return Err(crate::Error::unsupported("encode: aq_strength outside 0.0..=4.0"));
+        }
+        if self.lookahead > 0 && !matches!(self.rate, RateControl::Bitrate { .. }) {
+            return Err(crate::Error::unsupported(
+                "encode: a lookahead without a bitrate target (a lookahead informs a rate controller; a fixed quantiser has none)",
+            ));
+        }
+        if self.lookahead > 250 {
+            return Err(crate::Error::unsupported("encode: lookahead above 250 pictures"));
         }
         Ok(())
     }
