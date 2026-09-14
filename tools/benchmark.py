@@ -338,9 +338,10 @@ def main():
     # second is quantised to within a few per cent of itself and every
     # comparison reads 1.000. These are the short clips repeated.
     streams = [s for s in args.streams.split(",") if s] or [
-        f for f in ("cabac3.264", "cavlc3.264", "hevc6.265", "wpp10.265",
-                    "bbb_720p_cabac.264", "bbb_720p_cavlc.264",
-                    "bbb_720p_hevc.265", "bbb_720p_wpp.265") if os.path.exists(f)][:4]
+        f for f in ("x264_720p_cabac.264", "x264_720p_cavlc.264",
+                    "x265_720p_nowpp.265", "x265_720p_wpp.265",
+                    "x264_main_cabac_b.264", "x264_main_cavlc_b_temporal.264",
+                    "x265_main_wpp_sao.265", "x265_main10_nowpp.265") if os.path.exists(f)][:4]
     threads = cpu_threads()
     tiers = available_tiers()
     picked = selected_rung(args.dec)

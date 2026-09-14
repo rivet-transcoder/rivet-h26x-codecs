@@ -11,19 +11,36 @@
 #                  stream decodes to the same bytes, including the ones no
 #                  reference data covers.
 #
+# --no-suites      stop after the fixtures and the rung sweep — for a fixture
+#                  change, or a machine without conf/ fetched.
+#
 #   JOBS=n         streams in parallel per suite (default 6)
 #   H26X_WORK=dir  the scratch directory holding the fixtures and conf/
 #                  (default: this script's directory)
+#   GOLD=file      the golden list (default: golden.txt beside this script,
+#                  i.e. the committed tools/golden.txt)
 #
 # Safe to run while another copy of it is running: the decoder is copied to a
 # private name and each suite writes to a private scratch directory. Sharing
 # either lets one run report green having tested the other's binary.
-cd "${H26X_WORK:-$(dirname "$0")}"
+HERE=$(cd "$(dirname "$0")" && pwd)
+cd "${H26X_WORK:-$HERE}"
 BASE=""
-if [ "$1" = "--baseline" ]; then BASE=$2; shift 2; fi
+SUITES=1
+while :; do
+  case "$1" in
+    --baseline) BASE=$2; shift 2 ;;
+    --no-suites) SUITES=0; shift ;;
+    *) break ;;
+  esac
+done
 # `golden.txt`: "<fixture> <md5>" per line, the MD5 each fixture must decode
-# to. Regenerate deliberately, never to make a red run go green.
-GOLD=${GOLD:-golden.txt}
+# to. The fixtures come from tools/make_fixtures.sh and the list from
+# tools/record_golden.sh; regenerate deliberately, never to make a red run
+# go green. A missing list is an error, not zero fixtures: an empty loop
+# below would report "0 matched, 0 failed" and go on to say ALL GREEN.
+GOLD=${GOLD:-$HERE/golden.txt}
+[ -s "$GOLD" ] || { echo "verify.sh: no golden list at $GOLD" >&2; exit 2; }
 DEC=${1:-../release/examples/h26xdec.exe}
 DEC=$(cd "$(dirname "$DEC")" && pwd)/$(basename "$DEC")
 # Prove the decoder exists and produces output before anything is compared.
@@ -40,7 +57,7 @@ if [ ! -x "$DEC" ] && [ ! -f "$DEC" ]; then
   echo "  (this script cd's to ${H26X_WORK:-its own directory} first, so give an absolute path)" >&2
   exit 2
 fi
-_probe=$(head -1 "${GOLD:-golden.txt}" | cut -d' ' -f1)
+_probe=$(head -1 "$GOLD" | cut -d' ' -f1)
 if [ -n "$_probe" ] && [ -f "$_probe" ]; then
   if [ -z "$("$DEC" "$_probe" 2>/dev/null | head -c 1)" ]; then
     echo "verify.sh: $DEC produced no output for $_probe" >&2
@@ -87,6 +104,12 @@ for r in $RUNGS; do
   else printf "  %-6s %s  DIFFERS
 " "$r" "$h"; fail=1; fi
 done
+
+if [ "$SUITES" = 0 ]; then
+  echo
+  [ "$fail" = 0 ] && echo "FIXTURES AND RUNGS GREEN (suites skipped)" || echo "SOMETHING FAILED"
+  exit $fail
+fi
 
 echo
 echo "== conformance suites =="

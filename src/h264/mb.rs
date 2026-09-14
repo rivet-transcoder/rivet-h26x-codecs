@@ -1297,6 +1297,16 @@ pub(crate) fn next_qp(prev_qp: i32, qp_delta: i32, bit_depth: u32) -> i32 {
     ((prev_qp + qp_delta + 52 + 2 * bd_off) % (52 + bd_off)) - bd_off
 }
 
+/// The values `mb_qp_delta` may take (7.4.5): `-(26 + QpBdOffsetY / 2)` to
+/// `25 + QpBdOffsetY / 2`, so a deep stream may step further than an 8-bit
+/// one — x264's mb-tree routinely does, on the I picture of a 10-bit
+/// encode.
+#[inline]
+pub(crate) fn qp_delta_range(bit_depth: u32) -> std::ops::RangeInclusive<i32> {
+    let half = 3 * (bit_depth as i32 - 8);
+    -(26 + half)..=25 + half
+}
+
 /// The scaling a coded macroblock's parser applies to each coefficient as
 /// it is written (8.5.12.1 / 8.5.13.1 folded into one multiply, add and
 /// shift: `(c * LevelScale << shift + 32) >> 6`, exact for every QP): per
