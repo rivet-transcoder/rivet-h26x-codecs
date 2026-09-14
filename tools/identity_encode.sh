@@ -45,9 +45,11 @@ SOURCES=${SOURCES:-$(ls src_*.yuv 2>/dev/null)}
 # every row whose tag happens to occur in its name — a 10-bit clip is spelled
 # `..._420p10` and would join every `@p10` row — and its arrival would change
 # the cost of rows that never asked for it. `ilace`: the 10-bit interlaced
-# clip, src_ilace10_96x96_420p10, visited only by `@ilace10` rows.
+# clip, src_ilace10_96x96_420p10, visited only by `@ilace10` rows. `fdeep`:
+# the 10-bit gain-and-offset fade, src_fdeep10_64x64_420p10, visited only by
+# `@fdeep10` rows.
 # Defined identically in verify_encode.sh: the two must visit the same cells.
-EXCLUSIVE_TOKENS="ilace"
+EXCLUSIVE_TOKENS="ilace fdeep"
 [ -n "$SOURCES" ] || { echo "no source clips (src_*.yuv)" >&2; exit 2; }
 # The configuration list is verify_encode.sh's own, read out of it so the
 # two cannot drift: everything between CONFIGS=${CONFIGS:-" and the closing
