@@ -522,7 +522,7 @@ impl<S: Sample> Core<S> {
             // which may already have been coded and left `held`, so its
             // luma is kept aside for exactly this.
             let (dw, dh) = (self.cfg.width as usize, self.cfg.height as usize);
-            let cost = PicCost::measure(&samples[..dw * dh], dw, dh, self.last_luma.as_deref());
+            let cost = PicCost::measure(&samples[..dw * dh], dw, dh, self.last_luma.as_deref(), self.cfg.bit_depth);
             self.costs.insert(display, cost);
             self.last_luma = Some(samples[..dw * dh].to_vec());
         }
@@ -1459,9 +1459,21 @@ impl PicCost {
         (self.intra as f64 * REF_NOISE_AT_45 * 2f64.powf((qp_ref - 45) as f64 / REF_NOISE_HALVING)) as u64
     }
 
-    /// Measure a `w` by `h` luma plane (stride `w`), and `prev` — the
-    /// picture pushed before it at the same size — when there is one.
-    fn measure<S: Sample>(luma: &[S], w: usize, h: usize, prev: Option<&[S]>) -> Self {
+    /// Measure a `w` by `h` luma plane (stride `w`) of `bit_depth`-bit
+    /// samples, and `prev` — the picture pushed before it at the same size
+    /// — when there is one.
+    ///
+    /// **In 8-bit sample units, whatever the depth.** A SATD grows with the
+    /// sample scale, four times at 10 bits for the same picture, while the
+    /// bits a quantiser buys do not: H.265 offsets the quantiser by the
+    /// depth (`QpBdOffset`), so quantiser 30 at 10 bits spends what 30 does
+    /// at 8. Unscaled, the calibrated seed ([`SEED_BITS_PER_COST`](super::rc))
+    /// saw a 10-bit keyframe as four times the content it was and asked for
+    /// twelve quantiser steps more than the same picture at 8 bits — motion10
+    /// under `--lookahead 8` at 96 kbps seeded its keyframe at 41 against 29
+    /// for the 8-bit clip, spent 3496 of 12287 planned bits and ended at
+    /// 0.77x of target. So each sum is shifted down by `bit_depth - 8`.
+    fn measure<S: Sample>(luma: &[S], w: usize, h: usize, prev: Option<&[S]>, bit_depth: u32) -> Self {
         let dist = DistortionDsp::<S>::new(Cpu::detect_honouring_env());
         let (bw, bh) = (w / 8, h / 8);
         let mut flat = [S::default(); 64];
@@ -1483,6 +1495,8 @@ impl PicCost {
                 }
             }
         }
+        let shift = bit_depth.saturating_sub(8);
+        let (intra, inter) = (intra >> shift, inter >> shift);
         PicCost { intra, inter: if prev.is_some() { inter } else { intra } }
     }
 }
@@ -2762,6 +2776,35 @@ mod tests {
         ] {
             let e = H265Encoder::new(cfg(64, 64, chroma)).unwrap();
             assert_eq!(e.frame_bytes(), (64.0 * 64.0 * per_px) as usize, "{chroma:?}");
+        }
+    }
+
+    /// The lookahead cost is in 8-bit sample units at every depth: a
+    /// 10-bit picture that is an 8-bit one shifted up two costs what the
+    /// 8-bit one does, intra and inter, to within the rounding of the
+    /// shift. Unscaled it cost four times as much, and the rate
+    /// controller seeded a 10-bit keyframe twelve quantiser steps coarser
+    /// than its 8-bit twin.
+    #[test]
+    fn a_ten_bit_picture_costs_what_its_eight_bit_twin_does() {
+        let (w, h) = (64usize, 64usize);
+        let pic = |t: usize| -> Vec<u8> {
+            (0..w * h)
+                .map(|i| {
+                    let (x, y) = (i % w, i / w);
+                    ((x * 3 + y * 5 + t * 7) % 97 + ((x * y + t) % 13) * 9) as u8
+                })
+                .collect()
+        };
+        let (a8, b8) = (pic(0), pic(1));
+        let widen = |p: &[u8]| p.iter().map(|&s| u16::from(s) << 2).collect::<Vec<u16>>();
+        let (a10, b10) = (widen(&a8), widen(&b8));
+        let c8 = PicCost::measure(&b8, w, h, Some(&a8[..]), 8);
+        let c10 = PicCost::measure(&b10, w, h, Some(&a10[..]), 10);
+        assert!(c8.intra > 10_000 && c8.inter > 10_000, "the pictures must have content to cost: {c8:?}");
+        for (name, a, b) in [("intra", c8.intra, c10.intra), ("inter", c8.inter, c10.inter)] {
+            let (lo, hi) = (a.min(b) as f64, a.max(b) as f64);
+            assert!(hi / lo < 1.01, "{name}: 8-bit {a} against 10-bit {b}");
         }
     }
 
