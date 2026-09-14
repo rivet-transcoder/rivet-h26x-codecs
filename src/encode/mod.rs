@@ -291,8 +291,35 @@ pub struct Config {
     /// and against the previous picture) and the controller allocates the
     /// window's budget by those measurements; see `encode::rc`'s lookahead
     /// section for exactly what changes. Costs `lookahead` pictures of
-    /// output delay and their source samples in memory. Ignored by H.264,
-    /// whose rate control does not drive the lookahead path yet.
+    /// output delay and their source samples in memory.
+    ///
+    /// H.264 refuses it by name ("rate lookahead is not calibrated for
+    /// H.264"). It was wired and measured on the branch
+    /// `agent/h264tools-lookahead`, first with H.265's constants and then
+    /// with H.264's own calibration of them (bits per cost of P and B
+    /// against intra pictures, the reference-noise floor, the insensitivity
+    /// band, each measured on the corpus), and it did not beat the
+    /// past-only controller. Mean `|achieved / target - 1|` over the ten
+    /// 8-bit clips, one binary, 2026-09-14:
+    ///
+    /// ```text
+    ///   row                without   H.265 constants   H.264 calibration
+    ///   abr 64k             0.177        0.195             0.183
+    ///   abr 128k            0.152        0.151             0.121
+    ///   CAVLC 64k           0.193        0.233             0.202
+    ///   IPB 64k             0.186        0.261             0.229
+    ///   AQ 64k              0.165        0.195             0.173
+    ///   10-bit 128k         0.075        0.193             0.214
+    /// ```
+    ///
+    /// Calibrated, the buffer row (64k, 125 ms, `src_cut`) was still refused
+    /// — keyframes planned at QP 42..49 left P pictures that cost more than
+    /// the per-picture rate at QP 51 — and PSNR at 64k fell 4.97 dB on
+    /// average, because the past-only controller's first keyframe overshoots
+    /// at the seed's QP 26 and carries a short clip, where the lookahead
+    /// plans it at its share. On the held-out 256x160 clip the calibrated
+    /// lookahead was the better controller at 128k..1280k (0.253 to 0.095 at
+    /// 1280k), which is why the branch is kept rather than discarded.
     pub lookahead: u32,
     /// Weighted prediction, both codecs: off by default. On, the PPS sets
     /// `weighted_pred_flag` and every P slice carries a

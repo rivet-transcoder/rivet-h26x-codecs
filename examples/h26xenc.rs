@@ -125,7 +125,7 @@ fn main() {
             // Both codecs: adaptive quantisation at this strength (0 off).
             "--aq" => cfg.aq_strength = val(&mut i, &args, "--aq").parse().unwrap_or_else(|_| die("--aq")),
             // H.265 only, with --bitrate: hold this many pictures back and
-            // let the rate controller see them.
+            // let the rate controller see them. H.264 refuses it by name.
             "--lookahead" => cfg.lookahead = val(&mut i, &args, "--lookahead").parse().unwrap_or_else(|_| die("--lookahead")),
             // Both codecs: weighted prediction, a fitted gain and offset per
             // reference in every P slice.

@@ -346,6 +346,16 @@ impl<S: Sample> Core<S> {
                 "H.264 encode: adaptive quantisation on a lossless picture (no quantiser to adapt)",
             ));
         }
+        if cfg.lookahead > 0 {
+            // Wired and measured on agent/h264tools-lookahead, and not
+            // landed: H.264's own calibration of the lookahead still left a
+            // buffer row refused and did not beat the past-only controller —
+            // see `Config::lookahead`. Refused by name rather than coded by
+            // a controller measured to be worse.
+            return Err(Error::unsupported(
+                "H.264 encode: rate lookahead is not calibrated for H.264 (the past-only controller is used; see Config::lookahead)",
+            ));
+        }
         if cfg.weighted_pred && cfg.rate == RateControl::Lossless {
             // A lossless stream's inter pictures are all-skip copies of
             // their reference (PCM has no inter spelling), and a weighting
@@ -1673,5 +1683,23 @@ mod tests {
             .err()
             .expect("weighted prediction on a lossless stream must refuse");
         assert!(format!("{err}").contains("weighted prediction"), "{err}");
+    }
+    /// A lookahead is refused by name on H.264, with a bitrate target (where
+    /// it would otherwise mean something) as without one (where the
+    /// configuration's own check names the missing target first).
+    #[test]
+    fn a_lookahead_is_refused_by_name() {
+        let err = H264Encoder::new(Config {
+            lookahead: 8,
+            rate: RateControl::Bitrate { bps: 64_000 },
+            ..cfg(64, 64, ChromaFormat::Yuv420, 8)
+        })
+        .err()
+        .expect("an H.264 lookahead must refuse");
+        assert!(format!("{err}").contains("rate lookahead is not calibrated for H.264"), "{err}");
+        let err = H264Encoder::new(Config { lookahead: 4, ..cfg(64, 64, ChromaFormat::Yuv420, 8) })
+            .err()
+            .expect("a lookahead at a constant quantiser must refuse");
+        assert!(format!("{err}").contains("lookahead"), "{err}");
     }
 }
