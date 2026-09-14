@@ -181,10 +181,10 @@ pub(crate) fn entry_for(fits: [PlaneFit; 3], bit_depth_luma: u32, bit_depth_chro
     WeightEntry { luma: comp(&fits[0], bit_depth_luma), chroma: [comp(&fits[1], bit_depth_chroma), comp(&fits[2], bit_depth_chroma)] }
 }
 
-/// A P slice's table from its list-0 entries, one per reference in
-/// `RefPicList0` order.
-pub(crate) fn table_for(entries: Vec<WeightEntry>) -> PredWeightTable {
-    PredWeightTable { luma_log2_denom: LOG2_DENOM, chroma_log2_denom: LOG2_DENOM, lists: [entries, Vec::new()] }
+/// A slice's table from its entries, one per reference in each list's
+/// order: `RefPicList0`, then `RefPicList1`, which a P slice leaves empty.
+pub(crate) fn table_for(lists: [Vec<WeightEntry>; 2]) -> PredWeightTable {
+    PredWeightTable { luma_log2_denom: LOG2_DENOM, chroma_log2_denom: LOG2_DENOM, lists }
 }
 
 #[cfg(test)]
@@ -248,6 +248,35 @@ mod tests {
         let flat = Frame::<u8>::new(32, 24, ChromaFormat::Monochrome, 8).y;
         let f = fit_plane(&cur, 32, &flat, 32, 24, 8);
         assert!(!f.used(), "{f:?}");
+    }
+
+    /// A B picture between two anchors of a fade: the list-0 anchor is
+    /// brighter than the picture and the list-1 anchor darker, so each
+    /// list fits its own gain — below the identity for one, above it for
+    /// the other — both are used, and the table carries each in its own
+    /// list. Between two copies of the picture itself neither list fits
+    /// anything and the table is the defaults.
+    #[test]
+    fn a_b_picture_fits_each_anchor_its_own_gain() {
+        let bright = reference();
+        let mut dark = Frame::<u8>::new(32, 24, ChromaFormat::Monochrome, 8).y;
+        let o = dark.origin();
+        for (i, v) in scaled(&bright, 32, 24, 0.5, 0.0).into_iter().enumerate() {
+            dark.data[o + (i / 32) * dark.stride + i % 32] = v;
+        }
+        let cur = scaled(&bright, 32, 24, 0.75, 0.0);
+        let (f0, f1) = (fit_plane(&cur, 32, &bright, 32, 24, 8), fit_plane(&cur, 32, &dark, 32, 24, 8));
+        assert_eq!(f0.weight, 48, "list 0, the brighter anchor: {f0:?}");
+        assert!((95..=97).contains(&f1.weight), "list 1, the darker anchor, wants a gain of one and a half: {f1:?}");
+        assert!(f0.used() && f1.used(), "{f0:?} {f1:?}");
+        let id = PlaneFit::identity(1);
+        let t = table_for([vec![entry_for([f0, id, id], 8, 8)], vec![entry_for([f1, id, id], 8, 8)]]);
+        assert_eq!((t.lists[0][0].luma.0, t.lists[1][0].luma.0), (f0.weight, f1.weight), "{t:?}");
+
+        let held = fit_plane(&scaled(&bright, 32, 24, 1.0, 0.0), 32, &bright, 32, 24, 8);
+        assert!(!held.used(), "{held:?}");
+        let t = table_for([vec![entry_for([held, id, id], 8, 8)], vec![entry_for([held, id, id], 8, 8)]]);
+        assert!(t.lists.iter().flatten().all(|e| e.luma == (64, 0) && e.chroma == [(64, 0); 2]), "{t:?}");
     }
 
     /// Ten-bit samples: the offset is fitted in samples and carried in

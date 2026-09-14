@@ -118,8 +118,9 @@
 //!   representable). The quantiser and the weighting are the caller's:
 //!   per-unit quantisers through `MeCtx::qp`, and list 0's explicit
 //!   weighting through [`InterPicture::wp`] when the slice carries a
-//!   `pred_weight_table` (`Weighting::Default` otherwise; B slices
-//!   always).
+//!   `pred_weight_table` (`Weighting::Default` otherwise), and a B
+//!   slice's list-0, list-1 and bi weighting through
+//!   [`InterPicture::wp_b`].
 //! - **All four chroma formats.** Monochrome omits every chroma element,
 //!   mirroring the reader's uniform `chroma_array_type != 0` gates in
 //!   `transform_tree` and `transform_unit`; 4:2:0 carries one half-size
@@ -532,8 +533,18 @@ pub struct InterPicture<S: Sample> {
     /// carries no table (every reference default). Read by
     /// [`Self::code_ctu`]'s scoring and its final prediction, so a
     /// vector is chosen for the prediction that will actually be made.
-    /// The B walk ignores it: `weighted_bipred_flag` is never set.
+    /// The B walk does not read it; see [`Self::wp_b`].
     pub wp: Vec<[Weighting; 3]>,
+    /// The explicit weighting a B picture's predictions carry, by
+    /// `inter_pred_idc` — `[0]` `PRED_L0`, `[1]` `PRED_L1`, `[2]` `PRED_BI`
+    /// — per component: what `hevc::ctu::explicit_weighting` derives from
+    /// the slice's `pred_weight_table` for reference indices `[0, -1]`,
+    /// `[-1, 0]` and `[0, 0]`, each list's one active reference. All
+    /// `Weighting::Default` when the slice carries no table, or one whose
+    /// every entry is the default (which predicts the same samples). Read
+    /// by [`Self::code_cu_b`]'s search, its merge and bi scoring and its
+    /// final prediction. The P walk does not read it.
+    pub wp_b: [[Weighting; 3]; 3],
 }
 
 impl<S: Sample> InterPicture<S> {
@@ -575,6 +586,7 @@ impl<S: Sample> InterPicture<S> {
             spred14_b: vec![0; nmax],
             spred: vec![S::default(); nmax],
             wp: Vec::new(),
+            wp_b: [[Weighting::Default; 3]; 3],
         }
     }
 
@@ -582,6 +594,16 @@ impl<S: Sample> InterPicture<S> {
     /// default when the slice has no table.
     fn wp_for(&self, r: usize) -> [Weighting; 3] {
         self.wp.get(r).copied().unwrap_or([Weighting::Default; 3])
+    }
+
+    /// The weighting a B prediction from the lists `ref_idx` uses carries
+    /// (see [`Self::wp_b`]): one list's, or the pair's.
+    fn wp_b_for(&self, ref_idx: [i8; 2]) -> [Weighting; 3] {
+        match (ref_idx[0] >= 0, ref_idx[1] >= 0) {
+            (true, false) => self.wp_b[0],
+            (false, true) => self.wp_b[1],
+            _ => self.wp_b[2],
+        }
     }
 
     /// The reference-list context the decoder's candidate derivation
@@ -748,7 +770,8 @@ impl<S: Sample> InterPicture<S> {
             let mut seeds: Vec<Mv> = vec![Mv::ZERO, mvp[r][0], mvp[r][1]];
             seeds.extend(merge.iter().filter(|c| c.ref_idx[0] == r as i8).map(|c| c.mv[0]));
             let full = self.search_full(ctx, &rf.y, x0, y0, n, src, y_stride, &seeds);
-            per_ref.push(self.refine_subpel(ctx, &rf.y, r, x0, y0, n, src, y_stride, full));
+            let wp = self.wp_for(r)[0];
+            per_ref.push(self.refine_subpel(ctx, &rf.y, wp, 0, x0, y0, n, src, y_stride, full));
         }
 
         // Cost the shapes. Merge candidates are scored at their exact
@@ -958,9 +981,11 @@ impl<S: Sample> InterPicture<S> {
             let mut seeds: Vec<Mv> = vec![Mv::ZERO, mvp[list][0], mvp[list][1]];
             seeds.extend(merge.iter().filter(|c| c.ref_idx[list] == 0).map(|c| c.mv[list]));
             let full = self.search_full(ctx, plane, x0, y0, n, src, y_stride, &seeds);
-            // Reference 0 of either list: a B slice carries no weights,
-            // so the index only names the default.
-            uni[list] = self.refine_subpel(ctx, plane, 0, x0, y0, n, src, y_stride, full);
+            // Scored under the weighting a one-list prediction from this
+            // list carries, so the vector is chosen for the prediction
+            // that will be made.
+            let wp = self.wp_b[list][0];
+            uni[list] = self.refine_subpel(ctx, plane, wp, list, x0, y0, n, src, y_stride, full);
         }
 
         let lam = lambda(ctx.qp) * satd_lambda_scale(ctx.bit_depth);
@@ -1005,7 +1030,7 @@ impl<S: Sample> InterPicture<S> {
             }
         }
         // idc 2: the bi trial at the two winners.
-        let bi_satd = self.satd_bi_at(ctx, &ref0.y, &ref1.y, x0, y0, n, src, y_stride, uni[0].0, uni[1].0);
+        let bi_satd = self.satd_bi_at(ctx, &ref0.y, &ref1.y, x0, y0, n, src, y_stride, uni[0].0, uni[1].0, self.wp_b[2][0]);
         {
             let bits = rate.amvp_b(2, best_mvd, best_flag, true);
             let cost = bi_satd as f32 + lam * bits;
@@ -1028,9 +1053,9 @@ impl<S: Sample> InterPicture<S> {
             }
             seen.push(key);
             let satd = match (cand.ref_idx[0] >= 0, cand.ref_idx[1] >= 0) {
-                (true, true) => self.satd_bi_at(ctx, &ref0.y, &ref1.y, x0, y0, n, src, y_stride, cand.mv[0], cand.mv[1]),
-                (true, false) => self.satd_at(ctx, &ref0.y, 0, x0, y0, n, src, y_stride, cand.mv[0]),
-                (false, true) => self.satd_at(ctx, &ref1.y, 0, x0, y0, n, src, y_stride, cand.mv[1]),
+                (true, true) => self.satd_bi_at(ctx, &ref0.y, &ref1.y, x0, y0, n, src, y_stride, cand.mv[0], cand.mv[1], self.wp_b[2][0]),
+                (true, false) => self.satd_at_weighted(ctx, &ref0.y, x0, y0, n, src, y_stride, cand.mv[0], self.wp_b[0][0], 0),
+                (false, true) => self.satd_at_weighted(ctx, &ref1.y, x0, y0, n, src, y_stride, cand.mv[1], self.wp_b[1][0], 1),
                 (false, false) => unreachable!("filtered above"),
             };
             let bits = rate.skip(idx as u8).min(rate.merge(idx as u8));
@@ -1078,10 +1103,12 @@ impl<S: Sample> InterPicture<S> {
         }
 
         // The chosen prediction, through the decoder's own MC — uni or bi
-        // by which lists the winner uses, and per-format chroma for free.
+        // by which lists the winner uses, and per-format chroma for free —
+        // weighted exactly as the slice header says those lists are.
         let r0 = (ref_pair[0] >= 0).then_some((ref0, mv_pair[0]));
         let r1 = (ref_pair[1] >= 0).then_some((ref1, mv_pair[1]));
-        predict_block(ctx.dsp, &mut self.scratch, &mut self.recon, x0, y0, n, n, r0, r1, [Weighting::Default; 3]);
+        let wp = self.wp_b_for(ref_pair);
+        predict_block(ctx.dsp, &mut self.scratch, &mut self.recon, x0, y0, n, n, r0, r1, wp);
 
         let any = self.code_residual_cu(ctx, x0, y0, log2_cu, src, y_stride, src_cb, src_cr, c_stride, &mut out);
         out.kind = match (merge_wins, any) {
@@ -1461,11 +1488,13 @@ impl<S: Sample> InterPicture<S> {
     }
 
     /// SATD refinement: the eight half-sample neighbours of `start`, then
-    /// the eight quarter-sample neighbours of that winner.
+    /// the eight quarter-sample neighbours of that winner — each scored
+    /// under `wp`, the luma weighting a one-list prediction from `list`
+    /// carries (see [`Self::satd_at_weighted`]).
     #[allow(clippy::too_many_arguments)]
-    fn refine_subpel(&mut self, ctx: &MeCtx<'_, S>, refp: &Plane16<S>, r: usize, x: usize, y: usize, n: usize, src: &[S], src_stride: usize, start: Mv) -> (Mv, u32) {
+    fn refine_subpel(&mut self, ctx: &MeCtx<'_, S>, refp: &Plane16<S>, wp: Weighting, list: usize, x: usize, y: usize, n: usize, src: &[S], src_stride: usize, start: Mv) -> (Mv, u32) {
         let mut best = start;
-        let mut best_satd = self.satd_at(ctx, refp, r, x, y, n, src, src_stride, start);
+        let mut best_satd = self.satd_at_weighted(ctx, refp, x, y, n, src, src_stride, start, wp, list);
         for step in [2i16, 1] {
             let centre = best;
             for dy in [-step, 0, step] {
@@ -1474,7 +1503,7 @@ impl<S: Sample> InterPicture<S> {
                         continue;
                     }
                     let mv = Mv::new(centre.x.wrapping_add(dx), centre.y.wrapping_add(dy));
-                    let satd = self.satd_at(ctx, refp, r, x, y, n, src, src_stride, mv);
+                    let satd = self.satd_at_weighted(ctx, refp, x, y, n, src, src_stride, mv, wp, list);
                     if satd < best_satd {
                         best_satd = satd;
                         best = mv;
@@ -1492,22 +1521,23 @@ impl<S: Sample> InterPicture<S> {
     #[allow(clippy::too_many_arguments)]
     fn satd_at(&mut self, ctx: &MeCtx<'_, S>, refp: &Plane16<S>, r: usize, x: usize, y: usize, n: usize, src: &[S], src_stride: usize, mv: Mv) -> u32 {
         let wp = self.wp_for(r)[0];
-        self.satd_at_weighted(ctx, refp, x, y, n, src, src_stride, mv, wp)
+        self.satd_at_weighted(ctx, refp, x, y, n, src, src_stride, mv, wp, 0)
     }
 
     /// [`Self::satd_at`] under a given luma weighting: the default
     /// uni-prediction, or the decoder's `weighted_uni` at the table's
-    /// `log2WD`, weight and offset for list 0 — the same kernel
-    /// `predict_block` will commit the winner through.
+    /// `log2WD` and the weight and offset of `list` — the entry
+    /// `predict_block` takes for a one-list prediction from that list, and
+    /// the same kernel it will commit the winner through.
     #[allow(clippy::too_many_arguments)]
-    fn satd_at_weighted(&mut self, ctx: &MeCtx<'_, S>, refp: &Plane16<S>, x: usize, y: usize, n: usize, src: &[S], src_stride: usize, mv: Mv, wp: Weighting) -> u32 {
+    fn satd_at_weighted(&mut self, ctx: &MeCtx<'_, S>, refp: &Plane16<S>, x: usize, y: usize, n: usize, src: &[S], src_stride: usize, mv: Mv, wp: Weighting, list: usize) -> u32 {
         let InterPicture { swin, stmp, spred14, spred, .. } = self;
         predict14(ctx, refp, x, y, n, mv, swin, stmp, spred14);
         let bd = ctx.bit_depth;
         let max = (1i32 << bd) - 1;
         match wp {
             Weighting::Default => (ctx.dsp.uni)(spred, n, spred14, n, n, 14 - bd as i32, max),
-            Weighting::Explicit { log2_wd, w, o } => (ctx.dsp.weighted_uni)(spred, n, spred14, n, n, log2_wd, w[0], o[0], max),
+            Weighting::Explicit { log2_wd, w, o } => (ctx.dsp.weighted_uni)(spred, n, spred14, n, n, log2_wd, w[list], o[list], max),
         }
         (ctx.dist.satd)(src, src_stride, spred, n, n, n)
     }
@@ -1521,17 +1551,54 @@ impl<S: Sample> InterPicture<S> {
         let n = 1usize << log2_cu;
         let src = &src_y[y0 * y_stride + x0..];
         let wp = self.wp_for(r)[0];
-        let plain = self.satd_at_weighted(ctx, &refp.y, x0, y0, n, src, y_stride, mv, Weighting::Default);
-        let weighted = self.satd_at_weighted(ctx, &refp.y, x0, y0, n, src, y_stride, mv, wp);
+        let plain = self.satd_at_weighted(ctx, &refp.y, x0, y0, n, src, y_stride, mv, Weighting::Default, 0);
+        let weighted = self.satd_at_weighted(ctx, &refp.y, x0, y0, n, src, y_stride, mv, wp, 0);
         (plain, weighted)
+    }
+
+    /// [`Self::weighting_gain`] for a B CU: the luma SATD at the chosen
+    /// vectors `mv` of the lists `ref_idx` uses (reference 0 of each, `ref0`
+    /// and `ref1`), without weighting and with this picture's — one list's
+    /// prediction, or the pair's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn weighting_gain_b(
+        &mut self,
+        ctx: &MeCtx<'_, S>,
+        ref0: &Frame<S>,
+        ref1: &Frame<S>,
+        x0: usize,
+        y0: usize,
+        log2_cu: u32,
+        src_y: &[S],
+        y_stride: usize,
+        mv: [Mv; 2],
+        ref_idx: [i8; 2],
+    ) -> (u32, u32) {
+        let n = 1usize << log2_cu;
+        let src = &src_y[y0 * y_stride + x0..];
+        let wp = self.wp_b_for(ref_idx)[0];
+        match (ref_idx[0] >= 0, ref_idx[1] >= 0) {
+            (true, true) => {
+                let plain = self.satd_bi_at(ctx, &ref0.y, &ref1.y, x0, y0, n, src, y_stride, mv[0], mv[1], Weighting::Default);
+                (plain, self.satd_bi_at(ctx, &ref0.y, &ref1.y, x0, y0, n, src, y_stride, mv[0], mv[1], wp))
+            }
+            (one0, _) => {
+                let (refp, list) = if one0 { (&ref0.y, 0) } else { (&ref1.y, 1) };
+                let plain = self.satd_at_weighted(ctx, refp, x0, y0, n, src, y_stride, mv[list], Weighting::Default, list);
+                (plain, self.satd_at_weighted(ctx, refp, x0, y0, n, src, y_stride, mv[list], wp, list))
+            }
+        }
     }
 
     /// SATD of the *bi-predicted* luma block at `(mv0, mv1)`: the two
     /// lists' 14-bit predictions combined through the decoder's own
     /// `dsp.bi` at `15 - bit_depth`, which is the shift `predict_block`
-    /// uses for default-weighted bi-prediction (8.5.3.3.4.2). Scoring the
-    /// average rather than either half is what makes the BI trial
-    /// comparable with the two uni ones.
+    /// uses for default-weighted bi-prediction (8.5.3.3.4.2), or under
+    /// `wp` through its `dsp.weighted_bi` at the table's `log2WD` and both
+    /// lists' weights and offsets (8.5.3.3.4.3) — the arithmetic
+    /// `predict_block` commits the winner through. Scoring the average
+    /// rather than either half is what makes the BI trial comparable with
+    /// the two uni ones.
     #[allow(clippy::too_many_arguments)]
     fn satd_bi_at(
         &mut self,
@@ -1545,13 +1612,17 @@ impl<S: Sample> InterPicture<S> {
         src_stride: usize,
         mv0: Mv,
         mv1: Mv,
+        wp: Weighting,
     ) -> u32 {
         let InterPicture { swin, stmp, spred14, spred14_b, spred, .. } = self;
         predict14(ctx, ref0, x, y, n, mv0, swin, stmp, spred14);
         predict14(ctx, ref1, x, y, n, mv1, swin, stmp, spred14_b);
         let bd = ctx.bit_depth;
         let max = (1i32 << bd) - 1;
-        (ctx.dsp.bi)(spred, n, spred14, spred14_b, n, n, 15 - bd as i32, max);
+        match wp {
+            Weighting::Default => (ctx.dsp.bi)(spred, n, spred14, spred14_b, n, n, 15 - bd as i32, max),
+            Weighting::Explicit { log2_wd, w, o } => (ctx.dsp.weighted_bi)(spred, n, spred14, spred14_b, n, n, log2_wd, w[0], w[1], o[0], o[1], max),
+        }
         (ctx.dist.satd)(src, src_stride, spred, n, n, n)
     }
 }
@@ -2318,7 +2389,7 @@ mod tests {
             // drive each `inter_pred_idc` for real.
             let mut seen_idc = [false; 3];
             for scen in [BScenario::Uni0, BScenario::Uni1, BScenario::Bi] {
-                replay_b_one_format(chroma, scen, &mut seen_idc);
+                replay_b_one_format(chroma, scen, &mut seen_idc, None);
             }
             assert!(seen_idc[0], "{chroma:?}: no CU ever coded PRED_L0 through AMVP");
             assert!(seen_idc[1], "{chroma:?}: no CU ever coded PRED_L1 through AMVP");
@@ -2344,6 +2415,55 @@ mod tests {
         }
     }
 
+    /// The B replay under explicit weighting: the same three scenarios,
+    /// with each anchor handed to the decision as the picture its list's
+    /// table entry weights back to the content the source was built from
+    /// — so the weighted prediction, not the default one, is what matches.
+    /// The list-0 and list-1 entries differ in every component, gain and
+    /// offset, luma and chroma, so a walk that predicted without the
+    /// weights, or weighted one list with the other's entry, diverges from
+    /// the replay, which derives its weighting from the table through the
+    /// reader's own `explicit_weighting`.
+    #[test]
+    fn every_weighted_b_decision_replays_through_an_independent_decoder_state() {
+        let table = weighted_b_table();
+        for chroma in [ChromaFormat::Monochrome, ChromaFormat::Yuv420, ChromaFormat::Yuv422, ChromaFormat::Yuv444] {
+            let mut seen_idc = [false; 3];
+            for scen in [BScenario::Uni0, BScenario::Uni1, BScenario::Bi] {
+                replay_b_one_format(chroma, scen, &mut seen_idc, Some(&table));
+            }
+            assert!(seen_idc[0], "{chroma:?} weighted: no CU ever coded PRED_L0 through AMVP");
+            assert!(seen_idc[1], "{chroma:?} weighted: no CU ever coded PRED_L1 through AMVP");
+        }
+    }
+
+    /// A B slice's table whose two lists differ in every component: list 0
+    /// a gain below the identity with positive offsets, list 1 a gain above
+    /// it with negative ones. Denominators 6, 8-bit offsets.
+    fn weighted_b_table() -> crate::hevc::slice::PredWeightTable {
+        use crate::hevc::slice::{PredWeightTable, WeightEntry};
+        PredWeightTable {
+            luma_log2_denom: 6,
+            chroma_log2_denom: 6,
+            lists: [vec![WeightEntry { luma: (56, 12), chroma: [(60, 6), (64, 3)] }], vec![WeightEntry { luma: (72, -10), chroma: [(66, -2), (68, -6)] }]],
+        }
+    }
+
+    /// The inverse of the weighting `(w, o)` at denominator 6 over the
+    /// picture area of `plane`: each sample `p` becomes the `q` whose
+    /// `((q * w + 32) >> 6) + o` lands nearest `p`, so a prediction from
+    /// the result under that weighting reproduces the plane it was made
+    /// from, to a rounding.
+    fn unweight(plane: &mut Plane16<u8>, (w, o): (i32, i32)) {
+        for y in 0..plane.height {
+            for x in 0..plane.width {
+                let off = plane.offset(x as isize, y as isize);
+                let p = i32::from(plane.data[off]);
+                plane.data[off] = (((p - o) * 64 + w / 2) / w).clamp(0, 255) as u8;
+            }
+        }
+    }
+
     /// What the source of a B replay looks like, and therefore which
     /// signalling the decision should reach for.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2358,7 +2478,7 @@ mod tests {
         Bi,
     }
 
-    fn replay_b_one_format(chroma: ChromaFormat, scen: BScenario, seen_idc: &mut [bool; 3]) {
+    fn replay_b_one_format(chroma: ChromaFormat, scen: BScenario, seen_idc: &mut [bool; 3], weights: Option<&crate::hevc::slice::PredWeightTable>) {
         let kit = Kit::new();
         let ctx = kit.ctx(30);
         let (sps, pps) = parsed_sets_fmt(64, 64, chroma);
@@ -2412,12 +2532,24 @@ mod tests {
                 }
             }
         }
+        // Under a table, each anchor becomes the picture its own list's
+        // entry weights back to the content the source was built from.
+        if let Some(t) = weights {
+            for (f, e) in [(&mut ref0, &t.lists[0][0]), (&mut ref1, &t.lists[1][0])] {
+                unweight(&mut f.y, e.luma);
+                unweight(&mut f.cb, e.chroma[0]);
+                unweight(&mut f.cr, e.chroma[1]);
+                f.extend_rows(0, 64);
+            }
+        }
+        let weighting = |ref_idx: [i8; 2]| weights.map_or([Weighting::Default; 3], |t| crate::hevc::ctu::explicit_weighting(t, 8, 8, ref_idx));
 
         let (w, h) = (64usize, 64usize);
         let n = 1usize << sps.log2_ctb_size;
         let (sw, _) = sub_wh(cat);
         let c_stride = if cat == 0 { 0 } else { w / sw };
         let mut pic = InterPicture::new(&sps, &pps, 2);
+        pic.wp_b = [[0, -1], [-1, 0], [0, 0]].map(weighting);
         let mut decisions = Vec::new();
         for cy in 0..h / n {
             for cx in 0..w / n {
@@ -2425,7 +2557,7 @@ mod tests {
             }
         }
         assert_invariants(&decisions, cat);
-        let tag = format!("{chroma:?}/{scen:?}");
+        let tag = format!("{chroma:?}/{scen:?}{}", if weights.is_some() { " weighted" } else { "" });
         // Record which `inter_pred_idc` values were reached, for the
         // caller's aggregate coverage check. Only a CODED CU counts: a
         // `UseIntra` decision still carries the motion fields this module
@@ -2523,7 +2655,7 @@ mod tests {
 
             let r0 = (ref_idx[0] >= 0).then_some((&ref0, mv[0]));
             let r1 = (ref_idx[1] >= 0).then_some((&ref1, mv[1]));
-            predict_block(&kit.dsp, &mut scratch, &mut frame, x0, y0, n, n, r0, r1, [Weighting::Default; 3]);
+            predict_block(&kit.dsp, &mut scratch, &mut frame, x0, y0, n, n, r0, r1, weighting(ref_idx));
             if d.rqt_root_cbf {
                 let bd_shift = 20 - 8i32;
                 let mut work = [0i16; 1024];

@@ -1283,6 +1283,15 @@ mod tests {
             (ChromaFormat::Monochrome, 8, Kind::P, 4, 4, vec![entry(12, 9, [16, 16], [0, 0])], vec![]),
             // Ten bits: offsets held shifted by two, spelled in 8-bit units.
             (ChromaFormat::Yuv420, 10, Kind::P, 6, 6, vec![entry(50, -12 << 2, [64, 70], [0, 8 << 2])], vec![]),
+            // A B slice at ten bits, both lists weighted in every
+            // component, offsets of both signs held shifted.
+            (ChromaFormat::Yuv420, 10, Kind::B, 6, 6, vec![entry(56, 12 << 2, [60, 64], [6 << 2, 3 << 2])], vec![entry(72, -10 << 2, [66, 68], [-2 << 2, -6 << 2])]),
+            // A B slice weighting list 0 alone: list 1's entry is the
+            // default, its flags clear, while list 0's are set.
+            (ChromaFormat::Yuv420, 8, Kind::B, 6, 6, vec![entry(48, -3, [64, 64], [0, 0])], vec![entry(64, 0, [64, 64], [0, 0])]),
+            // A monochrome B slice: no chroma syntax in either list, and
+            // list 1 weighted while list 0 is not.
+            (ChromaFormat::Monochrome, 8, Kind::B, 6, 6, vec![entry(64, 0, [64, 64], [0, 0])], vec![entry(80, 5, [64, 64], [0, 0])]),
         ];
         for (chroma, bit_depth, kind, ld, cd, l0, l1) in cases {
             let tag = format!("{chroma:?} {bit_depth}-bit {kind:?} denoms {ld}/{cd} l0 {l0:?} l1 {l1:?}");

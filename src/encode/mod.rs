@@ -331,12 +331,14 @@ pub struct Config {
     /// change a reference's brightness, so without this every block of a
     /// fading picture carries the level change as residual.
     ///
-    /// B slices keep default weighting (H.265's `weighted_bipred_flag`,
-    /// H.264's `weighted_bipred_idc`, both 0): the two-list decision would
-    /// need weights per list and its own fit, and the P anchors are where
-    /// a fade's cost is. A lossless H.264 stream refuses it, its inter
-    /// pictures being exact copies. Off, the stream is byte-identical to
-    /// one from an encoder that never had it.
+    /// H.265 weights B slices too when the GOP has B pictures: the PPS
+    /// sets `weighted_bipred_flag` and every B slice's table carries an
+    /// entry for each list's reference, fitted the same way, which the
+    /// one-list and the bi predictions both apply (8.5.3.3.4.3). H.264's B
+    /// slices keep default weighting (`weighted_bipred_idc` 0). A lossless
+    /// H.264 stream refuses it, its inter pictures being exact copies.
+    /// Off, the stream is byte-identical to one from an encoder that never
+    /// had it.
     pub weighted_pred: bool,
     /// Colour description to write into the SPS VUI, or `None` to write
     /// nothing about colour — which is what every stream this encoder

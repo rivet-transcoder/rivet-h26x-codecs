@@ -405,11 +405,15 @@ impl<S: Sample> Core<S> {
         // the granularity that decision has — and half the CTB once the
         // coding quadtree may split it, so that a group can follow the
         // units it holds without a delta per 8x8 unit.
-        // Weighted prediction sets the P-slice flag and no other: every
-        // P slice then carries a table, B slices stay default.
+        // Weighted prediction sets the P-slice flag, and the B-slice flag
+        // when the GOP codes B pictures: every P and B slice then carries
+        // a table. Without B pictures the second flag would be a PPS bit
+        // no slice reads, and one every such stream coded before B slices
+        // were weighted does not have.
         let pps_opts = PpsOptions {
             cu_qp_delta_depth: (cfg.aq_strength > 0.0).then_some(u32::from(tree_depth(&cfg, &g) > 0)),
             weighted_pred: cfg.weighted_pred,
+            weighted_bipred: cfg.weighted_pred && cfg.bframes > 0,
             ..PpsOptions::default()
         };
         let (sw, sh) = cfg.chroma.subsampling();
@@ -1093,37 +1097,56 @@ impl<S: Sample> Core<S> {
         // the same field a decoder of this stream sizes its frames by.
         let mut pic = InterPicture::<S>::new(&sps, &pps, c.poc as i32);
 
-        // Weighted prediction, for a P slice under the PPS flag: one
-        // entry for list 0's one reference, each component fitted to the
-        // source against the reference's reconstruction and kept only
-        // where it lowers the zero-motion residual (`h265_wp`). The
-        // table travels in the slice header; the walk predicts with
-        // exactly what a decoder derives from that table, through the
-        // reader's own `explicit_weighting`.
-        let wp = (self.cfg.weighted_pred && c.kind == Kind::P).then(|| {
+        // Weighted prediction, for a P slice under `weighted_pred_flag` and
+        // a B slice under `weighted_bipred_flag`: one entry per reference
+        // in each list the slice uses, each component fitted to the source
+        // against that reference's reconstruction and kept only where it
+        // lowers the zero-motion residual (`h265_wp`). The table travels
+        // in the slice header; the walk predicts with exactly what a
+        // decoder derives from that table, through the reader's own
+        // `explicit_weighting`.
+        let weighted = match c.kind {
+            Kind::P => self.pps_opts.weighted_pred,
+            Kind::B => self.pps_opts.weighted_bipred,
+            Kind::Idr | Kind::I => false,
+        };
+        let wp = weighted.then(|| {
             let identity = h265_wp::PlaneFit::identity(0);
-            // One entry per reference in the list, each its own fit: an
+            let fit = |rf: &&crate::hevc::frame::Frame<S>| -> [h265_wp::PlaneFit; 3] {
+                let luma = h265_wp::fit_plane(&src[..dw * dh], dw, &rf.y, dw, dh, bit_depth);
+                let (cb, cr) = if cat != 0 {
+                    (
+                        h265_wp::fit_plane(&src[dw * dh..dw * dh + cdw * cdh], cdw, &rf.cb, cdw, cdh, bit_depth),
+                        h265_wp::fit_plane(&src[dw * dh + cdw * cdh..], cdw, &rf.cr, cdw, cdh, bit_depth),
+                    )
+                } else {
+                    (identity, identity)
+                };
+                [luma, cb, cr]
+            };
+            // One entry per reference in each list, each its own fit: an
             // older reference of a fade is further down the ramp and
-            // wants a different gain.
-            let fits: Vec<[h265_wp::PlaneFit; 3]> = l0
-                .iter()
-                .map(|rf| {
-                    let luma = h265_wp::fit_plane(&src[..dw * dh], dw, &rf.y, dw, dh, bit_depth);
-                    let (cb, cr) = if cat != 0 {
-                        (
-                            h265_wp::fit_plane(&src[dw * dh..dw * dh + cdw * cdh], cdw, &rf.cb, cdw, cdh, bit_depth),
-                            h265_wp::fit_plane(&src[dw * dh + cdw * cdh..], cdw, &rf.cr, cdw, cdh, bit_depth),
-                        )
-                    } else {
-                        (identity, identity)
-                    };
-                    [luma, cb, cr]
-                })
-                .collect();
-            let entries = fits.iter().map(|f| h265_wp::entry_for(*f, bit_depth, bit_depth)).collect();
-            (h265_wp::table_for(entries), fits)
+            // wants a different gain, and a B picture's two anchors sit on
+            // either side of it, so each list's gain is its own too.
+            let l1: Vec<&crate::hevc::frame::Frame<S>> = if c.kind == Kind::B { future.into_iter().collect() } else { Vec::new() };
+            let fits: [Vec<[h265_wp::PlaneFit; 3]>; 2] = [l0.iter().map(&fit).collect(), l1.iter().map(&fit).collect()];
+            let entries = |list: &[[h265_wp::PlaneFit; 3]]| list.iter().map(|f| h265_wp::entry_for(*f, bit_depth, bit_depth)).collect();
+            (h265_wp::table_for([entries(&fits[0]), entries(&fits[1])]), fits)
         });
-        pic.wp = wp.as_ref().map_or(Vec::new(), |(t, _)| (0..l0.len()).map(|r| explicit_weighting(t, bit_depth, bit_depth, [r as i8, -1])).collect());
+        match (&wp, c.kind) {
+            (Some((t, _)), Kind::P) => pic.wp = (0..l0.len()).map(|r| explicit_weighting(t, bit_depth, bit_depth, [r as i8, -1])).collect(),
+            // A B slice's three predictions — list 0, list 1, both — each
+            // weighted as the reader derives it for reference 0 of the
+            // lists it uses. A table whose every entry is the default
+            // predicts exactly the samples default weighting does, uni and
+            // bi alike (`w = 1 << denom` and `o = 0` reduce 8.5.3.3.4.3 to
+            // 8.5.3.3.4.2), so it leaves the walk on default weighting and
+            // its fused kernels.
+            (Some((t, fits)), Kind::B) if fits.iter().flatten().any(|f| f.iter().any(h265_wp::PlaneFit::used)) => {
+                pic.wp_b = [[0, -1], [-1, 0], [0, 0]].map(|r| explicit_weighting(t, bit_depth, bit_depth, r));
+            }
+            _ => {}
+        }
 
         let mut w = BitWriter::with_capacity(cw * ch / 4);
         syn::write_slice_header(
@@ -1148,8 +1171,8 @@ impl<S: Sample> Core<S> {
                 // As in `code_picture`, and from the same switch.
                 sao: sao_flags(self.cfg.sao, cat),
                 // The table a P slice must carry under `weighted_pred_flag`
-                // — defaults and all — and a B slice never does, since
-                // `weighted_bipred_flag` is never set.
+                // and a B slice under `weighted_bipred_flag`, defaults and
+                // all.
                 pred_weights: wp.as_ref().map(|(t, _)| syn::PredWeights {
                     table: t.clone(),
                     chroma: cat != 0,
@@ -1232,15 +1255,24 @@ impl<S: Sample> Core<S> {
         // reports it on every clip.
         let mut wp_stats = (0u64, 0u64, 0u64);
         if let Some((_, fits)) = &wp {
-            if fits.iter().any(|f| f[0].used()) {
+            if fits.iter().flatten().any(|f| f[0].used()) {
                 wp_stats.0 = 1;
                 for cu in &cus {
                     let PCuDecision::Inter(d) = &cu.d else { continue };
-                    if d.ref_idx < 0 || !fits[d.ref_idx as usize][0].used() {
+                    // A CU counts when a list it predicts from carries a
+                    // chosen luma fit; a bi CU is scored as the pair.
+                    let ref_idx = [d.ref_idx, d.ref_idx_l1];
+                    let fitted = |list: usize| ref_idx[list] >= 0 && fits[list][ref_idx[list] as usize][0].used();
+                    if !fitted(0) && !fitted(1) {
                         continue;
                     }
-                    let r = d.ref_idx as usize;
-                    let (plain, weighted) = pic.weighting_gain(&mctx, l0[r], r, cu.x0, cu.y0, cu.log2, &py, cw, d.mv);
+                    let (plain, weighted) = match refs {
+                        TreeRefs::B(r0, r1) => pic.weighting_gain_b(&mctx, r0, r1, cu.x0, cu.y0, cu.log2, &py, cw, [d.mv, d.mv_l1], ref_idx),
+                        TreeRefs::P(_) => {
+                            let r = d.ref_idx as usize;
+                            pic.weighting_gain(&mctx, l0[r], r, cu.x0, cu.y0, cu.log2, &py, cw, d.mv)
+                        }
+                    };
                     wp_stats.1 += u64::from(weighted < plain);
                     wp_stats.2 += u64::from(weighted > plain);
                 }
