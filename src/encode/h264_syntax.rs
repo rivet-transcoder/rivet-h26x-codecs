@@ -22,7 +22,7 @@ use crate::cabac_enc::CabacEncoder;
 use crate::encode::gop::Kind;
 use crate::h264::SliceType;
 use crate::h264::cabac_mb::{CabacState, MB_TYPE_I_PCM, write_mb_type_i_cabac};
-use crate::encode::{Config, Entropy};
+use crate::encode::{ColourDescription, Config, ContentLightLevel, Entropy, MasteringDisplay};
 use crate::picture::ChromaFormat;
 use crate::sample::Sample;
 
@@ -74,25 +74,87 @@ fn write_hrd(w: &mut BitWriter, cpb: &Cpb) {
     w.bits(5, 0); // time_offset_length — no pic_struct, so no time_offset
 }
 
-/// `vui_parameters()` (E.1.1) carrying only what the buffer model needs:
-/// the clock the removal delays are counted in, and the NAL HRD.
-/// Everything else is absent by its own flag — a VUI is optional and this
-/// encoder wrote none until a buffer needed one.
-fn write_vui(w: &mut BitWriter, cpb: &Cpb, fps: u32) {
+/// `vui_parameters()` (E.1.1) carrying only what was asked for: the
+/// colour description and the chroma siting when the caller gave them,
+/// and the clock the removal delays are counted in plus the NAL HRD when
+/// a buffer was declared. Everything else is absent by its own flag — a
+/// VUI is optional and this encoder wrote none until a buffer needed one
+/// — and each part is present only under its own condition, so a stream
+/// with a buffer and no colour is byte-identical to one from before
+/// colour existed. The inverse of `h264::sps::parse_vui`, which keeps
+/// every field written here.
+fn write_vui(
+    w: &mut BitWriter,
+    colour: Option<&ColourDescription>,
+    chroma_loc: Option<u8>,
+    cpb: Option<&Cpb>,
+    fps: u32,
+) {
     w.flag(false); // aspect_ratio_info_present_flag
     w.flag(false); // overscan_info_present_flag
-    w.flag(false); // video_signal_type_present_flag
-    w.flag(false); // chroma_loc_info_present_flag
-    w.flag(true); // timing_info_present_flag
-    w.bits(32, 1); // num_units_in_tick
-    w.bits(32, TICKS_PER_FRAME * fps.max(1)); // time_scale
-    w.flag(true); // fixed_frame_rate_flag
-    w.flag(true); // nal_hrd_parameters_present_flag
-    write_hrd(w, cpb);
-    w.flag(false); // vcl_hrd_parameters_present_flag
-    w.flag(false); // low_delay_hrd_flag (present: a NAL HRD is)
+    write_video_signal_type(w, colour);
+    write_chroma_loc(w, chroma_loc);
+    match cpb {
+        Some(cpb) => {
+            w.flag(true); // timing_info_present_flag
+            w.bits(32, 1); // num_units_in_tick
+            w.bits(32, TICKS_PER_FRAME * fps.max(1)); // time_scale
+            w.flag(true); // fixed_frame_rate_flag
+            w.flag(true); // nal_hrd_parameters_present_flag
+            write_hrd(w, cpb);
+            w.flag(false); // vcl_hrd_parameters_present_flag
+            w.flag(false); // low_delay_hrd_flag (present: a NAL HRD is)
+        }
+        None => {
+            w.flag(false); // timing_info_present_flag
+            w.flag(false); // nal_hrd_parameters_present_flag
+            w.flag(false); // vcl_hrd_parameters_present_flag
+            // low_delay_hrd_flag is absent: neither HRD is present.
+        }
+    }
     w.flag(false); // pic_struct_present_flag
     w.flag(false); // bitstream_restriction_flag
+}
+
+/// The `video_signal_type_present_flag` group of a VUI (E.1.1): the
+/// three H.273 code points and the range flag, or the one zero flag that
+/// says nothing about colour. `video_format` is 5, "unspecified" — the
+/// value for content that is not a broadcast standard's — which is what
+/// every encoder that writes this group writes.
+///
+/// Identical in H.264 and H.265 (E.2.1 copies E.1.1 field for field), so
+/// the H.265 writer calls this one.
+pub(crate) fn write_video_signal_type(w: &mut BitWriter, colour: Option<&ColourDescription>) {
+    match colour {
+        Some(c) => {
+            w.flag(true); // video_signal_type_present_flag
+            w.bits(3, 5); // video_format: unspecified
+            w.flag(c.full_range); // video_full_range_flag
+            w.flag(true); // colour_description_present_flag
+            w.bits(8, u32::from(c.primaries)); // colour_primaries
+            w.bits(8, u32::from(c.transfer)); // transfer_characteristics
+            w.bits(8, u32::from(c.matrix)); // matrix_coefficients
+        }
+        None => w.flag(false), // video_signal_type_present_flag
+    }
+}
+
+/// The `chroma_loc_info_present_flag` group of a VUI (E.1.1): one
+/// `chroma_sample_loc_type` for each field, the same value twice because
+/// this encoder codes frames, or the one zero flag that says nothing
+/// about siting — under which every decoder assumes type 0.
+///
+/// Identical in H.264 and H.265 (E.2.1), so the H.265 writer calls this
+/// one.
+pub(crate) fn write_chroma_loc(w: &mut BitWriter, chroma_loc: Option<u8>) {
+    match chroma_loc {
+        Some(t) => {
+            w.flag(true); // chroma_loc_info_present_flag
+            w.ue(u32::from(t)); // chroma_sample_loc_type_top_field
+            w.ue(u32::from(t)); // chroma_sample_loc_type_bottom_field
+        }
+        None => w.flag(false), // chroma_loc_info_present_flag
+    }
 }
 
 /// One SEI message wrapped as an SEI NAL payload: `payloadType`,
@@ -103,8 +165,15 @@ fn write_vui(w: &mut BitWriter, cpb: &Cpb, fps: u32) {
 /// is applied once, here, to the whole NAL. A payload that had already
 /// been escaped would be escaped again — a timing SEI is mostly zero
 /// bytes, exactly the pattern the escape targets — and a reader would
-/// find `0x03` where a delay's bits should be.
-fn sei_nal(payload_type: u32, payload: &[u8]) -> Vec<u8> {
+/// find `0x03` where a delay's bits should be. (Which is what the H.265
+/// buffering period did until it was routed through here: its payload
+/// went out escaped and sized as escaped, then the NAL was escaped
+/// again — `00 00 03 03` on the wire, and a checker reading a stray
+/// byte inside the initial delay.)
+///
+/// Shared by both syntaxes: an SEI message is the same bytes in H.264
+/// and H.265, only the NAL header around it differs.
+pub(crate) fn sei_nal(payload_type: u32, payload: &[u8]) -> Vec<u8> {
     let mut w = BitWriter::with_capacity(payload.len() + 8);
     let mut t = payload_type;
     while t >= 255 {
@@ -123,6 +192,35 @@ fn sei_nal(payload_type: u32, payload: &[u8]) -> Vec<u8> {
     }
     w.rbsp_trailing_bits();
     w.into_nal()
+}
+
+/// The `mastering_display_colour_volume` SEI (payloadType 137; D.1.29,
+/// and H.265 D.2.28 field for field): the three primaries in the SEI's
+/// own order — green, blue, red, the order both standards recommend and
+/// every writer follows — then the white point and the two luminances,
+/// all as the caller gave them. 24 bytes, byte-aligned by its own
+/// syntax, so no payload alignment bits. The test below holds it
+/// byte-identical to what x265 writes for the same values.
+pub fn write_mastering_display_sei(m: &MasteringDisplay) -> Vec<u8> {
+    let mut p = BitWriter::with_capacity(24);
+    for (x, y) in [m.green, m.blue, m.red] {
+        p.bits(16, u32::from(x)); // display_primaries_x[c]
+        p.bits(16, u32::from(y)); // display_primaries_y[c]
+    }
+    p.bits(16, u32::from(m.white_point.0)); // white_point_x
+    p.bits(16, u32::from(m.white_point.1)); // white_point_y
+    p.bits(32, m.max_luminance); // max_display_mastering_luminance
+    p.bits(32, m.min_luminance); // min_display_mastering_luminance
+    sei_nal(137, &p.into_rbsp())
+}
+
+/// The `content_light_level_info` SEI (payloadType 144; D.1.31, H.265
+/// D.2.35): the two light levels, four bytes.
+pub fn write_content_light_level_sei(c: &ContentLightLevel) -> Vec<u8> {
+    let mut p = BitWriter::with_capacity(4);
+    p.bits(16, u32::from(c.max_cll)); // max_content_light_level
+    p.bits(16, u32::from(c.max_fall)); // max_pic_average_light_level
+    sei_nal(144, &p.into_rbsp())
 }
 
 /// A `buffering_period` SEI (D.1.2), for every IDR access unit: the
@@ -244,9 +342,10 @@ fn has_chroma_extension(profile: u8) -> bool {
 }
 
 /// Sequence parameter set. With a coded picture buffer declared it
-/// carries a VUI — the frame clock and the NAL HRD — and without one no
-/// VUI at all, so a stream that declares no buffer is byte-identical to
-/// one from before the buffer model existed.
+/// carries a VUI — the frame clock and the NAL HRD — and with a colour
+/// description the VUI carries that; with neither, no VUI at all, so a
+/// stream that declares no buffer and no colour is byte-identical to one
+/// from before either existed.
 pub fn write_sps(
     cfg: &Config,
     g: &Geometry,
@@ -313,12 +412,11 @@ pub fn write_sps(
     } else {
         w.flag(false);
     }
-    match cpb {
-        Some(cpb) => {
-            w.flag(true); // vui_parameters_present_flag
-            write_vui(&mut w, cpb, cfg.fps);
-        }
-        None => w.flag(false), // vui_parameters_present_flag
+    if cpb.is_some() || cfg.colour.is_some() || cfg.chroma_loc.is_some() {
+        w.flag(true); // vui_parameters_present_flag
+        write_vui(&mut w, cfg.colour.as_ref(), cfg.chroma_loc, cpb, cfg.fps);
+    } else {
+        w.flag(false); // vui_parameters_present_flag
     }
     w.rbsp_trailing_bits();
     w.into_nal()
@@ -853,6 +951,138 @@ mod tests {
                 assert_eq!(parsed.disable_deblocking_filter_idc, 0);
             }
         }
+    }
+
+    /// The two HDR10 static-metadata SEIs are byte-identical to the ones
+    /// x265 writes for the same values (the NAL bytes after its two-byte
+    /// HEVC header, from an x265 3.x stream with
+    /// `master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)`
+    /// and `max-cll=1000,400` — BT.2020 primaries, D65, 1000 nits down to
+    /// 0.0001). There is no reader for these in the crate, so the second
+    /// writer is the fixture: it agrees with libavcodec's reading in the
+    /// gate (tools/vui_probe.py) and these bytes are what it produced.
+    /// The mastering display's `00 00 00 01` tail (min luminance 1) is
+    /// what puts an emulation-prevention byte in the fixture, so the
+    /// single escape in `sei_nal` is exercised too.
+    #[test]
+    fn the_hdr10_static_metadata_seis_match_x265_byte_for_byte() {
+        use crate::encode::{ContentLightLevel, MasteringDisplay};
+        let m = MasteringDisplay {
+            red: (34000, 16000),
+            green: (13250, 34500),
+            blue: (7500, 3000),
+            white_point: (15635, 16450),
+            max_luminance: 10_000_000,
+            min_luminance: 1,
+        };
+        let x265_mdcv = "891833c286c41d4c0bb884d03e803d13404200989680000003000180";
+        let ours: String = write_mastering_display_sei(&m).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(ours, x265_mdcv, "mastering display SEI");
+        let c = ContentLightLevel { max_cll: 1000, max_fall: 400 };
+        let x265_cll = "900403e8019080";
+        let ours: String = write_content_light_level_sei(&c).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(ours, x265_cll, "content light level SEI");
+    }
+
+    /// The colour description round-trips through the decoder's own SPS
+    /// parser, field for field, on its own and beside a buffer; with a
+    /// buffer and no colour the VUI says nothing about colour, and with
+    /// neither there is no VUI at all — the flag, not a VUI of zeros —
+    /// so every stream from before colour existed is byte-identical.
+    ///
+    /// Three code points are asserted separately rather than as one
+    /// tuple so that writing one of them into another's field — the
+    /// mutation this test exists to catch — names the field it lost.
+    #[test]
+    fn the_colour_description_survives_the_decoders_own_sps_parser() {
+        use crate::encode::ColourDescription;
+        let colours = [
+            ColourDescription { primaries: 9, transfer: 16, matrix: 9, full_range: false }, // HDR10
+            ColourDescription { primaries: 9, transfer: 18, matrix: 9, full_range: false }, // HLG
+            ColourDescription { primaries: 1, transfer: 1, matrix: 1, full_range: true }, // BT.709 full
+            ColourDescription { primaries: 12, transfer: 17, matrix: 6, full_range: false }, // P3 / SMPTE 428 / 601
+        ];
+        let (base, g) = geom(64, 64, ChromaFormat::Yuv420);
+        for c in colours {
+            let cfg = Config { colour: Some(c), ..base.clone() };
+            let sps = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 16, 16, None)))
+                .unwrap_or_else(|e| panic!("{c:?}: SPS rejected: {e}"));
+            let vui = sps.vui.as_ref().unwrap_or_else(|| panic!("{c:?}: no VUI"));
+            let (p, t, m) = vui.colour_description.unwrap_or_else(|| panic!("{c:?}: no colour description"));
+            assert_eq!(p, c.primaries, "{c:?}: primaries");
+            assert_eq!(t, c.transfer, "{c:?}: transfer");
+            assert_eq!(m, c.matrix, "{c:?}: matrix");
+            assert_eq!(vui.full_range, c.full_range, "{c:?}: range");
+            assert_eq!(vui.chroma_loc, None, "{c:?}: no siting asked for, none written");
+            assert_eq!(vui.timing, None, "{c:?}: no buffer, no clock");
+            assert_eq!(vui.nal_hrd, None, "{c:?}: no buffer, no HRD");
+            assert!(!vui.bitstream_restriction);
+        }
+        // Beside a buffer: both halves present, neither disturbing the other.
+        let cpb = Cpb::new(64_000, 125).expect("representable");
+        let cfg = Config {
+            colour: Some(colours[0]),
+            rate: crate::encode::RateControl::Bitrate { bps: 64_000 },
+            cpb_ms: 125,
+            ..base.clone()
+        };
+        let sps = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 16, 16, Some(&cpb))))
+            .expect("SPS");
+        let vui = sps.vui.as_ref().expect("VUI");
+        assert_eq!(vui.colour_description, Some((9, 16, 9)));
+        assert_eq!(vui.timing, Some((1, 60)));
+        assert_eq!(vui.nal_hrd.map(|h| h.bit_rate), Some(cpb.bit_rate));
+        // A buffer alone says nothing about colour.
+        let cfg = Config { colour: None, ..cfg };
+        let sps = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 16, 16, Some(&cpb))))
+            .expect("SPS");
+        let vui = sps.vui.as_ref().expect("VUI");
+        assert_eq!(vui.colour_description, None, "a buffer alone must not invent a colour");
+        assert!(!vui.full_range);
+        assert_eq!(vui.timing, Some((1, 60)));
+        // The chroma siting: alone it is a VUI that says nothing about
+        // colour, and every code comes back for both fields.
+        for t in 0..=5u8 {
+            let cfg = Config { chroma_loc: Some(t), ..base.clone() };
+            let sps = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 16, 16, None)))
+                .expect("SPS");
+            let vui = sps.vui.as_ref().expect("a siting alone is a VUI");
+            assert_eq!(vui.chroma_loc, Some((t, t)), "chroma_sample_loc_type {t}");
+            assert_eq!(vui.colour_description, None, "a siting alone must not invent a colour");
+        }
+        // Beside a colour: both there, neither disturbing the other.
+        let cfg = Config { colour: Some(colours[0]), chroma_loc: Some(1), ..base.clone() };
+        let sps = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 16, 16, None)))
+            .expect("SPS");
+        let vui = sps.vui.as_ref().expect("VUI");
+        assert_eq!(vui.colour_description, Some((9, 16, 9)));
+        assert_eq!(vui.chroma_loc, Some((1, 1)));
+        // Neither: the bytes from before either existed.
+        let plain = write_sps(&base, &g, 16, 16, None);
+        let sps = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&plain)).expect("SPS");
+        assert!(sps.vui.is_none(), "no buffer, no colour and no siting, no VUI");
+        assert_ne!(plain, write_sps(&Config { colour: Some(colours[0]), ..base.clone() }, &g, 16, 16, None));
+        assert_ne!(plain, write_sps(&Config { chroma_loc: Some(0), ..base }, &g, 16, 16, None));
+    }
+
+    /// A chroma siting describes a 4:2:0 grid and nothing else: E.2.1
+    /// wants `chroma_loc_info_present_flag` 0 for any other format, and
+    /// libavcodec reports no siting there whatever is written — so the
+    /// configuration is refused by name rather than written into a VUI
+    /// no reader will honour. A code above 5 is refused likewise.
+    #[test]
+    fn a_chroma_siting_is_refused_off_420_and_above_5() {
+        let (base, _) = geom(64, 64, ChromaFormat::Yuv420);
+        assert!(Config { chroma_loc: Some(2), ..base.clone() }.validate().is_ok(), "4:2:0 takes a siting");
+        assert!(Config { chroma_loc: None, chroma: ChromaFormat::Yuv444, ..base.clone() }.validate().is_ok());
+        for c in [ChromaFormat::Monochrome, ChromaFormat::Yuv422, ChromaFormat::Yuv444] {
+            let e = Config { chroma_loc: Some(0), chroma: c, ..base.clone() }
+                .validate()
+                .expect_err("a siting off 4:2:0 must be refused");
+            assert!(e.to_string().contains("chroma_loc"), "{c:?}: {e}");
+        }
+        let e = Config { chroma_loc: Some(6), ..base }.validate().expect_err("6 is not a chroma_sample_loc_type");
+        assert!(e.to_string().contains("0..=5"), "{e}");
     }
 
     #[test]

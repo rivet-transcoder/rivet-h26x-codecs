@@ -10,10 +10,43 @@
 //!   h26xenc --input src.yuv --size 64x64 --format 420 --output out.264 \
 //!           --recon out.rec.yuv [--codec h264|h265] [--qp N | --lossless]
 //!           [--gop N] [--bframes N] [--cavlc] [--threads N]
+//!           [--color PRIMARIES:TRANSFER:MATRIX [--full-range]] [--chroma-loc N]
+//!           [--mastering-display G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)]
+//!           [--content-light MAXCLL,MAXFALL]
 
 
 use h26x::ChromaFormat;
-use h26x::encode::{Config, Entropy, RateControl};
+use h26x::encode::{ColourDescription, Config, ContentLightLevel, Entropy, MasteringDisplay, RateControl};
+
+/// `G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)` — x265's `master-display`
+/// syntax, in the SEI's units — or `None` for anything else.
+fn parse_mastering_display(s: &str) -> Option<MasteringDisplay> {
+    let mut rest = s;
+    let mut pair = |label: &str| -> Option<(u64, u64)> {
+        rest = rest.strip_prefix(label)?.strip_prefix('(')?;
+        let end = rest.find(')')?;
+        let (a, b) = rest[..end].split_once(',')?;
+        rest = &rest[end + 1..];
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    };
+    let g = pair("G")?;
+    let b = pair("B")?;
+    let r = pair("R")?;
+    let wp = pair("WP")?;
+    let l = pair("L")?;
+    if !rest.is_empty() {
+        return None;
+    }
+    let xy = |(x, y): (u64, u64)| Some((u16::try_from(x).ok()?, u16::try_from(y).ok()?));
+    Some(MasteringDisplay {
+        red: xy(r)?,
+        green: xy(g)?,
+        blue: xy(b)?,
+        white_point: xy(wp)?,
+        max_luminance: u32::try_from(l.0).ok()?,
+        min_luminance: u32::try_from(l.1).ok()?,
+    })
+}
 
 fn die(msg: &str) -> ! {
     eprintln!("h26xenc: {msg}");
@@ -22,7 +55,11 @@ fn die(msg: &str) -> ! {
          \x20      [--recon F] [--codec h264|h265] [--qp N | --lossless | --bitrate BPS]\n\
          \x20      [--fps N] [--cpb-ms N]\n\
          \x20      [--gop N] [--bframes N] [--cavlc] [--t8x8] [--subparts] [--sao]\n\
-         \x20      [--aq STRENGTH] [--lookahead N] [--wpred] [--refs N] [--depth N] [--threads N]"
+         \x20      [--aq STRENGTH] [--lookahead N] [--wpred] [--refs N] [--depth N] [--threads N]\n\
+         \x20      [--color PRIMARIES:TRANSFER:MATRIX (H.273 codes, e.g. 9:16:9 for HDR10)]\n\
+         \x20      [--full-range] [--chroma-loc N (H.273 chroma_sample_loc_type 0..=5)]\n\
+         \x20      [--mastering-display G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)] (ST 2086, SEI units)\n\
+         \x20      [--content-light MAXCLL,MAXFALL] (cd/m2)"
     );
     std::process::exit(2);
 }
@@ -35,6 +72,7 @@ fn main() {
     let mut codec = "h264".to_string();
     let mut cfg = Config::default();
     let mut fmt = "420".to_string();
+    let mut full_range = false;
 
     let mut i = 1;
     let val = |i: &mut usize, args: &Vec<String>, what: &str| -> String {
@@ -96,6 +134,44 @@ fn main() {
             // the default and every stream written with it is
             // byte-identical to before multiple references existed.
             "--refs" => cfg.max_refs = val(&mut i, &args, "--refs").parse().unwrap_or_else(|_| die("--refs")),
+            // The VUI colour description, as the three H.273 code points
+            // (colour_primaries:transfer_characteristics:matrix_coefficients).
+            // Absent, the stream says nothing about colour.
+            "--color" => {
+                let s = val(&mut i, &args, "--color");
+                let mut it = s.split(':').map(|x| x.parse::<u8>());
+                let (Some(Ok(p)), Some(Ok(t)), Some(Ok(m)), None) = (it.next(), it.next(), it.next(), it.next())
+                else {
+                    die("--color wants PRIMARIES:TRANSFER:MATRIX, three H.273 codes 0..=255")
+                };
+                cfg.colour = Some(ColourDescription { primaries: p, transfer: t, matrix: m, full_range: false });
+            }
+            // `video_full_range_flag`, beside a --color.
+            "--full-range" => full_range = true,
+            // The VUI chroma siting, as H.273's chroma_sample_loc_type.
+            // Absent, the stream says nothing about siting.
+            "--chroma-loc" => {
+                let s = val(&mut i, &args, "--chroma-loc");
+                cfg.chroma_loc = Some(match s.parse::<u8>() {
+                    Ok(t) if t <= 5 => t,
+                    _ => die("--chroma-loc wants a chroma_sample_loc_type 0..=5 (0 left, 1 centre, 2 top-left)"),
+                });
+            }
+            // HDR10 static metadata: an SEI each, in every IDR access unit.
+            "--mastering-display" => {
+                let s = val(&mut i, &args, "--mastering-display");
+                cfg.mastering_display = Some(parse_mastering_display(&s).unwrap_or_else(|| {
+                    die("--mastering-display wants G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min), integers in the SEI's units")
+                }));
+            }
+            "--content-light" => {
+                let s = val(&mut i, &args, "--content-light");
+                let Some((Ok(max_cll), Ok(max_fall))) = s.split_once(',').map(|(a, b)| (a.parse::<u16>(), b.parse::<u16>()))
+                else {
+                    die("--content-light wants MAXCLL,MAXFALL in cd/m2, each 0..=65535")
+                };
+                cfg.content_light = Some(ContentLightLevel { max_cll, max_fall });
+            }
             other => die(&format!("unknown argument {other}")),
         }
         i += 1;
@@ -112,6 +188,12 @@ fn main() {
     };
     if codec != "h264" && codec != "h265" {
         die("--codec must be h264 or h265");
+    }
+    if full_range {
+        match cfg.colour.as_mut() {
+            Some(c) => c.full_range = true,
+            None => die("--full-range needs a --color to sit beside"),
+        }
     }
 
     let raw = std::fs::read(&input).unwrap_or_else(|e| die(&format!("read {input}: {e}")));

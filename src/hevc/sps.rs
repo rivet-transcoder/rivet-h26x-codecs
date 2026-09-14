@@ -329,6 +329,10 @@ pub struct Vui {
     pub full_range: bool,
     /// `(colour_primaries, transfer_characteristics, matrix_coeffs)`.
     pub colour_description: Option<(u8, u8, u8)>,
+    /// `(chroma_sample_loc_type_top_field, chroma_sample_loc_type_bottom_field)`
+    /// when `chroma_loc_info_present_flag` — H.273's siting codes, 0..=5.
+    /// Not applied by the decoder; kept for a consumer that resamples.
+    pub chroma_loc: Option<(u8, u8)>,
     /// `(num_units_in_tick, time_scale)`.
     pub timing: Option<(u32, u32)>,
     /// `default_display_window` offsets in luma samples (l, r, t, b) — kept
@@ -482,8 +486,10 @@ fn parse_vui(r: &mut BitReader, max_sub_layers_minus1: u32) -> Vui {
         }
     }
     if r.flag() {
-        r.ue();
-        r.ue();
+        // chroma_loc_info_present_flag
+        let top = r.ue();
+        let bottom = r.ue();
+        vui.chroma_loc = Some((top as u8, bottom as u8));
     }
     r.flag(); // neutral_chroma_indication
     r.flag(); // field_seq

@@ -717,6 +717,14 @@ impl<S: Sample> Core<S> {
         if let Some(cpb) = self.cpb.as_ref() {
             out.extend_from_slice(&syn::annexb(syn::NAL_PREFIX_SEI, &syn::write_buffering_period_sei(cpb)));
         }
+        // HDR10 static metadata, with every IRAP so that a stream joined at
+        // any of them carries it (as x265 does with repeated headers).
+        if let Some(m) = self.cfg.mastering_display.as_ref() {
+            out.extend_from_slice(&syn::annexb(syn::NAL_PREFIX_SEI, &syn::write_mastering_display_sei(m)));
+        }
+        if let Some(c) = self.cfg.content_light.as_ref() {
+            out.extend_from_slice(&syn::annexb(syn::NAL_PREFIX_SEI, &syn::write_content_light_level_sei(c)));
+        }
 
         let mut w = BitWriter::with_capacity(cw * ch / 2);
         syn::write_slice_header(

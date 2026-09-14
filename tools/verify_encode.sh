@@ -93,6 +93,62 @@
 #               (clip, configuration, bytes, PSNR, seconds, frames/s), so
 #               two runs can be set side by side.
 #
+#   8. VUI      Only for --color rows. The colour description is three
+#               H.273 code points and a range flag in the SPS VUI, and
+#               nothing above can see whether they are there: SELF and
+#               CROSS compare samples, which do not change when the VUI
+#               says BT.2020 PQ instead of nothing, and the crate's own
+#               parser is the inverse of its own writer, so a shared
+#               misreading of E.1.1 / E.2.1 round-trips cleanly. What
+#               settles it is a third reader: tools/vui_probe.py asks
+#               ffprobe, which reports the VUI as names, and the row is
+#               green only when all four fields name exactly the codes
+#               the encoder was handed. A player that shows BT.2020 PQ as
+#               BT.709 is what this row exists to prevent.
+#
+#               Its mutation: write the transfer code into the primaries
+#               field, and every --color row must go red naming the field.
+#               Which is why the H.264 rows carry three DIFFERENT codes
+#               (sRGB-on-709 full range, 1:13:6; P3 / ST 428 / 601,
+#               12:17:6) rather than the BT.709 triple 1:1:1 they first
+#               had: under that mutation 1:1:1 writes 1 where 1 belonged
+#               and stayed green in ten cells at once. The HDR rows have
+#               primaries equal to matrix (9:16:9, 9:18:9) because that
+#               is what HDR10 and HLG are; the H.264 rows are where a
+#               primaries/matrix swap shows.
+#
+#               The same property covers the chroma siting
+#               (`chroma_sample_loc_type`, ffprobe's chroma_location) on
+#               the rows that write one — and only those: for an absent
+#               field libavcodec reports the type 0 the standard infers
+#               ("left"), never "unspecified", so a written 0 is invisible
+#               to it and absence is not checkable here (the parser test
+#               holds "unasked, unwritten"). And it reports a siting for
+#               4:2:0 only — 4:2:2 / 4:4:4 read "unspecified" whatever the
+#               VUI says (E.2.1 wants the flag 0 there, and the encoder
+#               refuses a siting off 4:2:0 by name) — so the siting rows
+#               name 4:2:0 clips and carry non-zero codes: the H.264
+#               `@src_cut` row 1 ("center", the 2x2 box siting), the H.265
+#               `@420p10` row 2 ("topleft", BT.2100's 4:2:0 siting). Its
+#               mutation: stub the writer to the zero flag, and both rows
+#               must go red naming chroma_location while every other
+#               --color row stays green.
+#
+#               The same property covers the HDR10 static-metadata SEIs
+#               (mastering display colour volume, content light level)
+#               on the rows that write them: the probe is handed the
+#               values and asks ffprobe's frame side data. Its mutation:
+#               swap the red and green primaries in the writer, and the
+#               row must go red naming red_x. The H.264 SEI row is a
+#               buffer row so the two SEIs travel beside a buffering
+#               period and a pic timing, where an ordering or framing
+#               slip would show — with a 250 ms buffer, not the 125 ms
+#               of the other buffer rows: at 125 ms picture 0 was already
+#               carried by the re-code (632 bits short on the cap alone),
+#               and the 45 bytes of SEI NAL put it past what the re-code
+#               can recover, so the encoder refuses by name ("picture 0
+#               needs 3432 bits and the declared buffer affords 2893").
+#
 # Usage: verify_encode.sh [encoder] [decoder]
 #   H26X_WORK=dir   scratch directory holding the source clips (default: here)
 #   JOBS=n          configurations in parallel (default 4)
@@ -118,6 +174,14 @@ HRD=${HRD:-$(dirname "$ENC")/h26xhrd.exe}
 FFMPEG=${FFMPEG:-ffmpeg}
 # The BOX checker (property 6) lives in the repo, beside this script.
 PARAM_SETS=${PARAM_SETS:-$SCRIPT_DIR/param_sets.py}
+# The VUI probe (property 8) too; it asks ffprobe, which lives beside the
+# ffmpeg named above (the same suffix, `.exe` or none), or is on the PATH
+# when ffmpeg is.
+VUI_PROBE=${VUI_PROBE:-$SCRIPT_DIR/vui_probe.py}
+case "$FFMPEG" in
+  */*) FFPROBE=${FFPROBE:-$(dirname "$FFMPEG")/ffprobe${FFMPEG##*/ffmpeg}} ;;
+  *) FFPROBE=${FFPROBE:-ffprobe} ;;
+esac
 TAG=$$
 OUT=enc_out_$TAG
 JOBS=${JOBS:-4}
@@ -319,6 +383,14 @@ h264-10-abr-128k@p10|--codec h264 --bitrate 128000 --gop 8
 h264-12-cqp-ip@p12|--codec h264 --qp 26 --gop 8
 h264-12-cavlc40-ipb-t8x8-subparts@p12|--codec h264 --qp 40 --gop 8 --bframes 2 --cavlc --t8x8 --subparts
 h264-12-lossless-intra@p12|--codec h264 --lossless --gop 0
+cqp-ip-srgb-pc|--codec h264 --qp 26 --gop 8 --color 1:13:6 --full-range
+abr-64k-cpb-p3@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8 --color 12:17:6 --chroma-loc 1
+hevc-vbv-125-hdr10@src_cut|--codec h265 --bitrate 64000 --cpb-ms 125 --gop 8 --color 9:16:9
+hevc10-hdr10-ip@p10|--codec h265 --qp 26 --gop 8 --color 9:16:9
+hevc10-hlg-ipb@p10|--codec h265 --qp 26 --gop 8 --bframes 2 --color 9:18:9
+hevc10-hlg-topleft-ip@420p10|--codec h265 --qp 26 --gop 8 --color 9:18:9 --chroma-loc 2
+abr-64k-cpb250-hdr10-sei@src_cut|--codec h264 --bitrate 64000 --cpb-ms 250 --gop 8 --color 9:16:9 --mastering-display G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1) --content-light 1000,400
+hevc10-hdr10-sei-ip@p10|--codec h265 --qp 26 --gop 8 --color 9:16:9 --mastering-display G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1) --content-light 1000,400
 "}
 
 # Split a clip's format token into its chroma format and sample depth:
@@ -434,6 +506,32 @@ one() {
       ;;
   esac
 
+  # 8. VUI. Only where a colour was given. The probe is told the codes the
+  # encoder was handed and the range flag beside them, and asks ffprobe
+  # whether the stream says so — the one reader here that is neither the
+  # writer nor its own inverse.
+  case "$flags" in
+    *--color*)
+      colour=$(echo "$flags" | sed -n 's/.*--color \([0-9:]*\).*/\1/p')
+      range=tv; case "$flags" in *--full-range*) range=pc ;; esac
+      # The HDR10 static-metadata SEIs, when the row wrote them: the probe
+      # is told the same values and asks ffprobe's frame side data.
+      hdr=""
+      md=$(echo "$flags" | sed -n 's/.*--mastering-display \([^ ]*\).*/\1/p')
+      [ -n "$md" ] && hdr="$hdr --mastering-display $md"
+      cl=$(echo "$flags" | sed -n 's/.*--content-light \([^ ]*\).*/\1/p')
+      [ -n "$cl" ] && hdr="$hdr --content-light $cl"
+      # The chroma siting, when the row wrote one; without it the probe
+      # insists the stream says nothing about siting.
+      loc=$(echo "$flags" | sed -n 's/.*--chroma-loc \([0-9]*\).*/\1/p')
+      [ -n "$loc" ] && hdr="$hdr --chroma-loc $loc"
+      if ! out=$(FFPROBE="$FFPROBE" python "$VUI_PROBE" "$bs" "$colour" "$range" $hdr 2>&1); then
+        echo "VUI-FAIL    $tag: $(echo "$out" | tail -1 | head -c 120)"
+        return 1
+      fi
+      ;;
+  esac
+
   # 3. QUALITY. Gated only when the configuration claims to be lossless.
   psnr=$(psnr_of "$src" "$rec" "$depth")
   size=$(stat -c %s "$bs")
@@ -516,7 +614,7 @@ print("inf" if mse == 0 else f"{10 * math.log10(peak * peak / mse):.2f}")
 PY
 }
 export -f one ffpix psnr_of chroma_of depth_of frame_bytes
-export ENC DEC HRD FFMPEG OUT PARAM_SETS H26X_SPEED_TABLE JOBS
+export ENC DEC HRD FFMPEG FFPROBE OUT PARAM_SETS VUI_PROBE H26X_SPEED_TABLE JOBS
 
 echo "== encode verification =="
 results="$OUT/results.txt"
@@ -561,7 +659,7 @@ pass=$(grep -c '^PASS' "$results")
 # failure prefix is missing from this pattern reports its failure and is
 # then counted as green - which is how the RATE rows first shipped, caught
 # only by running the mutation they exist to catch.
-bad=$(grep -cE '^(ENCODE|SELF|CROSS|LOSSLESS|RATE|HRD|PS)-FAIL' "$results")
+bad=$(grep -cE '^(ENCODE|SELF|CROSS|LOSSLESS|RATE|HRD|PS|VUI)-FAIL' "$results")
 echo
 echo "encode: $pass passed, $bad failed"
 [ "$bad" = 0 ] || fail=1

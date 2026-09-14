@@ -45,6 +45,17 @@
 //! pictures under the other one to garbage — which is how rivet's first
 //! H.264 file failed with the whole gate green. See `tools/param_sets.py`.
 //!
+//! One more exact property applies only to what the samples cannot show:
+//! **the stream says what colour it is**. A [`ColourDescription`], a
+//! chroma siting or the HDR10 static metadata change no sample, so SELF
+//! and CROSS pass whether the VUI and SEIs carry them or not, and the
+//! crate's own parsers are the writers' inverses — a shared misreading of
+//! E.1.1 round-trips cleanly. The gate therefore asks a *third* reader:
+//! `tools/vui_probe.py` has ffprobe name every field, and a `--color` row
+//! is green only when the names are exactly the codes the encoder was
+//! handed (`VUI-FAIL` otherwise). A player showing BT.2020 PQ as washed-out
+//! BT.709 is the failure that row exists to prevent.
+//!
 //! # Shape
 //!
 //! Deliberately the mirror of the decoders: an `H264Encoder` takes pictures
@@ -116,6 +127,69 @@ pub enum Entropy {
     Cavlc,
     /// Context-adaptive arithmetic coding. H.265 has nothing else.
     Cabac,
+}
+
+/// The colour a stream's samples are to be interpreted in: the H.273
+/// code points a display needs to show BT.2020 PQ as HDR rather than as
+/// washed-out BT.709, carried in the SPS VUI (`video_signal_type_present_flag`,
+/// H.264 E.1.1 / H.265 E.2.1). A stream without one says nothing, which
+/// every player reads as BT.709 limited range.
+///
+/// The codes are the standard's own, not an enum: the writer copies them
+/// into three 8-bit fields, the reader (`h264::sps::Vui`, `hevc::sps::Vui`)
+/// hands them back as the same three numbers, and an enum in between would
+/// be a place for a value to fail to round-trip. BT.2020 PQ is `9, 16, 9`;
+/// HLG is `9, 18, 9`; SDR BT.709 is `1, 1, 1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColourDescription {
+    /// `colour_primaries` (H.273 table 2): 1 BT.709, 9 BT.2020.
+    pub primaries: u8,
+    /// `transfer_characteristics` (H.273 table 3): 1 BT.709, 16 PQ (SMPTE
+    /// ST 2084), 18 HLG (ARIB STD-B67).
+    pub transfer: u8,
+    /// `matrix_coefficients` (H.273 table 4): 1 BT.709, 9 BT.2020
+    /// non-constant luminance.
+    pub matrix: u8,
+    /// `video_full_range_flag`: false is studio range (16..235 at 8
+    /// bits), true is full range.
+    pub full_range: bool,
+}
+
+/// HDR10 static metadata, first half: the colour volume of the display
+/// the content was mastered on (SMPTE ST 2086), carried as the
+/// `mastering_display_colour_volume` SEI — payloadType 137, H.264 D.1.29
+/// and H.265 D.2.28, the same twelve fields in the same order. A player
+/// tone-maps against these; without them Apple's fall back to BT.709 even
+/// when the VUI says BT.2020 PQ.
+///
+/// Chromaticities are CIE 1931 (x, y) in units of 0.00002 (so BT.2020's
+/// red is `(34000, 16000)`), luminances in units of 0.0001 cd/m² (so 1000
+/// nits is `10_000_000`) — the SEI's own units, copied into it unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MasteringDisplay {
+    /// Red primary (x, y) — `display_primaries_x/y[2]` in the SEI's order.
+    pub red: (u16, u16),
+    /// Green primary (x, y) — `display_primaries_x/y[0]`.
+    pub green: (u16, u16),
+    /// Blue primary (x, y) — `display_primaries_x/y[1]`.
+    pub blue: (u16, u16),
+    /// White point (x, y).
+    pub white_point: (u16, u16),
+    /// `max_display_mastering_luminance`, 0.0001 cd/m².
+    pub max_luminance: u32,
+    /// `min_display_mastering_luminance`, 0.0001 cd/m².
+    pub min_luminance: u32,
+}
+
+/// HDR10 static metadata, second half: how bright the content itself gets
+/// (CTA-861.3), carried as the `content_light_level_info` SEI —
+/// payloadType 144, H.264 D.1.31 and H.265 D.2.35. Both in cd/m².
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentLightLevel {
+    /// `max_content_light_level`: the brightest pixel in the stream.
+    pub max_cll: u16,
+    /// `max_pic_average_light_level`: the brightest picture average.
+    pub max_fall: u16,
 }
 
 /// Everything the encoder needs that is not a picture.
@@ -232,6 +306,34 @@ pub struct Config {
     /// Ignored by H.264, whose weighted prediction is a different table
     /// this encoder does not write yet.
     pub weighted_pred: bool,
+    /// Colour description to write into the SPS VUI, or `None` to write
+    /// nothing about colour — which is what every stream this encoder
+    /// wrote before the field existed, so an unset field keeps them all
+    /// byte-identical. Set for HDR: without it a BT.2020 PQ picture is
+    /// displayed as BT.709 by every player that does not read the
+    /// container's colour box, and some that do.
+    pub colour: Option<ColourDescription>,
+    /// Where the 4:2:0 chroma samples sit relative to the luma grid, as
+    /// H.273's `chroma_sample_loc_type` (0 left — the siting every decoder
+    /// assumes when nothing is said; 1 centre — JPEG / MPEG-1, what a 2x2
+    /// box average produces; 2 top-left; 3 top; 4 bottom-left; 5 bottom),
+    /// written into the SPS VUI's `chroma_loc_info_present_flag` group for
+    /// both fields — or `None` to write nothing, which keeps every stream
+    /// from before the field existed byte-identical. A consumer that
+    /// upsamples at the wrong siting loses about a decibel of chroma on
+    /// detail; the field is what lets it not. 4:2:0 only: the siting
+    /// describes a subsampled grid, E.2.1 says the flag should be 0 for
+    /// any other format, and libavcodec reports none there whatever the
+    /// VUI says — so a siting beside another format is refused by name.
+    pub chroma_loc: Option<u8>,
+    /// HDR10 mastering display colour volume, written as an SEI in every
+    /// IDR / IRAP access unit — or `None` for no such SEI, which is what
+    /// every stream before the field existed had. Meaningful beside a
+    /// BT.2020 PQ [`colour`](Self::colour); the encoder does not insist.
+    pub mastering_display: Option<MasteringDisplay>,
+    /// HDR10 content light level, likewise an SEI in every IDR / IRAP
+    /// access unit, or `None` for none.
+    pub content_light: Option<ContentLightLevel>,
 }
 
 impl Default for Config {
@@ -255,6 +357,10 @@ impl Default for Config {
             aq_strength: 0.0,
             lookahead: 0,
             weighted_pred: false,
+            colour: None,
+            chroma_loc: None,
+            mastering_display: None,
+            content_light: None,
         }
     }
 }
@@ -283,6 +389,14 @@ impl Config {
         }
         if self.lookahead > 250 {
             return Err(crate::Error::unsupported("encode: lookahead above 250 pictures"));
+        }
+        if self.chroma_loc.is_some_and(|t| t > 5) {
+            return Err(crate::Error::unsupported("encode: chroma_loc outside 0..=5 (H.273 chroma_sample_loc_type)"));
+        }
+        if self.chroma_loc.is_some() && self.chroma != ChromaFormat::Yuv420 {
+            return Err(crate::Error::unsupported(
+                "encode: chroma_loc is a 4:2:0 siting (E.2.1: chroma_loc_info_present_flag should be 0 for any other format)",
+            ));
         }
         Ok(())
     }

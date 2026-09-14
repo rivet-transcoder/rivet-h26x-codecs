@@ -24,7 +24,7 @@
 
 use crate::bitwriter::BitWriter;
 use crate::encode::gop::Kind;
-use crate::encode::Config;
+use crate::encode::{ColourDescription, Config};
 use crate::hevc::slice::PredWeightTable;
 use crate::picture::ChromaFormat;
 
@@ -304,30 +304,54 @@ fn write_hrd(w: &mut BitWriter, cpb: &Cpb, fps: u32) {
     w.flag(false); // cbr_flag
 }
 
-/// `vui_parameters` carrying only what the buffer model needs: the frame
-/// rate the removal times are counted in, and the HRD.
+/// `vui_parameters` (E.2.1) carrying only what was asked for: the colour
+/// description and the chroma siting when the caller gave them, and the
+/// frame rate the removal times are counted in plus the HRD when a buffer
+/// was declared.
 ///
 /// Everything else is absent by its own flag. A VUI is optional and this
 /// encoder had none until the buffer model needed one, so the only reason
 /// any of it is here is that a removal schedule without a frame rate is not
-/// a schedule.
-fn write_vui(w: &mut BitWriter, cpb: &Cpb, fps: u32) {
+/// a schedule — and, later, that a BT.2020 PQ picture with no colour
+/// description is shown as BT.709. Each part is present only under its own
+/// condition, so a stream with a buffer and no colour is byte-identical to
+/// one from before colour existed. The inverse of `hevc::sps::parse_vui`.
+fn write_vui(
+    w: &mut BitWriter,
+    colour: Option<&ColourDescription>,
+    chroma_loc: Option<u8>,
+    cpb: Option<&Cpb>,
+    fps: u32,
+) {
     w.flag(false); // aspect_ratio_info_present_flag
     w.flag(false); // overscan_info_present_flag
-    w.flag(false); // video_signal_type_present_flag
-    w.flag(false); // chroma_loc_info_present_flag
+    // E.2.1 copies E.1.1's video_signal_type and chroma_loc_info groups
+    // field for field.
+    crate::encode::h264_syntax::write_video_signal_type(w, colour);
+    crate::encode::h264_syntax::write_chroma_loc(w, chroma_loc);
     w.flag(false); // neutral_chroma_indication_flag
     w.flag(false); // field_seq_flag
     w.flag(false); // frame_field_info_present_flag
     w.flag(false); // default_display_window_flag
-    w.flag(true); // vui_timing_info_present_flag
-    w.bits(32, 1); // vui_num_units_in_tick
-    w.bits(32, fps.max(1)); // vui_time_scale — ticks per second
-    w.flag(false); // vui_poc_proportional_to_timing_flag
-    w.flag(true); // vui_hrd_parameters_present_flag
-    write_hrd(w, cpb, fps);
+    match cpb {
+        Some(cpb) => {
+            w.flag(true); // vui_timing_info_present_flag
+            w.bits(32, 1); // vui_num_units_in_tick
+            w.bits(32, fps.max(1)); // vui_time_scale — ticks per second
+            w.flag(false); // vui_poc_proportional_to_timing_flag
+            w.flag(true); // vui_hrd_parameters_present_flag
+            write_hrd(w, cpb, fps);
+        }
+        None => w.flag(false), // vui_timing_info_present_flag
+    }
     w.flag(false); // bitstream_restriction_flag
 }
+
+// The HDR10 static-metadata SEIs are the same bytes in both standards
+// (payloadTypes 137 and 144, D.2.28 / D.2.35 here), so the H.264
+// module's writers serve this one; only the NAL header differs, and
+// `annexb` adds that.
+pub use crate::encode::h264_syntax::{write_content_light_level_sei, write_mastering_display_sei};
 
 /// A `buffering_period` SEI message, wrapped as a prefix SEI NAL.
 ///
@@ -348,22 +372,13 @@ pub fn write_buffering_period_sei(cpb: &Cpb) -> Vec<u8> {
     p.bits(cpb.initial_delay_length, cpb.initial_removal_delay_90k());
     p.bits(cpb.initial_delay_length, 0); // initial_cpb_removal_offset
     p.rbsp_trailing_bits();
-    let payload = p.into_nal();
-
-    let mut w = BitWriter::with_capacity(payload.len() + 8);
-    w.bits(8, 0); // payload_type: buffering_period
-    // payload_size, in the standard's 255-at-a-time form.
-    let mut n = payload.len();
-    while n >= 255 {
-        w.bits(8, 255);
-        n -= 255;
-    }
-    w.bits(8, n as u32);
-    for b in &payload {
-        w.bits(8, *b as u32);
-    }
-    w.rbsp_trailing_bits();
-    w.into_nal()
+    // The raw payload: `sei_nal` sizes it as RBSP bytes and escapes the
+    // whole NAL once. This wrapped `p.into_nal()` — the payload already
+    // escaped, then sized and escaped again — so a buffering period whose
+    // delay bits held `00 00 00` went out as `00 00 03 03`, one byte
+    // longer than its payload_size said, and h26xhrd read the stray byte
+    // as part of the initial delay.
+    crate::encode::h264_syntax::sei_nal(0, &p.into_rbsp())
 }
 
 /// Video parameter set.
@@ -464,12 +479,11 @@ pub fn write_sps(cfg: &Config, g: &Geometry, log2_max_poc_lsb: u32, cpb: Option<
     w.flag(false); // long_term_ref_pics_present_flag
     w.flag(false); // sps_temporal_mvp_enabled_flag
     w.flag(false); // strong_intra_smoothing_enabled_flag
-    match cpb {
-        Some(cpb) => {
-            w.flag(true); // vui_parameters_present_flag
-            write_vui(&mut w, cpb, cfg.fps);
-        }
-        None => w.flag(false), // vui_parameters_present_flag
+    if cpb.is_some() || cfg.colour.is_some() || cfg.chroma_loc.is_some() {
+        w.flag(true); // vui_parameters_present_flag
+        write_vui(&mut w, cfg.colour.as_ref(), cfg.chroma_loc, cpb, cfg.fps);
+    } else {
+        w.flag(false); // vui_parameters_present_flag
     }
     w.flag(false); // sps_extension_present_flag
     w.rbsp_trailing_bits();
@@ -904,6 +918,95 @@ mod tests {
         let (cfg, g) = geom(64, 64, ChromaFormat::Yuv420);
         let sps = Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 8, None))).expect("SPS");
         assert!(sps.vui.is_none(), "an SPS with no buffer declared should carry no VUI");
+    }
+
+    /// The colour description round-trips through the decoder's own SPS
+    /// parser, on its own and beside a buffer; a buffer alone says
+    /// nothing about colour; neither writes no VUI (the test above). Each
+    /// code point is asserted by name so that writing one into another's
+    /// field — the mutation this exists to catch — names the field lost.
+    #[test]
+    fn the_colour_description_survives_the_decoders_own_sps_parser() {
+        use crate::encode::ColourDescription;
+        use crate::hevc::sps::Sps;
+        let colours = [
+            ColourDescription { primaries: 9, transfer: 16, matrix: 9, full_range: false }, // HDR10
+            ColourDescription { primaries: 9, transfer: 18, matrix: 9, full_range: false }, // HLG
+            ColourDescription { primaries: 1, transfer: 1, matrix: 1, full_range: true }, // BT.709 full
+            ColourDescription { primaries: 12, transfer: 17, matrix: 6, full_range: false }, // P3 / SMPTE 428 / 601
+        ];
+        let (base, g) = geom(64, 64, ChromaFormat::Yuv420);
+        for c in colours {
+            let cfg = Config { colour: Some(c), ..base.clone() };
+            let sps = Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 8, None)))
+                .unwrap_or_else(|e| panic!("{c:?}: SPS rejected: {e}"));
+            let vui = sps.vui.as_ref().unwrap_or_else(|| panic!("{c:?}: no VUI"));
+            let (p, t, m) = vui.colour_description.unwrap_or_else(|| panic!("{c:?}: no colour description"));
+            assert_eq!(p, c.primaries, "{c:?}: primaries");
+            assert_eq!(t, c.transfer, "{c:?}: transfer");
+            assert_eq!(m, c.matrix, "{c:?}: matrix");
+            assert_eq!(vui.full_range, c.full_range, "{c:?}: range");
+            assert_eq!(vui.chroma_loc, None, "{c:?}: no siting asked for, none written");
+            assert_eq!(vui.timing, None, "{c:?}: no buffer, no clock");
+            assert!(vui.hrd.is_none(), "{c:?}: no buffer, no HRD");
+        }
+        let cpb = Cpb::new(64_000, 125).expect("representable");
+        let cfg = Config {
+            colour: Some(colours[0]),
+            rate: crate::encode::RateControl::Bitrate { bps: 64_000 },
+            cpb_ms: 125,
+            ..base.clone()
+        };
+        let sps = Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 8, Some(&cpb)))).expect("SPS");
+        let vui = sps.vui.as_ref().expect("VUI");
+        assert_eq!(vui.colour_description, Some((9, 16, 9)));
+        assert_eq!(vui.timing, Some((1, 30)));
+        assert_eq!(vui.hrd.map(|h| h.bit_rate), Some(cpb.bit_rate));
+        let cfg = Config { colour: None, ..cfg };
+        let sps = Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 8, Some(&cpb)))).expect("SPS");
+        let vui = sps.vui.as_ref().expect("VUI");
+        assert_eq!(vui.colour_description, None, "a buffer alone must not invent a colour");
+        assert!(!vui.full_range);
+        assert_eq!(vui.timing, Some((1, 30)));
+        // The chroma siting: alone it is a VUI that says nothing about
+        // colour, and every code comes back for both fields.
+        for t in 0..=5u8 {
+            let cfg = Config { chroma_loc: Some(t), ..base.clone() };
+            let sps = Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 8, None))).expect("SPS");
+            let vui = sps.vui.as_ref().expect("a siting alone is a VUI");
+            assert_eq!(vui.chroma_loc, Some((t, t)), "chroma_sample_loc_type {t}");
+            assert_eq!(vui.colour_description, None, "a siting alone must not invent a colour");
+        }
+        let cfg = Config { colour: Some(colours[0]), chroma_loc: Some(1), ..base.clone() };
+        let sps = Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 8, None))).expect("SPS");
+        let vui = sps.vui.as_ref().expect("VUI");
+        assert_eq!(vui.colour_description, Some((9, 16, 9)));
+        assert_eq!(vui.chroma_loc, Some((1, 1)));
+        let plain = write_sps(&base, &g, 8, None);
+        assert_ne!(plain, write_sps(&Config { colour: Some(colours[0]), ..base.clone() }, &g, 8, None));
+        assert_ne!(plain, write_sps(&Config { chroma_loc: Some(0), ..base }, &g, 8, None));
+    }
+
+    /// The buffering period SEI is escaped once and sized as RBSP: what a
+    /// reader unescapes is exactly `payload_type, payload_size, payload,
+    /// trailing byte`, with no emulation-prevention byte left inside the
+    /// payload. Before this held the payload went out escaped, then sized
+    /// and escaped again, and a delay whose bits held `00 00 00` reached
+    /// the reader with a `03` inside it (`00 0b 80 00 00 03 03 …`). The
+    /// last assertion keeps the test honest: this buffer's payload does
+    /// contain the zero run that triggers an escape.
+    #[test]
+    fn the_buffering_period_sei_is_escaped_once_and_sized_as_rbsp() {
+        let cpb = Cpb::new(64_000, 125).expect("representable");
+        let nal = write_buffering_period_sei(&cpb);
+        let rbsp = crate::nal::unescape_rbsp(&nal);
+        assert_eq!(rbsp[0], 0, "payload_type buffering_period");
+        let size = rbsp[1] as usize;
+        assert_eq!(rbsp.len(), 2 + size + 1, "type, size, payload, one trailing byte: {rbsp:02x?}");
+        assert_eq!(rbsp[2 + size], 0x80, "rbsp_trailing_bits: {rbsp:02x?}");
+        let payload = &rbsp[2..2 + size];
+        assert!(!payload.windows(3).any(|w| w == [0, 0, 3]), "an escape byte inside the payload: {rbsp:02x?}");
+        assert!(payload.windows(3).any(|w| w == [0, 0, 0]), "the zero run that exercises the escape: {rbsp:02x?}");
     }
 
     /// The declared values are rounded **down** from what was asked for,
