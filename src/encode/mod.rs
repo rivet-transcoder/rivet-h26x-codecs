@@ -258,21 +258,25 @@ pub struct Config {
     /// `sample_adaptive_offset_enabled_flag` in the SPS, which makes one
     /// or two more flags appear in *every* slice header.
     pub sao: bool,
-    /// Adaptive quantisation strength (H.265 only): 0 is off, which is
-    /// the default. Above 0 the PPS sets `cu_qp_delta_enabled_flag` and
-    /// every coding tree block is quantised at its own offset from the
-    /// picture quantiser, chosen from its luma variance — flat blocks
-    /// finer, textured blocks coarser, zero-mean over the picture, and at
-    /// most six steps either way. 1.0 is the strength the
-    /// measurements in `encode::aq` were taken at.
+    /// Adaptive quantisation strength, both codecs: 0 is off, which is
+    /// the default. Above 0 every block — an H.265 coding tree block, an
+    /// H.264 macroblock — is quantised at its own offset from the picture
+    /// quantiser, chosen from its luma variance: flat blocks finer,
+    /// textured blocks coarser, zero-mean over the picture, and at most
+    /// six steps either way — one model, `encode::aq`. H.265 sets
+    /// `cu_qp_delta_enabled_flag` in the PPS and carries each offset as a
+    /// `cu_qp_delta`; H.264 has no switch to set and carries it as the
+    /// `mb_qp_delta` every macroblock with a residual already has room
+    /// for. In both, a block with no residual can carry no delta and holds
+    /// the predicted quantiser. 1.0 is the strength the measurements in
+    /// `encode::aq` were taken at. A lossless stream has no quantiser to
+    /// adapt, and both codecs refuse the combination by name.
     ///
     /// A switch rather than always-on for the reason SAO is: it costs a
-    /// `cu_qp_delta` per coded block and it trades global PSNR for a
-    /// more even distribution of error, which a caller measuring PSNR
-    /// does not want. Off, the stream is byte-identical to one from an
-    /// encoder that never had it. Ignored by H.264, whose per-macroblock
-    /// `mb_qp_delta` is a different mechanism this encoder does not
-    /// drive yet.
+    /// delta per coded block and it trades global PSNR for a more even
+    /// distribution of error, which a caller measuring PSNR does not
+    /// want. Off, the stream is byte-identical to one from an encoder
+    /// that never had it.
     pub aq_strength: f32,
     /// Rate-control lookahead (H.265 only): how many pictures the encoder
     /// holds back before coding one, so the controller can place bits by
@@ -287,24 +291,52 @@ pub struct Config {
     /// and against the previous picture) and the controller allocates the
     /// window's budget by those measurements; see `encode::rc`'s lookahead
     /// section for exactly what changes. Costs `lookahead` pictures of
-    /// output delay and their source samples in memory. Ignored by H.264,
-    /// whose rate control does not drive the lookahead path yet.
+    /// output delay and their source samples in memory.
+    ///
+    /// H.264 refuses it by name ("rate lookahead is not calibrated for
+    /// H.264"). It was wired and measured on the branch
+    /// `agent/h264tools-lookahead`, first with H.265's constants and then
+    /// with H.264's own calibration of them (bits per cost of P and B
+    /// against intra pictures, the reference-noise floor, the insensitivity
+    /// band, each measured on the corpus), and it did not beat the
+    /// past-only controller. Mean `|achieved / target - 1|` over the ten
+    /// 8-bit clips, one binary, 2026-09-14:
+    ///
+    /// ```text
+    ///   row                without   H.265 constants   H.264 calibration
+    ///   abr 64k             0.177        0.195             0.183
+    ///   abr 128k            0.152        0.151             0.121
+    ///   CAVLC 64k           0.193        0.233             0.202
+    ///   IPB 64k             0.186        0.261             0.229
+    ///   AQ 64k              0.165        0.195             0.173
+    ///   10-bit 128k         0.075        0.193             0.214
+    /// ```
+    ///
+    /// Calibrated, the buffer row (64k, 125 ms, `src_cut`) was still refused
+    /// — keyframes planned at QP 42..49 left P pictures that cost more than
+    /// the per-picture rate at QP 51 — and PSNR at 64k fell 4.97 dB on
+    /// average, because the past-only controller's first keyframe overshoots
+    /// at the seed's QP 26 and carries a short clip, where the lookahead
+    /// plans it at its share. On the held-out 256x160 clip the calibrated
+    /// lookahead was the better controller at 128k..1280k (0.253 to 0.095 at
+    /// 1280k), which is why the branch is kept rather than discarded.
     pub lookahead: u32,
-    /// Weighted prediction (H.265 only): off by default. On, the PPS sets
+    /// Weighted prediction, both codecs: off by default. On, the PPS sets
     /// `weighted_pred_flag` and every P slice carries a
     /// `pred_weight_table` — a gain and an offset per reference, fitted
     /// per picture to the source against the reference and used only
-    /// where the fit lowers the residual (`encode::h265_wp`), the default
-    /// weights otherwise. What it buys is a fade: motion compensation
-    /// cannot change a reference's brightness, so without this every
-    /// block of a fading picture carries the level change as residual.
+    /// where the fit lowers the residual (`encode::h265_wp`, one fit held
+    /// to the weights each codec's table carries), the default weights
+    /// otherwise. What it buys is a fade: motion compensation cannot
+    /// change a reference's brightness, so without this every block of a
+    /// fading picture carries the level change as residual.
     ///
-    /// B slices keep default weighting (`weighted_bipred_flag` stays 0):
-    /// the two-list decision would need weights per list and its own
-    /// fit, and the P anchors are where a fade's cost is. Off, the stream
-    /// is byte-identical to one from an encoder that never had it.
-    /// Ignored by H.264, whose weighted prediction is a different table
-    /// this encoder does not write yet.
+    /// B slices keep default weighting (H.265's `weighted_bipred_flag`,
+    /// H.264's `weighted_bipred_idc`, both 0): the two-list decision would
+    /// need weights per list and its own fit, and the P anchors are where
+    /// a fade's cost is. A lossless H.264 stream refuses it, its inter
+    /// pictures being exact copies. Off, the stream is byte-identical to
+    /// one from an encoder that never had it.
     pub weighted_pred: bool,
     /// Colour description to write into the SPS VUI, or `None` to write
     /// nothing about colour — which is what every stream this encoder

@@ -21,15 +21,22 @@ use crate::dsp::Cpu;
 use crate::dsp::distortion::DistortionDsp;
 use crate::dsp::h264::H264Dsp;
 use crate::dsp::h264_enc::{H264EncDsp, Quant};
+use crate::encode::aq;
 use crate::encode::h264_deblock::{deblock_recon, nz_mask_of};
 use crate::encode::h264_intra::{IntraCtx, MbAvail, MbDecision, MbKind, code_macroblock};
 use crate::encode::h264_me::{
-    BDecision, BMbKind, InterDecision, InterMbKind, MbMotionState, code_macroblock_b,
-    code_macroblock_p,
+    BDecision, BMbKind, InterDecision, InterMbKind, MbMotionState, PRef, code_macroblock_b,
+    code_macroblock_p, weighted_search_plane, weighting_gain,
 };
 use crate::encode::h264_syntax::{Geometry, Plane, Recon};
 use crate::h264::frame::{BlockMotion, Frame, Mv};
-use crate::h264::mb::{MbInfo, MbKind as DecKind, MbMotion, MbNeighbours, PicInfo, chroma_qp};
+use crate::h264::inter::Weighting;
+use crate::h264::recon::explicit_weighting;
+use crate::h264::slice::PredWeightTable;
+use crate::h264::mb::{
+    MbInfo, MbKind as DecKind, MbMotion, MbNeighbours, PicInfo, chroma_qp, has_residual, next_qp,
+    qp_delta_range,
+};
 use crate::h264::sps::ScalingLists;
 use crate::h264::transform::Dequant;
 use crate::picture::ChromaFormat;
@@ -60,6 +67,13 @@ pub struct IntraTools<S: Sample> {
     pub(crate) transform_8x8: bool,
     /// Whether inter partitions smaller than 16x16 are on offer.
     pub(crate) subparts: bool,
+    /// Adaptive quantisation strength (`Config::aq_strength`), 0 for off.
+    /// Above 0 every picture walk decides each macroblock at the picture
+    /// quantiser plus an offset from its own luma variance (`encode::aq`,
+    /// over the macroblock's 16x16), and [`QpChain`] settles what a
+    /// decoder will hold for it. One constant per encoder, riding here for
+    /// the reason the two switches above do.
+    pub(crate) aq_strength: f32,
 }
 
 impl<S: Sample> IntraTools<S> {
@@ -81,7 +95,14 @@ impl<S: Sample> IntraTools<S> {
             bit_depth,
             transform_8x8,
             subparts,
+            aq_strength: 0.0,
         }
+    }
+
+    /// The same tools with adaptive quantisation at `strength` (0 off).
+    pub(crate) fn with_aq(mut self, strength: f32) -> Self {
+        self.aq_strength = strength;
+        self
     }
 }
 
@@ -113,6 +134,22 @@ pub struct PicMotion {
     /// Per-4x4 motion per list, inside a decoder frame so that
     /// `MotionCache::gather` takes it directly.
     pub(crate) frame: Frame<u8>,
+    /// What the picture's weighted prediction did ([`WeightCensus`]) — the
+    /// default for every picture that carried no table.
+    pub(crate) weighting: WeightCensus,
+}
+
+/// What a P picture's explicit weighting did, for the census.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WeightCensus {
+    /// The picture's table weights something: some entry is not the default.
+    pub on: bool,
+    /// Under a luma weighting, inter macroblocks whose luma SATD at the
+    /// chosen vectors was lower weighted than plain — the fit's prediction
+    /// holding, macroblock by macroblock.
+    pub won: u64,
+    /// The same, higher weighted than plain — the fit's prediction failing.
+    pub lost: u64,
 }
 
 impl PicMotion {
@@ -127,7 +164,7 @@ impl PicMotion {
             vec![BlockMotion::default(); n * 16],
         ];
         frame.mb_intra = vec![false; n];
-        PicMotion { info: PicInfo::new(mbs_wide, mbs_high), frame }
+        PicMotion { info: PicInfo::new(mbs_wide, mbs_high), frame, weighting: WeightCensus::default() }
     }
 
     /// Commit one coded macroblock: everything a decoder stores about it
@@ -166,24 +203,96 @@ impl PicMotion {
 /// documentation in src/h264/mb.rs). It is true of every shape this
 /// encoder codes today and must be derived, the way `derive_motion` does
 /// it, the day that changes.
-fn coded_info(
-    kind: DecKind,
-    nz_mask: u16,
-    transform_8x8: bool,
-    qp: i32,
-    qpc: [i32; 2],
-    part_edges: [u16; 2],
-) -> MbInfo {
+///
+/// `q` is what [`QpChain`] settled: the `QP_Y` a decoder holds for the
+/// macroblock — the loop filter averages it with each neighbour's — its
+/// chroma QP, and whether a non-zero `mb_qp_delta` was coded, which the
+/// reader's `derive()` records as the next macroblock's CABAC context.
+fn coded_info(kind: DecKind, nz_mask: u16, transform_8x8: bool, q: MbQp, part_edges: [u16; 2]) -> MbInfo {
     MbInfo {
         kind,
         decoded: true,
         slice: 0,
-        qp: qp as i8,
-        qpc: [qpc[0] as i8, qpc[1] as i8],
+        qp: q.qp_y as i8,
+        qpc: [q.qpc as i8; 2],
+        qp_delta_nonzero: q.delta != 0,
         transform_8x8,
         nz_mask,
         part_edges,
         ..MbInfo::default()
+    }
+}
+
+/// What [`QpChain`] settled for one macroblock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MbQp {
+    /// `QP_Y` as a decoder derives it for the macroblock.
+    qp_y: i32,
+    /// `QP_C` from it (both chroma QP offsets are zero in this encoder's
+    /// PPS, so one value serves both components).
+    qpc: i32,
+    /// The `mb_qp_delta` to code: 0 where the macroblock carries none.
+    delta: i32,
+}
+
+/// The encoder's mirror of the reader's quantiser chain (7.4.5), which
+/// adaptive quantisation has to run exactly as a decoder will:
+///
+/// - `QP_Y,PRED` is the slice quantiser for the first macroblock of the
+///   slice and the previous macroblock's `QP_Y`, in decoding order, after
+///   it — skipped macroblocks included.
+/// - A macroblock whose syntax carries a residual — the reader's
+///   [`has_residual`]: any coded block, or `Intra_16x16` — codes
+///   `mb_qp_delta`, and its `QP_Y` is the prediction plus the delta,
+///   wrapped ([`next_qp`], the reader's own arithmetic). The delta is
+///   chosen inside [`qp_delta_range`] at the stream's depth, going round
+///   the wrap the other way when the plain difference would not fit.
+/// - A macroblock without one codes no delta and **holds the prediction**,
+///   whatever quantiser the encoder decided it at. That is harmless to the
+///   samples — with no coefficient nothing was scaled — but not to the
+///   loop filter, which averages that macroblock's `QP_Y` with its
+///   neighbours', so what is committed for it is the prediction.
+///
+/// The decoder's skip paths (`layer.qp = qps.prev_qp`, src/h264/decoder.rs)
+/// and its parsers (`qps.prev_qp = layer.qp` after the delta) are what this
+/// follows. With adaptive quantisation off every macroblock wants the
+/// slice quantiser, so every delta is zero and every `QP_Y` the slice's.
+struct QpChain {
+    /// `QP_Y,PRED` for the next macroblock.
+    prev: i32,
+    /// The stream's depth, which widens the delta range and the wrap.
+    bit_depth: u32,
+}
+
+impl QpChain {
+    fn new(slice_qp: i32, bit_depth: u32) -> Self {
+        QpChain { prev: slice_qp, bit_depth }
+    }
+
+    /// The next macroblock, in decoding order, was decided at `want` and
+    /// carries a residual or not: what a decoder will hold for it.
+    fn settle(&mut self, want: i32, residual: bool) -> MbQp {
+        let bd_off = 6 * (self.bit_depth as i32 - 8);
+        let (qp_y, delta) = if residual {
+            let range = qp_delta_range(self.bit_depth);
+            let span = 52 + bd_off;
+            let d = want - self.prev;
+            let d = if d > *range.end() {
+                d - span
+            } else if d < *range.start() {
+                d + span
+            } else {
+                d
+            };
+            debug_assert!(range.contains(&d), "no mb_qp_delta takes {} to {want} at {} bits", self.prev, self.bit_depth);
+            let qp_y = next_qp(self.prev, d, self.bit_depth);
+            debug_assert_eq!(qp_y, want, "the coded delta must land the quantiser the macroblock was decided at");
+            (qp_y, d)
+        } else {
+            (self.prev, 0)
+        };
+        self.prev = qp_y;
+        MbQp { qp_y, qpc: chroma_qp(qp_y, 0, bd_off), delta }
     }
 }
 
@@ -289,6 +398,9 @@ struct PicCoding<'a, S: Sample> {
     src_cb: Vec<S>,
     /// See `src_y`.
     src_cr: Vec<S>,
+    /// Adaptive quantisation's offset per macroblock (raster), or `None`
+    /// when it is off and every macroblock takes the picture quantiser.
+    offsets: Option<Vec<i32>>,
 }
 
 impl<'a, S: Sample> PicCoding<'a, S> {
@@ -334,6 +446,12 @@ impl<'a, S: Sample> PicCoding<'a, S> {
         } else {
             (0, Vec::new(), Vec::new())
         };
+        // Measured over the source at coded size, edge replication and
+        // all — the H.265 side takes its CTB offsets the same way — since
+        // the replicated samples are what the edge macroblocks code.
+        let offsets = (tools.aq_strength > 0.0).then(|| {
+            aq::ctb_offsets(&src_y, luma_stride, luma_stride, g.coded_height as usize, 4, g.bit_depth, tools.aq_strength)
+        });
         PicCoding {
             ctx,
             mbs_wide,
@@ -343,7 +461,27 @@ impl<'a, S: Sample> PicCoding<'a, S> {
             src_y,
             src_cb,
             src_cr,
+            offsets,
         }
+    }
+
+    /// The quantiser macroblock `addr` is decided at: the picture's, plus
+    /// its offset when adaptive quantisation is on, held to `0..=51` as
+    /// the H.265 side holds its CTBs.
+    fn mb_qp(&self, addr: usize) -> i32 {
+        match &self.offsets {
+            Some(o) => (self.ctx.qp + o[addr]).clamp(0, 51),
+            None => self.ctx.qp,
+        }
+    }
+
+    /// The picture's context at quantiser `qp`: `QP_Y`, the chroma QP the
+    /// 8.5.8 map gives it, and both primed — the derivation `new` makes for
+    /// the picture quantiser, so at that quantiser this *is* `self.ctx`.
+    fn ctx_at(&self, qp: i32) -> IntraCtx<'a, S> {
+        let bd_off = 6 * (self.ctx.bit_depth as i32 - 8);
+        let qpc = chroma_qp(qp, 0, bd_off);
+        IntraCtx { qp, qpc: [qpc; 2], qp_prime: qp + bd_off, qpc_prime: [qpc + bd_off; 2], ..self.ctx }
     }
 }
 
@@ -386,6 +524,7 @@ pub(crate) fn code_intra_picture<S: Sample>(
 
     let mut pm = PicMotion::new(mbs_wide, mbs_high);
     let mut top_modes: Vec<[Option<u8>; 4]> = vec![[None; 4]; mbs_wide];
+    let mut chain = QpChain::new(ctx.qp, g.bit_depth);
     for mb_y in 0..mbs_high {
         let mut left_modes: [Option<u8>; 4] = [None; 4];
         for mb_x in 0..mbs_wide {
@@ -395,8 +534,10 @@ pub(crate) fn code_intra_picture<S: Sample>(
                 top_left: mb_x > 0 && mb_y > 0,
                 top_right: mb_y > 0 && mb_x + 1 < mbs_wide,
             };
-            let (dec, modes) = code_macroblock(
-                ctx,
+            let addr = mb_y * mbs_wide + mb_x;
+            let mctx = pc.ctx_at(pc.mb_qp(addr));
+            let (mut dec, modes) = code_macroblock(
+                &mctx,
                 rec,
                 mb_x,
                 mb_y,
@@ -408,15 +549,16 @@ pub(crate) fn code_intra_picture<S: Sample>(
                 &left_modes,
                 &top_modes[mb_x],
             );
+            let q = chain.settle(mctx.qp, has_residual(filter_kind(dec.kind), dec.cbp_luma | (dec.cbp_chroma << 4)));
+            dec.qp_delta = q.delta as i8;
             emit(mb_x, mb_y, &dec);
             pm.commit(
-                mb_y * mbs_wide + mb_x,
+                addr,
                 coded_info(
                     filter_kind(dec.kind),
                     nz_mask_of(&dec.nz_luma, dec.transform_8x8),
                     dec.transform_8x8,
-                    ctx.qp,
-                    ctx.qpc,
+                    q,
                     [0; 2],
                 ),
                 &[[BlockMotion::default(); 16]; 2],
@@ -440,7 +582,10 @@ pub(crate) fn code_intra_picture<S: Sample>(
 ///
 /// `refp` is the reference picture's reconstruction, borders already
 /// replicated ([`crate::encode::h264_me::prepare_reference`]); exactly one
-/// reference is active.
+/// reference is active. `weights` is the slice's `pred_weight_table` when
+/// the PPS sets `weighted_pred_flag`: every prediction from `refp` then
+/// takes the weighting the reader's `explicit_weighting` derives from it,
+/// skips included, and the search scores against the weighted luma.
 ///
 /// Three per-macroblock states walk the picture together, each mirroring
 /// what the reader derives rather than what would be convenient:
@@ -466,6 +611,7 @@ pub(crate) fn code_p_picture<S: Sample>(
     planes: &[Plane<'_, S>],
     rec: &mut [Recon<S>],
     refp: &[Recon<S>],
+    weights: Option<&PredWeightTable>,
     mut emit: impl FnMut(usize, usize, PMb<'_>),
 ) -> PicMotion {
     let pc = PicCoding::new(g, tools, qp, planes);
@@ -473,21 +619,41 @@ pub(crate) fn code_p_picture<S: Sample>(
     let (mbs_wide, mbs_high) = (pc.mbs_wide, pc.mbs_high);
     let (src_y, src_cb, src_cr) = (&pc.src_y[..], &pc.src_cb[..], &pc.src_cr[..]);
 
+    // The reference as the decisions see it: its planes, the weighting its
+    // slice's table gives every prediction — the reader's own derivation,
+    // so the encoder predicts exactly what a decoder will — and the luma
+    // plane the search scores against, weighted when the luma is.
+    let weighting = weights.map_or(Weighting::Default, |t| explicit_weighting(t, g.bit_depth, 0, -1, false));
+    let weighted_luma = match weighting {
+        Weighting::Weighted { log_wd, w, o } if (w[0][0], o[0][0]) != (1 << log_wd[0], 0) => {
+            Some(weighted_search_plane(&refp[0], log_wd[0], w[0][0], o[0][0], ctx.max))
+        }
+        _ => None,
+    };
+    let pref = PRef { planes: refp, search: weighted_luma.as_ref().unwrap_or(&refp[0]), weighting };
+    let mut wstats = WeightCensus {
+        on: weights.is_some_and(|t| t.lists[0].iter().any(|e| e.luma_flag || e.chroma_flag)),
+        ..WeightCensus::default()
+    };
+
     let mut top_modes: Vec<[Option<u8>; 4]> = vec![[None; 4]; mbs_wide];
     // The picture's motion in the decoder's own layout, and the
     // per-macroblock working set its derivations read.
     let mut pm = PicMotion::new(mbs_wide, mbs_high);
     let mut dnb = MbNeighbours::default();
     let mut st = MbMotionState::new();
+    let mut chain = QpChain::new(ctx.qp, g.bit_depth);
     for mb_y in 0..mbs_high {
         let mut left_modes: [Option<u8>; 4] = [None; 4];
         for mb_x in 0..mbs_wide {
             let addr = mb_y * mbs_wide + mb_x;
             st.start(&pm.frame, &pm.info, addr, &mut dnb);
-            let dec = code_macroblock_p(
+            let mctx = pc.ctx_at(pc.mb_qp(addr));
+            let ctx = &mctx;
+            let mut dec = code_macroblock_p(
                 ctx,
                 rec,
-                refp,
+                &pref,
                 mb_x,
                 mb_y,
                 src_y,
@@ -496,12 +662,29 @@ pub(crate) fn code_p_picture<S: Sample>(
                 pc.chroma_stride,
                 &mut st,
             );
+            // The weighting's model check, at the vectors this macroblock
+            // chose (a skip's is the derived one, over the whole 16x16).
+            if weighted_luma.is_some() && dec.kind != InterMbKind::UseIntra {
+                let mut rects = [(0usize, 0usize, 0usize, 0usize); 16];
+                let n = if dec.kind == InterMbKind::PSkip {
+                    rects[0] = (0, 0, 16, 16);
+                    1
+                } else {
+                    dec.rects(&mut rects)
+                };
+                let (plain, weighted) =
+                    weighting_gain(ctx, &pref, mb_x * 16, mb_y * 16, src_y, pc.luma_stride, &rects[..n], st.motion());
+                wstats.won += u64::from(weighted < plain);
+                wstats.lost += u64::from(weighted > plain);
+            }
             match dec.kind {
                 InterMbKind::PSkip => {
+                    // A skip carries no delta and holds the prediction.
+                    let q = chain.settle(ctx.qp, false);
                     emit(mb_x, mb_y, PMb::Skip(&dec));
                     pm.commit(
                         addr,
-                        coded_info(DecKind::PSkip, 0, false, ctx.qp, ctx.qpc, [0; 2]),
+                        coded_info(DecKind::PSkip, 0, false, q, [0; 2]),
                         st.motion(),
                     );
                     left_modes = [Some(2); 4];
@@ -511,6 +694,8 @@ pub(crate) fn code_p_picture<S: Sample>(
                 | InterMbKind::P16x8
                 | InterMbKind::P8x16
                 | InterMbKind::P8x8 => {
+                    let q = chain.settle(ctx.qp, has_residual(dec.kind.dec_kind(), dec.cbp_luma | (dec.cbp_chroma << 4)));
+                    dec.qp_delta = q.delta as i8;
                     emit(mb_x, mb_y, PMb::Coded(&dec));
                     let mut rects = [(0usize, 0usize, 0usize, 0usize); 16];
                     let n = dec.rects(&mut rects);
@@ -520,8 +705,7 @@ pub(crate) fn code_p_picture<S: Sample>(
                             dec.kind.dec_kind(),
                             nz_mask_of(&dec.nz_luma, dec.transform_8x8),
                             dec.transform_8x8,
-                            ctx.qp,
-                            ctx.qpc,
+                            q,
                             part_edges_of(&rects[..n]),
                         ),
                         st.motion(),
@@ -536,7 +720,7 @@ pub(crate) fn code_p_picture<S: Sample>(
                         top_left: mb_x > 0 && mb_y > 0,
                         top_right: mb_y > 0 && mb_x + 1 < mbs_wide,
                     };
-                    let (idec, modes) = code_macroblock(
+                    let (mut idec, modes) = code_macroblock(
                         ctx,
                         rec,
                         mb_x,
@@ -549,6 +733,8 @@ pub(crate) fn code_p_picture<S: Sample>(
                         &left_modes,
                         &top_modes[mb_x],
                     );
+                    let q = chain.settle(ctx.qp, has_residual(filter_kind(idec.kind), idec.cbp_luma | (idec.cbp_chroma << 4)));
+                    idec.qp_delta = q.delta as i8;
                     emit(mb_x, mb_y, PMb::Intra(&idec));
                     pm.commit(
                         addr,
@@ -556,8 +742,7 @@ pub(crate) fn code_p_picture<S: Sample>(
                             filter_kind(idec.kind),
                             nz_mask_of(&idec.nz_luma, idec.transform_8x8),
                             idec.transform_8x8,
-                            ctx.qp,
-                            ctx.qpc,
+                            q,
                             [0; 2],
                         ),
                         &[[BlockMotion::default(); 16]; 2],
@@ -571,6 +756,7 @@ pub(crate) fn code_p_picture<S: Sample>(
     // the reconstruction becomes the next picture's reference — the
     // decoder's own ordering.
     deblock_recon(&tools.dsp, g, &mut pm, rec);
+    pm.weighting = wstats;
     pm
 }
 
@@ -621,12 +807,15 @@ pub(crate) fn code_b_picture<S: Sample>(
     let mut pm = PicMotion::new(mbs_wide, mbs_high);
     let mut dnb = MbNeighbours::default();
     let mut st = MbMotionState::new();
+    let mut chain = QpChain::new(ctx.qp, g.bit_depth);
     for mb_y in 0..mbs_high {
         let mut left_modes: [Option<u8>; 4] = [None; 4];
         for mb_x in 0..mbs_wide {
             let addr = mb_y * mbs_wide + mb_x;
             st.start(&pm.frame, &pm.info, addr, &mut dnb);
-            let dec = code_macroblock_b(
+            let mctx = pc.ctx_at(pc.mb_qp(addr));
+            let ctx = &mctx;
+            let mut dec = code_macroblock_b(
                 ctx,
                 rec,
                 refs,
@@ -647,7 +836,7 @@ pub(crate) fn code_b_picture<S: Sample>(
                     top_left: mb_x > 0 && mb_y > 0,
                     top_right: mb_y > 0 && mb_x + 1 < mbs_wide,
                 };
-                let (idec, modes) = code_macroblock(
+                let (mut idec, modes) = code_macroblock(
                     ctx,
                     rec,
                     mb_x,
@@ -660,6 +849,8 @@ pub(crate) fn code_b_picture<S: Sample>(
                     &left_modes,
                     &top_modes[mb_x],
                 );
+                let q = chain.settle(ctx.qp, has_residual(filter_kind(idec.kind), idec.cbp_luma | (idec.cbp_chroma << 4)));
+                idec.qp_delta = q.delta as i8;
                 emit(mb_x, mb_y, BMb::Intra(&idec));
                 pm.commit(
                     addr,
@@ -667,8 +858,7 @@ pub(crate) fn code_b_picture<S: Sample>(
                         filter_kind(idec.kind),
                         nz_mask_of(&idec.nz_luma, idec.transform_8x8),
                         idec.transform_8x8,
-                        ctx.qp,
-                        ctx.qpc,
+                        q,
                         [0; 2],
                     ),
                     &[[BlockMotion::default(); 16]; 2],
@@ -676,6 +866,11 @@ pub(crate) fn code_b_picture<S: Sample>(
                 (left_modes, top_modes[mb_x]) = edge_modes(idec.kind, &modes);
                 continue;
             }
+            // B_Skip carries no delta whatever its record holds; the other
+            // shapes carry one exactly when the reader's rule says so.
+            let residual = dec.kind != BMbKind::BSkip && has_residual(dec.kind.dec_kind(), dec.cbp_luma | (dec.cbp_chroma << 4));
+            let q = chain.settle(ctx.qp, residual);
+            dec.qp_delta = q.delta as i8;
             emit(
                 mb_x,
                 mb_y,
@@ -717,8 +912,7 @@ pub(crate) fn code_b_picture<S: Sample>(
                         dec.kind.dec_kind(),
                         nz_mask_of(&dec.nz_luma, dec.transform_8x8),
                         dec.transform_8x8,
-                        ctx.qp,
-                        ctx.qpc,
+                        q,
                         part_edges_of(&rects[..n]),
                     )
                 },
@@ -730,4 +924,33 @@ pub(crate) fn code_b_picture<S: Sample>(
     }
     deblock_recon(&tools.dsp, g, &mut pm, rec);
     pm
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The chain lands every quantiser the encoder can want from every
+    /// prediction, at 8, 10 and 14 bits, with a delta inside the reader's
+    /// range that the reader's own `next_qp` turns back into that
+    /// quantiser — including the differences that only fit by going round
+    /// the wrap — and a macroblock without a residual codes nothing and
+    /// holds the prediction.
+    #[test]
+    fn the_quantiser_chain_lands_where_the_reader_derives() {
+        for bit_depth in [8u32, 10, 14] {
+            for prev in 0..=51 {
+                for want in 0..=51 {
+                    let mut c = QpChain::new(prev, bit_depth);
+                    let q = c.settle(want, true);
+                    assert!(qp_delta_range(bit_depth).contains(&q.delta), "{prev} -> {want} at {bit_depth} bits: delta {}", q.delta);
+                    assert_eq!(next_qp(prev, q.delta, bit_depth), want, "{prev} -> {want} at {bit_depth} bits");
+                    assert_eq!(q.qp_y, want);
+                    assert_eq!(q.qpc, chroma_qp(want, 0, 6 * (bit_depth as i32 - 8)));
+                    let held = c.settle((want + 7) % 52, false);
+                    assert_eq!((held.qp_y, held.delta), (want, 0), "a residual-free macroblock holds the prediction");
+                }
+            }
+        }
+    }
 }

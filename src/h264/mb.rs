@@ -276,8 +276,17 @@ impl MbLayer {
     /// condition under which `mb_qp_delta` and residual are present, together
     /// with the chroma bits and I16x16.
     pub fn has_residual(&self) -> bool {
-        self.cbp != 0 || self.kind == MbKind::I16x16
+        has_residual(self.kind, self.cbp)
     }
+}
+
+/// [`MbLayer::has_residual`] for a macroblock described by its kind and
+/// `coded_block_pattern` alone — the reader's presence rule for
+/// `mb_qp_delta` and the residual (7.3.5), which an encoder deciding
+/// whether a macroblock can carry a quantiser change asks as well.
+#[inline]
+pub(crate) fn has_residual(kind: MbKind, cbp: u8) -> bool {
+    cbp != 0 || kind == MbKind::I16x16
 }
 
 /// One motion-compensation job: `(x, y, w, h, ref0, mv0, ref1, mv1)` in

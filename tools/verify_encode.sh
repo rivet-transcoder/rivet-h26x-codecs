@@ -293,6 +293,26 @@ fi
 # TAKES it. Where a feature is chosen per block rather than set per
 # stream, a row proves the syntax and a clip proves the feature. Reach
 # for the corpus before reaching for the configuration list.
+#
+# The h264-aq rows are H.264's adaptive quantisation: the H.265 model
+# (encode::aq) over each 16x16 macroblock, carried as mb_qp_delta. A 64x64
+# clip is sixteen macroblocks rather than four coding tree blocks, so the
+# uniform clips move quantisers here where the H.265 rows move none;
+# h26xenc's `aq` census line says which cells did. One row per entropy
+# coder and prediction mode, one of each above QP 29 (the chroma QP table
+# is indexed per macroblock now), and deep rows at 10 and 12 bits.
+#
+# The h264-wp rows are H.264's explicit weighted prediction for P slices.
+# Only the fade clip changes brightness, so it carries most of them. Two rows
+# run over every 8-bit clip, for opposite reasons. At QP 26 the fit has to
+# decline on content that does not fade (h26xenc's `wp` line counts the P
+# pictures that took a weighting: none on detail, motion or static). At QP 40
+# it does not decline: a reconstruction that coarse has drifted in level from
+# its source, the fit takes a weighting to correct it (21 of 84 P pictures on
+# the cut clip at QP 38), and that is the weighted path on content the fade
+# rows never show it — a row at QP 26 alone proved it only on the fade. The corpus has no deep or non-4:2:0
+# fade, so the @p10 rows prove the syntax at depth; a deep, 4:2:2, 4:4:4 and
+# monochrome fade run in the unit test.
 CONFIGS=${CONFIGS:-"
 lossless-intra|--codec h264 --lossless --gop 0
 cqp-intra|--codec h264 --qp 26 --gop 0
@@ -383,6 +403,28 @@ h264-10-abr-128k@p10|--codec h264 --bitrate 128000 --gop 8
 h264-12-cqp-ip@p12|--codec h264 --qp 26 --gop 8
 h264-12-cavlc40-ipb-t8x8-subparts@p12|--codec h264 --qp 40 --gop 8 --bframes 2 --cavlc --t8x8 --subparts
 h264-12-lossless-intra@p12|--codec h264 --lossless --gop 0
+h264-aq-intra|--codec h264 --qp 26 --gop 0 --aq 1.0
+h264-aq-ip|--codec h264 --qp 26 --gop 8 --aq 1.0
+h264-aq-ipb|--codec h264 --qp 26 --gop 8 --bframes 2 --aq 1.0
+h264-aq40-ip|--codec h264 --qp 40 --gop 8 --aq 1.0
+h264-aq-cavlc-intra|--codec h264 --qp 26 --gop 0 --cavlc --aq 1.0
+h264-aq-cavlc-ipb|--codec h264 --qp 26 --gop 8 --bframes 2 --cavlc --aq 1.0
+h264-aq40-cavlc-ip|--codec h264 --qp 40 --gop 8 --cavlc --aq 1.0
+h264-aq-t8x8-subparts-ipb|--codec h264 --qp 26 --gop 8 --bframes 2 --t8x8 --subparts --aq 1.0
+h264-abr-aq-64k|--codec h264 --bitrate 64000 --gop 8 --aq 1.0
+h264-10-aq-ip@p10|--codec h264 --qp 26 --gop 8 --aq 1.0
+h264-10-aq40-cavlc-ipb@p10|--codec h264 --qp 40 --gop 8 --bframes 2 --cavlc --aq 1.0
+h264-12-aq40-ip@p12|--codec h264 --qp 40 --gop 8 --aq 1.0
+h264-wp-ip|--codec h264 --qp 26 --gop 8 --wpred
+h264-wp-cavlc-ip@fade|--codec h264 --qp 26 --gop 8 --cavlc --wpred
+h264-wp-ipb@fade|--codec h264 --qp 26 --gop 8 --bframes 2 --wpred
+h264-wp40-ip|--codec h264 --qp 40 --gop 8 --wpred
+h264-wp40-cavlc-ip@fade|--codec h264 --qp 40 --gop 8 --cavlc --wpred
+h264-wp-t8x8-subparts-ip@fade|--codec h264 --qp 26 --gop 8 --t8x8 --subparts --wpred
+h264-wp-aq-ip@fade|--codec h264 --qp 26 --gop 8 --aq 1.0 --wpred
+h264-wp-abr-64k@fade|--codec h264 --bitrate 64000 --gop 8 --wpred
+h264-10-wp-ip@p10|--codec h264 --qp 26 --gop 8 --wpred
+h264-10-wp-cavlc-ipb@p10|--codec h264 --qp 26 --gop 8 --bframes 2 --cavlc --wpred
 cqp-ip-srgb-pc|--codec h264 --qp 26 --gop 8 --color 1:13:6 --full-range
 abr-64k-cpb-p3@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8 --color 12:17:6 --chroma-loc 1
 hevc-vbv-125-hdr10@src_cut|--codec h265 --bitrate 64000 --cpb-ms 125 --gop 8 --color 9:16:9
@@ -426,6 +468,18 @@ one() {
   t1=$(date +%s%N)
   frames=$(( $(stat -c %s "$src") / $(frame_bytes "$geom" "$chroma" "$depth") ))
   speed=$(awk -v ns="$((t1 - t0))" -v f="$frames" 'BEGIN { s = ns / 1e9; printf "%.3f s, %.0f f/s", s, (s > 0 ? f / s : 0) }')
+
+  # Every source picture has to come out. SELF and CROSS compare the stream
+  # with itself, so an encoder that drops pictures — a flush that forgets the
+  # ones a lookahead is holding — writes a shorter stream whose every picture
+  # still decodes to its reconstruction on both decoders, at a PSNR over the
+  # pictures that exist and a rate divided by them. Counting the
+  # reconstruction is the check nothing else here makes.
+  fb=$(frame_bytes "$geom" "$chroma" "$depth")
+  if [ "$(stat -c %s "$rec")" != "$((frames * fb))" ]; then
+    echo "ENCODE-FAIL $tag: the reconstruction holds $(( $(stat -c %s "$rec") / fb )) pictures, the source $frames"
+    return 1
+  fi
 
   # 1. SELF.
   ours="$OUT/$base.$name.ours.yuv"

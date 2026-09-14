@@ -620,6 +620,7 @@ pub fn write_intra_picture<S: Sample>(
 /// `refp` is the reference picture's reconstruction, borders already
 /// replicated ([`crate::encode::h264_me::prepare_reference`]); exactly one
 /// reference is active, which is why no `ref_idx` is ever written.
+#[allow(clippy::too_many_arguments)]
 pub fn write_p_picture<S: Sample>(
     w: &mut BitWriter,
     g: &Geometry,
@@ -628,6 +629,7 @@ pub fn write_p_picture<S: Sample>(
     planes: &[Plane<'_, S>],
     rec: &mut [Recon<S>],
     refp: &[Recon<S>],
+    weights: Option<&crate::h264::slice::PredWeightTable>,
 ) -> PicMotion {
     let mbs_wide = g.mbs_wide as usize;
     let rows = if g.chroma == crate::picture::ChromaFormat::Yuv444 { 0 } else { g.chroma_mb().1 as usize / 4 };
@@ -638,7 +640,7 @@ pub fn write_p_picture<S: Sample>(
     // when the slice ends in skips (7.3.4).
     let mut skip_run: u32 = 0;
     let t8x8 = tools.transform_8x8;
-    let fmbs = code_p_picture(g, tools, qp, planes, rec, refp, |mb_x, mb_y, mb| match mb {
+    let fmbs = code_p_picture(g, tools, qp, planes, rec, refp, weights, |mb_x, mb_y, mb| match mb {
         PMb::Skip(_) => {
             skip_run += 1;
             skip_nz(&mut st, mb_x);
