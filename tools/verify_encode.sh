@@ -221,6 +221,16 @@ if [ -z "$SOURCES" ]; then
   exit 2
 fi
 
+# EXCLUSIVE_TOKENS: a source whose name contains one of these tokens is
+# visited ONLY by rows whose `@` tag contains that same token. A row's tag is
+# otherwise a plain substring of the clip name, so a new clip is visited by
+# every row whose tag happens to occur in its name — a 10-bit clip is spelled
+# `..._420p10` and would join every `@p10` row — and its arrival would change
+# the cost of rows that never asked for it. `ilace`: the 10-bit interlaced
+# clip, src_ilace10_96x96_420p10, visited only by `@ilace10` rows.
+# Defined identically in identity_encode.sh, whose cells must be these.
+EXCLUSIVE_TOKENS="ilace"
+
 # A configuration's name may carry an `@substring` suffix, which restricts
 # it to sources whose filename contains that substring. Rows are not all
 # meaningful on all clips and pretending otherwise costs either coverage or
@@ -768,6 +778,9 @@ for src in $SOURCES; do
   # only, and the H.265 rows have their deep twins listed explicitly so
   # the tally says how many deep cells ran rather than folding them in.
   case "$src" in *_[0-9][0-9][0-9]p[0-9]*.yuv) deep=1 ;; *) deep=0 ;; esac
+  # The exclusive tokens (EXCLUSIVE_TOKENS, above) this source carries.
+  excl=
+  for tok in $EXCLUSIVE_TOKENS; do case "$src" in *"$tok"*) excl="$excl $tok" ;; esac; done
   echo "$CONFIGS" | while IFS='|' read -r name flags; do
     [ -z "$name" ] && continue
     # A configuration with no flags is always a mistake — most often a
@@ -782,6 +795,7 @@ for src in $SOURCES; do
     case "$name" in
       *@*)
         pat=${name##*@}
+        for tok in $excl; do case "$pat" in *"$tok"*) ;; *) continue 2 ;; esac; done
         case "$src" in
           *"$pat"*) name=${name%@*} ;;
           *) continue ;;
@@ -789,6 +803,7 @@ for src in $SOURCES; do
         ;;
       *)
         [ "$deep" = 1 ] && continue
+        [ -n "$excl" ] && continue
         ;;
     esac
     echo "$src|$name|$flags"

@@ -38,6 +38,16 @@ mkdir -p "$OUT"
 trap 'rm -rf "$OUT"' EXIT
 
 SOURCES=${SOURCES:-$(ls src_*.yuv 2>/dev/null)}
+
+# EXCLUSIVE_TOKENS: a source whose name contains one of these tokens is
+# visited ONLY by rows whose `@` tag contains that same token. A row's tag is
+# otherwise a plain substring of the clip name, so a new clip is visited by
+# every row whose tag happens to occur in its name — a 10-bit clip is spelled
+# `..._420p10` and would join every `@p10` row — and its arrival would change
+# the cost of rows that never asked for it. `ilace`: the 10-bit interlaced
+# clip, src_ilace10_96x96_420p10, visited only by `@ilace10` rows.
+# Defined identically in verify_encode.sh: the two must visit the same cells.
+EXCLUSIVE_TOKENS="ilace"
 [ -n "$SOURCES" ] || { echo "no source clips (src_*.yuv)" >&2; exit 2; }
 # The configuration list is verify_encode.sh's own, read out of it so the
 # two cannot drift: everything between CONFIGS=${CONFIGS:-" and the closing
@@ -82,11 +92,16 @@ for src in $SOURCES; do
     # As verify_encode.sh: a clip deeper than 8 bits is visited only by
     # rows that name it with `@p10` / `@p12`; a row without `@` is 8-bit.
     case "$src" in *_[0-9][0-9][0-9]p[0-9]*.yuv) deep=1 ;; *) deep=0 ;; esac
+    # As verify_encode.sh: a source carrying an exclusive token
+    # (EXCLUSIVE_TOKENS, above) is visited only by rows whose tag carries it.
+    excl=
+    for tok in $EXCLUSIVE_TOKENS; do case "$src" in *"$tok"*) excl="$excl $tok" ;; esac; done
     case "$name" in
       *@*)
         pat=${name##*@}
+        for tok in $excl; do case "$pat" in *"$tok"*) ;; *) continue 2 ;; esac; done
         case "$src" in *"$pat"*) name=${name%@*} ;; *) continue ;; esac ;;
-      *) [ "$deep" = 1 ] && continue ;;
+      *) [ "$deep" = 1 ] && continue; [ -n "$excl" ] && continue ;;
     esac
     echo "$src|$name|$flags"
   done
