@@ -331,6 +331,15 @@ impl H264Encoder {
 
 impl<S: Sample> Core<S> {
     fn new(cfg: Config) -> Result<Self> {
+        if cfg.max_cu_depth.is_some_and(|d| d > 0) {
+            // The coding quadtree is H.265's: H.264 codes 16x16
+            // macroblocks and has no coding tree to split. A depth asked
+            // for on purpose is refused by name rather than ignored;
+            // `None` (the codec's default) and `Some(0)` ask for nothing.
+            return Err(Error::unsupported(
+                "H.264 encode: a coding quadtree depth (max_cu_depth, an H.265 tool; H.264 codes 16x16 macroblocks)",
+            ));
+        }
         if cfg.sao {
             // Not "in progress": H.264 has no sample adaptive offset at
             // all. Refusing names that rather than silently ignoring a

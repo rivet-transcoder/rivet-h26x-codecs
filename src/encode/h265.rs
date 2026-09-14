@@ -4405,6 +4405,25 @@ mod tests {
         assert!(format!("{err}").contains("max_cu_depth"), "{err}");
     }
 
+    /// The coding quadtree is H.265's: the H.264 encoder refuses a depth
+    /// asked for on purpose by name, and takes the default (`None`) and an
+    /// explicit `Some(0)` — which is what keeps every H.264 caller building
+    /// its configuration from `Config::default()` working after the H.265
+    /// default became a tree.
+    #[test]
+    fn the_h264_encoder_refuses_a_quadtree_depth_by_name() {
+        for depth in [1u32, 2] {
+            let err = crate::encode::h264::H264Encoder::new(Config { max_cu_depth: Some(depth), ..cfg(64, 64, ChromaFormat::Yuv420) })
+                .err()
+                .unwrap_or_else(|| panic!("H.264 accepted max_cu_depth Some({depth})"));
+            let msg = format!("{err}");
+            assert!(msg.contains("max_cu_depth") && msg.contains("H.264"), "{msg}");
+        }
+        for ok in [None, Some(0)] {
+            assert!(crate::encode::h264::H264Encoder::new(Config { max_cu_depth: ok, ..cfg(64, 64, ChromaFormat::Yuv420) }).is_ok(), "H.264 refused {ok:?}");
+        }
+    }
+
     /// A source sample above the declared depth is refused by name, not
     /// coded: nothing downstream checks the range, and a wrapped sample
     /// would be a desync far from its cause.

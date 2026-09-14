@@ -275,11 +275,6 @@ fn main() {
         return;
     }
 
-    if cfg.max_cu_depth.is_some_and(|d| d > 0) {
-        // Refused by name rather than ignored: H.264 codes macroblocks,
-        // and a caller asking for a coding quadtree asked for a codec.
-        die("--cu-depth is the H.265 coding quadtree; H.264 has none");
-    }
     let aq = cfg.aq_strength > 0.0;
     let wpred = cfg.weighted_pred;
     let mut enc = match h26x::encode::h264::H264Encoder::new(cfg) {
