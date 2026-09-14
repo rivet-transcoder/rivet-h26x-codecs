@@ -191,3 +191,11 @@ gen big    "testsrc2=size=128x80:rate=25,format=yuv420p[a];mandelbrot=size=128x8
 # enough for pairs of both kinds to sit beside each other. The `p8` depth
 # suffix keeps every untagged row off it: only `@interlace` rows visit it.
 gen interlace "testsrc2=size=48x96:rate=50,scroll=horizontal=0.06[a];testsrc2=size=48x96:rate=50,loop=loop=-1:size=1:start=0[b];[a][b]hstack=inputs=2,tinterlace=mode=interleave_top" 8 96x96_420p8 yuv420p
+
+# The same interlaced clip at 10 bits, through `deep` (two bits of noise
+# below the up-shift, like every deep clip). A PAFF row on the progressive
+# @p10 clips codes frame pictures only; this is where 10-bit PAFF has field
+# pictures to choose. Its name carries `ilace`, one of verify_encode.sh's
+# EXCLUSIVE_TOKENS, so only `@ilace10` rows visit it: its `420p10` token
+# alone would have put it under every `@p10` row.
+deep ilace10 "testsrc2=size=48x96:rate=50,scroll=horizontal=0.06[a];testsrc2=size=48x96:rate=50,loop=loop=-1:size=1:start=0[b];[a][b]hstack=inputs=2,tinterlace=mode=interleave_top" 8 96x96 420 10
