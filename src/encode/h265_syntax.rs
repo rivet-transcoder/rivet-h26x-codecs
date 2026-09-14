@@ -89,33 +89,36 @@ pub struct Geometry {
 impl Geometry {
     /// Derive the coded geometry from a configuration.
     ///
-    /// The CTU size is chosen rather than configured: 64x64 unless the
-    /// picture is smaller than that, because a CTU larger than the picture is
-    /// legal but wastes header bits describing a tree that cannot split.
+    /// The CTB size is chosen rather than configured. Where the coding
+    /// quadtree may split (`max_cu_depth` above 0, the default), the CTB is
+    /// 32x32 and the coded picture is the smallest legal one, a whole number
+    /// of 8x8 minimum coding blocks: the CTBs along the right and bottom
+    /// edges are partial, and the tree decisions and the writer produce the
+    /// splits the reader infers there (`tree_steps` in `encode::h265`). A
+    /// whole-CTB unit at `max_cu_depth` 0 cannot be partial, so there the
+    /// coded picture is a whole number of CTBs, 16 or 32, whichever pads
+    /// less, the larger on a tie — the geometry every stream had before
+    /// partial CTBs. The conformance window crops whatever is coded beyond
+    /// the requested size. The standard's CTB floor is 16 (an 8x8 CTB is
+    /// illegal — this crate's own SPS parser rejects it, which is how that
+    /// constraint was rediscovered), and the decision machinery's ceiling
+    /// is 32; 64x64 CTBs are not produced.
     pub fn new(cfg: &Config) -> Self {
         let log2_min_cb = 3;
-        // The coded picture is a whole number of CTUs, with the conformance
-        // window cropping the rest — not the minimal legal size, which only
-        // needs a multiple of the minimum coding block. Whole CTUs because a
-        // partial edge CTU needs the splits the reader infers at the
-        // picture edge, which the decision machinery does not produce — it
-        // codes a whole CTB, or a quadtree of it by choice; the
-        // padding costs a few edge blocks of replicated content, and the
-        // window hides them. The standard's CTB floor is 16 (an 8x8 CTB is
-        // illegal — this crate's own SPS parser rejects it, which is how
-        // that constraint was rediscovered), and the decision machinery's
-        // ceiling is 32, so the choice is 16 or 32: whichever pads less,
-        // the larger on a tie.
-        let (log2_ctb, coded_width, coded_height) = [5u32, 4]
-            .into_iter()
-            .map(|v| {
-                let n = 1u32 << v;
-                let w = cfg.width.div_ceil(n) * n;
-                let h = cfg.height.div_ceil(n) * n;
-                (v, w, h)
-            })
-            .min_by_key(|&(v, w, h)| (w * h, u32::MAX - v))
-            .unwrap();
+        let tree = cfg.max_cu_depth.unwrap_or(crate::encode::h265::DEFAULT_CU_DEPTH) > 0;
+        let (log2_ctb, coded_width, coded_height) = if tree {
+            let m = 1u32 << log2_min_cb;
+            (5, cfg.width.div_ceil(m) * m, cfg.height.div_ceil(m) * m)
+        } else {
+            [5u32, 4]
+                .into_iter()
+                .map(|v| {
+                    let n = 1u32 << v;
+                    (v, cfg.width.div_ceil(n) * n, cfg.height.div_ceil(n) * n)
+                })
+                .min_by_key(|&(v, w, h)| (w * h, u32::MAX - v))
+                .unwrap()
+        };
         let ctb = 1u32 << log2_ctb;
         Self {
             log2_ctb,
@@ -1129,7 +1132,7 @@ mod tests {
     #[test]
     fn the_conformance_window_recovers_the_requested_size() {
         let (cfg, g) = geom(50, 34, ChromaFormat::Yuv420);
-        assert_eq!((g.coded_width, g.coded_height), (64, 48));
+        assert_eq!((g.coded_width, g.coded_height), (56, 40));
         let sps = write_sps(&cfg, &g, 8, None);
         let parsed = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&sps)).unwrap();
         let (l, r, t, b) = parsed.conf_win;
@@ -1137,20 +1140,32 @@ mod tests {
         assert_eq!(g.coded_height - t - b, 34);
     }
 
-    /// The coded picture is a whole number of CTUs, CTB 16 or 32 by least
-    /// padding — see `Geometry::new` for why partial edge CTUs are avoided.
+    /// Under the coding quadtree the CTB is 32 and the coded picture the
+    /// smallest legal one, whole 8x8 minimum coding blocks, whatever the
+    /// edge CTBs are left holding; at depth 0 it is whole CTBs, 16 or 32 by
+    /// least padding. See `Geometry::new`.
     #[test]
-    fn the_coded_picture_is_whole_ctus_with_least_padding() {
-        let g = Geometry::new(&geom(64, 64, ChromaFormat::Yuv420).0);
-        assert_eq!((g.log2_ctb, g.coded_width, g.coded_height), (5, 64, 64));
-        let g = Geometry::new(&geom(48, 48, ChromaFormat::Yuv420).0);
-        assert_eq!((g.log2_ctb, g.coded_width, g.coded_height), (4, 48, 48));
+    fn the_coded_picture_is_minimal_under_the_quadtree_and_whole_ctus_at_depth_0() {
+        let at = |w: u32, h: u32, depth: Option<u32>| {
+            let g = Geometry::new(&Config { max_cu_depth: depth, ..geom(w, h, ChromaFormat::Yuv420).0 });
+            (g.log2_ctb, g.coded_width, g.coded_height, g.ctbs_wide, g.ctbs_high)
+        };
+        for depth in [None, Some(1), Some(2)] {
+            assert_eq!(at(64, 64, depth), (5, 64, 64, 2, 2));
+            assert_eq!(at(48, 48, depth), (5, 48, 48, 2, 2));
+            assert_eq!(at(24, 24, depth), (5, 24, 24, 1, 1));
+            assert_eq!(at(50, 34, depth), (5, 56, 40, 2, 2));
+            assert_eq!(at(1280, 720, depth), (5, 1280, 720, 40, 23));
+            assert_eq!(at(1366, 768, depth), (5, 1368, 768, 43, 24));
+            assert_eq!(at(3840, 2160, depth), (5, 3840, 2160, 120, 68));
+        }
+        assert_eq!(at(64, 64, Some(0)), (5, 64, 64, 2, 2));
+        assert_eq!(at(48, 48, Some(0)), (4, 48, 48, 3, 3));
         // 24x24 pads to 32x32 under either CTB size; the tie goes to 32.
-        let g = Geometry::new(&geom(24, 24, ChromaFormat::Yuv420).0);
-        assert_eq!((g.log2_ctb, g.coded_width, g.coded_height), (5, 32, 32));
+        assert_eq!(at(24, 24, Some(0)), (5, 32, 32, 1, 1));
         // 50x34: CTB 16 pads to 64x48, CTB 32 to 64x64 — 16 pads less.
-        let g = Geometry::new(&geom(50, 34, ChromaFormat::Yuv420).0);
-        assert_eq!((g.log2_ctb, g.coded_width, g.coded_height), (4, 64, 48));
+        assert_eq!(at(50, 34, Some(0)), (4, 64, 48, 4, 3));
+        assert_eq!(at(1280, 720, Some(0)), (4, 1280, 720, 80, 45));
     }
 
     /// The reference picture set a P or B slice carries is written here

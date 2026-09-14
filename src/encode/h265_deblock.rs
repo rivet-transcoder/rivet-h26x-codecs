@@ -258,7 +258,7 @@ fn build_info<S: Sample>(pic: &IntraPicture<S>, cus: &[TreeCu<CuDecision>]) -> P
     let (w, h) = (pic.recon.width, pic.recon.height);
     let log2 = pic.log2_ctb;
     let (w4, h4) = (w / 4, h / 4);
-    let (wc, hc) = (w >> log2, h >> log2);
+    let (wc, hc) = (w.div_ceil(1 << log2), h.div_ceil(1 << log2));
     let shift = log2 - 2;
     let mut min_tb_addr_zs = vec![0u32; w4 * h4];
     for y4 in 0..h4 {
@@ -510,9 +510,13 @@ mod tests {
         assert_eq!(before, luma_snapshot(&pic), "a lossless picture was filtered");
     }
 
+    /// The parameter sets of a `w` by `h` P picture coded as whole CTBs:
+    /// `max_cu_depth` 0, the geometry these hand-built whole-CTB decisions
+    /// describe (under the quadtree a 32x16 picture is one partial 32x32
+    /// CTB, and a whole-CTB decision list for it would be empty).
     fn parsed_sets(w: u32, h: u32) -> (crate::hevc::sps::Sps, Pps) {
         use crate::encode::h265_syntax::{write_pps, write_sps, Geometry as SynGeometry};
-        let cfg = crate::encode::Config { width: w, height: h, gop: 8, ..crate::encode::Config::default() };
+        let cfg = crate::encode::Config { width: w, height: h, gop: 8, max_cu_depth: Some(0), ..crate::encode::Config::default() };
         let syn = SynGeometry::new(&cfg);
         let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &syn, 16, None))).unwrap();
         let mut pps = Pps::parse(&crate::nal::unescape_rbsp(&write_pps(26, false, true))).unwrap();
