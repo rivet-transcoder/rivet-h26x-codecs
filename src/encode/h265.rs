@@ -1836,6 +1836,8 @@ pub struct KindCensus {
     /// nearest (`ref_idx` 1 or more) — the choice multi-reference
     /// prediction exists for, taken.
     pub ref_older: u64,
+    /// Intra units coded `PART_NxN`: four 4x4 blocks at the 8x8 minimum.
+    pub nxn: u64,
     /// Coding units at quadtree depth 1: one split below the CTB.
     pub depth1: u64,
     /// Coding units at quadtree depth 2: two splits below — 8x8 at a 32x32
@@ -1860,6 +1862,7 @@ impl KindCensus {
             c.cus += 1;
             c.intra += 1;
             c.split_tu += u64::from(d.split_tu);
+            c.nxn += u64::from(d.nxn);
             c.qp_moved += u64::from(d.qp_y != pic_qp);
             c.count_depth(cu.depth);
         }
@@ -1878,6 +1881,7 @@ impl KindCensus {
                 PCuDecision::Intra(d) => {
                     c.intra += 1;
                     c.split_tu += u64::from(d.split_tu);
+                    c.nxn += u64::from(d.nxn);
                 }
                 PCuDecision::Inter(d) => {
                     match d.kind {
@@ -1915,6 +1919,7 @@ impl KindCensus {
         self.wp_won += other.wp_won;
         self.wp_lost += other.wp_lost;
         self.ref_older += other.ref_older;
+        self.nxn += other.nxn;
         self.depth1 += other.depth1;
         self.depth2 += other.depth2;
         self.model_bits += other.model_bits;
@@ -1937,6 +1942,7 @@ impl KindCensus {
             ("wp_won", self.wp_won),
             ("wp_lost", self.wp_lost),
             ("ref_older", self.ref_older),
+            ("nxn", self.nxn),
             ("depth1", self.depth1),
             ("depth2", self.depth2),
             ("model_bits", self.model_bits),
@@ -2343,7 +2349,11 @@ fn write_cu_intra_in_p(
 fn write_cu_intra_body(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, cat: u32, qp_delta: Option<i32>) {
     let log2 = d.log2_cu;
     debug_assert!((MIN_CB_LOG2..=5).contains(&log2), "a coding unit is 8x8 to 32x32");
-    debug_assert!(!d.nxn, "PART_NxN exists only at the minimum CU size");
+    debug_assert!(!d.nxn || log2 == MIN_CB_LOG2, "PART_NxN exists only at the minimum CU size");
+    if d.nxn {
+        write_cu_intra_nxn_body(e, cx, d, cat, qp_delta);
+        return;
+    }
     let mut pending = qp_delta;
 
     let syn0 = d.luma_syntax[0];
@@ -2508,6 +2518,111 @@ fn write_cu_intra_body(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, 
             }
         }
     }
+}
+
+/// The `PART_NxN` intra coding unit proper, at the 8x8 minimum coding
+/// block: [`write_cu_intra_body`]'s twin for the four-block shape, in the
+/// reader's element order.
+///
+/// - `prev_intra_luma_pred_flag` for all four blocks, and only then each
+///   block's `mpm_idx` or `rem_intra_luma_pred_mode` — `coding_unit` reads
+///   the flags in one loop and the payloads in the next.
+/// - `intra_chroma_pred_mode` once, or at 4:4:4 four times in z-order
+///   (`nc = if cat == 3 { npu } else { 1 }`); never in monochrome.
+/// - The transform tree's root, 8x8, splits by inference (`IntraSplitFlag`)
+///   and codes no split flag. Its chroma cbfs are coded there — both 4:2:2
+///   bins, the `log2 == 3` arm.
+/// - Four 4x4 children, which code no split flag (the 4x4 minimum). At
+///   4:4:4 each codes its own chroma cbfs under the root's gate; at 4:2:0
+///   and 4:2:2 they inherit the root's (`log2 == 2` inherits). Each codes
+///   `cbf_luma`; then the quantiser delta, if it is the first unit with a
+///   coded cbf — which at 4:2:0 and 4:2:2 counts the INHERITED chroma bins,
+///   so a set root chroma bin puts the delta in the first child whatever
+///   its luma holds; then its luma residual; then chroma — its own 4x4
+///   blocks at 4:4:4, Cb then Cr under its own block's chroma mode, and at
+///   4:2:0 and 4:2:2 the CU's chroma once, after the fourth child
+///   (`blk_idx == 3`).
+fn write_cu_intra_nxn_body(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, cat: u32, qp_delta: Option<i32>) {
+    let mut pending = qp_delta;
+    for pb in 0..4 {
+        write_prev_intra_luma_pred_flag(e, cx, d.luma_syntax[pb].prev_flag);
+    }
+    for pb in 0..4 {
+        let syn = d.luma_syntax[pb];
+        if syn.prev_flag {
+            write_mpm_idx(e, u32::from(syn.mpm_idx));
+        } else {
+            write_rem_intra_luma_pred_mode(e, u32::from(syn.rem));
+        }
+    }
+    match cat {
+        0 => {}
+        3 => {
+            for pb in 0..4 {
+                write_intra_chroma_pred_mode(e, cx, u32::from(d.chroma_syntax_nxn[pb]));
+            }
+        }
+        _ => write_intra_chroma_pred_mode(e, cx, u32::from(d.chroma_syntax)),
+    }
+    let params = |c_idx: usize, mode: u8| ResidualParams {
+        log2_size: 2,
+        c_idx,
+        scan_idx: residual_scan_idx(true, 2, c_idx, cat, u32::from(mode)),
+        bypass: d.bypass,
+        transform_skip_allowed: false,
+        sign_hiding: false,
+        intra: true,
+        pred_mode_intra: u32::from(mode),
+        ts_context: false,
+        implicit_rdpcm: false,
+        explicit_rdpcm: false,
+        persistent_rice: false,
+        trace: false,
+    };
+    if cat != 0 {
+        for comp in 0..2 {
+            write_cbf_chroma(e, cx, 0, d.cbf_chroma[comp]);
+            if cat == 2 {
+                write_cbf_chroma(e, cx, 0, d.cbf_chroma_bot[comp]);
+            }
+        }
+    }
+    let inherited = cat != 0 && cat != 3 && (0..2).any(|comp| d.cbf_chroma[comp] || d.cbf_chroma_bot[comp]);
+    for i in 0..4 {
+        if cat == 3 {
+            for comp in 0..2 {
+                if d.cbf_chroma[comp] {
+                    write_cbf_chroma(e, cx, 1, d.cbf_chroma_tu[comp][i]);
+                }
+            }
+        }
+        write_cbf_luma(e, cx, 1, d.cbf_luma[4 * i]);
+        let child_chroma = if cat == 3 { (0..2).any(|comp| d.cbf_chroma_tu[comp][i]) } else { inherited };
+        if pending.is_some() && (d.cbf_luma[4 * i] || child_chroma) {
+            write_cu_qp_delta(e, cx, pending.take().expect("checked"));
+        }
+        if d.cbf_luma[4 * i] {
+            write_residual(e, cx, &params(0, d.luma_modes[i]), &d.luma[16 * i..16 * i + 16]);
+        }
+        if cat == 3 {
+            for comp in 0..2 {
+                if d.cbf_chroma_tu[comp][i] {
+                    write_residual(e, cx, &params(comp + 1, d.chroma_mode_nxn[i]), &d.chroma[comp][16 * i..16 * i + 16]);
+                }
+            }
+        } else if cat != 0 && i == 3 {
+            for comp in 0..2 {
+                let pair = if cat == 2 { 2 } else { 1 };
+                for t in 0..pair {
+                    let cbf = if t == 0 { d.cbf_chroma[comp] } else { d.cbf_chroma_bot[comp] };
+                    if cbf {
+                        write_residual(e, cx, &params(comp + 1, d.chroma_mode), &d.chroma[comp][t * 16..(t + 1) * 16]);
+                    }
+                }
+            }
+        }
+    }
+    debug_assert!(pending.is_none(), "a quantiser delta was handed to an NxN CU with no coded cbf");
 }
 
 #[cfg(test)]
@@ -4108,11 +4223,14 @@ mod tests {
     fn the_coding_quadtree_takes_every_depth_and_round_trips() {
         use super::super::RateControl::{ConstantQp, Lossless};
         let mut total = [KindCensus::default(); 3];
+        // PART_NxN units per chroma format, by ChromaArrayType.
+        let mut nxn_by_format = [0u64; 4];
         for (w, h, chroma, bit_depth, gop, bframes, rate, aq_strength, max_cu_depth) in [
             (64usize, 64usize, ChromaFormat::Yuv420, 8u32, 0u32, 0u32, ConstantQp(30), 0.0f32, 2u32),
             (64, 64, ChromaFormat::Yuv420, 8, 8, 2, ConstantQp(30), 0.0, 2),
             (64, 64, ChromaFormat::Yuv420, 8, 8, 2, ConstantQp(30), 0.0, 1),
             (64, 64, ChromaFormat::Yuv422, 8, 8, 0, ConstantQp(40), 0.0, 2),
+            (64, 64, ChromaFormat::Yuv422, 8, 0, 0, ConstantQp(26), 0.0, 2),
             (64, 64, ChromaFormat::Yuv444, 8, 8, 2, ConstantQp(30), 0.0, 2),
             (64, 64, ChromaFormat::Monochrome, 8, 8, 0, ConstantQp(30), 0.0, 2),
             (64, 64, ChromaFormat::Yuv420, 10, 8, 2, ConstantQp(30), 0.0, 2),
@@ -4167,7 +4285,16 @@ mod tests {
             for (t, k) in total.iter_mut().zip(census.by_kind.iter()) {
                 t.add(k);
             }
+            let cat = match chroma {
+                ChromaFormat::Monochrome => 0,
+                ChromaFormat::Yuv420 => 1,
+                ChromaFormat::Yuv422 => 2,
+                ChromaFormat::Yuv444 => 3,
+            };
+            nxn_by_format[cat] += census.by_kind.iter().map(|k| k.nxn).sum::<u64>();
         }
+        assert!(nxn_by_format.iter().all(|&n| n > 0), "PART_NxN was not taken in every chroma format (by ChromaArrayType): {nxn_by_format:?}");
+        assert!(total[0].nxn > 0 && total[1].nxn + total[2].nxn > 0, "PART_NxN never taken in an I picture or never inside a P/B one: {total:?}");
         for (slot, name) in [(0usize, "I"), (1, "P"), (2, "B")] {
             let t = &total[slot];
             assert!(t.depth1 > 0 && t.depth2 > 0, "{name} pictures never took both split depths: {t:?}");

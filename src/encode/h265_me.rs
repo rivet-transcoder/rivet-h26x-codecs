@@ -211,7 +211,7 @@
 
 use crate::dsp::hevc_enc::{qbits, quant_offset, quant_scale};
 use crate::encode::h265_intra::{
-    CuDecision, Geo, IntraCtx, MIN_CB_LOG2, RegionSave, Srcs, TreeCu, chroma_tbs, code_cu_2nx2n_intra, cu_ssd, restore4, satd_lambda_scale,
+    CuDecision, Geo, IntraCtx, MIN_CB_LOG2, RegionSave, Srcs, TreeCu, chroma_tbs, code_cu_2nx2n_intra, code_cu_nxn_intra, cu_ssd, restore4, satd_lambda_scale,
     save4, ssd_lambda, sub_wh,
 };
 use crate::cabac_enc::CabacEncoder;
@@ -1363,9 +1363,44 @@ impl<S: Sample> InterPicture<S> {
         } else {
             PCuDecision::Inter(d)
         };
-        let ssd = cu_ssd(ctx, &self.recon, self.cat, x0, y0, 1 << log2, src);
+        let n = 1usize << log2;
+        let ssd = cu_ssd(ctx, &self.recon, self.cat, x0, y0, n, src);
         let bits = crate::encode::h265::p_cu_bits(&coded, self.cat, ctx.qp, ctx.bypass, is_b, nref, depth);
+        // An intra unit at the minimum coding block has a second shape, as
+        // in an I picture: code `PART_NxN` too and keep the cheaper, the
+        // loser's state put back from a copy.
+        if log2 == MIN_CB_LOG2 && matches!(coded, PCuDecision::Intra(_)) {
+            let saved = TrialSave::take(self, x0, y0, n);
+            let nxn = PCuDecision::Intra(Box::new(self.code_cu_intra_nxn(ctx, x0, y0, src.y, src.y_stride, src.cb, src.cr, src.c_stride)));
+            let ssd_n = cu_ssd(ctx, &self.recon, self.cat, x0, y0, n, src);
+            let bits_n = crate::encode::h265::p_cu_bits(&nxn, self.cat, ctx.qp, ctx.bypass, is_b, nref, depth);
+            let lam = ssd_lambda(ctx.qp, ctx.bit_depth);
+            if ssd_n as f64 + lam * f64::from(bits_n) < ssd as f64 + lam * f64::from(bits) {
+                return (nxn, ssd_n, bits_n);
+            }
+            saved.put(self, x0, y0, n);
+        }
         (coded, ssd, bits)
+    }
+
+    /// The `PART_NxN` alternative to [`Self::code_cu_intra`] for an 8x8 unit
+    /// the inter decision handed over: `code_cu_nxn_intra` over this
+    /// picture's state, as `code_cu_intra` runs `code_cu_2nx2n_intra`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn code_cu_intra_nxn(
+        &mut self,
+        ctx: &MeCtx<'_, S>,
+        x0: usize,
+        y0: usize,
+        src_y: &[S],
+        y_stride: usize,
+        src_cb: &[S],
+        src_cr: &[S],
+        c_stride: usize,
+    ) -> CuDecision {
+        let PicInfo { intra_mode, pred_mode, .. } = &mut self.info;
+        let (intra_mode, pred_mode) = (&mut intra_mode[..], &pred_mode[..]);
+        code_cu_nxn_intra(ctx, self.geo, &mut self.recon, intra_mode, Some(pred_mode), &mut self.intra_scratch, x0, y0, src_y, y_stride, src_cb, src_cr, c_stride)
     }
 
     /// Greedy small-diamond SAD descent at full-sample positions, seeded
