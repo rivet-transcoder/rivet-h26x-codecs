@@ -111,6 +111,16 @@ gen cut    "testsrc2=size=64x64:rate=25,trim=end_frame=51,setpts=PTS-STARTPTS[a]
 # ones is the smallest picture on which it has something to move.
 gen fade   "testsrc2=size=32x64:rate=25,format=yuv420p[a];color=c=0x808080:size=32x64:rate=25,format=yuv420p[b];[a][b]hstack=inputs=2,geq=lum='p(X,Y)*(1-N/16)':cb='p(X,Y)':cr='p(X,Y)'" 12 64x64_420 yuv420p
 
+# The gain-and-offset fade: the fade above with an offset as well as a gain,
+# luma of picture N `p * (1 - N/16) - 3N` (clipped at 0), chroma untouched.
+# The fade above is a pure gain, so the weighting fitted to it carries offsets
+# that round to zero, and a writer spelling every weighting offset with its
+# sign flipped left 14 of the 25 weighted-prediction cells of the gate green
+# (2026-09-14). Here the fit has an offset to carry. Its format token carries
+# its depth, `420p8`, so the untagged rows skip it the way they skip the deep
+# clips and only rows tagged `@wpoff` visit it.
+gen wpoff  "testsrc2=size=32x64:rate=25,format=yuv420p[a];color=c=0x808080:size=32x64:rate=25,format=yuv420p[b];[a][b]hstack=inputs=2,geq=lum='max(0,p(X,Y)*(1-N/16)-3*N)':cb='p(X,Y)':cr='p(X,Y)'" 12 64x64_420p8 yuv420p
+
 # Deep samples. The format token grows a depth suffix — `420p10` — which
 # verify_encode.sh splits into `--format 420 --depth 10` and maps to
 # ffmpeg's `yuv420p10le` for the CROSS decode; a token without a suffix is
