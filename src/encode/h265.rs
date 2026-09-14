@@ -31,6 +31,66 @@
 //! (`QgChain`), which follows the reader's quantisation groups at any group
 //! and unit size. At 0 every CTB is one unit, and the stream is the one this
 //! encoder wrote before the quadtree existed.
+//!
+//! ## Measured (2026-09-14), and the proposal on the default
+//!
+//! One binary, `--cu-depth` the only difference, BD-rate by
+//! `tools/bd_rate.py`'s method (QP 22/27/32/37, luma PSNR of the encoder's
+//! own reconstruction) over the eleven 8-bit clips of the encode corpus.
+//! Control: depth 0 encoded twice is byte-identical at every point.
+//!
+//! ```text
+//!   BD-rate against depth 0, mean of 11 clips
+//!                  depth 1    depth 2
+//!   all-intra      -19.0%     -29.2%
+//!   IP             -15.8%     -36.5%
+//!   IPB            -15.7%     -36.3%
+//!
+//!   depth 2, IP, per clip: big (256x160) -58.2%, motion -55.6%,
+//!   detail 400/420/422/444 -47.3/-45.7/-45.1/-40.2%, cut -42.4%,
+//!   fade -31.0%, static -27.6%, odd -8.4% (16x16 CTBs: depth 1 is its
+//!   limit), grad -0.1% (smooth gradients split almost nowhere)
+//! ```
+//!
+//! The gate's rows at their own quantisers agree: `hevc-cu2-ipb` is 30.4%
+//! smaller than `hevc-cqp-ipb` at +1.95 dB (mean over eleven clips),
+//! `hevc-cu2-intra` 24.9% smaller at +1.41 dB, `hevc-cu2-40-ip` 5.9%
+//! smaller at +0.53 dB, lossless IPB 33.0% smaller. The model check holds:
+//! what the split decisions priced the coded units at is within +4.5% to
+//! +9.7% of the slice data they took on every lossy configuration (census
+//! `model_bits` over `coded_bits`; the neutral-context prices run a little
+//! high, never low).
+//!
+//! Encode time, per-process CPU seconds on one pinned core, five
+//! interleaved rounds, median of paired ratios against depth 0, on
+//! workloads long enough for the CPU clock to resolve (the detail and cut
+//! clips repeated to 960 frames, the 256x160 clip to 256). The control, a
+//! second depth-0 run in every round, came out at 0.94–1.02: on a shared
+//! machine, differences under about 10% are not resolved.
+//!
+//! ```text
+//!                      depth 1   depth 2
+//!   detail  all-intra   1.97x     2.91x
+//!   cut     all-intra   2.01x     3.09x
+//!   big     all-intra   1.73x     2.75x
+//!   detail  IPB         2.61x     5.96x
+//!   cut     IPB         2.27x     4.50x
+//!   big     IPB         2.33x     5.09x
+//! ```
+//!
+//! Inter pictures pay more than intra ones because a whole-CTB inter unit
+//! is cheap — one motion search, mostly skips — while every node below it
+//! runs a search of its own.
+//!
+//! **Proposal, for the lead to decide: make `max_cu_depth` default to 2.**
+//! It buys a third of the bits at equal quality (-29% all-intra, -36% IP)
+//! for three to six times the CPU — a larger saving than every other tool
+//! this encoder has put together, on every clip but the flat gradient,
+//! where it costs nothing but time. If encode throughput is what binds —
+//! rivet's software tier runs this encoder inline — depth 1 is the middle
+//! of the road: half the saving (-19% / -16%) for about twice the CPU. The
+//! default stays 0 in this commit, because flipping it moves every H.265
+//! stream the gate knows.
 
 use super::gop::{Coded, Kind, Scheduler};
 use super::h265_deblock::{deblock_inter_picture, deblock_picture};

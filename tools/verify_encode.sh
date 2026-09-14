@@ -263,6 +263,26 @@ fi
 # format axis lives in the sources; a QP table reached under one format
 # alone needs both, and a row above 29 is necessary rather than
 # sufficient.
+# The `hevc*-cu*` rows turn on the H.265 coding quadtree (`--cu-depth`), and
+# which clip carries what is worth knowing. Depth 2 (8x8 units, PART_NxN)
+# is reachable only on 32x32 CTBs: the odd clip's 16x16 CTBs stop at depth
+# 1 whatever the row asks, and grad's smooth gradients split almost nowhere
+# (its cells prove the syntax). detail, motion, cut and fade split at every
+# depth in every picture kind; NxN is taken on every clip in I pictures and
+# on seven of them inside P/B. The @big clip, src_big_256x160_420p8 — the
+# one clip larger than 64x64, forty CTBs of four unrelated contents — is
+# spelled with a depth token so every row without an `@` skips it (the deep
+# clips' rule); its `hevc-cu0-*@big` rows are the depth-0 twins of the
+# `hevc-cu2-*@big` ones.
+#
+# The quadtree's mutations, each run once against these rows: the split
+# decision ignored by the writer, the split_cu_flag neighbour context
+# reported at depth 0, and the quantiser prediction read at the unit
+# instead of its quantisation group all fail SELF (the last is invisible
+# on the odd clip, whose 8x8 groups are the minimum unit — the AQ rows on
+# detail, cut and @big carry it); 4:4:4 PART_NxN's four chroma modes
+# written in reverse fails SELF on the 4:4:4 clips.
+#
 # Nothing below this line may be a comment. CONFIGS is a quoted string, so
 # a leading # is data: the reader takes the whole line as a configuration
 # name with no flags and runs the encoder's defaults under it, which
