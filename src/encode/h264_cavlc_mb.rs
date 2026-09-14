@@ -31,7 +31,7 @@ use crate::bitwriter::BitWriter;
 use crate::encode::h264_intra::{MbDecision, MbKind};
 use crate::encode::h264_me::{BDecision, BMbKind, InterDecision, InterMbKind};
 use crate::encode::h264_pic::{
-    BMb, IntraTools, PMb, PicMotion, code_b_picture, code_intra_picture, code_p_picture,
+    BMb, Colocated, IntraTools, PMb, PicMotion, code_b_picture, code_intra_picture, code_p_picture,
 };
 use crate::encode::h264_syntax::{Geometry, Plane, Recon};
 use crate::h264::cavlc::{SCAN8_SUB, SCAN8_SUB_FIELD, SCAN_CHROMA_DC, part_index_of, write_residual_block_cavlc};
@@ -781,7 +781,7 @@ pub fn write_b_picture<S: Sample>(
     planes: &[Plane<'_, S>],
     rec: &mut [Recon<S>],
     refs: [&[Recon<S>]; 2],
-    col: &PicMotion,
+    col: &Colocated,
 ) -> PicMotion {
     let mbs_wide = g.mbs_wide as usize;
     let rows = if g.chroma == crate::picture::ChromaFormat::Yuv444 { 0 } else { g.chroma_mb().1 as usize / 4 };

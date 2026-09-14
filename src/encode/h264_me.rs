@@ -68,7 +68,7 @@
 use crate::dsp::distortion::DistortionDsp;
 use crate::dsp::h264::{NO_DC, PRED_STRIDE};
 use crate::dsp::h264_enc::{qbits4, quant_offset};
-use crate::encode::h264_pic::PicMotion;
+use crate::encode::h264_pic::Colocated;
 use crate::encode::h264_intra::{
     IntraCtx, code_block_8x8, quad_rasters, reconstruct_8x8, satd_lambda, ssd_lambda,
 };
@@ -81,7 +81,7 @@ use crate::h264::cavlc::{mb_partitions, part_index_of, sub_partition_rect};
 use crate::h264::mb::SubMbShape;
 use crate::h264::mb::{
     MbKind as DecMbKind, MbMotion, MbNeighbours, MotionCache, PRED_BI, PRED_L0, PRED_L1,
-    PicInfo, colocated_block, fill_motion, p_skip_mv, predict_mv,
+    PicInfo, fill_motion, p_skip_mv, predict_mv,
 };
 use crate::h264::transform::{chroma_dc_transform_420, chroma_dc_transform_422};
 
@@ -1901,8 +1901,10 @@ pub fn b_sub_mb_type_code(shape: SubMbShape, dir: u8) -> u32 {
 /// satisfied.
 pub fn spatial_direct(
     st: &MbMotionState,
-    col: &PicMotion,
+    col: &Colocated,
     addr: usize,
+    field_mb: bool,
+    mb_parity: u8,
 ) -> ([i8; 2], [[Mv; 2]; 4]) {
     let mut ref_idx = st.direct_ref_idx();
     let mut mvp = [Mv::ZERO; 2];
@@ -1929,8 +1931,7 @@ pub fn spatial_direct(
     // partitioned P one, which is exactly where the tag said to look.
     let mut mv = [[Mv::ZERO; 2]; 4];
     for part in 0..4 {
-        let blk = colocated_block(true, part, 0);
-        let (col_mv, col_ref) = col.colocated(addr, blk);
+        let (col_mv, col_ref) = col.motion(addr, field_mb, mb_parity, part);
         let col_zero =
             col_ref == 0 && (-1..=1).contains(&col_mv.x) && (-1..=1).contains(&col_mv.y);
         for l in 0..2 {
@@ -2351,7 +2352,7 @@ pub fn code_macroblock_b<S: Sample>(
     src_chroma: [&[S]; 2],
     chroma_stride: usize,
     st: &mut MbMotionState,
-    col: &PicMotion,
+    col: &Colocated,
     addr: usize,
 ) -> BDecision {
     let (px, py) = (mb_x * 16, mb_y * 16);
@@ -2361,7 +2362,9 @@ pub fn code_macroblock_b<S: Sample>(
 
     // Direct: derived once, a candidate in itself and the motion any
     // `B_Direct_8x8` sub-macroblock takes.
-    let direct = spatial_direct(st, col, addr);
+    // Outside MBAFF every macroblock is its picture's kind: the parity is
+    // the picture's.
+    let direct = spatial_direct(st, col, addr, false, col.map.cur_parity);
     let (dref, dmv) = direct;
     let dused = [dref[0] >= 0, dref[1] >= 0];
     let ddir = (dused[0] as u8) * PRED_L0 + (dused[1] as u8) * PRED_L1;
@@ -2967,7 +2970,7 @@ mod tests {
                 // The colocated picture as the encoder now stores one:
                 // real per-4x4 motion, which is what `colocated_motion`
                 // reads.
-                let mut col = PicMotion::new(3, 3);
+                let mut col = crate::encode::h264_pic::PicMotion::new(3, 3);
                 let mut col_mot = [[BlockMotion::default(); 16]; 2];
                 for l in 0..2 {
                     let uses = !col_intra && (l == 1 || !col_list1_only);
@@ -3026,7 +3029,7 @@ mod tests {
                 // Mine, over the same state the picture walk would hold.
                 let mut st = MbMotionState::new();
                 st.start(&frame, &info, cur_addr, &mut dnb);
-                let (got_ref, got_mv) = spatial_direct(&st, &col, cur_addr);
+                let (got_ref, got_mv) = spatial_direct(&st, &Colocated::progressive(&col), cur_addr, false, PARITY_FRAME);
                 assert_eq!(got_ref, want_ref, "mask {mask:04b} draw {draw} ref");
                 // The colocated macroblock here has one motion, so all
                 // four 8x8 answers must agree with the whole-macroblock
@@ -3067,7 +3070,7 @@ mod tests {
         ]);
         let _ = &mut st;
 
-        let mut col = PicMotion::new(3, 3);
+        let mut col = crate::encode::h264_pic::PicMotion::new(3, 3);
         let mut mot = [[BlockMotion::default(); 16]; 2];
         // Upper 16x8 still (colZero true), lower 16x8 moving.
         for blk in 0..16 {
@@ -3090,7 +3093,7 @@ mod tests {
             &mot,
         );
 
-        let (refs, mv) = spatial_direct(&st, &col, 4);
+        let (refs, mv) = spatial_direct(&st, &Colocated::progressive(&col), 4, false, PARITY_FRAME);
         assert_eq!(refs, [0, -1], "one list-0 neighbour gives reference 0 on list 0 only");
         // Partitions 0 and 1 are the upper half: their colocated corners
         // are blocks 0 and 3, both still, so colZeroFlag holds.

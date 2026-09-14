@@ -45,7 +45,7 @@ use crate::h264::slice::{PredWeightTable, WeightEntry};
 use super::{Access, Config, Entropy, FieldCoding, FieldOrder, RateControl};
 use crate::bitwriter::BitWriter;
 use crate::h264::dpb::{DecodedPic, Dpb, PocState, RefMark};
-use crate::h264::frame::{Frame, SharedFrame};
+use crate::h264::frame::{BlockMotion, Frame, SharedFrame};
 use crate::sample::Sample;
 use crate::{Error, Result};
 use std::sync::Arc;
@@ -232,6 +232,35 @@ struct StoredFrame<S: Sample> {
     id: u64,
     /// Top and bottom field, once coded.
     fields: [Option<StoredField<S>>; 2],
+    /// The frame's motion in the decoder's frame-row layout, once both
+    /// fields are coded ([`field_pair_motion`]) — what a later B picture's
+    /// colocated derivation reads.
+    col: Frame<u8>,
+}
+
+/// A field-coded frame's motion in the decoder's frame-row layout: each
+/// field's macroblock rows at frame rows `2r + parity`, flagged field
+/// macroblocks, the frame marked field-coded with its fields' POCs — built
+/// with the decoder's own `take_field_motion_row`, which is how the decoder
+/// lays out the colocated frame its direct derivation reads.
+fn field_pair_motion<S: Sample>(frame: &StoredFrame<S>, g: &syn::Geometry, field_poc: [i32; 2]) -> Frame<u8> {
+    let (mbw, mbh) = (g.mbs_wide as usize, g.mbs_high as usize);
+    let n = mbw * mbh;
+    let mut col = Frame::<u8>::empty();
+    col.mb_width = mbw;
+    col.mb_height = mbh;
+    col.motion = [vec![BlockMotion::default(); n * 16], vec![BlockMotion::default(); n * 16]];
+    col.mb_intra = vec![false; n];
+    col.mb_field = vec![false; n];
+    col.field_coded = true;
+    col.field_poc = field_poc;
+    for (p, field) in frame.fields.iter().enumerate() {
+        let field = field.as_ref().expect("both fields are coded before the frame's motion is laid out");
+        for r in 0..mbh / 2 {
+            col.take_field_motion_row(&field.motion.frame, r, p);
+        }
+    }
+    col
 }
 
 /// One reconstructed field: its planes at field size, borders replicated,
@@ -1140,14 +1169,14 @@ impl<S: Sample> Core<S> {
             let p0 = past.expect("checked above");
             let p1 = future.expect("checked above");
             let refs2 = [&self.refs[p0].1[..], &self.refs[p1].1[..]];
-            let col = &self.refs[p1].2;
+            let col = super::h264_pic::Colocated::progressive(&self.refs[p1].2);
             if cabac {
                 motion = super::h264_cabac_mb::write_b_picture_cabac(
-                    &mut w, &g, &self.tools, qp, &planes, &mut recon, refs2, col,
+                    &mut w, &g, &self.tools, qp, &planes, &mut recon, refs2, &col,
                 );
             } else {
                 motion = super::h264_cavlc_mb::write_b_picture(
-                    &mut w, &g, &self.tools, qp, &planes, &mut recon, refs2, col,
+                    &mut w, &g, &self.tools, qp, &planes, &mut recon, refs2, &col,
                 );
                 w.rbsp_trailing_bits();
             }
@@ -1285,8 +1314,9 @@ impl<S: Sample> Core<S> {
         // The model's stand-in for this frame: both fields' entries are one
         // DPB entry, found by this shared frame.
         let shared = Arc::new(SharedFrame::new(Frame::<u8>::empty(), id, true));
-        let mut cur = StoredFrame::<S> { id, fields: [None, None] };
+        let mut cur = StoredFrame::<S> { id, fields: [None, None], col: Frame::empty() };
         let mut census = Vec::with_capacity(2);
+        let mut field_poc = [0i32; 2];
         for k in 0..2usize {
             let parity = match f.order {
                 FieldOrder::TopFirst => k,
@@ -1337,6 +1367,7 @@ impl<S: Sample> Core<S> {
             }
             let (top, bottom) = crate::h264::dpb::compute_poc(&f.sps, &hdr, &mut model.poc);
             let poc = if parity == 0 { top } else { bottom };
+            field_poc[parity] = poc;
             // Index 0 of each list the slice predicts from, as (frame id,
             // field parity).
             let mut ref0: [Option<(u64, usize)>; 2] = [None, None];
@@ -1416,10 +1447,27 @@ impl<S: Sample> Core<S> {
                 Kind::B => {
                     let (r0, r1) = (field_of(ref0[0])?, field_of(ref0[1])?);
                     let refs2 = [&r0.planes[..], &r1.planes[..]];
+                    // Direct prediction reads the list-1 reference's frame
+                    // in the decoder's frame-row layout, through the
+                    // decoder's colocated mapping for a field picture.
+                    let (rid, rpar) = ref0[1].expect("a B field has list 1");
+                    let colf = f.stored.iter().find(|s| s.id == rid).ok_or_else(|| {
+                        Error::bitstream("H.264 encode: a B field's list-1 reference is not a stored frame")
+                    })?;
+                    let col = super::h264_pic::Colocated {
+                        frame: &colf.col,
+                        map: crate::h264::recon::ColMap {
+                            cur_parity: parity as u8,
+                            col_parity: rpar as u8,
+                            cur_poc: poc,
+                            cur_mbaff: false,
+                            mb_width: g.mbs_wide as usize,
+                        },
+                    };
                     if cabac {
-                        super::h264_cabac_mb::write_b_picture_cabac(&mut w, &gf, &self.tools, qp, &planes, &mut recon, refs2, &r1.motion)
+                        super::h264_cabac_mb::write_b_picture_cabac(&mut w, &gf, &self.tools, qp, &planes, &mut recon, refs2, &col)
                     } else {
-                        let m = super::h264_cavlc_mb::write_b_picture(&mut w, &gf, &self.tools, qp, &planes, &mut recon, refs2, &r1.motion);
+                        let m = super::h264_cavlc_mb::write_b_picture(&mut w, &gf, &self.tools, qp, &planes, &mut recon, refs2, &col);
                         w.rbsp_trailing_bits();
                         m
                     }
@@ -1455,6 +1503,8 @@ impl<S: Sample> Core<S> {
             census.push((kind, motion.info.mbs.clone()));
             cur.fields[parity] = Some(StoredField { planes: recon, motion });
         }
+
+        cur.col = field_pair_motion(&cur, &g, field_poc);
 
         // The frame a decoder outputs: the two fields' rows interleaved,
         // cropped to the displayed size.

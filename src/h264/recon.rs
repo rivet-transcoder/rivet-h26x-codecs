@@ -1260,7 +1260,7 @@ fn predict_jobs<S: Sample>(cur: &mut Frame<S>, layer: &MbLayer, refs: &SliceRefs
 /// How the colocated vertical vector relates to the current picture's
 /// units (Table 8-8's vertMvScale).
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum VertScale {
+pub(crate) enum VertScale {
     OneToOne,
     FrmToFld,
     FldToFrm,
@@ -1268,18 +1268,42 @@ enum VertScale {
 
 /// A colocated 4x4 block: the macroblock (in the colocated frame's
 /// frame-row addressing) and the 4x4 in it, and the vector scaling.
-struct ColBlock {
-    addr: usize,
-    blk: usize,
-    scale: VertScale,
+pub(crate) struct ColBlock {
+    pub(crate) addr: usize,
+    pub(crate) blk: usize,
+    pub(crate) scale: VertScale,
 }
 
 /// For a frame picture whose RefPicList1[0] is a field-coded frame: the
 /// field of it that is colPic (Table 8-6 — the one closer in POC).
 fn col_field_of_frame<S: Sample>(refs: &SliceRefs<S>, col: &Frame<S>) -> u8 {
-    let top = (col.field_poc[0] - refs.cur_poc).abs();
-    let bottom = (col.field_poc[1] - refs.cur_poc).abs();
+    col_field_by_poc(refs.cur_poc, col)
+}
+
+/// [`col_field_of_frame`] for a current picture of POC `cur_poc`.
+fn col_field_by_poc<S: Sample>(cur_poc: i32, col: &Frame<S>) -> u8 {
+    let top = (col.field_poc[0] - cur_poc).abs();
+    let bottom = (col.field_poc[1] - cur_poc).abs();
     if top < bottom { 0 } else { 1 }
+}
+
+/// What the colocated derivation reads of the current picture: which
+/// picture it is, which picture of the colocated frame `RefPicList1[0]`
+/// names, the current POC (Table 8-6's closer field), whether the current
+/// frame is MBAFF, and the width in macroblocks. The whole of
+/// [`colocated_in`]'s dependence on a slice's reference state.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ColMap {
+    /// 0 / 1 a field, [`PARITY_FRAME`] a frame.
+    pub(crate) cur_parity: u8,
+    /// Which picture of the colocated frame is `RefPicList1[0]`.
+    pub(crate) col_parity: u8,
+    /// The current picture's POC.
+    pub(crate) cur_poc: i32,
+    /// The current picture is an MBAFF frame.
+    pub(crate) cur_mbaff: bool,
+    /// Picture width in macroblocks.
+    pub(crate) mb_width: usize,
 }
 
 /// The colocated block for direct prediction of 8x8 partition `part` /
@@ -1299,13 +1323,38 @@ fn colocated<S: Sample>(
     part: usize,
     sub: usize,
 ) -> ColBlock {
-    let mbw = cur.mb_width;
+    let map = ColMap {
+        cur_parity: refs.cur_parity,
+        col_parity: refs.col_parity,
+        cur_poc: refs.cur_poc,
+        cur_mbaff: cur.mbaff,
+        mb_width: cur.mb_width,
+    };
+    colocated_in(map, col, addr, field_mb, mb_parity, inference, part, sub)
+}
+
+/// [`colocated`] from the facts of the current picture it reads
+/// ([`ColMap`]) rather than a slice's whole reference state — so the
+/// encoder's direct derivation reads the colocated block a decoder reads,
+/// by calling this.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn colocated_in<S: Sample>(
+    map: ColMap,
+    col: &Frame<S>,
+    addr: usize,
+    field_mb: bool,
+    mb_parity: u8,
+    inference: bool,
+    part: usize,
+    sub: usize,
+) -> ColBlock {
+    let mbw = map.mb_width;
     let (x, row) = (addr % mbw, addr / mbw);
     let blk = colocated_block(inference, part, sub);
     let (bx, by) = (blk % 4, blk / 4);
     let y_col = by * 4;
-    let cur_field = refs.cur_parity != PARITY_FRAME;
-    if cur.mbaff {
+    let cur_field = map.cur_parity != PARITY_FRAME;
+    if map.cur_mbaff {
         // AFRM current (Table 8-8, last six rows): the colocated pair is at
         // this pair's position; which of its two macroblocks depends on the
         // kinds on both sides.
@@ -1318,7 +1367,7 @@ fn colocated<S: Sample>(
             let cp = if field_mb {
                 mb_parity as usize
             } else {
-                col_field_of_frame(refs, col) as usize
+                col_field_by_poc(map.cur_poc, col) as usize
             };
             let frow = 2 * pr + cp;
             if field_mb {
@@ -1345,7 +1394,7 @@ fn colocated<S: Sample>(
                 },
                 (false, true) => {
                     // mbAddrCol6: the field macroblock (of the pair) closer in POC.
-                    let cp = col_field_of_frame(refs, col) as usize;
+                    let cp = col_field_by_poc(map.cur_poc, col) as usize;
                     let y_m = 8 * bottom + 4 * (y_col / 8);
                     ColBlock {
                         addr: (2 * pr + cp) * mbw + x,
@@ -1367,7 +1416,7 @@ fn colocated<S: Sample>(
     } else if cur_field {
         if col.field_coded {
             // FLD / FLD: the same position in the colocated field.
-            let frow = 2 * row + refs.col_parity as usize;
+            let frow = 2 * row + map.col_parity as usize;
             ColBlock {
                 addr: frow * mbw + x,
                 blk,
@@ -1376,7 +1425,7 @@ fn colocated<S: Sample>(
         } else if col.mbaff && col.mb_field[(2 * row) * mbw + x] {
             // FLD / AFRM with a field pair: the field macroblock of the
             // current parity.
-            let frow = 2 * row + refs.cur_parity as usize;
+            let frow = 2 * row + map.cur_parity as usize;
             ColBlock {
                 addr: frow * mbw + x,
                 blk,
@@ -1396,7 +1445,7 @@ fn colocated<S: Sample>(
     } else if col.field_coded {
         // FRM / FLD: the field macroblock (of the field chosen by POC
         // distance) covering this frame macroblock's rows.
-        let cp = col_field_of_frame(refs, col) as usize;
+        let cp = col_field_by_poc(map.cur_poc, col) as usize;
         let frow = 2 * (row / 2) + cp;
         let y_m = 8 * (row % 2) + 4 * (y_col / 8);
         ColBlock {

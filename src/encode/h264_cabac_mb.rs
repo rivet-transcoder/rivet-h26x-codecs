@@ -38,7 +38,7 @@ use crate::encode::h264_intra::{MbDecision, MbKind};
 use crate::encode::h264_cavlc_mb::sub_mb_type_p;
 use crate::encode::h264_me::{BDecision, BMbKind, InterDecision, InterMbKind};
 use crate::encode::h264_pic::{
-    BMb, IntraTools, PMb, PicMotion, code_b_picture, code_intra_picture, code_p_picture,
+    BMb, Colocated, IntraTools, PMb, PicMotion, code_b_picture, code_intra_picture, code_p_picture,
 };
 use crate::encode::h264_syntax::{Geometry, Plane, Recon};
 use crate::h264::SliceType;
@@ -390,7 +390,7 @@ pub fn write_b_picture_cabac<S: Sample>(
     planes: &[Plane<'_, S>],
     rec: &mut [Recon<S>],
     refs: [&[Recon<S>]; 2],
-    col: &PicMotion,
+    col: &Colocated,
 ) -> PicMotion {
     let mbw = g.mbs_wide as usize;
     let total = mbw * g.mbs_high as usize;

@@ -188,11 +188,47 @@ impl PicMotion {
         }
     }
 
-    /// The colocated motion of macroblock `addr`, block `blk` (raster
-    /// 4x4), through the decoder's own `colocated_motion` — what a B
-    /// picture's direct derivation reads out of its list-1 reference.
-    pub(crate) fn colocated(&self, addr: usize, blk: usize) -> (Mv, i8) {
-        let (mv, ref_idx, _, _) = crate::h264::mb::colocated_motion(&self.frame, addr, blk);
+}
+
+/// What a B picture's direct prediction reads colocated motion out of —
+/// the frame holding `RefPicList1[0]` — and how the current picture maps
+/// onto it (8.4.1.2.1, Tables 8-6 and 8-8), read through the decoder's own
+/// `colocated_in` and `colocated_motion`: so a field picture over a
+/// field-coded anchor, or any other combination the standard spells out,
+/// reads the block a decoder reads.
+pub struct Colocated<'a> {
+    /// The colocated frame's motion in the decoder's frame-row layout: a
+    /// field picture's macroblock row `r` at frame row `2r + parity` with
+    /// `mb_field` set, and `field_coded`, `mbaff` and `field_poc` as the
+    /// decoder records them.
+    pub(crate) frame: &'a Frame<u8>,
+    /// The current picture's side of the mapping.
+    pub(crate) map: crate::h264::recon::ColMap,
+}
+
+impl<'a> Colocated<'a> {
+    /// A progressive B picture over its progressive list-1 reference: the
+    /// same macroblock, the same corner block.
+    pub(crate) fn progressive(col: &'a PicMotion) -> Self {
+        Colocated {
+            frame: &col.frame,
+            map: crate::h264::recon::ColMap {
+                cur_parity: crate::h264::frame::PARITY_FRAME,
+                col_parity: crate::h264::frame::PARITY_FRAME,
+                cur_poc: 0,
+                cur_mbaff: false,
+                mb_width: col.frame.mb_width,
+            },
+        }
+    }
+
+    /// `(mvCol, refIdxCol)` for 8x8 partition `part` of the macroblock at
+    /// storage address `addr` (`field_mb` / `mb_parity`: an MBAFF field
+    /// macroblock and its parity), under `direct_8x8_inference` — which
+    /// every SPS this encoder writes sets.
+    pub(crate) fn motion(&self, addr: usize, field_mb: bool, mb_parity: u8, part: usize) -> (Mv, i8) {
+        let cb = crate::h264::recon::colocated_in(self.map, self.frame, addr, field_mb, mb_parity, true, part, 0);
+        let (mv, ref_idx, _, _) = crate::h264::mb::colocated_motion(self.frame, cb.addr, cb.blk);
         (mv, ref_idx)
     }
 }
@@ -798,18 +834,14 @@ pub(crate) fn code_b_picture<S: Sample>(
     planes: &[Plane<'_, S>],
     rec: &mut [Recon<S>],
     refs: [&[Recon<S>]; 2],
-    col: &PicMotion,
+    col: &Colocated,
     mut emit: impl FnMut(usize, usize, BMb<'_>),
 ) -> PicMotion {
     let pc = PicCoding::new(g, tools, qp, planes);
     let ctx = &pc.ctx;
     let (mbs_wide, mbs_high) = (pc.mbs_wide, pc.mbs_high);
     let (src_y, src_cb, src_cr) = (&pc.src_y[..], &pc.src_cb[..], &pc.src_cr[..]);
-    debug_assert_eq!(
-        col.info.mbs.len(),
-        mbs_wide * mbs_high,
-        "the colocated picture is the same size"
-    );
+    debug_assert_eq!(col.frame.mb_width, mbs_wide, "the colocated picture is the same width");
 
     let mut top_modes: Vec<[Option<u8>; 4]> = vec![[None; 4]; mbs_wide];
     let mut pm = PicMotion::new(mbs_wide, mbs_high);
