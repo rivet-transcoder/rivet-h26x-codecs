@@ -910,6 +910,7 @@ impl<S: Sample> Core<S> {
                 keyframe: idr,
                 poc: c.poc,
                 encode_index: c.encode,
+                display: c.display,
             },
             rec: cropped,
             recon,
@@ -1094,21 +1095,38 @@ mod tests {
             })
             .unwrap();
             let frame = vec![0u8; 64 * 64 * 3 / 2];
+            let mut units = Vec::new();
             for i in 0..6 {
                 // Coding, holding, and refusing an unbuilt tool are all
                 // legitimate. "scheduler released an absent picture" is not:
                 // it means a picture was released under an index the map
                 // never held, which is the bookkeeping fault this exists to
                 // catch, and it would otherwise look like a coding bug.
-                if let Err(err) = e.push(&frame) {
-                    panic!("gop={gop} b={bframes} picture {i}: {err}");
+                match e.push(&frame) {
+                    Ok(u) => units.extend(u),
+                    Err(err) => panic!("gop={gop} b={bframes} picture {i}: {err}"),
                 }
             }
             // Flushing releases whatever is still held, and must not find a
             // picture missing either.
-            if let Err(err) = e.flush() {
-                let s = format!("{err}");
-                assert!(!s.contains("absent picture"), "gop={gop} b={bframes} flush: {s}");
+            match e.flush() {
+                Ok(u) => units.extend(u),
+                Err(err) => {
+                    let s = format!("{err}");
+                    assert!(!s.contains("absent picture"), "gop={gop} b={bframes} flush: {s}");
+                }
+            }
+            // Every access unit names the picture it codes by stream-wide
+            // display index: the six pushed, each exactly once, and — with
+            // B pictures — not in the order they were coded.
+            let mut displays: Vec<u64> = units.iter().map(|u| u.display).collect();
+            displays.sort_unstable();
+            assert_eq!(displays, (0..6).collect::<Vec<u64>>(), "gop={gop} b={bframes}");
+            if bframes > 0 {
+                assert!(
+                    units.iter().any(|u| u.display != u.encode_index),
+                    "gop={gop} b={bframes}: no picture was coded out of display order"
+                );
             }
         }
     }
