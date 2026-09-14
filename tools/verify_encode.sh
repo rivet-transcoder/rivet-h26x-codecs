@@ -293,6 +293,14 @@ fi
 # TAKES it. Where a feature is chosen per block rather than set per
 # stream, a row proves the syntax and a clip proves the feature. Reach
 # for the corpus before reaching for the configuration list.
+#
+# The h264-aq rows are H.264's adaptive quantisation: the H.265 model
+# (encode::aq) over each 16x16 macroblock, carried as mb_qp_delta. A 64x64
+# clip is sixteen macroblocks rather than four coding tree blocks, so the
+# uniform clips move quantisers here where the H.265 rows move none;
+# h26xenc's `aq` census line says which cells did. One row per entropy
+# coder and prediction mode, one of each above QP 29 (the chroma QP table
+# is indexed per macroblock now), and deep rows at 10 and 12 bits.
 CONFIGS=${CONFIGS:-"
 lossless-intra|--codec h264 --lossless --gop 0
 cqp-intra|--codec h264 --qp 26 --gop 0
@@ -383,6 +391,18 @@ h264-10-abr-128k@p10|--codec h264 --bitrate 128000 --gop 8
 h264-12-cqp-ip@p12|--codec h264 --qp 26 --gop 8
 h264-12-cavlc40-ipb-t8x8-subparts@p12|--codec h264 --qp 40 --gop 8 --bframes 2 --cavlc --t8x8 --subparts
 h264-12-lossless-intra@p12|--codec h264 --lossless --gop 0
+h264-aq-intra|--codec h264 --qp 26 --gop 0 --aq 1.0
+h264-aq-ip|--codec h264 --qp 26 --gop 8 --aq 1.0
+h264-aq-ipb|--codec h264 --qp 26 --gop 8 --bframes 2 --aq 1.0
+h264-aq40-ip|--codec h264 --qp 40 --gop 8 --aq 1.0
+h264-aq-cavlc-intra|--codec h264 --qp 26 --gop 0 --cavlc --aq 1.0
+h264-aq-cavlc-ipb|--codec h264 --qp 26 --gop 8 --bframes 2 --cavlc --aq 1.0
+h264-aq40-cavlc-ip|--codec h264 --qp 40 --gop 8 --cavlc --aq 1.0
+h264-aq-t8x8-subparts-ipb|--codec h264 --qp 26 --gop 8 --bframes 2 --t8x8 --subparts --aq 1.0
+h264-abr-aq-64k|--codec h264 --bitrate 64000 --gop 8 --aq 1.0
+h264-10-aq-ip@p10|--codec h264 --qp 26 --gop 8 --aq 1.0
+h264-10-aq40-cavlc-ipb@p10|--codec h264 --qp 40 --gop 8 --bframes 2 --cavlc --aq 1.0
+h264-12-aq40-ip@p12|--codec h264 --qp 40 --gop 8 --aq 1.0
 cqp-ip-srgb-pc|--codec h264 --qp 26 --gop 8 --color 1:13:6 --full-range
 abr-64k-cpb-p3@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8 --color 12:17:6 --chroma-loc 1
 hevc-vbv-125-hdr10@src_cut|--codec h265 --bitrate 64000 --cpb-ms 125 --gop 8 --color 9:16:9

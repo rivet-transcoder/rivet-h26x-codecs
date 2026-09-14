@@ -122,7 +122,7 @@ fn main() {
             "--sao" => cfg.sao = true,
             // H.264 only: offer inter partitions below 16x16.
             "--subparts" => cfg.subparts = true,
-            // H.265 only: adaptive quantisation at this strength (0 off).
+            // Both codecs: adaptive quantisation at this strength (0 off).
             "--aq" => cfg.aq_strength = val(&mut i, &args, "--aq").parse().unwrap_or_else(|_| die("--aq")),
             // H.265 only, with --bitrate: hold this many pictures back and
             // let the rate controller see them.
@@ -271,6 +271,7 @@ fn main() {
         return;
     }
 
+    let aq = cfg.aq_strength > 0.0;
     let mut enc = match h26x::encode::h264::H264Encoder::new(cfg) {
         Ok(e) => e,
         Err(e) => {
@@ -346,6 +347,22 @@ fn main() {
         }
         let list: Vec<String> = taken.iter().map(|(k, n)| format!("{k} {n}")).collect();
         eprintln!("shapes {name}: {}", list.join(", "));
+    }
+    // The quantiser census, when adaptive quantisation was asked for: the
+    // row turns it on, and only this says whether the clip moved any
+    // macroblock's quantiser or coded zero deltas and proved the syntax.
+    if aq {
+        let c = enc.shape_census();
+        for (pic, name) in ["I", "P", "B"].iter().enumerate() {
+            if c.pictures[pic] == 0 {
+                continue;
+            }
+            let mbs: u64 = c.counts[pic].iter().sum();
+            eprintln!(
+                "aq {name}: {} of {mbs} macroblocks off the picture quantiser, {} non-zero mb_qp_delta, in {} of {} pictures",
+                c.qp_moved[pic], c.qp_delta[pic], c.qp_delta_pictures[pic], c.pictures[pic]
+            );
+        }
     }
 }
 

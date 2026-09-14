@@ -1678,9 +1678,17 @@ fn decode_qp_delta(c: &mut Cabac, st: &mut CabacState, bit_depth: u32) -> Result
 /// does around its reader: `qp_delta != 0` after a macroblock with
 /// residual, `false` after one without (I_PCM included). This function
 /// only reads the flag, because its reader only reads it.
+///
+/// `bit_depth` bounds the value as the reader bounds it: 7.4.5's range
+/// widens by `QpBdOffsetY / 2` either way above 8 bits
+/// ([`super::mb::qp_delta_range`]), and an adaptively quantised deep
+/// picture may use the width.
 #[allow(dead_code)] // the picture loop being built is the caller
-pub(crate) fn write_mb_qp_delta_cabac(e: &mut CabacEncoder, st: &mut CabacState, qp_delta: i32) {
-    debug_assert!((-26..=25).contains(&qp_delta), "mb_qp_delta out of range");
+pub(crate) fn write_mb_qp_delta_cabac(e: &mut CabacEncoder, st: &mut CabacState, qp_delta: i32, bit_depth: u32) {
+    debug_assert!(
+        super::mb::qp_delta_range(bit_depth).contains(&qp_delta),
+        "mb_qp_delta {qp_delta} outside 7.4.5's range at {bit_depth} bits"
+    );
     let inc = st.prev_qp_delta_nonzero as usize;
     if qp_delta == 0 {
         e.encode_decision(&mut st.ctx[CTX_MB_QP_DELTA + inc], 0);
@@ -3632,7 +3640,7 @@ mod mb_round_trip {
         }
         let has_residual = d.kind == IntraKind::I16x16 || d.cbp_luma != 0 || d.cbp_chroma != 0;
         if has_residual {
-            write_mb_qp_delta_cabac(e, st, d.qp_delta as i32);
+            write_mb_qp_delta_cabac(e, st, d.qp_delta as i32, 8);
             st.prev_qp_delta_nonzero = d.qp_delta != 0;
             write_intra_residual_cabac(e, st, field, cfi, d, lnb, anb);
         } else {
@@ -3695,7 +3703,7 @@ mod mb_round_trip {
             write_transform_8x8_cabac(e, st, lnb, anb, d.transform_8x8);
         }
         if d.cbp_luma != 0 || d.cbp_chroma != 0 {
-            write_mb_qp_delta_cabac(e, st, d.qp_delta as i32);
+            write_mb_qp_delta_cabac(e, st, d.qp_delta as i32, 8);
             st.prev_qp_delta_nonzero = d.qp_delta != 0;
             write_inter_residual_cabac(e, st, field, cfi, d, lnb, anb);
         } else {
@@ -4621,8 +4629,8 @@ mod mb_round_trip {
     /// (7.4.5: the widest legal step is `-(26 + QpBdOffsetY / 2)`, whose
     /// mapped unary is `52 + QpBdOffsetY` one-bins): -32 at 10 bits is 64
     /// of them, legal there and a runaway at 8. The bins are written here
-    /// rather than by `write_mb_qp_delta_cabac`, which asserts the 8-bit
-    /// range.
+    /// rather than by `write_mb_qp_delta_cabac`, whose assertion refuses
+    /// the out-of-range values this test has to write.
     #[test]
     fn qp_delta_unary_guard_follows_bit_depth() {
         fn bins(v: i32) -> Vec<u8> {

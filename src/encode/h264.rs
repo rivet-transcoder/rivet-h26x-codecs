@@ -180,6 +180,16 @@ pub struct ShapeCensus {
     /// `[picture type][macroblock kind]`: picture types 0 intra, 1 P, 2 B;
     /// kinds in [`ShapeCensus::KINDS`]' order.
     pub counts: [[u64; 11]; 3],
+    /// Pictures coded, per picture type.
+    pub pictures: [u64; 3],
+    /// Macroblocks whose `QP_Y` differs from their picture's quantiser, per
+    /// picture type — what proves adaptive quantisation moved something
+    /// rather than coding zero deltas.
+    pub qp_moved: [u64; 3],
+    /// Macroblocks that coded a non-zero `mb_qp_delta`, per picture type.
+    pub qp_delta: [u64; 3],
+    /// Pictures with at least one non-zero `mb_qp_delta`, per picture type.
+    pub qp_delta_pictures: [u64; 3],
 }
 
 impl ShapeCensus {
@@ -189,17 +199,26 @@ impl ShapeCensus {
         [I4x4, I8x8, I16x16, IPcm, Inter16x16, Inter16x8, Inter8x16, Inter8x8, PSkip, BSkip, BDirect16x16]
     };
 
-    /// Count one coded picture's macroblocks.
-    fn add(&mut self, kind: Kind, mbs: &[crate::h264::mb::MbInfo]) {
+    /// Count one coded picture's macroblocks, coded at picture quantiser
+    /// `pic_qp`: their kinds, and — read off the same committed `MbInfo`
+    /// the loop filter reads — how many left that quantiser and how many
+    /// coded a delta to do it.
+    fn add(&mut self, kind: Kind, mbs: &[crate::h264::mb::MbInfo], pic_qp: u8) {
         let pic = match kind {
             Kind::Idr | Kind::I => 0,
             Kind::P => 1,
             Kind::B => 2,
         };
+        self.pictures[pic] += 1;
+        let mut deltas = 0u64;
         for m in mbs {
             let k = Self::KINDS.iter().position(|&k| k == m.kind).expect("every kind is listed");
             self.counts[pic][k] += 1;
+            self.qp_moved[pic] += u64::from(i32::from(m.qp) != i32::from(pic_qp));
+            deltas += u64::from(m.qp_delta_nonzero);
         }
+        self.qp_delta[pic] += deltas;
+        self.qp_delta_pictures[pic] += u64::from(deltas > 0);
     }
 
     /// The kinds that occurred in pictures of type `pic` (0 intra, 1 P,
@@ -305,6 +324,13 @@ impl<S: Sample> Core<S> {
                 "H.264 encode: sample adaptive offset (an H.265 tool; H.264 has none)",
             ));
         }
+        if cfg.aq_strength > 0.0 && cfg.rate == RateControl::Lossless {
+            // Every macroblock of a lossless picture is I_PCM, which has
+            // no quantiser: a per-macroblock one would steer nothing.
+            return Err(Error::unsupported(
+                "H.264 encode: adaptive quantisation on a lossless picture (no quantiser to adapt)",
+            ));
+        }
         let (sw, sh) = cfg.chroma.subsampling();
         let luma = cfg.width as usize * cfg.height as usize;
         let chroma = if cfg.chroma == crate::ChromaFormat::Monochrome {
@@ -338,7 +364,7 @@ impl<S: Sample> Core<S> {
             plane_dims.push((cw, chh));
             plane_dims.push((cw, chh));
         }
-        let tools = super::h264_pic::IntraTools::new(cfg.transform_8x8, cfg.subparts, cfg.bit_depth);
+        let tools = super::h264_pic::IntraTools::new(cfg.transform_8x8, cfg.subparts, cfg.bit_depth).with_aq(cfg.aq_strength);
         // The buffer to declare, snapped to what the syntax can carry —
         // the same rules, and the same refusals, as the H.265 side.
         let cpb = match (cfg.cpb_ms, cfg.rate) {
@@ -472,13 +498,13 @@ impl<S: Sample> Core<S> {
             // `None` means no buffer was declared and nothing can fail.
             let affordable = self.rc.as_ref().and_then(|rc| rc.affordable_bits());
             let Some(afford) = affordable else {
-                return Ok(self.commit(&c, a));
+                return Ok(self.commit(&c, a, qp));
             };
             if bits <= afford {
                 if let Some(rc) = self.rc.as_mut() {
                     rc.note_recode(qp);
                 }
-                return Ok(self.commit(&c, a));
+                return Ok(self.commit(&c, a, qp));
             }
             if attempt + 1 == super::rc::MAX_ATTEMPTS || qp >= 51 {
                 // The declared buffer is smaller than this content can be
@@ -517,10 +543,10 @@ impl<S: Sample> Core<S> {
     /// headers run on. Every write this encoder makes per picture is here
     /// — `code_attempt` makes none — so a re-coded attempt leaves no
     /// trace.
-    fn commit(&mut self, c: &Coded, a: Attempt<S>) -> Access {
+    fn commit(&mut self, c: &Coded, a: Attempt<S>, qp: u8) -> Access {
         let idr = c.kind == Kind::Idr;
         self.recon.push(a.rec);
-        self.census.add(c.kind, &a.motion.info.mbs);
+        self.census.add(c.kind, &a.motion.info.mbs, qp);
         if idr {
             // The attempt wrote `frame_num` 0 for an IDR; the count
             // restarts from there.
@@ -1308,5 +1334,166 @@ mod tests {
                 }
             }
         }
+    }
+    /// Pictures whose four quadrants differ sharply in variance — flat, a
+    /// ramp, noise, a checkerboard — so adaptive quantisation has something
+    /// to move: the H.265 side's generator, whose quadrants are four
+    /// macroblocks each here. `count` frames, drifting a little each so the
+    /// inter pictures carry residual.
+    fn aq_frames(chroma: ChromaFormat, bit_depth: u32, count: usize) -> Vec<Vec<u8>> {
+        let (w, h) = (64usize, 64usize);
+        let (sw, sh) = match chroma {
+            ChromaFormat::Yuv420 => (2usize, 2usize),
+            ChromaFormat::Yuv422 => (2, 1),
+            _ => (1, 1),
+        };
+        let (cw, ch) = if chroma == ChromaFormat::Monochrome { (0, 0) } else { (w / sw, h / sh) };
+        let shift = bit_depth - 8;
+        (0..count)
+            .map(|i| {
+                let mut seed = 0x9e37u32.wrapping_add(i as u32 * 7919);
+                let mut samples: Vec<u32> = Vec::with_capacity(w * h + 2 * cw * ch);
+                for y in 0..h {
+                    for x in 0..w {
+                        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                        let v: i32 = match (x >= 32, y >= 32) {
+                            (false, false) => 110 + i as i32,
+                            (true, false) => ((x + y + i) % 96) as i32 + 60,
+                            (false, true) => (seed >> 24) as i32,
+                            (true, true) => if ((x / 4) + (y / 4) + i) % 2 == 0 { 40 } else { 200 },
+                        };
+                        samples.push((v.clamp(0, 255) as u32) << shift);
+                    }
+                }
+                for _ in 0..2 {
+                    for y in 0..ch {
+                        for x in 0..cw {
+                            samples.push((((120 + x / 2 + y / 3 + i) & 0xff) as u32) << shift);
+                        }
+                    }
+                }
+                if shift == 0 {
+                    samples.iter().map(|&v| v as u8).collect()
+                } else {
+                    samples.iter().flat_map(|&v| (v as u16).to_le_bytes()).collect()
+                }
+            })
+            .collect()
+    }
+
+    /// Encode `frames` under `config`, decode the stream with the production
+    /// decoder and hold every picture to the encoder's own reconstruction
+    /// (SELF, in process) — matched through each access unit's POC, as
+    /// `deep_pictures_round_trip_through_the_decoder` matches them.
+    fn encode_and_self_check(tag: &str, config: Config, frames: &[Vec<u8>]) -> (Vec<Access>, ShapeCensus) {
+        let gop = config.gop;
+        let mut e = H264Encoder::new(config).unwrap_or_else(|err| panic!("{tag}: {err}"));
+        let mut units = Vec::new();
+        for f in frames {
+            units.extend(e.push(f).unwrap_or_else(|err| panic!("{tag}: {err}")));
+        }
+        units.extend(e.flush().unwrap_or_else(|err| panic!("{tag}: {err}")));
+        assert_eq!(units.len(), frames.len(), "{tag}: one access unit per picture");
+        let mut dec = crate::h264::H264Decoder::new();
+        for u in &units {
+            dec.push_annexb(&u.data).unwrap_or_else(|err| panic!("{tag}: decoder rejected the stream: {err}"));
+        }
+        dec.flush().unwrap_or_else(|err| panic!("{tag}: decoder failed to flush: {err}"));
+        let mut by_display = vec![None; units.len()];
+        for u in &units {
+            let display = if gop == 0 { u.encode_index as usize } else { (u.poc / 2) as usize };
+            by_display[display] = Some(u.encode_index as usize);
+        }
+        for (i, coded) in by_display.iter().enumerate() {
+            let want = &e.reconstructions()[coded.unwrap_or_else(|| panic!("{tag}: display index {i} never coded"))];
+            let got = dec.next_picture().unwrap_or_else(|| panic!("{tag}: picture {i} missing")).into_packed();
+            assert!(got == *want, "{tag}: picture {i} decoded differently than the encoder reconstructed it");
+        }
+        (units, e.shape_census().clone())
+    }
+
+    /// Adaptive quantisation — a quantiser per macroblock, carried by
+    /// `mb_qp_delta` — round-trips through the production decoder for
+    /// intra, P and B pictures, both entropy coders, every chroma format,
+    /// the 8x8 transform and the sub-partitions, at 8, 10 and 14 bits and
+    /// on both sides of the chroma QP table's identity region; and the
+    /// census proves it moved something: a stream whose every delta was
+    /// zero, or whose every macroblock kept the picture quantiser, would
+    /// pass SELF while proving only the syntax.
+    ///
+    /// SELF is the check that matters: a residual coded at one quantiser
+    /// and scaled at another desyncs the reconstruction, and a
+    /// residual-free macroblock filtered at a quantiser a decoder does not
+    /// hold for it moves the deblocked samples.
+    #[test]
+    fn adaptive_quantisation_round_trips_and_moves_the_quantiser() {
+        for (chroma, bit_depth, bframes, entropy, tools) in [
+            (ChromaFormat::Yuv420, 8u32, 0u32, Entropy::Cabac, false),
+            (ChromaFormat::Yuv420, 8, 2, Entropy::Cavlc, false),
+            (ChromaFormat::Yuv420, 8, 2, Entropy::Cabac, true),
+            (ChromaFormat::Yuv422, 8, 0, Entropy::Cavlc, true),
+            (ChromaFormat::Yuv444, 8, 2, Entropy::Cabac, false),
+            (ChromaFormat::Yuv444, 8, 0, Entropy::Cavlc, true),
+            (ChromaFormat::Monochrome, 8, 0, Entropy::Cabac, false),
+            (ChromaFormat::Yuv420, 10, 2, Entropy::Cabac, true),
+            (ChromaFormat::Yuv420, 10, 0, Entropy::Cavlc, false),
+            (ChromaFormat::Yuv422, 14, 2, Entropy::Cavlc, true),
+        ] {
+            let frames = aq_frames(chroma, bit_depth, 6);
+            for qp in [22u8, 40] {
+                let tag = format!("{chroma:?} {bit_depth}-bit bframes={bframes} {entropy:?} t8x8+subparts={tools} qp {qp}");
+                let (_, census) = encode_and_self_check(
+                    &tag,
+                    Config {
+                        gop: 8,
+                        bframes,
+                        entropy,
+                        transform_8x8: tools,
+                        subparts: tools,
+                        rate: RateControl::ConstantQp(qp),
+                        aq_strength: 2.0,
+                        ..cfg(64, 64, chroma, bit_depth)
+                    },
+                    &frames,
+                );
+                for (pic, name) in [(0usize, "intra"), (1, "P")] {
+                    assert!(census.qp_moved[pic] > 0, "{tag}: no {name} macroblock left the picture quantiser: {census:?}");
+                    assert!(census.qp_delta[pic] > 0, "{tag}: no {name} macroblock coded a non-zero mb_qp_delta: {census:?}");
+                }
+                if bframes > 0 {
+                    assert!(census.pictures[2] > 0, "{tag}: no B picture was coded");
+                }
+            }
+        }
+
+        // Strength 0 is off: the stream is what the encoder writes with the
+        // switch absent, and the census says nothing moved.
+        let frames = aq_frames(ChromaFormat::Yuv420, 8, 3);
+        for entropy in [Entropy::Cabac, Entropy::Cavlc] {
+            let encode = |strength: f32| -> (Vec<u8>, ShapeCensus) {
+                let mut e = H264Encoder::new(Config { gop: 8, entropy, aq_strength: strength, ..cfg(64, 64, ChromaFormat::Yuv420, 8) }).unwrap();
+                let mut out = Vec::new();
+                for f in &frames {
+                    for u in e.push(f).unwrap() {
+                        out.extend_from_slice(&u.data);
+                    }
+                }
+                for u in e.flush().unwrap() {
+                    out.extend_from_slice(&u.data);
+                }
+                (out, e.shape_census().clone())
+            };
+            let (off, census) = encode(0.0);
+            assert_eq!(off, encode(Config::default().aq_strength).0, "{entropy:?}");
+            assert_eq!(census.qp_moved, [0; 3], "{entropy:?}: nothing moves with the switch off");
+            assert_eq!(census.qp_delta, [0; 3], "{entropy:?}");
+            assert_ne!(off, encode(1.0).0, "{entropy:?}: strength 1 must change the stream");
+        }
+
+        // Lossless has no quantiser to adapt: refused by name.
+        let err = H264Encoder::new(Config { rate: RateControl::Lossless, aq_strength: 1.0, ..cfg(64, 64, ChromaFormat::Yuv420, 8) })
+            .err()
+            .expect("adaptive quantisation on a lossless stream must refuse");
+        assert!(format!("{err}").contains("adaptive quantisation"), "{err}");
     }
 }

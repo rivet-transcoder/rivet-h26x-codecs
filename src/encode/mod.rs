@@ -258,21 +258,25 @@ pub struct Config {
     /// `sample_adaptive_offset_enabled_flag` in the SPS, which makes one
     /// or two more flags appear in *every* slice header.
     pub sao: bool,
-    /// Adaptive quantisation strength (H.265 only): 0 is off, which is
-    /// the default. Above 0 the PPS sets `cu_qp_delta_enabled_flag` and
-    /// every coding tree block is quantised at its own offset from the
-    /// picture quantiser, chosen from its luma variance — flat blocks
-    /// finer, textured blocks coarser, zero-mean over the picture, and at
-    /// most six steps either way. 1.0 is the strength the
-    /// measurements in `encode::aq` were taken at.
+    /// Adaptive quantisation strength, both codecs: 0 is off, which is
+    /// the default. Above 0 every block — an H.265 coding tree block, an
+    /// H.264 macroblock — is quantised at its own offset from the picture
+    /// quantiser, chosen from its luma variance: flat blocks finer,
+    /// textured blocks coarser, zero-mean over the picture, and at most
+    /// six steps either way — one model, `encode::aq`. H.265 sets
+    /// `cu_qp_delta_enabled_flag` in the PPS and carries each offset as a
+    /// `cu_qp_delta`; H.264 has no switch to set and carries it as the
+    /// `mb_qp_delta` every macroblock with a residual already has room
+    /// for. In both, a block with no residual can carry no delta and holds
+    /// the predicted quantiser. 1.0 is the strength the measurements in
+    /// `encode::aq` were taken at. A lossless stream has no quantiser to
+    /// adapt, and both codecs refuse the combination by name.
     ///
     /// A switch rather than always-on for the reason SAO is: it costs a
-    /// `cu_qp_delta` per coded block and it trades global PSNR for a
-    /// more even distribution of error, which a caller measuring PSNR
-    /// does not want. Off, the stream is byte-identical to one from an
-    /// encoder that never had it. Ignored by H.264, whose per-macroblock
-    /// `mb_qp_delta` is a different mechanism this encoder does not
-    /// drive yet.
+    /// delta per coded block and it trades global PSNR for a more even
+    /// distribution of error, which a caller measuring PSNR does not
+    /// want. Off, the stream is byte-identical to one from an encoder
+    /// that never had it.
     pub aq_strength: f32,
     /// Rate-control lookahead (H.265 only): how many pictures the encoder
     /// holds back before coding one, so the controller can place bits by
