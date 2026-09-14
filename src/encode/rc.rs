@@ -288,23 +288,92 @@ const B_WEIGHT: f64 = 0.79;
 /// survivable.
 const MAX_K_RATIO: f64 = 4.0;
 
-/// How little the bits may change, across a quantiser move of at least
-/// [`MAX_QP_STEP`], before this module concludes that the content is not
-/// responding to the quantiser at all.
+/// How far the bits may *fall*, on a picture coded at a lower quantiser
+/// than the walk began at, and still count as not having answered it.
 ///
 /// Bounding the complexity step (above) slows a runaway; it cannot stop
 /// one, because a picture whose cost never moves keeps implying a cheaper
 /// picture forever and the quantiser keeps walking. The only way out is to
-/// notice. This is the noticing: move the quantiser meaningfully, see the
-/// bits stay inside this band, and conclude that the model does not apply
-/// here — then stop lowering the quantiser, because lowering it is what
-/// the model recommends and the model is the thing that is wrong.
+/// notice, and the noticing starts with a **walk**: the quantiser lowered,
+/// picture after picture, while the bits stay where they were. Only a
+/// lowered quantiser starts one, because the runaway only goes down and
+/// the verdict only stops lowering. Bits are compared per unit of
+/// lookahead cost, so a picture the lookahead measured as cheaper is not
+/// read as one that ignored the quantiser.
 ///
-/// It is deliberately a tight band. Content that responds even weakly
-/// still gets steered; only content that does not respond at all is
-/// frozen, and the flag is recomputed on every observation, so content
-/// that starts responding again is steered again.
+/// Bits that fall while the quantiser falls are not a picture ignoring
+/// the quantiser; they are a picture that got cheaper — references that
+/// improved, a scene settling after a cut. So a fall beyond this band
+/// restarts the walk instead of adding to it. The band itself is noise:
+/// content that truly ignores the quantiser codes to the same size
+/// within it.
+///
+/// This band was once the whole rule, applied to one move of three steps
+/// in either direction, and it froze the quantiser for the rest of a clip
+/// on a single observation. H.265 on the cut clip at 64 kbps with a
+/// depth-0 quadtree: quantiser 41 to 38 while the bits fell 168 to 160 —
+/// a picture right after the cut, cheaper because its reference had just
+/// been coded — and all 37 inter pictures after it were coded at 38 on a
+/// third of their plan, 0.86x for the clip. H.264 at 128 kbps: 28 to 32
+/// with the bits up 3.6 %, a *raised* quantiser, and 62 inter pictures at
+/// 32 on under half their plan. Ten of the gate's 18 cut-clip rate cells
+/// ended between 0.81x and 0.95x that way. See [`INSENSITIVE_SPAN`] and
+/// [`INSENSITIVE_RETRY`] for what replaced it.
 const INSENSITIVE_BAND: f64 = 0.06;
+
+/// How much of the law's predicted response counts as the bits answering
+/// a quantiser move: a quarter of it, in the log, in either direction.
+///
+/// The law says `d` steps down multiplies the bits by `2^(d/6)`, and `d`
+/// steps up divides them by it. Content that answers even weakly — a
+/// quarter of that, nine percent for three steps — is being steered and
+/// is left alone. The fraction is deliberately small, because what this
+/// guards against is content that does not answer *at all*, and a
+/// controller that wrongly concludes that stops spending.
+const INSENSITIVE_RESPONSE: f64 = 0.25;
+
+/// How far a walk must have lowered the quantiser before its silence is
+/// worth asking about: six steps, a predicted doubling of the bits, across
+/// at least two pictures — or twice that in one.
+///
+/// Two pictures because one is an anecdote: the ordinary step limit is
+/// [`MAX_QP_STEP`], a predicted 41 %, and consecutive pictures of real
+/// content routinely differ by that much on their own. A single move of
+/// twelve steps or more — a first measured correction ([`MAX_FIRST_STEP`])
+/// or a lookahead-widened one — predicts four times the bits, which no
+/// picture-to-picture noise hides, and waiting a second picture there
+/// would be twelve more steps of runaway.
+///
+/// **A silent walk is still not a verdict.** References that improve by
+/// exactly the law's slope per picture — each lowered picture predicting
+/// better from the one before — hold the bits flat all the way down, and
+/// no amount of walking tells that apart from content that ignores the
+/// quantiser. Asking from the other side does. So the next picture of the
+/// kind is coded [`MAX_QP_STEP`] *above* the walk's bottom: content that
+/// ignores the quantiser ignores a raised one too, and its bits stay put,
+/// while improving references and a raised quantiser push the bits the
+/// same way and they fall by more than the law alone. Only a walk that
+/// stayed silent *and* a raised picture that did not answer
+/// ([`INSENSITIVE_RESPONSE`]) is a verdict. The question costs one picture
+/// three steps coarser, and only after a silent walk, which real content
+/// rarely produces.
+const INSENSITIVE_SPAN: i32 = 6;
+
+/// How many picks a verdict holds the quantiser at its floor before one
+/// is allowed [`MAX_QP_STEP`] below it, to ask the content again.
+///
+/// A verdict that nothing can overturn is a freeze, and the one this
+/// replaced was exactly that: holding the quantiser means no move, no
+/// move means no evidence, and the verdict stood for the rest of the clip
+/// whatever the content did. Two things re-open it. The bits moving
+/// further from the verdict's than [`MAX_QP_STEP`]'s worth of the law, at
+/// any quantiser, which is the content changing. And this: every
+/// `INSENSITIVE_RETRY + 1`th pick under a verdict probes one step limit
+/// below the floor, and a probe that answers releases it. A probe that
+/// does not leaves the floor where it was, not where the probe went —
+/// content that truly ignores the quantiser costs one picture in nine
+/// coded three steps finer, at no cost in bits, and never walks.
+const INSENSITIVE_RETRY: u32 = 8;
 
 /// How much of what the buffer can afford a picture is allowed to aim at.
 ///
@@ -414,17 +483,105 @@ impl PicKind {
 #[derive(Clone, Copy)]
 struct Complexity {
     k: f64,
-    /// The last `(quantiser, bits)` actually observed for this kind, to
-    /// tell a picture that got cheaper from one that never cared.
-    last_obs: Option<(u8, u64)>,
-    /// Set when the last two observations showed a real quantiser move and
-    /// essentially no change in bits. See [`INSENSITIVE_BAND`].
-    insensitive: bool,
+    /// The last observation of this kind: its quantiser and
+    /// `log2(bits / cost)` — bits per unit of lookahead cost, so a
+    /// picture that measured cheaper is not mistaken for one that ignored
+    /// the quantiser. The cost is one without a lookahead.
+    last_obs: Option<(u8, f64)>,
+    /// Whether this kind's bits answer the quantiser, as far as the
+    /// observations so far can tell. See [`INSENSITIVE_BAND`].
+    response: Response,
     /// Whether `k` has been pinned by a real observation yet, or is still
     /// the seed. The first real observation replaces the seed outright
     /// rather than being blended into it — a seed is a guess and deserves
     /// no weight once a fact exists.
     observed: bool,
+}
+
+/// What the observations of one kind say about whether its bits answer the
+/// quantiser. Quantisers are the ones pictures were coded at; `y` is
+/// `log2(bits / cost)`, the cost being one without a lookahead.
+#[derive(Clone, Copy, Debug)]
+enum Response {
+    /// Nothing observed yet.
+    Unknown,
+    /// Pictures since the anchor `(qp, y)` have been coded at quantisers no
+    /// higher than the one before, and `moves` of them were lowered without
+    /// the bits answering. See [`INSENSITIVE_BAND`].
+    Walk { qp: u8, y: f64, moves: u32 },
+    /// A walk went silent over [`INSENSITIVE_SPAN`], bottoming out at
+    /// `(floor, y)`; the next pick is raised a step limit above the floor
+    /// to ask whether a raised quantiser is ignored too.
+    Confirm { floor: u8, y: f64 },
+    /// The verdict: the bits ignore the quantiser. Picks are held at or
+    /// above `floor` — fixed, so the verdict neither ratchets up behind a
+    /// raised quantiser nor walks down behind a probe — and `held` counts
+    /// them since the verdict or the last probe ([`INSENSITIVE_RETRY`]).
+    /// `y` is the bits when it was reached, to notice the content change.
+    Insensitive { floor: u8, y: f64, held: u32 },
+}
+
+impl Complexity {
+    fn new(k: f64) -> Self {
+        Complexity { k, last_obs: None, response: Response::Unknown, observed: false }
+    }
+
+    /// Fold one observation — the quantiser `qp` a picture was coded at and
+    /// `y = log2(bits / cost)` — into [`Response`].
+    fn observe_response(&mut self, qp: u8, y: f64) {
+        let last = self.last_obs.replace((qp, y));
+        let restart = Response::Walk { qp, y, moves: 0 };
+        // The law's predicted change in `y` for `steps` quantiser steps
+        // down, and the quarter of it that counts as an answer.
+        let answer = |steps: i32| INSENSITIVE_RESPONSE * f64::from(steps) / 6.0;
+        let band = (1.0 - INSENSITIVE_BAND).log2();
+        self.response = match (self.response, last) {
+            (Response::Insensitive { floor, y: vy, held }, Some((lqp, ly))) => {
+                let answered = if qp < floor && qp < lqp {
+                    // A probe below the floor, against the picture before it.
+                    y - ly >= answer(i32::from(lqp - qp))
+                } else {
+                    // Anywhere else: has the content moved further than the
+                    // law's response to one step limit?
+                    (y - vy).abs() > f64::from(MAX_QP_STEP) / 6.0
+                };
+                if answered { restart } else { Response::Insensitive { floor, y: vy, held } }
+            }
+            (Response::Confirm { floor, y: fy }, _) => {
+                // The raised picture: a verdict only if its bits neither fell
+                // by an answer's worth nor rose beyond noise.
+                let change = y - fy;
+                if qp > floor && change > -answer(i32::from(qp - floor)) && change < -band {
+                    Response::Insensitive { floor, y: fy, held: 0 }
+                } else {
+                    restart
+                }
+            }
+            (Response::Walk { qp: wqp, y: wy, moves }, Some((lqp, ly))) => {
+                if qp > lqp || (qp == lqp && (y - ly < band || y - ly > -band)) {
+                    // A raised quantiser is not a walk; a held one whose bits
+                    // moved means the content did, and the anchor no longer
+                    // describes it.
+                    restart
+                } else if qp == lqp {
+                    self.response
+                } else {
+                    let span = i32::from(wqp) - i32::from(qp);
+                    let rise = y - wy;
+                    if rise >= answer(span) || rise < band {
+                        // Answered, or got cheaper: either way not a picture
+                        // ignoring the quantiser.
+                        restart
+                    } else if span >= INSENSITIVE_SPAN && (moves >= 1 || span >= 2 * INSENSITIVE_SPAN) {
+                        Response::Confirm { floor: qp, y }
+                    } else {
+                        Response::Walk { qp: wqp, y: wy, moves: moves + 1 }
+                    }
+                }
+            }
+            _ => restart,
+        };
+    }
 }
 
 /// Picture-level rate control against an average bitrate.
@@ -544,9 +701,9 @@ impl RateController {
             avg_weight,
             budget: 0.0,
             complexity: [
-                Complexity { k: seed_k(seed_for(PicKind::Intra)), observed: false, last_obs: None, insensitive: false },
-                Complexity { k: seed_k(seed_for(PicKind::Inter)), observed: false, last_obs: None, insensitive: false },
-                Complexity { k: seed_k(seed_for(PicKind::B)), observed: false, last_obs: None, insensitive: false },
+                Complexity::new(seed_k(seed_for(PicKind::Intra))),
+                Complexity::new(seed_k(seed_for(PicKind::Inter))),
+                Complexity::new(seed_k(seed_for(PicKind::B))),
             ],
             last_informed: [None; 3],
             last_any: [None; 3],
@@ -753,11 +910,20 @@ impl RateController {
         }
         // Content that does not answer the quantiser cannot be steered by
         // it, and the model's advice — lower it further — is exactly wrong.
-        // Hold the line instead of walking to zero.
-        if c.insensitive {
-            if let Some(last) = self.last_informed[kind as usize] {
-                qp = qp.max(last as i32);
+        // Hold the line instead of walking to zero, except for the periodic
+        // probe that asks again (INSENSITIVE_RETRY). A silent walk first
+        // asks from above (INSENSITIVE_SPAN).
+        match &mut self.complexity[kind as usize].response {
+            Response::Confirm { floor, .. } => qp = qp.max(i32::from(*floor) + MAX_QP_STEP),
+            Response::Insensitive { floor, held, .. } if *held >= INSENSITIVE_RETRY => {
+                qp = qp.max(i32::from(*floor) - MAX_QP_STEP);
+                *held = 0;
             }
+            Response::Insensitive { floor, held, .. } => {
+                qp = qp.max(i32::from(*floor));
+                *held += 1;
+            }
+            _ => {}
         }
         let qp = qp.clamp(QP_MIN, QP_MAX) as u8;
         if informed {
@@ -828,26 +994,10 @@ impl RateController {
                 // bounded against.
                 c.k = k_obs;
             }
-            // Did the quantiser move, and did the bits care? Recomputed
-            // every time, so the verdict follows the content.
-            // Only a picture coded at a *different* quantiser carries
-            // information about whether the quantiser matters. When one is
-            // held — which is exactly what the verdict below causes — the
-            // absence of a move is not evidence against it, so the verdict
-            // stands until a real move contradicts it. Recomputing it to
-            // false on every held picture made the controller alternate
-            // between holding and stepping down, walking to zero in pairs.
-            match c.last_obs {
-                Some((pqp, pbits)) if pbits > 0 && (qp as i32 - pqp as i32).abs() >= MAX_QP_STEP => {
-                    let change = (bits as f64 / pbits as f64 - 1.0).abs();
-                    c.insensitive = change < INSENSITIVE_BAND;
-                    c.last_obs = Some((qp, bits));
-                }
-                None => c.last_obs = Some((qp, bits)),
-                // A held quantiser: keep both the verdict and the reference
-                // point it was reached from.
-                _ => {}
-            }
+            // Did the quantiser move down, and did the bits care? See
+            // INSENSITIVE_BAND for the walk and INSENSITIVE_RETRY for how a
+            // verdict is reopened.
+            c.observe_response(qp, (bits as f64 / cost).log2());
             c.observed = true;
         }
     }
@@ -1024,6 +1174,193 @@ mod tests {
             lowest > 4,
             "the quantiser ran away to {lowest} chasing bits that do not respond to it: {qps:?}"
         );
+    }
+
+    /// Whether a kind's controller holds a standing verdict that its bits
+    /// ignore the quantiser.
+    fn verdict(rc: &RateController, kind: PicKind) -> bool {
+        matches!(rc.complexity[kind as usize].response, Response::Insensitive { .. })
+    }
+
+    /// Fold a sequence of `(quantiser, bits)` observations into a fresh
+    /// estimate, at a cost of one, and return the response after each —
+    /// the rule alone, without a controller choosing the quantisers.
+    fn responses(seq: &[(u8, f64)]) -> Vec<Response> {
+        let mut c = Complexity::new(1.0);
+        seq.iter()
+            .map(|&(qp, bits)| {
+                c.observe_response(qp, bits.log2());
+                c.response
+            })
+            .collect()
+    }
+
+    /// Drive one observation at a quantiser of the test's choosing: pick
+    /// (so the controller's bookkeeping runs), overrule the pick through
+    /// the re-code hook, and account the bytes. What replays a real trace.
+    fn observe_at(rc: &mut RateController, kind: PicKind, qp: u8, bytes: usize) {
+        let _ = rc.pick_qp(kind);
+        rc.note_recode(qp);
+        rc.account(bytes);
+    }
+
+    /// **The misfires, replayed.** Two traces from the gate's cut clip that
+    /// froze the quantiser for the rest of the clip under the one-move rule,
+    /// fed back observation for observation: neither may reach a verdict.
+    ///
+    /// - H.265 at 64 kbps with a depth-0 quadtree, inter pictures 45 to 54:
+    ///   41 to 38 while the bits fell 168 to 160, a picture right after the
+    ///   cut, cheaper because its reference had just been coded. The old
+    ///   rule held 38 for the 37 inter pictures left, on a third of their
+    ///   plan.
+    /// - H.264 at 128 kbps, inter pictures 19 to 25: 28 to 32, a *raised*
+    ///   quantiser, with the bits up 3.6 %. The old rule held 32 for 62
+    ///   inter pictures on under half their plan.
+    #[test]
+    fn a_single_move_after_a_cut_or_a_raised_quantiser_is_not_a_verdict() {
+        let h265: [(u8, usize); 7] = [(36, 1624), (39, 1048), (38, 1416), (38, 3408), (41, 168), (38, 160), (38, 176)];
+        let mut rc = RateController::new(64_000, 30, 64, 64, 8, 0);
+        observe_at(&mut rc, PicKind::Intra, 36, 6760 / 8);
+        for (qp, bits) in h265 {
+            observe_at(&mut rc, PicKind::Inter, qp, bits / 8);
+            assert!(!verdict(&rc, PicKind::Inter), "H.265 cut: a verdict at quantiser {qp}, {bits} bits");
+        }
+
+        let h264: [(u8, usize); 6] = [(29, 3224), (29, 3304), (29, 3224), (29, 3352), (28, 2672), (32, 2768)];
+        let mut rc = RateController::new(128_000, 30, 64, 64, 8, 0);
+        observe_at(&mut rc, PicKind::Intra, 23, 9000);
+        for (qp, bits) in h264 {
+            observe_at(&mut rc, PicKind::Inter, qp, bits / 8);
+            assert!(!verdict(&rc, PicKind::Inter), "H.264: a verdict at quantiser {qp}, {bits} bits");
+        }
+    }
+
+    /// **Bits held flat by improving references are not a verdict.** A
+    /// scene whose inter complexity falls by a three-step factor every
+    /// picture — each picture predicting better from the finer one before
+    /// it — while the quantiser walks down three a picture: the bits stay
+    /// exactly flat, and the walk alone cannot tell that from content that
+    /// ignores the quantiser. The raised picture can: the references are
+    /// still improving and the raised quantiser pushes the same way, so its
+    /// bits fall by twice the law's step and the walk restarts.
+    #[test]
+    fn bits_held_flat_by_improving_references_are_not_a_verdict() {
+        let bits = |qp: u8, t: i32| 1e6 * 2f64.powf(-f64::from(qp) / 6.0 - f64::from(t) / 2.0);
+        // The walk, then the raised picture the rule asks with, then the
+        // scene settling at picture 5 while the controller walks on.
+        let seq = [(40, 0), (37, 1), (34, 2), (37, 3), (34, 4), (31, 5), (28, 5), (25, 5)];
+        let r = responses(&seq.map(|(qp, t)| (qp, bits(qp, t))));
+        assert!(matches!(r[2], Response::Confirm { floor: 34, .. }), "the walk should have gone silent and asked: {r:?}");
+        assert!(r.iter().all(|x| !matches!(x, Response::Insensitive { .. })), "improving references reached a verdict: {r:?}");
+    }
+
+    /// **Bits that truly stop answering still reach a verdict**, through
+    /// each of its gates: a walk of two lowered pictures over six steps, or
+    /// one move of twelve, then a raised picture whose bits also stay put.
+    /// A single three- or six-step move is not enough, nor a walk whose
+    /// raised picture answers, nor one whose bits fell along the way.
+    #[test]
+    fn bits_that_do_not_answer_the_quantiser_reach_a_verdict_and_nothing_less_does() {
+        let f = 3000.0;
+        let r = responses(&[(40, f), (37, f * 1.02), (34, f * 0.99), (37, f * 1.01)]);
+        assert!(matches!(r[2], Response::Confirm { floor: 34, .. }) && matches!(r[3], Response::Insensitive { floor: 34, .. }), "{r:?}");
+        let r = responses(&[(26, f), (10, f), (13, f)]);
+        assert!(matches!(r[1], Response::Confirm { floor: 10, .. }) && matches!(r[2], Response::Insensitive { floor: 10, .. }), "{r:?}");
+
+        for seq in [
+            // One move of three, and one of six.
+            &[(40, f), (37, f)][..],
+            &[(40, f), (34, f), (34, f)][..],
+            // The raised picture answers.
+            &[(40, f), (37, f), (34, f), (37, f * 0.8)][..],
+            // The bits fell along the walk.
+            &[(40, f), (37, f * 0.97), (34, f * 0.9), (37, f * 0.9)][..],
+            // The lowered pictures answered a quarter of the law.
+            &[(40, f), (37, f * 1.1), (34, f * 1.2), (37, f * 1.2)][..],
+        ] {
+            let r = responses(seq);
+            assert!(r.iter().all(|x| !matches!(x, Response::Insensitive { .. })), "{seq:?} reached a verdict: {r:?}");
+        }
+    }
+
+    /// **A verdict re-opens.** Bits that move at the floor are content that
+    /// changed, and release it at once; a probe below the floor whose bits
+    /// answer releases it too; a probe that does not leaves it standing
+    /// with its floor where it was.
+    #[test]
+    fn a_verdict_is_released_by_content_change_or_an_answering_probe() {
+        let f = 3000.0;
+        let base = [(40, f), (37, f), (34, f), (37, f)];
+        let with = |tail: &[(u8, f64)]| responses(&[&base[..], tail].concat());
+        let r = with(&[(34, f), (34, f * 1.5)]);
+        assert!(matches!(r[4], Response::Insensitive { .. }) && matches!(r[5], Response::Walk { .. }), "content change: {r:?}");
+        let r = with(&[(34, f), (31, f * 1.3)]);
+        assert!(matches!(r[5], Response::Walk { .. }), "answering probe: {r:?}");
+        let r = with(&[(34, f), (31, f * 1.02), (34, f)]);
+        assert!(matches!(r[6], Response::Insensitive { floor: 34, .. }), "silent probe: {r:?}");
+    }
+
+    /// Closed loop, content that never answers: each kind reaches its
+    /// verdict and then *holds* it — over the next three hundred and fifty
+    /// pictures its floor never moves and no pick, probes included, goes
+    /// more than one step limit below it.
+    #[test]
+    fn content_that_ignores_the_quantiser_is_held_without_walking() {
+        let mut rc = RateController::new(2_000_000, 30, W, H, 8, 0);
+        let floor_of = |rc: &RateController, kind: PicKind| match rc.complexity[kind as usize].response {
+            Response::Insensitive { floor, .. } => Some(floor),
+            _ => None,
+        };
+        let mut floors: [Option<u8>; 2] = [None; 2];
+        let mut probes = 0;
+        for i in 0..400 {
+            let kind = if i % 8 == 0 { PicKind::Intra } else { PicKind::Inter };
+            let qp = rc.pick_qp(kind);
+            if i >= 50 {
+                let fl = floors[kind as usize].expect("a verdict for both kinds within fifty pictures");
+                assert!(i32::from(qp) >= i32::from(fl) - MAX_QP_STEP, "picture {i}: {kind:?} picked {qp} under a floor of {fl}");
+                probes += usize::from(qp < fl);
+            }
+            rc.account(400);
+            if i < 50 {
+                floors[kind as usize] = floor_of(&rc, kind);
+            } else {
+                assert_eq!(floor_of(&rc, kind), floors[kind as usize], "picture {i}: {kind:?}'s verdict moved or was released");
+            }
+        }
+        assert!(probes > 0, "no probe was ever made, so nothing above tested the hold against one");
+    }
+
+    /// Closed loop, content that ignores the quantiser at or above some
+    /// level and answers below it — all-skip pictures that start coding
+    /// residual once the quantiser is fine enough. The verdict forms at the
+    /// level, the periodic probe finds the answer, and the controller then
+    /// steers below the old floor instead of holding it for the rest of the
+    /// stream.
+    #[test]
+    fn a_probe_below_the_floor_finds_content_that_answers_again() {
+        let mut rc = RateController::new(2_000_000, 30, W, H, 8, 0);
+        let mut floor = None;
+        let mut below = u8::MAX;
+        for i in 0..160 {
+            let kind = if i % 8 == 0 { PicKind::Intra } else { PicKind::Inter };
+            let qp = rc.pick_qp(kind);
+            let bytes = match (kind, floor) {
+                (PicKind::Inter, Some(fl)) if qp < fl => (400.0 * 2f64.powf(f64::from(fl - qp) / 6.0)) as usize,
+                _ => 400,
+            };
+            if kind == PicKind::Inter && floor.is_some() {
+                below = below.min(qp);
+            }
+            rc.account(bytes);
+            if floor.is_none() && i >= 40 {
+                if let Response::Insensitive { floor: fl, .. } = rc.complexity[PicKind::Inter as usize].response {
+                    floor = Some(fl);
+                }
+            }
+        }
+        let fl = floor.expect("a verdict on the constant phase");
+        assert!(i32::from(below) <= i32::from(fl) - 2 * MAX_QP_STEP, "the controller never went more than a probe below the floor {fl}: lowest {below}");
     }
 
     /// The quantiser may not lurch. A controller that jumps from 20 to 45
