@@ -221,15 +221,17 @@ impl<S: Sample> PicShared<S> {
         let spin = true;
         // Spin briefly: the producer is usually one CTB away.
         let start = std::time::Instant::now();
-        while spin {
-            for _ in 0..64 {
-                std::hint::spin_loop();
-            }
-            if pic.ctb_done[addr].load(Ordering::Acquire) {
-                return Ok(());
-            }
-            if start.elapsed() > std::time::Duration::from_micros(15) {
-                break;
+        if spin {
+            loop {
+                for _ in 0..64 {
+                    std::hint::spin_loop();
+                }
+                if pic.ctb_done[addr].load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                if start.elapsed() > std::time::Duration::from_micros(15) {
+                    break;
+                }
             }
         }
         if Self::blocking_wait(pic, WaitOn::Ctb(addr)) {
