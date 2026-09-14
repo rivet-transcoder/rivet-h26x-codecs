@@ -507,7 +507,7 @@ fn dist_planes(rng: &mut Rng, kind: u32, max: i32) -> (Vec<u16>, Vec<u16>) {
 /// of 0 against a block of `max`.
 pub fn distortion(tables: &[(&str, DistortionDsp<u16>)]) -> Result<u64, String> {
     let s = DistortionDsp::<u16>::scalar();
-    let mut rng = Rng(0x5add_16);
+    let mut rng = Rng(0x5add_1606);
     let mut n = 0;
     for bd in DISTORTION_DEPTHS {
         let max = ((1u32 << bd) - 1) as i32;
