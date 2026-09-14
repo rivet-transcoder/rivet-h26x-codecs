@@ -227,3 +227,16 @@ deep ilace10 "testsrc2=size=48x96:rate=50,scroll=horizontal=0.06[a];testsrc2=siz
 # rows visit it: its `420p10` token alone would have put it under every
 # `@p10` row. md5 6c22ac2b899b2fb3980c54b401463779, generated twice.
 gen fdeep10 "testsrc2=size=32x64:rate=25,format=yuv420p[a];color=c=0x808080:size=32x64:rate=25,format=yuv420p[b];[a][b]hstack=inputs=2,format=yuv420p10le,geq=lum='min(1023,max(0,p(X,Y)*(1-N/16)-12*N)+floor(random(0)*4))':cb='min(1023,p(X,Y)+floor(random(1)*4))':cr='min(1023,p(X,Y)+floor(random(2)*4))'" 12 64x64_420p10 yuv420p10le
+
+# A native 10-bit weighted fade. fdeep10 above is 8-bit content scaled up,
+# and from QP 26 on it codes like its own 8-bit twin, so it checks the
+# 10-bit path's consistency and nothing about 10-bit rate-distortion. This
+# one is computed at 10 bits: luma a sinusoidal texture drifting by a
+# quarter radian per picture, `512 + 300 sin(X/5 + N/4) cos(Y/7)`, under
+# the fdeep10 gain and offset (`* (1 - N/16) - 12N`), chroma two drifting
+# waves about 512, and two bits of noise on every plane. Its low bits carry
+# the texture's gradients, so truncating it to 8 bits costs 0.84 dB of luma
+# at QP 26. Its name carries `wsine`, one of the EXCLUSIVE_TOKENS, so only
+# `@wsine10` rows visit it. md5 8e3b7d967a299d69f9cb232012421615, generated
+# three times.
+gen wsine10 "nullsrc=size=64x64:rate=25,format=yuv420p10le,geq=lum='min(1023,max(0,(512+300*sin(X/5+N/4)*cos(Y/7))*(1-N/16)-12*N+floor(random(0)*4)))':cb='min(1023,512+120*cos(X/9-N/5)+floor(random(1)*4))':cr='min(1023,512+120*sin(Y/8+N/6)+floor(random(2)*4))'" 12 64x64_420p10 yuv420p10le

@@ -344,9 +344,10 @@ fi
 # the cost of rows that never asked for it. `ilace`: the 10-bit interlaced
 # clip, src_ilace10_96x96_420p10, visited only by `@ilace10` rows. `fdeep`:
 # the 10-bit gain-and-offset fade, src_fdeep10_64x64_420p10, visited only by
-# `@fdeep10` rows.
+# `@fdeep10` rows. `wsine`: the native 10-bit weighted fade,
+# src_wsine10_64x64_420p10, visited only by `@wsine10` rows.
 # Defined identically in identity_encode.sh, whose cells must be these.
-EXCLUSIVE_TOKENS="ilace fdeep"
+EXCLUSIVE_TOKENS="ilace fdeep wsine"
 
 # A configuration's name may carry an `@substring` suffix, which restricts
 # it to sources whose filename contains that substring. Rows are not all
@@ -497,6 +498,16 @@ EXCLUSIVE_TOKENS="ilace fdeep"
 # so no `@p10` or `@420p10` row visits it and its arrival changed no other
 # cell. h26xenc's `shapes B` census line says whether each cell's B pictures
 # took a table (wp_on), and how many kept the defaults (wp_rd_default).
+# fdeep10 is 8-bit content at four times the scale: its two noise bits
+# quantise away from QP 26 on, and it codes to within a few bytes and a
+# tenth of a dB of its own 8-bit twin, so those rows check the 10-bit path's
+# consistency rather than its rate-distortion. The `@wsine10` rows are the
+# 10-bit case proper: src_wsine10_64x64_420p10 is computed at 10 bits (a
+# drifting sinusoidal texture under the same gain and offset), and at QP 26
+# its reconstruction is 0.84 dB (luma) to 1.6 dB (chroma) better than the
+# same encoder's on its 8-bit twin, on fewer bytes; its B pictures take both
+# outcomes of the table-against-defaults check. Its name carries `wsine`,
+# one of EXCLUSIVE_TOKENS.
 # The h264-paff / h264-mbaff rows are H.264 interlaced coding. They visit the
 # two interlaced clips: src_interlace_96x96_420p8 (`@interlace`: fields 20 ms
 # apart, a scrolling half beside a held one, combed so that PAFF has field
@@ -695,6 +706,9 @@ hevc10-wp-sao-ipb@fdeep10|--codec h265 --qp 26 --gop 8 --bframes 2 --sao --wpred
 hevc10-wp-ip@fdeep10|--codec h265 --qp 26 --gop 8 --wpred
 h264-verdict-g2-192k@settle|--codec h264 --bitrate 192000 --gop 2
 h264-verdict-g2-256k@settle|--codec h264 --bitrate 256000 --gop 2
+hevc10-wp-ipb@wsine10|--codec h265 --qp 26 --gop 8 --bframes 2 --wpred
+hevc10-wp-ip@wsine10|--codec h265 --qp 26 --gop 8 --wpred
+hevc10-wp40-ipb@wsine10|--codec h265 --qp 40 --gop 8 --bframes 2 --wpred
 "}
 
 # Split a clip's format token into its chroma format and sample depth:
