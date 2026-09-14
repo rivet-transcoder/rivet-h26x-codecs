@@ -985,6 +985,10 @@ pub(crate) fn code_b_picture<S: Sample>(
 /// a pair is decided (both ways, then once more for the winner) before
 /// either of its macroblocks is written.
 #[derive(Clone)]
+// The variants are all a macroblock's coefficients (one to two kilobytes);
+// they differ in size by the B decision's second list, and a walk holds two
+// pairs of them at a time, so boxing buys nothing.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum PairMb {
     /// A macroblock of an I slice.
     Intra(MbDecision),
@@ -1069,7 +1073,7 @@ pub(crate) enum MbaffRefs<'a, S: Sample> {
 /// one — the rule `predicted_intra_mode` applies (src/h264/cavlc.rs), which
 /// the test below holds this to. The above neighbour is always a bottom row,
 /// where 8.3.2.1's `n` = 2 is the block on the edge.
-fn mbaff_edge_modes(nb: &MbNeighbours, info: &PicInfo) -> ([Option<u8>; 4], [Option<u8>; 4], [Option<u8>; 4]) {
+fn mbaff_edge_modes(nb: &MbNeighbours, info: &PicInfo) -> (EdgeModes, EdgeModes, EdgeModes) {
     let mode = |a: usize, blk: usize| -> u8 {
         if matches!(info.mbs[a].kind, DecKind::I4x4 | DecKind::I8x8) { info.intra_modes[a * 16 + blk] } else { 2 }
     };
@@ -1088,6 +1092,10 @@ fn mbaff_edge_modes(nb: &MbNeighbours, info: &PicInfo) -> ([Option<u8>; 4], [Opt
     });
     (left, top, left8)
 }
+
+/// One neighbouring intra mode per 4x4 row or column of a macroblock edge,
+/// `None` where no macroblock is there.
+type EdgeModes = [Option<u8>; 4];
 
 /// Commit an intra macroblock of an MBAFF pair: its quantiser through the
 /// chain, its record (a field macroblock's when `field`), and its modes
@@ -1550,18 +1558,18 @@ mod tests {
                             layer.intra_modes = [8; 16];
                             let tag = format!("cur_field {cur_field} nb_field {nb_field} {kind:?} bottom {bottom} side {side}");
                             if side == 0 {
-                                for r in 0..4 {
+                                for (r, got) in left.iter().enumerate() {
                                     let want = predicted_intra_mode(&info, &layer, &nb, &ctx, 0, r, false);
-                                    assert_eq!(Some(want), left[r].map(|m| m.min(8)), "{tag}: 4x4 row {r}");
+                                    assert_eq!(Some(want), got.map(|m| m.min(8)), "{tag}: 4x4 row {r}");
                                 }
                                 for r in [0usize, 2] {
                                     let want = predicted_intra_mode(&info, &layer, &nb, &ctx, 0, r, true);
                                     assert_eq!(Some(want), left8[r].map(|m| m.min(8)), "{tag}: 8x8 row {r}");
                                 }
                             } else {
-                                for c in 0..4 {
+                                for (c, got) in top.iter().enumerate() {
                                     let want = predicted_intra_mode(&info, &layer, &nb, &ctx, c, 0, false);
-                                    assert_eq!(Some(want), top[c].map(|m| m.min(8)), "{tag}: 4x4 column {c}");
+                                    assert_eq!(Some(want), got.map(|m| m.min(8)), "{tag}: 4x4 column {c}");
                                 }
                                 for c in [0usize, 2] {
                                     let want = predicted_intra_mode(&info, &layer, &nb, &ctx, c, 0, true);

@@ -3012,11 +3012,10 @@ mod residual_round_trip {
                 }
             }
         }
-        let nb_of = |l: Option<bool>, a: Option<bool>| {
-            let mut nb = MbNeighbours::default();
-            nb.pair = [l.map(|_| 0), a.map(|_| 1), None, None];
-            nb.pair_field = [l.unwrap_or(false), a.unwrap_or(false), false, false];
-            nb
+        let nb_of = |l: Option<bool>, a: Option<bool>| MbNeighbours {
+            pair: [l.map(|_| 0), a.map(|_| 1), None, None],
+            pair_field: [l.unwrap_or(false), a.unwrap_or(false), false, false],
+            ..MbNeighbours::default()
         };
         let mut w = BitWriter::new();
         let mut enc_st = CabacState::new(SliceType::P, 0, 26);

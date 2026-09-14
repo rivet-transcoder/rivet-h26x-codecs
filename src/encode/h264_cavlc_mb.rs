@@ -308,7 +308,6 @@ pub(crate) fn sub_mb_type_p(shape: SubMbShape) -> u32 {
 /// encoder's slice headers always declare one. The `debug_assert` is the
 /// tripwire for the day that stops being true.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn write_p16_macroblock(
     w: &mut BitWriter,
     dec: &InterDecision,
@@ -696,7 +695,6 @@ pub fn write_p_picture<S: Sample>(
 /// then straight to the coded block pattern — and neither does a
 /// `B_Direct_8x8` sub-macroblock, whose `sub_mb_type` of 0 is all it
 /// spells.
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn write_b_macroblock(
     w: &mut BitWriter,
