@@ -38,7 +38,7 @@
 //! records the measurement that decided it.
 
 use super::gop::{Coded, Kind, Scheduler};
-use super::rc::{PicKind, RateController};
+use super::rc::{Insensitivity, PicKind, RateController};
 use super::h264_syntax as syn;
 use super::h265_wp;
 use crate::h264::slice::{PredWeightTable, WeightEntry};
@@ -620,6 +620,13 @@ impl H264Encoder {
     /// reason given on the H.265 side: one division, in one place.
     pub fn rate_report(&self) -> Option<(f64, f64)> {
         with_core!(&self.inner, e => e.rate_report())
+    }
+
+    /// What the rate controller's insensitivity rule did — verdicts,
+    /// probes, releases; see `RateController::insensitivity`. `None` at a
+    /// constant quantiser.
+    pub fn rate_insensitivity(&self) -> Option<Insensitivity> {
+        with_core!(&self.inner, e => e.rc.as_ref().map(RateController::insensitivity))
     }
 
     /// The quantiser this picture is coded at, before any adaptive

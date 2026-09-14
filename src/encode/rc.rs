@@ -584,6 +584,24 @@ impl Complexity {
     }
 }
 
+/// What the insensitivity rule did over a stream, counted across every
+/// picture kind: verdicts reached ([`INSENSITIVE_SPAN`]), probes coded
+/// below a verdict's floor and verdicts released ([`INSENSITIVE_RETRY`]).
+///
+/// Reported, like the plan error, so a gate row can insist the rule was
+/// exercised rather than assume it: on the corpus as it stood when the rule
+/// was rewritten, no cell reached a verdict at all, so every property that
+/// held said nothing about the verdict path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Insensitivity {
+    /// Walks confirmed from above into a verdict.
+    pub verdicts: u64,
+    /// Picks coded below a standing verdict's floor to ask again.
+    pub probes: u64,
+    /// Verdicts ended, by a probe that answered or by the content changing.
+    pub releases: u64,
+}
+
 /// Picture-level rate control against an average bitrate.
 ///
 /// One per encoder, driven in coding order: [`RateController::pick_qp`]
@@ -655,6 +673,8 @@ pub struct RateController {
     /// [`RateController::plan_error`] reports.
     plan_error: f64,
     plan_count: u64,
+    /// See [`RateController::insensitivity`].
+    insensitivity: Insensitivity,
 }
 
 impl RateController {
@@ -719,6 +739,7 @@ impl RateController {
             planned: 0.0,
             plan_error: 0.0,
             plan_count: 0,
+            insensitivity: Insensitivity::default(),
         }
     }
 
@@ -731,6 +752,11 @@ impl RateController {
     /// before any picture has been accounted.
     pub fn plan_error(&self) -> Option<f64> {
         (self.plan_count > 0).then(|| self.plan_error / self.plan_count as f64)
+    }
+
+    /// What the insensitivity rule did so far: see [`Insensitivity`].
+    pub fn insensitivity(&self) -> Insensitivity {
+        self.insensitivity
     }
 
     /// The bits this picture is aiming for: its share by kind, plus a
@@ -918,6 +944,9 @@ impl RateController {
             Response::Insensitive { floor, held, .. } if *held >= INSENSITIVE_RETRY => {
                 qp = qp.max(i32::from(*floor) - MAX_QP_STEP);
                 *held = 0;
+                if qp < i32::from(*floor) {
+                    self.insensitivity.probes += 1;
+                }
             }
             Response::Insensitive { floor, held, .. } => {
                 qp = qp.max(i32::from(*floor));
@@ -997,8 +1026,15 @@ impl RateController {
             // Did the quantiser move down, and did the bits care? See
             // INSENSITIVE_BAND for the walk and INSENSITIVE_RETRY for how a
             // verdict is reopened.
+            let was = c.response;
             c.observe_response(qp, (bits as f64 / cost).log2());
             c.observed = true;
+            match (was, c.response) {
+                (Response::Confirm { .. }, Response::Insensitive { .. }) => self.insensitivity.verdicts += 1,
+                (Response::Insensitive { .. }, Response::Insensitive { .. }) => {}
+                (Response::Insensitive { .. }, _) => self.insensitivity.releases += 1,
+                _ => {}
+            }
         }
     }
 
@@ -1022,6 +1058,7 @@ impl RateController {
             planned: self.planned,
             plan_error: self.plan_error,
             plan_count: self.plan_count,
+            insensitivity: self.insensitivity,
         }
     }
 
@@ -1347,6 +1384,10 @@ mod tests {
             }
         }
         assert!(probes > 0, "no probe was ever made, so nothing above tested the hold against one");
+        // The report says the same: a verdict per kind, at least the probes
+        // counted above (which start at picture fifty), and no release.
+        let events = rc.insensitivity();
+        assert!(events.verdicts == 2 && events.probes as usize >= probes && events.releases == 0, "{events:?}, {probes} probes after picture 50");
     }
 
     /// Closed loop, content that ignores the quantiser at or above some
@@ -1380,6 +1421,8 @@ mod tests {
         }
         let fl = floor.expect("a verdict on the constant phase");
         assert!(i32::from(below) <= i32::from(fl) - 2 * MAX_QP_STEP, "the controller never went more than a probe below the floor {fl}: lowest {below}");
+        let events = rc.insensitivity();
+        assert!(events.verdicts >= 1 && events.probes >= 1 && events.releases >= 1, "the report missed a path: {events:?}");
     }
 
     /// The quantiser may not lurch. A controller that jumps from 20 to 45

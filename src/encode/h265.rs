@@ -94,7 +94,7 @@ use super::gop::{Coded, Kind, Scheduler};
 use super::h265_deblock::{deblock_inter_picture, deblock_picture};
 use super::h265_intra::{CuDecision, IntraCtx, IntraPicture, MIN_CB_LOG2, Srcs, TreeCu};
 use super::h265_me::{InterCuDecision, InterCuKind, InterPicture, PCuDecision, TreeRefs, MAX_MERGE_CAND};
-use super::rc::{PicKind, RateController};
+use super::rc::{Insensitivity, PicKind, RateController};
 use super::h265_sao::{SaoPlan, sao_picture};
 use super::aq;
 use super::h265_wp;
@@ -328,6 +328,13 @@ impl H265Encoder {
     /// constant quantiser, where nothing was planned.
     pub fn plan_error(&self) -> Option<f64> {
         with_core!(&self.inner, e => e.plan_error())
+    }
+
+    /// What the rate controller's insensitivity rule did — verdicts,
+    /// probes, releases; see `RateController::insensitivity`. `None` at a
+    /// constant quantiser.
+    pub fn rate_insensitivity(&self) -> Option<Insensitivity> {
+        with_core!(&self.inner, e => e.rc.as_ref().map(RateController::insensitivity))
     }
 
     /// The reconstructions produced so far, in coding order, packed as
