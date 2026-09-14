@@ -55,7 +55,7 @@ fn die(msg: &str) -> ! {
          \x20      [--recon F] [--codec h264|h265] [--qp N | --lossless | --bitrate BPS]\n\
          \x20      [--fps N] [--cpb-ms N]\n\
          \x20      [--gop N] [--bframes N] [--cavlc] [--t8x8] [--subparts] [--sao]\n\
-         \x20      [--aq STRENGTH] [--lookahead N] [--wpred] [--refs N] [--depth N] [--threads N]\n\
+         \x20      [--aq STRENGTH] [--lookahead N] [--wpred] [--refs N] [--cu-depth N] [--depth N] [--threads N]\n\
          \x20      [--color PRIMARIES:TRANSFER:MATRIX (H.273 codes, e.g. 9:16:9 for HDR10)]\n\
          \x20      [--full-range] [--chroma-loc N (H.273 chroma_sample_loc_type 0..=5)]\n\
          \x20      [--mastering-display G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)] (ST 2086, SEI units)\n\
@@ -134,6 +134,10 @@ fn main() {
             // the default and every stream written with it is
             // byte-identical to before multiple references existed.
             "--refs" => cfg.max_refs = val(&mut i, &args, "--refs").parse().unwrap_or_else(|_| die("--refs")),
+            // H.265 only: how many levels the coding quadtree may split a
+            // CTB (0, the default, codes one unit per CTB as every stream
+            // before the quadtree did).
+            "--cu-depth" => cfg.max_cu_depth = val(&mut i, &args, "--cu-depth").parse().unwrap_or_else(|_| die("--cu-depth")),
             // The VUI colour description, as the three H.273 code points
             // (colour_primaries:transfer_characteristics:matrix_coefficients).
             // Absent, the stream says nothing about colour.
@@ -271,6 +275,11 @@ fn main() {
         return;
     }
 
+    if cfg.max_cu_depth > 0 {
+        // Refused by name rather than ignored: H.264 codes macroblocks,
+        // and a caller asking for a coding quadtree asked for a codec.
+        die("--cu-depth is the H.265 coding quadtree; H.264 has none");
+    }
     let aq = cfg.aq_strength > 0.0;
     let wpred = cfg.weighted_pred;
     let mut enc = match h26x::encode::h264::H264Encoder::new(cfg) {

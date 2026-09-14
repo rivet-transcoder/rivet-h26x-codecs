@@ -210,7 +210,10 @@
 //! Lagrangian constant for the same reason.
 
 use crate::dsp::hevc_enc::{qbits, quant_offset, quant_scale};
-use crate::encode::h265_intra::{CuDecision, Geo, IntraCtx, chroma_tbs, code_cu_2nx2n_intra, satd_lambda_scale, sub_wh};
+use crate::encode::h265_intra::{
+    CuDecision, Geo, IntraCtx, MIN_CB_LOG2, RegionSave, Srcs, TreeCu, chroma_tbs, code_cu_2nx2n_intra, cu_ssd, restore4, satd_lambda_scale,
+    save4, ssd_lambda, sub_wh,
+};
 use crate::cabac_enc::CabacEncoder;
 use crate::hevc::ctu::{
     PartMode, SplitCuNb, chroma_qp, write_cu_skip_flag, write_inter_pred_idc, write_merge_flag,
@@ -1063,6 +1066,10 @@ impl<S: Sample> InterPicture<S> {
             fill_motion(&mut self.recon.motion, self.recon.w4, x0, y0, n, n, MotionInfo::INTRA);
             let w4 = self.info.w4;
             PicInfo::fill4(&mut self.info.pred_mode, w4, x0, y0, n, n, 1);
+            // Never skipped — and under the quadtree the area may still
+            // hold a skip mark from a trial that lost, which the P walk's
+            // identical fill already clears.
+            PicInfo::fill4(&mut self.info.skip, w4, x0, y0, n, n, 0);
             return out;
         }
 
@@ -1249,6 +1256,118 @@ impl<S: Sample> InterPicture<S> {
         )
     }
 
+    /// Decide and code the CTB at `(cu_x, cu_y)` (CTB units) of a P or B
+    /// picture as a coding quadtree — the walk and the cost of
+    /// [`super::h265_intra::IntraPicture::code_ctu_tree`] over this
+    /// picture's units: every node coded whole by the inter decision
+    /// ([`Self::code_cu`] or [`Self::code_cu_b`], handing over to
+    /// [`Self::code_cu_intra`] where it answers [`InterCuKind::UseIntra`])
+    /// and then split, the cheaper kept.
+    ///
+    /// A trial here leaves more behind than an intra one: beside the
+    /// samples, the motion grid and the `pred_mode`, `skip` and
+    /// `intra_mode` marks the candidate derivations read. All of it is put
+    /// back when the whole node wins (`TrialSave`), over exactly the
+    /// node's area — and nothing outside it is ever written — so the next
+    /// unit's merge and AMVP lists are built from the winners alone, as a
+    /// decoder builds them from what it parsed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn code_ctu_tree(
+        &mut self,
+        ctx: &MeCtx<'_, S>,
+        want: &dyn Fn(usize, usize, u32) -> i32,
+        max_depth: u32,
+        refs: TreeRefs<'_, S>,
+        cu_x: usize,
+        cu_y: usize,
+        src: &Srcs<'_, S>,
+    ) -> Vec<TreeCu<PCuDecision>> {
+        let log2 = self.log2_ctb;
+        let mut out = Vec::new();
+        self.tree_node(ctx, want, max_depth, refs, cu_x << log2, cu_y << log2, log2, 0, src, &mut out);
+        out
+    }
+
+    /// One node of [`Self::code_ctu_tree`]: returns its cost, having
+    /// pushed its winning units onto `out`.
+    #[allow(clippy::too_many_arguments)]
+    fn tree_node(
+        &mut self,
+        ctx: &MeCtx<'_, S>,
+        want: &dyn Fn(usize, usize, u32) -> i32,
+        max_depth: u32,
+        refs: TreeRefs<'_, S>,
+        x0: usize,
+        y0: usize,
+        log2: u32,
+        depth: u32,
+        src: &Srcs<'_, S>,
+        out: &mut Vec<TreeCu<PCuDecision>>,
+    ) -> f64 {
+        let qp = want(x0, y0, log2);
+        let cctx = IntraCtx { qp, ..*ctx };
+        let init = if matches!(refs, TreeRefs::B(..)) { 2 } else { 1 };
+        let lam = ssd_lambda(qp, ctx.bit_depth);
+        let (d, ssd, unit_bits) = self.tree_leaf(&cctx, refs, x0, y0, log2, depth, src);
+        let flag = if log2 > MIN_CB_LOG2 { crate::encode::h265::split_flag_bits(init, qp, false) } else { 0.0 };
+        let bits = unit_bits + flag;
+        let j_whole = ssd as f64 + lam * f64::from(bits);
+        if depth >= max_depth || log2 <= MIN_CB_LOG2 {
+            out.push(TreeCu { x0, y0, log2, depth, bits, d });
+            return j_whole;
+        }
+        let n = 1usize << log2;
+        let saved = TrialSave::take(self, x0, y0, n);
+        let mark = out.len();
+        let mut j_split = lam * f64::from(crate::encode::h265::split_flag_bits(init, qp, true));
+        let half = n / 2;
+        for i in 0..4 {
+            if j_split > j_whole {
+                break;
+            }
+            j_split += self.tree_node(ctx, want, max_depth, refs, x0 + (i & 1) * half, y0 + (i >> 1) * half, log2 - 1, depth + 1, src, out);
+        }
+        if j_whole <= j_split {
+            saved.put(self, x0, y0, n);
+            out.truncate(mark);
+            out.push(TreeCu { x0, y0, log2, depth, bits, d });
+            j_whole
+        } else {
+            j_split
+        }
+    }
+
+    /// Code the unit of `1 << log2` at `(x0, y0)` whole, as a quadtree
+    /// leaf: the decision (inter, or the intra one it handed over to), its
+    /// reconstruction SSD, and its counted syntax bits without the
+    /// `split_cu_flag`.
+    #[allow(clippy::too_many_arguments)]
+    fn tree_leaf(
+        &mut self,
+        ctx: &MeCtx<'_, S>,
+        refs: TreeRefs<'_, S>,
+        x0: usize,
+        y0: usize,
+        log2: u32,
+        depth: u32,
+        src: &Srcs<'_, S>,
+    ) -> (PCuDecision, u64, f32) {
+        let (d, nref, is_b) = match refs {
+            TreeRefs::P(l0) => {
+                (self.code_cu(ctx, l0, x0, y0, log2, depth, src.y, src.y_stride, src.cb, src.cr, src.c_stride), l0.len() as u32, false)
+            }
+            TreeRefs::B(r0, r1) => (self.code_cu_b(ctx, r0, r1, x0, y0, log2, depth, src.y, src.y_stride, src.cb, src.cr, src.c_stride), 1, true),
+        };
+        let coded = if matches!(d.kind, InterCuKind::UseIntra) {
+            PCuDecision::Intra(Box::new(self.code_cu_intra(ctx, x0, y0, log2, src.y, src.y_stride, src.cb, src.cr, src.c_stride)))
+        } else {
+            PCuDecision::Inter(d)
+        };
+        let ssd = cu_ssd(ctx, &self.recon, self.cat, x0, y0, 1 << log2, src);
+        let bits = crate::encode::h265::p_cu_bits(&coded, self.cat, ctx.qp, ctx.bypass, is_b, nref, depth);
+        (coded, ssd, bits)
+    }
+
     /// Greedy small-diamond SAD descent at full-sample positions, seeded
     /// at each of `seeds` (rounded toward zero to full samples, as the
     /// decoder's `>> 2` addresses them), returning the best vector in
@@ -1395,6 +1514,57 @@ impl<S: Sample> InterPicture<S> {
         let max = (1i32 << bd) - 1;
         (ctx.dsp.bi)(spred, n, spred14, spred14_b, n, n, 15 - bd as i32, max);
         (ctx.dist.satd)(src, src_stride, spred, n, n, n)
+    }
+}
+
+/// The references a coding-quadtree walk predicts from.
+pub enum TreeRefs<'r, S: Sample> {
+    /// A P slice's `RefPicList0`, nearest first.
+    P(&'r [&'r Frame<S>]),
+    /// A B slice's list-0 and list-1 anchors.
+    B(&'r Frame<S>, &'r Frame<S>),
+}
+
+impl<S: Sample> Clone for TreeRefs<'_, S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<S: Sample> Copy for TreeRefs<'_, S> {}
+
+/// Everything a coding trial over a square region of an inter picture
+/// writes, as the trial left it: the samples, the motion grid, and the
+/// `pred_mode`, `skip` and `intra_mode` marks. See
+/// [`InterPicture::code_ctu_tree`].
+struct TrialSave<S: Sample> {
+    planes: RegionSave<S>,
+    motion: Vec<MotionInfo>,
+    pred_mode: Vec<u8>,
+    skip: Vec<u8>,
+    intra_mode: Vec<u8>,
+}
+
+impl<S: Sample> TrialSave<S> {
+    fn take(pic: &InterPicture<S>, x0: usize, y0: usize, n: usize) -> Self {
+        let w4 = pic.info.w4;
+        TrialSave {
+            planes: RegionSave::take(&pic.recon, pic.cat, x0, y0, n),
+            motion: save4(&pic.recon.motion, pic.recon.w4, x0, y0, n),
+            pred_mode: save4(&pic.info.pred_mode, w4, x0, y0, n),
+            skip: save4(&pic.info.skip, w4, x0, y0, n),
+            intra_mode: save4(&pic.info.intra_mode, w4, x0, y0, n),
+        }
+    }
+
+    fn put(&self, pic: &mut InterPicture<S>, x0: usize, y0: usize, n: usize) {
+        let w4 = pic.info.w4;
+        self.planes.put(&mut pic.recon, pic.cat, x0, y0, n);
+        let mw4 = pic.recon.w4;
+        restore4(&mut pic.recon.motion, mw4, x0, y0, n, &self.motion);
+        restore4(&mut pic.info.pred_mode, w4, x0, y0, n, &self.pred_mode);
+        restore4(&mut pic.info.skip, w4, x0, y0, n, &self.skip);
+        restore4(&mut pic.info.intra_mode, w4, x0, y0, n, &self.intra_mode);
     }
 }
 

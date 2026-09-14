@@ -634,6 +634,257 @@ impl<S: Sample> IntraPicture<S> {
     pub fn mpm_list(&self, xp: usize, yp: usize) -> [u32; 3] {
         mpm_candidates(self.geo, &self.modes, None, xp, yp)
     }
+
+    /// Decide and code the CTB at `(cu_x, cu_y)` (in CTB units) as a coding
+    /// quadtree: at every node from the CTB down to `max_depth` levels
+    /// below it — never below the 8x8 minimum coding block — the node is
+    /// coded whole, then as four quarter-size nodes, and the cheaper by
+    /// rate-distortion cost is kept. Returns the coding units in decode
+    /// (z-scan) order, each placed; the reconstruction and the mode grid
+    /// are left holding exactly those units.
+    ///
+    /// The cost is `SSD + lambda * bits`: the reconstruction's squared
+    /// error over every plane of the unit, and the rate the production
+    /// writer counts for the unit's syntax under the slice's initial
+    /// contexts (`h265::intra_cu_bits`) plus its `split_cu_flag`. `lambda`
+    /// is `ssd_lambda`, the Lagrangian the transform-split decision and
+    /// the rate-distortion quantiser already pair with a true SSD, at the
+    /// quantiser `want` gives the node — the picture's, or the one adaptive
+    /// quantisation wants for the node's quantisation group.
+    ///
+    /// Trying both shapes never recomputes the loser. A trial reads only
+    /// samples outside its node or samples it wrote itself — the z-scan
+    /// availability order guarantees it — so the split trial simply
+    /// overwrites the whole one, and when the whole node wins its samples
+    /// and modes are put back from a copy (`RegionSave`). The split trial
+    /// also stops as soon as its running cost exceeds the whole node's:
+    /// every remaining child costs at least zero, so the answer is already
+    /// known, and stopping changes the time and nothing else.
+    #[allow(clippy::too_many_arguments)]
+    pub fn code_ctu_tree(
+        &mut self,
+        ctx: &IntraCtx<'_, S>,
+        want: &dyn Fn(usize, usize, u32) -> i32,
+        max_depth: u32,
+        cu_x: usize,
+        cu_y: usize,
+        src: &Srcs<'_, S>,
+    ) -> Vec<TreeCu<CuDecision>> {
+        let log2 = self.geo.log2_ctb;
+        let mut out = Vec::new();
+        self.tree_node(ctx, want, max_depth, cu_x << log2, cu_y << log2, log2, 0, src, &mut out);
+        out
+    }
+
+    /// One node of [`Self::code_ctu_tree`]: returns its cost, having
+    /// pushed its winning units onto `out`.
+    #[allow(clippy::too_many_arguments)]
+    fn tree_node(
+        &mut self,
+        ctx: &IntraCtx<'_, S>,
+        want: &dyn Fn(usize, usize, u32) -> i32,
+        max_depth: u32,
+        x0: usize,
+        y0: usize,
+        log2: u32,
+        depth: u32,
+        src: &Srcs<'_, S>,
+        out: &mut Vec<TreeCu<CuDecision>>,
+    ) -> f64 {
+        let qp = want(x0, y0, log2);
+        let cctx = IntraCtx { qp, ..*ctx };
+        let lam = ssd_lambda(qp, ctx.bit_depth);
+        let (d, ssd, unit_bits) = self.tree_leaf(&cctx, x0, y0, log2, src);
+        // The unit's own `split_cu_flag`, 0, exists above the minimum
+        // coding block only.
+        let flag = if log2 > MIN_CB_LOG2 { crate::encode::h265::split_flag_bits(0, qp, false) } else { 0.0 };
+        let bits = unit_bits + flag;
+        let j_whole = ssd as f64 + lam * f64::from(bits);
+        if depth >= max_depth || log2 <= MIN_CB_LOG2 {
+            out.push(TreeCu { x0, y0, log2, depth, bits, d });
+            return j_whole;
+        }
+        let n = 1usize << log2;
+        let (cat, w4) = (self.geo.cat, self.geo.w4);
+        let saved = RegionSave::take(&self.recon, cat, x0, y0, n);
+        let saved_modes = save4(&self.modes, w4, x0, y0, n);
+        let mark = out.len();
+        let mut j_split = lam * f64::from(crate::encode::h265::split_flag_bits(0, qp, true));
+        let half = n / 2;
+        for i in 0..4 {
+            if j_split > j_whole {
+                break;
+            }
+            j_split += self.tree_node(ctx, want, max_depth, x0 + (i & 1) * half, y0 + (i >> 1) * half, log2 - 1, depth + 1, src, out);
+        }
+        if j_whole <= j_split {
+            saved.put(&mut self.recon, cat, x0, y0, n);
+            restore4(&mut self.modes, w4, x0, y0, n, &saved_modes);
+            out.truncate(mark);
+            out.push(TreeCu { x0, y0, log2, depth, bits, d });
+            j_whole
+        } else {
+            j_split
+        }
+    }
+
+    /// Code the unit of `1 << log2` at `(x0, y0)` whole, as a quadtree
+    /// leaf: the decision, its reconstruction SSD, and its counted syntax
+    /// bits without the `split_cu_flag`.
+    fn tree_leaf(&mut self, ctx: &IntraCtx<'_, S>, x0: usize, y0: usize, log2: u32, src: &Srcs<'_, S>) -> (CuDecision, u64, f32) {
+        let geo = self.geo;
+        let split_depth = self.split_depth;
+        let IntraPicture { recon, modes, scratch, .. } = self;
+        let d = code_cu_2nx2n_intra(ctx, geo, recon, modes, None, scratch, split_depth, x0, y0, log2, src.y, src.y_stride, src.cb, src.cr, src.c_stride);
+        let ssd = cu_ssd(ctx, recon, geo.cat, x0, y0, 1 << log2, src);
+        let bits = crate::encode::h265::intra_cu_bits(&d, geo.cat, ctx.qp, ctx.bypass);
+        (d, ssd, bits)
+    }
+}
+
+/// log2 of the smallest coding block this encoder's SPS declares
+/// (`log2_min_luma_coding_block_size_minus3` 0): 8x8, where `split_cu_flag`
+/// stops being coded and an intra unit's `part_mode` starts.
+pub(crate) const MIN_CB_LOG2: u32 = 3;
+
+/// One coding unit of a coded CTB, placed.
+///
+/// Under the coding quadtree a CTB holds units of several sizes, so a
+/// decision alone no longer says where it lives. A CTB's units are kept in
+/// decode (z-scan) order, which is also the order the quadtree walk reads
+/// them back in; the quadtree itself is implicit in the placements — a
+/// node is split exactly when no unit covers it whole.
+#[derive(Clone)]
+pub struct TreeCu<D> {
+    /// Luma position of the unit's top-left sample.
+    pub x0: usize,
+    /// See `x0`.
+    pub y0: usize,
+    /// log2 of the unit's size.
+    pub log2: u32,
+    /// Depth in the coding quadtree, `CtDepth`: 0 for a whole CTB.
+    pub depth: u32,
+    /// The rate the split decision priced this unit at, in fractional
+    /// bits — its syntax and its own `split_cu_flag` — kept for the
+    /// census's model check. 0 where no tree decision was made.
+    pub bits: f32,
+    /// How the unit was coded.
+    pub d: D,
+}
+
+impl<D> TreeCu<D> {
+    /// One whole-CTB unit per decision, in raster CTB order: the geometry
+    /// every stream had before the coding quadtree, and the one a
+    /// `max_cu_depth` of 0 still codes.
+    pub fn whole_ctbs(decisions: impl IntoIterator<Item = D>, log2_ctb: u32, ctbs_wide: usize) -> Vec<TreeCu<D>> {
+        decisions
+            .into_iter()
+            .enumerate()
+            .map(|(i, d)| TreeCu { x0: (i % ctbs_wide) << log2_ctb, y0: (i / ctbs_wide) << log2_ctb, log2: log2_ctb, depth: 0, bits: 0.0, d })
+            .collect()
+    }
+}
+
+/// The source planes a picture is coded from: luma at its stride, the two
+/// chroma planes at theirs — empty slices in monochrome, never indexed.
+#[derive(Clone, Copy)]
+pub struct Srcs<'a, S: Sample> {
+    /// Luma.
+    pub y: &'a [S],
+    /// Luma stride.
+    pub y_stride: usize,
+    /// Cb.
+    pub cb: &'a [S],
+    /// Cr.
+    pub cr: &'a [S],
+    /// Chroma stride.
+    pub c_stride: usize,
+}
+
+/// A square region of a reconstruction as a coding trial left it — luma
+/// `n` by `n` at `(x0, y0)` and the chroma those samples cover — so that a
+/// losing trial is undone by putting the winner's samples back rather than
+/// by coding the winner again.
+pub(crate) struct RegionSave<S: Sample> {
+    y: Vec<S>,
+    cb: Vec<S>,
+    cr: Vec<S>,
+}
+
+impl<S: Sample> RegionSave<S> {
+    /// Copy the region out of `f`, whose `ChromaArrayType` is `cat`.
+    pub(crate) fn take(f: &Frame<S>, cat: u32, x0: usize, y0: usize, n: usize) -> Self {
+        let (sw, sh) = sub_wh(cat);
+        let chroma = |p: &Plane16<S>| if cat == 0 { Vec::new() } else { copy_out(p, x0 / sw, y0 / sh, n / sw, n / sh) };
+        RegionSave { y: copy_out(&f.y, x0, y0, n, n), cb: chroma(&f.cb), cr: chroma(&f.cr) }
+    }
+
+    /// Put the region back where [`RegionSave::take`] found it.
+    pub(crate) fn put(&self, f: &mut Frame<S>, cat: u32, x0: usize, y0: usize, n: usize) {
+        copy_in(&mut f.y, x0, y0, n, n, &self.y);
+        if cat != 0 {
+            let (sw, sh) = sub_wh(cat);
+            copy_in(&mut f.cb, x0 / sw, y0 / sh, n / sw, n / sh, &self.cb);
+            copy_in(&mut f.cr, x0 / sw, y0 / sh, n / sw, n / sh, &self.cr);
+        }
+    }
+}
+
+fn copy_out<S: Sample>(p: &Plane16<S>, x: usize, y: usize, w: usize, h: usize) -> Vec<S> {
+    let mut v = Vec::with_capacity(w * h);
+    for r in 0..h {
+        let o = p.offset(x as isize, (y + r) as isize);
+        v.extend_from_slice(&p.data[o..o + w]);
+    }
+    v
+}
+
+fn copy_in<S: Sample>(p: &mut Plane16<S>, x: usize, y: usize, w: usize, h: usize, v: &[S]) {
+    for r in 0..h {
+        let o = p.offset(x as isize, (y + r) as isize);
+        p.data[o..o + w].copy_from_slice(&v[r * w..(r + 1) * w]);
+    }
+}
+
+/// Copy the per-4x4 entries of the square luma region `n` by `n` at
+/// `(x0, y0)` out of a picture grid `w4` entries wide.
+pub(crate) fn save4<T: Copy>(grid: &[T], w4: usize, x0: usize, y0: usize, n: usize) -> Vec<T> {
+    let (bx, by, k) = (x0 >> 2, y0 >> 2, n >> 2);
+    (0..k * k).map(|i| grid[(by + i / k) * w4 + bx + i % k]).collect()
+}
+
+/// Put back what [`save4`] copied out.
+pub(crate) fn restore4<T: Copy>(grid: &mut [T], w4: usize, x0: usize, y0: usize, n: usize, saved: &[T]) {
+    let (bx, by, k) = (x0 >> 2, y0 >> 2, n >> 2);
+    for (i, &v) in saved.iter().enumerate() {
+        grid[(by + i / k) * w4 + bx + i % k] = v;
+    }
+}
+
+/// The squared error of a unit's reconstruction against its source, over
+/// luma and every chroma plane the format has — the distortion half of the
+/// quadtree's cost.
+pub(crate) fn cu_ssd<S: Sample>(ctx: &IntraCtx<'_, S>, recon: &Frame<S>, cat: u32, x0: usize, y0: usize, n: usize, src: &Srcs<'_, S>) -> u64 {
+    let yo = recon.y.offset(x0 as isize, y0 as isize);
+    let mut ssd = (ctx.dist.ssd)(&src.y[y0 * src.y_stride + x0..], src.y_stride, &recon.y.data[yo..], recon.y.stride, n, n);
+    if cat != 0 {
+        let (sw, sh) = sub_wh(cat);
+        let (cx, cy) = (x0 / sw, y0 / sh);
+        for (p, s) in [(&recon.cb, src.cb), (&recon.cr, src.cr)] {
+            let o = p.offset(cx as isize, cy as isize);
+            ssd += (ctx.dist.ssd)(&s[cy * src.c_stride + cx..], src.c_stride, &p.data[o..], p.stride, n / sw, n / sh);
+        }
+    }
+    ssd
+}
+
+/// The Lagrangian every SSD-against-bits comparison here pairs with a
+/// true SSD — the conventional `0.85 * 2^((QP - 12) / 3)` of the
+/// transform-split decision and the rate-distortion quantiser, scaled for
+/// depth by [`ssd_lambda_scale`] — in `f64`, the width the quadtree's
+/// summed costs are kept in.
+pub(crate) fn ssd_lambda(qp: i32, bit_depth: u32) -> f64 {
+    f64::from(0.85f32 * ((qp - 12) as f32 / 3.0).exp2() * ssd_lambda_scale(bit_depth))
 }
 
 /// Decide and code one `PART_2Nx2N` intra CU at luma `(x0, y0)`, leaving
@@ -683,6 +934,12 @@ pub(crate) fn code_cu_2nx2n_intra<S: Sample>(
     c_stride: usize,
 ) -> CuDecision {
     let n = 1usize << log2_cu;
+    // An 8x8 unit is the minimum coding block: one level of transform
+    // split would put its luma at 4x4, where the reader codes 4:2:0 and
+    // 4:2:2 chroma once at the parent (`transform_unit`'s `blk_idx == 3`
+    // arm), a shape the split trial below does not model. The four-4x4
+    // shape that pays there is `PART_NxN`, with a mode per block.
+    let split_depth = if log2_cu == MIN_CB_LOG2 { 0 } else { split_depth };
     // The chroma sources at this CU, or empty slices in monochrome —
     // where every chroma step below is skipped and they are never
     // indexed, mirroring the reader's uniform `chroma_array_type != 0`

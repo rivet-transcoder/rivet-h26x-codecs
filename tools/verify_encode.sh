@@ -433,6 +433,30 @@ hevc10-hlg-ipb@p10|--codec h265 --qp 26 --gop 8 --bframes 2 --color 9:18:9
 hevc10-hlg-topleft-ip@420p10|--codec h265 --qp 26 --gop 8 --color 9:18:9 --chroma-loc 2
 abr-64k-cpb250-hdr10-sei@src_cut|--codec h264 --bitrate 64000 --cpb-ms 250 --gop 8 --color 9:16:9 --mastering-display G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1) --content-light 1000,400
 hevc10-hdr10-sei-ip@p10|--codec h265 --qp 26 --gop 8 --color 9:16:9 --mastering-display G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1) --content-light 1000,400
+hevc-cu2-intra|--codec h265 --qp 26 --gop 0 --cu-depth 2
+hevc-cu2-ip|--codec h265 --qp 26 --gop 8 --cu-depth 2
+hevc-cu2-ipb|--codec h265 --qp 26 --gop 8 --bframes 2 --cu-depth 2
+hevc-cu1-ipb|--codec h265 --qp 26 --gop 8 --bframes 2 --cu-depth 1
+hevc-cu2-40-intra|--codec h265 --qp 40 --gop 0 --cu-depth 2
+hevc-cu2-40-ip|--codec h265 --qp 40 --gop 8 --cu-depth 2
+hevc-cu2-lossless-ipb|--codec h265 --lossless --gop 8 --bframes 2 --cu-depth 2
+hevc-cu2-40-sao-ip|--codec h265 --qp 40 --gop 8 --sao --cu-depth 2
+hevc-cu2-aq-ipb|--codec h265 --qp 26 --gop 8 --bframes 2 --aq 1.0 --cu-depth 2
+hevc-cu2-aq40-ip|--codec h265 --qp 40 --gop 8 --aq 1.0 --cu-depth 2
+hevc-cu2-abr-64k|--codec h265 --bitrate 64000 --gop 8 --cu-depth 2
+hevc-cu2-refs2-ip|--codec h265 --qp 26 --gop 8 --refs 2 --cu-depth 2
+hevc-cu2-vbv-125@src_cut|--codec h265 --bitrate 64000 --cpb-ms 125 --gop 8 --cu-depth 2
+hevc-cu2-wp-ipb@fade|--codec h265 --qp 26 --gop 8 --bframes 2 --wpred --cu-depth 2
+hevc10-cu2-ipb@p10|--codec h265 --qp 26 --gop 8 --bframes 2 --cu-depth 2
+hevc10-cu2-aq-ip@p10|--codec h265 --qp 26 --gop 8 --aq 1.0 --cu-depth 2
+hevc10-cu2-lossless-ip@p10|--codec h265 --lossless --gop 8 --cu-depth 2
+hevc12-cu2-40-sao-ip@p12|--codec h265 --qp 40 --gop 8 --sao --cu-depth 2
+hevc-cu0-intra@big|--codec h265 --qp 26 --gop 0
+hevc-cu0-ipb@big|--codec h265 --qp 26 --gop 8 --bframes 2
+hevc-cu2-intra@big|--codec h265 --qp 26 --gop 0 --cu-depth 2
+hevc-cu2-ipb@big|--codec h265 --qp 26 --gop 8 --bframes 2 --cu-depth 2
+hevc-cu2-aq40-ipb@big|--codec h265 --qp 40 --gop 8 --bframes 2 --aq 1.0 --cu-depth 2
+hevc-cu2-40-sao-ip@big|--codec h265 --qp 40 --gop 8 --sao --cu-depth 2
 "}
 
 # Split a clip's format token into its chroma format and sample depth:

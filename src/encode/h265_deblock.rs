@@ -47,7 +47,7 @@
 
 use std::sync::Arc;
 
-use crate::encode::h265_intra::{luma_tbs, z_within_ctb, CuDecision, IntraCtx, IntraPicture};
+use crate::encode::h265_intra::{luma_tbs, z_within_ctb, CuDecision, IntraCtx, IntraPicture, TreeCu};
 use crate::encode::h265_me::{InterPicture, PCuDecision};
 use crate::hevc::deblock::{deblock_rows, DeblockScratch};
 use crate::hevc::frame::Frame;
@@ -73,8 +73,8 @@ use crate::sample::Sample;
 /// and reads the same arrays — the CTB slice marks, the filter-exempt map,
 /// the geometry — so handing them on is what keeps the two filters
 /// agreeing about the picture rather than each building its own idea of it.
-pub fn deblock_picture<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &mut IntraPicture<S>, decisions: &[CuDecision]) -> PicInfo {
-    let mut info = build_info(pic, decisions);
+pub fn deblock_picture<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &mut IntraPicture<S>, cus: &[TreeCu<CuDecision>]) -> PicInfo {
+    let mut info = build_info(pic, cus);
     run_filter(ctx, &mut pic.recon, &info);
     info.sao.fill([crate::hevc::pic::SaoParams::default(); 3]);
     info
@@ -104,16 +104,13 @@ pub fn deblock_picture<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &mut IntraPicture<
 /// `pic.info`, stored by the walk when it chose intra, and that is what
 /// gives every one of its edges boundary strength 2 (8.7.2.4
 /// short-circuits on intra before it looks at cbf or motion).
-pub fn deblock_inter_picture<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &mut InterPicture<S>, decisions: &[PCuDecision]) {
-    let n = 1usize << pic.log2_ctb;
-    let (wc, hc) = (pic.recon.width >> pic.log2_ctb, pic.recon.height >> pic.log2_ctb);
+pub fn deblock_inter_picture<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &mut InterPicture<S>, cus: &[TreeCu<PCuDecision>]) {
     let w4 = pic.recon.width / 4;
-    let mut di = 0;
-    for cy in 0..hc {
-        for cx in 0..wc {
-            let d = &decisions[di];
-            di += 1;
-            let (x0, y0) = (cx * n, cy * n);
+    {
+        for cu in cus {
+            let d = &cu.d;
+            let n = 1usize << cu.log2;
+            let (x0, y0) = (cu.x0, cu.y0);
             // The mirror of coding_unit's bookkeeping block for one
             // 2Nx2N CU: the QP over the CU — the decision's `QpY`, which
             // is the picture quantiser unless the picture varies it per
@@ -257,10 +254,9 @@ fn run_filter<S: Sample>(ctx: &IntraCtx<'_, S>, recon: &mut Frame<S>, info: &Pic
 /// encoder does — identity CTB scan, single tile, and `min_tb_addr_zs`
 /// from [`z_within_ctb`], the interleave the availability tests hold
 /// against `Geometry`'s own construction.
-fn build_info<S: Sample>(pic: &IntraPicture<S>, decisions: &[CuDecision]) -> PicInfo {
+fn build_info<S: Sample>(pic: &IntraPicture<S>, cus: &[TreeCu<CuDecision>]) -> PicInfo {
     let (w, h) = (pic.recon.width, pic.recon.height);
     let log2 = pic.log2_ctb;
-    let n = 1usize << log2;
     let (w4, h4) = (w / 4, h / 4);
     let (wc, hc) = (w >> log2, h >> log2);
     let shift = log2 - 2;
@@ -290,12 +286,11 @@ fn build_info<S: Sample>(pic: &IntraPicture<S>, decisions: &[CuDecision]) -> Pic
     // `slices[0]` stays `SliceFilterParams::default()`: filtering enabled,
     // zero offsets — the parameters our headers declare.
 
-    let mut di = 0;
-    for cy in 0..hc {
-        for cx in 0..wc {
-            let d = &decisions[di];
-            di += 1;
-            let (x0, y0) = (cx * n, cy * n);
+    {
+        for cu in cus {
+            let d = &cu.d;
+            let n = 1usize << cu.log2;
+            let (x0, y0) = (cu.x0, cu.y0);
             PicInfo::fill4(&mut info.pred_mode, w4, x0, y0, n, n, 1u8);
             PicInfo::fill4(&mut info.qp_y, w4, x0, y0, n, n, d.qp_y as i8);
             if d.bypass {
@@ -411,7 +406,7 @@ mod tests {
             let (w, h) = (2 * n, 2 * n);
             let (mut pic, decisions) = synthetic(w, h, log2_cu, ChromaFormat::Yuv420, &|_, _| 128);
             let before = luma_snapshot(&pic);
-            deblock_picture(&ctx, &mut pic, &decisions);
+            { let cus = TreeCu::whole_ctbs(decisions.clone(), pic.log2_ctb, pic.recon.width >> pic.log2_ctb); deblock_picture(&ctx, &mut pic, &cus) };
             assert_eq!(before, luma_snapshot(&pic), "log2_cu={log2_cu}");
             for plane in [&pic.recon.cb, &pic.recon.cr] {
                 let o = plane.origin();
@@ -440,7 +435,7 @@ mod tests {
             let (w, h) = (2 * n, n);
             let (mut pic, decisions) = synthetic(w, h, log2_cu, ChromaFormat::Yuv420, &|x, _| if x < n { 120 } else { 126 });
             let before = luma_snapshot(&pic);
-            deblock_picture(&ctx, &mut pic, &decisions);
+            { let cus = TreeCu::whole_ctbs(decisions.clone(), pic.log2_ctb, pic.recon.width >> pic.log2_ctb); deblock_picture(&ctx, &mut pic, &cus) };
             let after = luma_snapshot(&pic);
             assert_ne!(before, after, "log2_cu={log2_cu}: the small step was not filtered");
             for y in 0..h {
@@ -459,7 +454,7 @@ mod tests {
 
             let (mut pic, decisions) = synthetic(w, h, log2_cu, ChromaFormat::Yuv420, &|x, _| if x < n { 120 } else { 250 });
             let before = luma_snapshot(&pic);
-            deblock_picture(&ctx, &mut pic, &decisions);
+            { let cus = TreeCu::whole_ctbs(decisions.clone(), pic.log2_ctb, pic.recon.width >> pic.log2_ctb); deblock_picture(&ctx, &mut pic, &cus) };
             assert_eq!(before, luma_snapshot(&pic), "log2_cu={log2_cu}: a real edge was smoothed away");
         }
     }
@@ -481,13 +476,13 @@ mod tests {
 
             let (mut pic, decisions) = synthetic(w, h, log2_cu, ChromaFormat::Yuv420, step);
             let before = luma_snapshot(&pic);
-            deblock_picture(&ctx, &mut pic, &decisions);
+            { let cus = TreeCu::whole_ctbs(decisions.clone(), pic.log2_ctb, pic.recon.width >> pic.log2_ctb); deblock_picture(&ctx, &mut pic, &cus) };
             assert_eq!(before, luma_snapshot(&pic), "log2_cu={log2_cu}: an unsplit CU has no interior edge to filter");
 
             let (mut pic, mut decisions) = synthetic(w, h, log2_cu, ChromaFormat::Yuv420, step);
             decisions[0].split_tu = true;
             let before = luma_snapshot(&pic);
-            deblock_picture(&ctx, &mut pic, &decisions);
+            { let cus = TreeCu::whole_ctbs(decisions.clone(), pic.log2_ctb, pic.recon.width >> pic.log2_ctb); deblock_picture(&ctx, &mut pic, &cus) };
             let after = luma_snapshot(&pic);
             assert_ne!(before, after, "log2_cu={log2_cu}: the split's interior edge was not filtered");
             let mid = n / 2;
@@ -511,7 +506,7 @@ mod tests {
             d.bypass = true;
         }
         let before = luma_snapshot(&pic);
-        deblock_picture(&ctx, &mut pic, &decisions);
+        { let cus = TreeCu::whole_ctbs(decisions.clone(), pic.log2_ctb, pic.recon.width >> pic.log2_ctb); deblock_picture(&ctx, &mut pic, &cus) };
         assert_eq!(before, luma_snapshot(&pic), "a lossless picture was filtered");
     }
 
@@ -589,7 +584,7 @@ mod tests {
             let n = h; // one CTB row: CTB size == h by the writer's choice
             let (mut pic, decisions) = synthetic_p(w, h, &|x, _| if x < n { 120 } else { 126 }, &|_, _| 128);
             let before = luma_snapshot_p(&pic);
-            deblock_inter_picture(&ctx, &mut pic, &decisions);
+            { let cus = TreeCu::whole_ctbs(decisions.clone(), pic.log2_ctb, pic.recon.width >> pic.log2_ctb); deblock_inter_picture(&ctx, &mut pic, &cus) };
             assert_eq!(before, luma_snapshot_p(&pic), "{w}x{h}: a bS-0 edge was filtered");
         }
     }
@@ -619,7 +614,7 @@ mod tests {
             d1.rqt_root_cbf = true;
             d1.cbf_luma = true;
             let before = luma_snapshot_p(&pic);
-            deblock_inter_picture(&ctx, &mut pic, &decisions);
+            { let cus = TreeCu::whole_ctbs(decisions.clone(), pic.log2_ctb, pic.recon.width >> pic.log2_ctb); deblock_inter_picture(&ctx, &mut pic, &cus) };
             let after = luma_snapshot_p(&pic);
             assert_ne!(before, after, "{w}x{h}: a bS-1 edge was not filtered");
             for y in 0..h {
@@ -656,7 +651,7 @@ mod tests {
             let w4 = pic.recon.w4;
             fill_motion(&mut pic.recon.motion, w4, n, 0, n, h, mi);
             let before = luma_snapshot_p(&pic);
-            deblock_inter_picture(&ctx, &mut pic, &decisions);
+            { let cus = TreeCu::whole_ctbs(decisions.clone(), pic.log2_ctb, pic.recon.width >> pic.log2_ctb); deblock_inter_picture(&ctx, &mut pic, &cus) };
             let changed = before != luma_snapshot_p(&pic);
             assert_eq!(changed, expect_filtered, "delta {delta}: filtered={changed}");
         }
@@ -717,7 +712,7 @@ mod tests {
             "a source equal to its reference should skip everywhere"
         );
         let before = luma_snapshot_p(&pic);
-        deblock_inter_picture(&ctx, &mut pic, &decisions);
+        { let cus = TreeCu::whole_ctbs(decisions.clone(), pic.log2_ctb, pic.recon.width >> pic.log2_ctb); deblock_inter_picture(&ctx, &mut pic, &cus) };
         assert_eq!(before, luma_snapshot_p(&pic), "a pure-skip picture was filtered");
     }
 
@@ -755,7 +750,7 @@ mod tests {
                 }
             }
             let before = luma_snapshot(&pic);
-            deblock_picture(&ctx, &mut pic, &decisions);
+            { let cus = TreeCu::whole_ctbs(decisions.clone(), pic.log2_ctb, pic.recon.width >> pic.log2_ctb); deblock_picture(&ctx, &mut pic, &cus) };
             let after = luma_snapshot(&pic);
             assert_ne!(before, after, "log2_cu={log2_cu}: filtering a coded noisy picture changed nothing");
             // Within three samples of an interior 8-grid line, on either
