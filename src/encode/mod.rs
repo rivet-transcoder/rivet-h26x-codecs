@@ -367,15 +367,26 @@ pub struct Config {
     /// access unit, or `None` for none.
     pub content_light: Option<ContentLightLevel>,
     /// H.265 only: how many levels the coding quadtree may split a coding
-    /// tree block into smaller coding units. 0 codes one unit per CTB —
-    /// the geometry every stream had before the quadtree existed, and
-    /// byte-identical to it; 1 lets a unit halve once; 2 twice. A split
-    /// never goes below the 8x8 minimum coding block the SPS declares, so a
-    /// 16x16 CTB (the encoder chooses one for small or oddly sized
-    /// pictures) splits at most once whatever this asks, and the census
-    /// line reports the depths each picture kind actually took. Every node
-    /// is a rate-distortion decision, which costs encode time.
-    pub max_cu_depth: u32,
+    /// tree block into smaller coding units, or `None` for the encoder's
+    /// default — [`h265::DEFAULT_CU_DEPTH`], 2. `Some(0)` codes one unit
+    /// per CTB, the geometry every stream had before the quadtree existed
+    /// and byte-identical to it; `Some(1)` lets a unit halve once, `Some(2)`
+    /// twice. A split never goes below the 8x8 minimum coding block the SPS
+    /// declares, so a 16x16 CTB (the encoder chooses one for small or oddly
+    /// sized pictures) splits at most once whatever this asks, and the
+    /// census line reports the depths each picture kind actually took.
+    ///
+    /// Every node is a rate-distortion decision, which is what the default
+    /// buys and costs: against `Some(0)`, depth 2 measured -29% BD-rate
+    /// all-intra and -36% IP for 2.8-3.1x the CPU all-intra and 4.5-6x
+    /// IPB; depth 1 half the saving for about twice the CPU (see
+    /// `encode::h265`). A caller that needs throughput asks for less.
+    ///
+    /// An `Option` rather than a number because H.264 has no quadtree: the
+    /// H.264 encoder refuses `Some(n)` with `n > 0` by name, and a number
+    /// defaulting to 2 would have made every default configuration one it
+    /// refuses.
+    pub max_cu_depth: Option<u32>,
 }
 
 impl Default for Config {
@@ -403,7 +414,7 @@ impl Default for Config {
             chroma_loc: None,
             mastering_display: None,
             content_light: None,
-            max_cu_depth: 0,
+            max_cu_depth: None,
         }
     }
 }
@@ -441,7 +452,7 @@ impl Config {
                 "encode: chroma_loc is a 4:2:0 siting (E.2.1: chroma_loc_info_present_flag should be 0 for any other format)",
             ));
         }
-        if self.max_cu_depth > 2 {
+        if self.max_cu_depth.is_some_and(|d| d > 2) {
             return Err(crate::Error::unsupported(
                 "encode: max_cu_depth above 2 (a coding tree block of at most 32x32 reaches the 8x8 minimum coding block in two splits)",
             ));
