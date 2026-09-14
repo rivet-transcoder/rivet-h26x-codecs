@@ -325,6 +325,12 @@ pub fn parse_st_rps(r: &mut BitReader, idx: usize, num_sets: usize, sets: &[StRp
 /// VUI fields the decoder uses.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Vui {
+    /// `video_signal_type_present_flag`: the stream states its video format
+    /// and range, with or without a colour description. Without it
+    /// `full_range` is the value E.3.1 infers (0), not something the stream
+    /// said — which a consumer choosing between the stream and a container
+    /// needs to tell apart.
+    pub video_signal_type: bool,
     /// `video_full_range_flag`.
     pub full_range: bool,
     /// `(colour_primaries, transfer_characteristics, matrix_coeffs)`.
@@ -476,6 +482,8 @@ fn parse_vui(r: &mut BitReader, max_sub_layers_minus1: u32) -> Vui {
         r.flag(); // overscan_appropriate
     }
     if r.flag() {
+        // video_signal_type_present_flag
+        vui.video_signal_type = true;
         r.bits(3);
         vui.full_range = r.flag();
         if r.flag() {
@@ -878,5 +886,47 @@ impl Sps {
             vui,
             range_ext,
         })
+    }
+}
+
+#[cfg(test)]
+mod vui_signal_type_tests {
+    use super::*;
+
+    /// An SPS NAL unit (its two header bytes included, no start code) → its
+    /// VUI.
+    fn vui(nal: &[u8]) -> Vui {
+        let rbsp = crate::nal::unescape_rbsp(nal);
+        Sps::parse(&rbsp[2..]).expect("SPS parses").vui.expect("VUI present")
+    }
+
+    /// ffmpeg 8.1.1 libx265, 64x64 testsrc2, `-color_range pc` and no other
+    /// colour option. trace_headers: video_signal_type_present_flag=1
+    /// video_full_range_flag=1 colour_description_present_flag=0.
+    const FULL_RANGE_ONLY: &[u8] = &[
+        0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00,
+        0x03, 0x00, 0x1e, 0xa0, 0x20, 0x81, 0x05, 0x96, 0x56, 0x69, 0x24, 0xca, 0xf0, 0x16, 0xc0,
+        0x80, 0x00, 0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x0f, 0x04,
+    ];
+    /// The same encode without `-color_range`: x265 still signals the video
+    /// signal type, limited range. trace_headers:
+    /// video_signal_type_present_flag=1 video_full_range_flag=0
+    /// colour_description_present_flag=0.
+    const LIMITED_RANGE_ONLY: &[u8] = &[
+        0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00,
+        0x03, 0x00, 0x1e, 0xa0, 0x20, 0x81, 0x05, 0x96, 0x56, 0x69, 0x24, 0xca, 0xf0, 0x16, 0x80,
+        0x80, 0x00, 0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x0f, 0x04,
+    ];
+
+    #[test]
+    fn a_range_without_a_colour_description_is_a_signalled_range() {
+        let v = vui(FULL_RANGE_ONLY);
+        assert!(v.video_signal_type);
+        assert!(v.full_range);
+        assert_eq!(v.colour_description, None);
+        let v = vui(LIMITED_RANGE_ONLY);
+        assert!(v.video_signal_type, "a signalled limited range is still signalled");
+        assert!(!v.full_range);
+        assert_eq!(v.colour_description, None);
     }
 }
