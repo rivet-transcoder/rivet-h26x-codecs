@@ -76,7 +76,10 @@ fn cfi_of(chroma: ChromaFormat) -> u32 {
 }
 
 /// Everything after `mb_type` for an intra macroblock — shared by the
-/// I-slice path and intra-in-P, exactly as the readers share it.
+/// I-slice path and intra-in-P, exactly as the readers share it. `field`:
+/// a field macroblock, whose residual takes the field scans and the
+/// field-coded significance contexts.
+#[allow(clippy::too_many_arguments)]
 fn write_intra_body(
     e: &mut CabacEncoder,
     st: &mut CabacState,
@@ -86,6 +89,7 @@ fn write_intra_body(
     cfi: u32,
     t8x8_mode: bool,
     bit_depth: u32,
+    field: bool,
 ) {
     let chroma = cfi == 1 || cfi == 2;
     let chroma_nb = chroma.then(|| {
@@ -114,7 +118,7 @@ fn write_intra_body(
     if has_residual {
         write_mb_qp_delta_cabac(e, st, d.qp_delta as i32, bit_depth);
         st.prev_qp_delta_nonzero = d.qp_delta != 0;
-        write_intra_residual_cabac(e, st, false, cfi, d, lnb, anb);
+        write_intra_residual_cabac(e, st, field, cfi, d, lnb, anb);
     } else {
         st.prev_qp_delta_nonzero = false;
     }
@@ -134,6 +138,7 @@ fn write_p16_body(
     cfi: u32,
     t8x8_mode: bool,
     bit_depth: u32,
+    field: bool,
 ) {
     debug_assert!(
         !matches!(d.kind, InterMbKind::PSkip | InterMbKind::UseIntra),
@@ -175,7 +180,7 @@ fn write_p16_body(
     if d.cbp_luma != 0 || d.cbp_chroma != 0 {
         write_mb_qp_delta_cabac(e, st, d.qp_delta as i32, bit_depth);
         st.prev_qp_delta_nonzero = d.qp_delta != 0;
-        write_inter_residual_cabac(e, st, false, cfi, d, lnb, anb);
+        write_inter_residual_cabac(e, st, field, cfi, d, lnb, anb);
     } else {
         st.prev_qp_delta_nonzero = false;
     }
@@ -201,6 +206,7 @@ fn write_b_body(
     cfi: u32,
     t8x8_mode: bool,
     bit_depth: u32,
+    field: bool,
 ) {
     debug_assert!(
         !matches!(d.kind, BMbKind::BSkip | BMbKind::UseIntra),
@@ -246,7 +252,7 @@ fn write_b_body(
         write_mb_qp_delta_cabac(e, st, d.qp_delta as i32, bit_depth);
         st.prev_qp_delta_nonzero = d.qp_delta != 0;
         write_inter_residual_fields_cabac(
-            e, st, false, cfi, d.transform_8x8, d.cbp_luma, &d.nz_luma, &d.luma, d.cbp_chroma,
+            e, st, field, cfi, d.transform_8x8, d.cbp_luma, &d.nz_luma, &d.luma, d.cbp_chroma,
             &d.chroma_dc, &d.chroma_ac, &d.nz_chroma, lnb, anb,
         );
     } else {
@@ -281,7 +287,7 @@ pub fn write_intra_picture_cabac<S: Sample>(
         let above = (mb_y > 0).then(|| &coded[idx - mbw]);
         let inc = left.map_or(0, |m| m.not_nxn as usize) + above.map_or(0, |m| m.not_nxn as usize);
         write_mb_type_i_cabac(&mut e, &mut st, inc, intra_mb_type_code(dec));
-        write_intra_body(&mut e, &mut st, dec, left, above, cfi, t8x8, g.bit_depth);
+        write_intra_body(&mut e, &mut st, dec, left, above, cfi, t8x8, g.bit_depth, g.field_pic);
         coded.push(Coded {
             nb: WrittenMb::from_decision(dec, cfi == 3),
             not_nxn: !dec.kind.is_nxn(),
@@ -340,7 +346,7 @@ pub fn write_p_picture_cabac<S: Sample>(
                 }
             }
             PMb::Coded(dec) => {
-                write_p16_body(&mut e, &mut st, dec, left, above, cfi, t8x8, g.bit_depth);
+                write_p16_body(&mut e, &mut st, dec, left, above, cfi, t8x8, g.bit_depth, g.field_pic);
                 Coded {
                     nb: WrittenMb::from_inter_decision(dec, cfi == 3),
                     not_nxn: true,
@@ -351,7 +357,7 @@ pub fn write_p_picture_cabac<S: Sample>(
                 // Intra in a P slice: the same macroblock, `mb_type`
                 // shifted by 5 (Table 7-11's note).
                 write_mb_type_p_cabac(&mut e, &mut st, 5 + intra_mb_type_code(idec));
-                write_intra_body(&mut e, &mut st, idec, left, above, cfi, t8x8, g.bit_depth);
+                write_intra_body(&mut e, &mut st, idec, left, above, cfi, t8x8, g.bit_depth, g.field_pic);
                 Coded {
                     nb: WrittenMb::from_decision(idec, cfi == 3),
                     not_nxn: !idec.kind.is_nxn(),
@@ -417,7 +423,7 @@ pub fn write_b_picture_cabac<S: Sample>(
                 }
             }
             BMb::Direct(dec) | BMb::Explicit(dec) => {
-                write_b_body(&mut e, &mut st, dec, inc, left, above, cfi, t8x8, g.bit_depth);
+                write_b_body(&mut e, &mut st, dec, inc, left, above, cfi, t8x8, g.bit_depth, g.field_pic);
                 Coded {
                     nb: WrittenMb::from_b_decision(dec, cfi == 3),
                     not_nxn: true,
@@ -428,7 +434,7 @@ pub fn write_b_picture_cabac<S: Sample>(
                 // Intra in a B slice: the same macroblock behind the B
                 // prefix, `mb_type` shifted by 23.
                 write_mb_type_b_cabac(&mut e, &mut st, inc, 23 + intra_mb_type_code(idec));
-                write_intra_body(&mut e, &mut st, idec, left, above, cfi, t8x8, g.bit_depth);
+                write_intra_body(&mut e, &mut st, idec, left, above, cfi, t8x8, g.bit_depth, g.field_pic);
                 Coded {
                     nb: WrittenMb::from_decision(idec, cfi == 3),
                     not_nxn: !idec.kind.is_nxn(),
@@ -584,7 +590,7 @@ mod tests {
                 let cond =
                     |m: Option<&Coded>| m.map_or(0, |m| !(m.nb.skip || m.nb.direct) as usize);
                 let inc = cond(left) + cond(above);
-                write_b_body(&mut e, &mut enc_st, d, inc, left, above, cfi, false, 8);
+                write_b_body(&mut e, &mut enc_st, d, inc, left, above, cfi, false, 8, false);
                 coded.push(Coded {
                     nb: WrittenMb::from_b_decision(d, false),
                     not_nxn: true,

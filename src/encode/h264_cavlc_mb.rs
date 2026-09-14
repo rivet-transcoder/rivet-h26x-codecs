@@ -34,13 +34,13 @@ use crate::encode::h264_pic::{
     BMb, IntraTools, PMb, PicMotion, code_b_picture, code_intra_picture, code_p_picture,
 };
 use crate::encode::h264_syntax::{Geometry, Plane, Recon};
-use crate::h264::cavlc::{SCAN8_SUB, SCAN_CHROMA_DC, part_index_of, write_residual_block_cavlc};
+use crate::h264::cavlc::{SCAN8_SUB, SCAN8_SUB_FIELD, SCAN_CHROMA_DC, part_index_of, write_residual_block_cavlc};
 use crate::h264::mb::SubMbShape;
 use crate::h264::mb::raster_of_blk;
 use crate::sample::Sample;
 use crate::h264::tables::{
     GOLOMB_TO_INTER_CBP, GOLOMB_TO_INTER_CBP_GRAY, GOLOMB_TO_INTRA4X4_CBP,
-    GOLOMB_TO_INTRA4X4_CBP_GRAY, SCAN_CHROMA_DC_422, ZIGZAG4X4,
+    FIELD_SCAN4X4, GOLOMB_TO_INTRA4X4_CBP_GRAY, SCAN_CHROMA_DC_422, ZIGZAG4X4,
 };
 
 /// `coded_block_pattern` me(v) for intra: cbp -> codeNum, the inverse of
@@ -117,6 +117,10 @@ struct NzState {
     rows: usize,
     /// ChromaArrayType 3: planes 1 and 2 of the luma-like state are live.
     c444: bool,
+    /// The picture is a field: its blocks are read in the field scans —
+    /// `FIELD_SCAN4X4` and the field 8x8 sub-scans — which is what
+    /// `parse_residual_luma_like` switches to under `ctx.field_pic`.
+    field: bool,
 }
 
 impl NzState {
@@ -129,6 +133,7 @@ impl NzState {
             left_chroma: [[0; 4]; 2],
             rows,
             c444,
+            field: false,
         }
     }
 }
@@ -414,6 +419,8 @@ fn write_plane_residual(
     nz: &[u8; 16],
 ) {
     let mut cur = [0u8; 16];
+    let (scan4, scan8sub): (&[u8; 16], &[[u8; 16]; 4]) =
+        if st.field { (&FIELD_SCAN4X4, &SCAN8_SUB_FIELD) } else { (&ZIGZAG4X4, &SCAN8_SUB) };
     let nc_at = |cur: &[u8; 16], st: &NzState, bx: usize, by: usize| -> i32 {
         let a = if bx > 0 {
             Some(cur[by * 4 + bx - 1])
@@ -436,7 +443,7 @@ fn write_plane_residual(
         // The DC block first. Its own count is not stored anywhere — the
         // reader discards it too — so the return is deliberately dropped.
         let nc = nc_at(&cur, st, 0, 0);
-        let _ = write_residual_block_cavlc(w, nc, &widen(dc), &ZIGZAG4X4, 0, 15, 16);
+        let _ = write_residual_block_cavlc(w, nc, &widen(dc), scan4, 0, 15, 16);
     }
     for blk8 in 0..4 {
         if cbp & (1 << blk8) == 0 {
@@ -461,15 +468,15 @@ fn write_plane_residual(
                 for (o, &v) in lv.iter_mut().zip(block8) {
                     *o = v as i32;
                 }
-                write_residual_block_cavlc(w, nc, &lv, &SCAN8_SUB[sub], 0, 15, 16)
+                write_residual_block_cavlc(w, nc, &lv, &scan8sub[sub], 0, 15, 16)
             } else {
                 let lv = widen(&levels[raster]);
                 // I_16x16 AC blocks start at scan position one — the DC
                 // went in the block above — and so carry at most fifteen.
                 if dc.is_some() {
-                    write_residual_block_cavlc(w, nc, &lv, &ZIGZAG4X4, 1, 15, 15)
+                    write_residual_block_cavlc(w, nc, &lv, scan4, 1, 15, 15)
                 } else {
-                    write_residual_block_cavlc(w, nc, &lv, &ZIGZAG4X4, 0, 15, 16)
+                    write_residual_block_cavlc(w, nc, &lv, scan4, 0, 15, 16)
                 }
             };
             debug_assert_eq!(
@@ -558,7 +565,8 @@ fn write_mb_residual(
                         None
                     };
                     let lv = widen(&chroma_ac[comp][blk]);
-                    let n = write_residual_block_cavlc(w, nc_of(a, b), &lv, &ZIGZAG4X4, 1, 15, 15);
+                    let scan4 = if st.field { &FIELD_SCAN4X4 } else { &ZIGZAG4X4 };
+                    let n = write_residual_block_cavlc(w, nc_of(a, b), &lv, scan4, 1, 15, 15);
                     debug_assert_eq!(
                         n, nz_chroma[comp][blk] as usize,
                         "chroma block {comp}/{blk}: the decision's count disagrees with the writer's"
@@ -604,6 +612,7 @@ pub fn write_intra_picture<S: Sample>(
     let mbs_wide = g.mbs_wide as usize;
     let rows = if g.chroma == crate::picture::ChromaFormat::Yuv444 { 0 } else { g.chroma_mb().1 as usize / 4 };
     let mut st = NzState::new(mbs_wide, rows, g.chroma == crate::picture::ChromaFormat::Yuv444);
+    st.field = g.field_pic;
     let t8x8 = tools.transform_8x8;
     code_intra_picture(g, tools, qp, planes, rec, |mb_x, mb_y, dec| {
         write_macroblock(w, dec, &mut st, mb_x, mb_x > 0, mb_y > 0, 0, t8x8);
@@ -634,6 +643,7 @@ pub fn write_p_picture<S: Sample>(
     let mbs_wide = g.mbs_wide as usize;
     let rows = if g.chroma == crate::picture::ChromaFormat::Yuv444 { 0 } else { g.chroma_mb().1 as usize / 4 };
     let mut st = NzState::new(mbs_wide, rows, g.chroma == crate::picture::ChromaFormat::Yuv444);
+    st.field = g.field_pic;
     // `mb_skip_run`: counted here, written before each coded macroblock,
     // and flushed after the last one — the reader expects a run before
     // *every* coded macroblock (zero included) and a bare trailing run
@@ -776,6 +786,7 @@ pub fn write_b_picture<S: Sample>(
     let mbs_wide = g.mbs_wide as usize;
     let rows = if g.chroma == crate::picture::ChromaFormat::Yuv444 { 0 } else { g.chroma_mb().1 as usize / 4 };
     let mut st = NzState::new(mbs_wide, rows, g.chroma == crate::picture::ChromaFormat::Yuv444);
+    st.field = g.field_pic;
     let mut skip_run: u32 = 0;
     let t8x8 = tools.transform_8x8;
     let fmbs = code_b_picture(g, tools, qp, planes, rec, refs, col, |mb_x, mb_y, mb| match mb {
@@ -1152,6 +1163,8 @@ mod tests {
                 c444: true,
                 t8x8: false,
                 subparts: false,
+                field: false,
+                chroma_mv_dy: [0; 2],
             };
             let mut rec = vec![
                 recon_plane(16, 16, LUMA_PAD),
@@ -1446,6 +1459,8 @@ mod tests {
                     c444: false,
                     t8x8: false,
                     subparts: false,
+                    field: false,
+                    chroma_mv_dy: [0; 2],
                 };
                 let mut rec = vec![
                     recon_plane(16, 16, LUMA_PAD),
@@ -1515,6 +1530,8 @@ mod tests {
                     c444,
                     t8x8: true,
                     subparts: false,
+                    field: false,
+                    chroma_mv_dy: [0; 2],
                 };
                 let cpad = if c444 { LUMA_PAD } else { CHROMA_PAD };
                 let cw = if c444 { 16 } else { 8 };
@@ -1545,7 +1562,7 @@ mod tests {
     /// block's tables).
     #[test]
     fn a_synthetic_i8x8_macroblock_round_trips() {
-        use crate::h264::cavlc::sub_block_counts_8x8;
+        use crate::h264::cavlc::sub_block_counts_8x8_scan;
         let mut dec = MbDecision {
             kind: MbKind::I8x8,
             transform_8x8: true,
@@ -1568,7 +1585,7 @@ mod tests {
         dec.luma.as_flattened_mut()[0..64].copy_from_slice(&b0);
         dec.luma.as_flattened_mut()[192..256].copy_from_slice(&b3);
         for (blk8, b) in [(0usize, &b0), (3, &b3)] {
-            let counts = sub_block_counts_8x8(b);
+            let counts = sub_block_counts_8x8_scan(b, false);
             for (sub, &r) in quad_rasters(blk8).iter().enumerate() {
                 dec.nz_luma[r] = counts[sub];
             }
@@ -1592,7 +1609,7 @@ mod tests {
     /// absent from the wire and a decoder infers zero.
     #[test]
     fn a_p16_macroblock_with_the_8x8_transform_round_trips() {
-        use crate::h264::cavlc::sub_block_counts_8x8;
+        use crate::h264::cavlc::sub_block_counts_8x8_scan;
         for (t8x8, coded) in [(true, true), (false, true), (false, false)] {
             let mut dec = InterDecision {
                 mvd: [crate::h264::frame::Mv::new(5, -9); 16],
@@ -1606,7 +1623,7 @@ mod tests {
                         *v = ((i as i16 % 5) - 2) * if i % 3 == 0 { 2 } else { -1 };
                     }
                     dec.luma.as_flattened_mut()[64..128].copy_from_slice(&b);
-                    let counts = sub_block_counts_8x8(&b);
+                    let counts = sub_block_counts_8x8_scan(&b, false);
                     for (sub, &r) in quad_rasters(1).iter().enumerate() {
                         dec.nz_luma[r] = counts[sub];
                     }

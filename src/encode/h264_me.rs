@@ -72,7 +72,7 @@ use crate::encode::h264_pic::PicMotion;
 use crate::encode::h264_intra::{
     IntraCtx, code_block_8x8, quad_rasters, reconstruct_8x8, satd_lambda, ssd_lambda,
 };
-use crate::h264::cavlc::sub_block_counts_8x8;
+use crate::h264::cavlc::sub_block_counts_8x8_scan;
 use crate::h264::inter::Weighting;
 use crate::encode::h264_syntax::Recon;
 use crate::sample::Sample;
@@ -544,9 +544,13 @@ fn luma_pred_into<S: Sample>(
 /// Interpolate one chroma component's prediction (8 wide, `ch` high) for
 /// luma vector `mv` at chroma position `(cx, cy)` into a scratch block,
 /// through the decoder's bilinear kernel. The vector conversion is
-/// `predict_partition`'s (src/h264/inter.rs, 8.4.1.4), progressive frames
-/// only: eighth-sample fractions in 4:2:0; in 4:2:2 the vertical component
-/// is in quarter *chroma* samples, so the fraction doubles.
+/// `predict_partition`'s (src/h264/inter.rs, 8.4.1.4): eighth-sample
+/// fractions in 4:2:0; in 4:2:2 the vertical component is in quarter
+/// *chroma* samples, so the fraction doubles. `dy` is Table 8-10's
+/// vertical offset for a 4:2:0 field predicting from the field of the
+/// other parity (±2 eighths), zero everywhere else — the decoder adds it
+/// to the vertical vector before splitting integer and fraction, and so
+/// does this.
 #[allow(clippy::too_many_arguments)]
 fn chroma_pred_into<S: Sample>(
     ctx: &MeCtx<S>,
@@ -554,6 +558,7 @@ fn chroma_pred_into<S: Sample>(
     cx: i32,
     cy: i32,
     mv: Mv,
+    dy: i32,
     cw: usize,
     ch_h: usize,
     ch: usize,
@@ -561,8 +566,10 @@ fn chroma_pred_into<S: Sample>(
 ) {
     let xci = cx + (mv.x as i32 >> 3);
     let (yci, yf) = if ch == 8 {
-        (cy + (mv.y as i32 >> 3), (mv.y & 7) as i32)
+        let mvcy = mv.y as i32 + dy;
+        (cy + (mvcy >> 3), mvcy & 7)
     } else {
+        debug_assert_eq!(dy, 0, "Table 8-10's offset is a 4:2:0 one");
         (cy + (mv.y as i32 >> 2), ((mv.y & 3) << 1) as i32)
     };
     let xf = (mv.x & 7) as i32;
@@ -836,12 +843,12 @@ fn predict_inter_rect<S: Sample>(
         let off = plane.offset(cx as isize, cy as isize);
         let stride = plane.stride;
         if used[0] && used[1] {
-            chroma_pred_into(ctx, &refs[0][comp + 1], cx as i32, cy as i32, mv[0], cw, crh, h, &mut a);
-            chroma_pred_into(ctx, &refs[1][comp + 1], cx as i32, cy as i32, mv[1], cw, crh, h, &mut b);
+            chroma_pred_into(ctx, &refs[0][comp + 1], cx as i32, cy as i32, mv[0], ctx.chroma_mv_dy[0], cw, crh, h, &mut a);
+            chroma_pred_into(ctx, &refs[1][comp + 1], cx as i32, cy as i32, mv[1], ctx.chroma_mv_dy[1], cw, crh, h, &mut b);
             (ctx.dsp.avg)(&mut plane.data[off..], stride, &a, &b, cw, crh);
         } else {
             let l = if used[0] { 0 } else { 1 };
-            chroma_pred_into(ctx, &refs[l][comp + 1], cx as i32, cy as i32, mv[l], cw, crh, h, &mut a);
+            chroma_pred_into(ctx, &refs[l][comp + 1], cx as i32, cy as i32, mv[l], ctx.chroma_mv_dy[l], cw, crh, h, &mut a);
             put_uni(ctx, &mut plane.data[off..], stride, &a, cw, crh, weighting, comp + 1, l);
         }
     }
@@ -944,7 +951,7 @@ fn code_luma_8x8<S: Sample>(
     debug_assert_eq!(
         out.luma.as_flattened().iter().filter(|&&v| v != 0).count(),
         (0..4)
-            .map(|b| sub_block_counts_8x8(&out.luma.as_flattened()[b * 64..b * 64 + 64])
+            .map(|b| sub_block_counts_8x8_scan(&out.luma.as_flattened()[b * 64..b * 64 + 64], ctx.field)
                 .iter()
                 .map(|&n| n as usize)
                 .sum::<usize>())
@@ -2565,6 +2572,8 @@ mod tests {
                 c444: false,
                 t8x8: false,
                 subparts: false,
+                field: false,
+                chroma_mv_dy: [0; 2],
             }
         }
     }
@@ -3149,7 +3158,7 @@ mod tests {
             for comp in 0..2 {
                 let plane = &rec[comp + 1];
                 let mut cpred = [0u8; 16 * PRED_STRIDE];
-                chroma_pred_into(&ctx, &refp[comp + 1], 8, 8, mv0, 8, 8, 8, &mut cpred);
+                chroma_pred_into(&ctx, &refp[comp + 1], 8, 8, mv0, 0, 8, 8, 8, &mut cpred);
                 let coff = plane.offset(8, 8);
                 let m = (qp % 6) as usize;
                 let mut dc = [0i32; 4];

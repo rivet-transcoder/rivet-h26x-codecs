@@ -137,6 +137,10 @@ pub struct PicMotion {
     /// What the picture's weighted prediction did ([`WeightCensus`]) — the
     /// default for every picture that carried no table.
     pub(crate) weighting: WeightCensus,
+    /// The picture is a field: every macroblock committed is a field
+    /// macroblock, as the decoder's `derive()` records one (`m.field` under
+    /// `ctx.field_pic`).
+    pub(crate) field_pic: bool,
 }
 
 /// What a P picture's explicit weighting did, for the census.
@@ -164,7 +168,7 @@ impl PicMotion {
             vec![BlockMotion::default(); n * 16],
         ];
         frame.mb_intra = vec![false; n];
-        PicMotion { info: PicInfo::new(mbs_wide, mbs_high), frame, weighting: WeightCensus::default() }
+        PicMotion { info: PicInfo::new(mbs_wide, mbs_high), frame, weighting: WeightCensus::default(), field_pic: false }
     }
 
     /// Commit one coded macroblock: everything a decoder stores about it
@@ -178,7 +182,7 @@ impl PicMotion {
     pub(crate) fn commit(&mut self, addr: usize, info: MbInfo, mot: &MbMotion) {
         debug_assert!(info.decoded, "a committed macroblock is decoded");
         self.frame.mb_intra[addr] = info.kind.is_intra();
-        self.info.mbs[addr] = info;
+        self.info.mbs[addr] = MbInfo { field: info.field || self.field_pic, ..info };
         for l in 0..2 {
             self.frame.motion[l][addr * 16..addr * 16 + 16].copy_from_slice(&mot[l]);
         }
@@ -431,6 +435,8 @@ impl<'a, S: Sample> PicCoding<'a, S> {
             c444: g.chroma == ChromaFormat::Yuv444,
             t8x8: tools.transform_8x8,
             subparts: tools.subparts,
+            field: g.field_pic,
+            chroma_mv_dy: g.chroma_mv_dy,
         };
         let (mbs_wide, mbs_high) = (g.mbs_wide as usize, g.mbs_high as usize);
         let luma_stride = g.coded_width as usize;
@@ -523,6 +529,7 @@ pub(crate) fn code_intra_picture<S: Sample>(
     let (src_y, src_cb, src_cr) = (&pc.src_y[..], &pc.src_cb[..], &pc.src_cr[..]);
 
     let mut pm = PicMotion::new(mbs_wide, mbs_high);
+    pm.field_pic = g.field_pic;
     let mut top_modes: Vec<[Option<u8>; 4]> = vec![[None; 4]; mbs_wide];
     let mut chain = QpChain::new(ctx.qp, g.bit_depth);
     for mb_y in 0..mbs_high {
@@ -640,6 +647,7 @@ pub(crate) fn code_p_picture<S: Sample>(
     // The picture's motion in the decoder's own layout, and the
     // per-macroblock working set its derivations read.
     let mut pm = PicMotion::new(mbs_wide, mbs_high);
+    pm.field_pic = g.field_pic;
     let mut dnb = MbNeighbours::default();
     let mut st = MbMotionState::new();
     let mut chain = QpChain::new(ctx.qp, g.bit_depth);
@@ -805,6 +813,7 @@ pub(crate) fn code_b_picture<S: Sample>(
 
     let mut top_modes: Vec<[Option<u8>; 4]> = vec![[None; 4]; mbs_wide];
     let mut pm = PicMotion::new(mbs_wide, mbs_high);
+    pm.field_pic = g.field_pic;
     let mut dnb = MbNeighbours::default();
     let mut st = MbMotionState::new();
     let mut chain = QpChain::new(ctx.qp, g.bit_depth);

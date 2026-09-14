@@ -342,6 +342,17 @@ fi
 # picture carries an offset, so that regression cannot pass the gate. The corpus has no deep or non-4:2:0
 # fade, so the @p10 rows prove the syntax at depth; a deep, 4:2:2, 4:4:4 and
 # monochrome fade run in the unit test.
+#
+# The h264-paff / h264-mbaff rows are H.264 interlaced coding. They visit the
+# one interlaced clip (src_interlace_96x96_420p8: fields 20 ms apart, a moving
+# half beside a held one), whose `p8` suffix keeps every untagged row off it,
+# and one deep row codes the progressive @p10 clips as interlaced. `field` codes
+# every frame as two field pictures; h26xenc's `interlace` census line counts
+# the field pictures each cell actually coded. CROSS is where a field row earns
+# its keep: libavcodec pairs the fields, builds its own field reference lists
+# and filters in field geometry, so a wrong bottom_field_flag, a list built
+# from frames or a field edge filtered as a frame edge disagrees there even
+# when our decoder shares the misreading.
 CONFIGS=${CONFIGS:-"
 lossless-intra|--codec h264 --lossless --gop 0
 cqp-intra|--codec h264 --qp 26 --gop 0
@@ -490,6 +501,13 @@ hevc-cu2-intra@big|--codec h265 --qp 26 --gop 0 --cu-depth 2
 hevc-cu2-ipb@big|--codec h265 --qp 26 --gop 8 --bframes 2 --cu-depth 2
 hevc-cu2-aq40-ipb@big|--codec h265 --qp 40 --gop 8 --bframes 2 --aq 1.0 --cu-depth 2
 hevc-cu2-40-sao-ip@big|--codec h265 --qp 40 --gop 8 --sao --cu-depth 2
+h264-paff-field-ip@interlace|--codec h264 --qp 26 --gop 8 --interlace tff --field-coding field
+h264-paff-field-cavlc-ip@interlace|--codec h264 --qp 26 --gop 8 --cavlc --interlace bff --field-coding field
+h264-paff-field-ipb@interlace|--codec h264 --qp 26 --gop 8 --bframes 2 --interlace tff --field-coding field
+h264-paff-field-cavlc-ipb@interlace|--codec h264 --qp 26 --gop 8 --bframes 2 --cavlc --interlace bff --field-coding field
+h264-paff-field40-t8x8-subparts-ipb@interlace|--codec h264 --qp 40 --gop 8 --bframes 2 --t8x8 --subparts --interlace tff --field-coding field
+h264-paff-field-cavlc40-t8x8-subparts-ip@interlace|--codec h264 --qp 40 --gop 8 --cavlc --t8x8 --subparts --interlace bff --field-coding field
+h264-10-paff-field-ipb@p10|--codec h264 --qp 26 --gop 8 --bframes 2 --interlace tff --field-coding field
 "}
 
 # Split a clip's format token into its chroma format and sample depth:

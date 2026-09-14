@@ -32,7 +32,7 @@ use crate::dsp::h264::{H264Dsp, NO_DC};
 use crate::dsp::h264_enc::{H264EncDsp, Quant, qbits4, qbits8, quant_offset};
 use crate::encode::h264_syntax::Recon;
 use crate::sample::Sample;
-use crate::h264::cavlc::sub_block_counts_8x8;
+use crate::h264::cavlc::sub_block_counts_8x8_scan;
 use crate::h264::intra::{IntraAvail, predict_4x4, predict_8x8, predict_16x16, predict_chroma};
 use crate::h264::mb::dequant_level;
 use crate::h264::tables::BLK4X4_FROM_RASTER;
@@ -246,6 +246,16 @@ pub struct IntraCtx<'a, S: Sample> {
     /// encoder's own switch, and its only job is to keep the streams that
     /// do not ask for them byte-identical to what came before.
     pub subparts: bool,
+    /// The macroblocks are field macroblocks — a field picture's (or, in
+    /// an MBAFF frame, a field pair's): their residual is read in the
+    /// field scans, so the CAVLC sub-scan counts of an 8x8 block are the
+    /// field sub-scans' (`sub_block_counts_8x8_scan` in src/h264/cavlc.rs).
+    pub field: bool,
+    /// Per reference list, the vertical chroma vector offset every chroma
+    /// prediction from that list's reference 0 takes
+    /// ([`Geometry::chroma_mv_dy`](crate::encode::h264_syntax::Geometry::chroma_mv_dy)):
+    /// zero outside a 4:2:0 field predicting from the opposite parity.
+    pub chroma_mv_dy: [i32; 2],
 }
 
 /// Whether a 4x4 block's top-right neighbour has been reconstructed by the
@@ -360,7 +370,7 @@ pub(crate) fn code_block_8x8<S: Sample>(
     let offset = quant_offset(qbits, intra);
     let mut levels = [0i16; 64];
     let _ = (ctx.enc.quant8)(&coeffs, &mut levels, &ctx.quant.mf8[list8][(qp % 6) as usize], qbits, offset);
-    let counts = sub_block_counts_8x8(&levels);
+    let counts = sub_block_counts_8x8_scan(&levels, ctx.field);
     (levels, counts)
 }
 
@@ -1499,6 +1509,8 @@ mod tests {
                 c444: true,
                 t8x8: true,
                 subparts: false,
+                field: false,
+                chroma_mv_dy: [0; 2],
             };
             // (the encoder's 8x8 list index, the plane it codes, whether
             // the macroblock is inter, and the QP that plane is coded at)
@@ -1588,6 +1600,8 @@ mod tests {
             c444: false,
             t8x8: false,
             subparts: false,
+            field: false,
+            chroma_mv_dy: [0; 2],
         };
         let mut rec = crate::encode::h264_syntax::recon_plane(32, 32, 16);
         for v in rec.data.iter_mut() {

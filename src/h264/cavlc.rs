@@ -1005,8 +1005,10 @@ fn read_ref_idx(r: &mut BitReader, num_ref_idx: u32) -> Result<i8> {
 /// `residual()` for CAVLC (7.3.5.3), filling the layer's coefficient
 /// arrays (raster order) and nonzero counts.
 /// For CAVLC 8x8 blocks (four interleaved 4x4 scans): where scan position
-/// `i` of sub-block `sub` lands in the 8x8 raster.
-static SCAN8_SUB_FIELD: [[u8; 16]; 4] = {
+/// `i` of sub-block `sub` lands in the 8x8 raster. Crate-visible for the
+/// reason [`SCAN8_SUB`] is: the encoder's field pictures hand the reader's
+/// own field sub-scans to [`write_residual_block_cavlc`].
+pub(crate) static SCAN8_SUB_FIELD: [[u8; 16]; 4] = {
     let mut t = [[0u8; 16]; 4];
     let mut sub = 0;
     while sub < 4 {
@@ -1053,13 +1055,26 @@ pub(crate) static SCAN_CHROMA_DC: [u8; 4] = [0, 1, 2, 3];
 /// positions taken every fourth, and counting them anywhere else would be
 /// a second, silently divergent, spelling of that.
 ///
-/// Frame scan only — a field macroblock interleaves [`SCAN8_SUB_FIELD`]
-/// instead, and the encoder that calls this codes frames.
+/// Under `field` — a field picture, or an MBAFF field macroblock — the
+/// sub-blocks are [`SCAN8_SUB_FIELD`]'s instead, which
+/// `parse_residual_luma_like` switches to under exactly that condition, so
+/// the counts it stores are those.
+pub(crate) fn sub_block_counts_8x8_scan(levels: &[i16], field: bool) -> [u8; 4] {
+    sub_block_counts_8x8_in(levels, if field { &SCAN8_SUB_FIELD } else { &SCAN8_SUB })
+}
+
+/// [`sub_block_counts_8x8_scan`] in the frame scan, for the round-trip
+/// tests written before field pictures.
+#[cfg(test)]
 pub(crate) fn sub_block_counts_8x8(levels: &[i16]) -> [u8; 4] {
+    sub_block_counts_8x8_scan(levels, false)
+}
+
+fn sub_block_counts_8x8_in(levels: &[i16], scan: &[[u8; 16]; 4]) -> [u8; 4] {
     debug_assert_eq!(levels.len(), 64, "an 8x8 block has sixty-four coefficients");
     let mut n = [0u8; 4];
     for (sub, count) in n.iter_mut().enumerate() {
-        *count = SCAN8_SUB[sub].iter().filter(|&&pos| levels[pos as usize] != 0).count() as u8;
+        *count = scan[sub].iter().filter(|&&pos| levels[pos as usize] != 0).count() as u8;
     }
     n
 }

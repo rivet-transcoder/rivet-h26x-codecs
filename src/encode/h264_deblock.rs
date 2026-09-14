@@ -67,6 +67,10 @@ pub fn deblock_recon<S: Sample>(dsp: &H264Dsp<S>, g: &Geometry, pm: &mut PicMoti
     frame.mb_height = mbh;
     frame.chroma = g.chroma;
     frame.bit_depth = g.bit_depth;
+    // A field picture filters its horizontal macroblock edges as field
+    // edges (intra bS 3, not 4) and compares vertical vectors in field
+    // units — what the decoder's frame flag for a field picture says.
+    frame.field_coded = g.field_pic;
     std::mem::swap(&mut frame.motion, &mut src.motion);
     std::mem::swap(&mut frame.mb_intra, &mut src.mb_intra);
     std::mem::swap(&mut frame.y, &mut rec[0]);

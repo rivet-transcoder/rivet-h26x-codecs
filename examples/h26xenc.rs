@@ -298,6 +298,7 @@ fn main() {
     }
 
     let aq = cfg.aq_strength > 0.0;
+    let interlaced = cfg.interlace.is_some();
     let wpred = cfg.weighted_pred;
     let mut enc = match h26x::encode::h264::H264Encoder::new(cfg) {
         Ok(e) => e,
@@ -400,6 +401,12 @@ fn main() {
             "wp P: {} of {} pictures weighted, {} macroblocks won, {} lost",
             c.wp_on[1], c.pictures[1], c.wp_won[1], c.wp_lost[1]
         );
+    }
+    // The interlace census, when interlaced coding was asked for: how many
+    // field pictures the frames were coded as.
+    if interlaced {
+        let c = enc.shape_census();
+        eprintln!("interlace: {} field pictures", c.field_pictures);
     }
 }
 

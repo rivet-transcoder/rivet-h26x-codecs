@@ -42,10 +42,13 @@ use super::rc::{PicKind, RateController};
 use super::h264_syntax as syn;
 use super::h265_wp;
 use crate::h264::slice::{PredWeightTable, WeightEntry};
-use super::{Access, Config, Entropy, RateControl};
+use super::{Access, Config, Entropy, FieldCoding, FieldOrder, RateControl};
 use crate::bitwriter::BitWriter;
+use crate::h264::dpb::{DecodedPic, Dpb, PocState, RefMark};
+use crate::h264::frame::{Frame, SharedFrame};
 use crate::sample::Sample;
 use crate::{Error, Result};
+use std::sync::Arc;
 
 /// H.264 encoder. See the module documentation for what is and is not built.
 ///
@@ -145,6 +148,107 @@ struct Core<S: Sample> {
     /// came out too large for it and were coded again at a higher
     /// quantiser. Reported rather than hidden, as on the H.265 side.
     recoded: u64,
+    /// The interlaced state, when the configuration asked for interlaced
+    /// coding: `None` for a progressive stream, whose every path above is
+    /// what it was before interlacing existed.
+    fields: Option<Fields<S>>,
+}
+
+/// What an interlaced encoder keeps between frames: the decoder's own
+/// reference model, and the reconstructed fields that model names.
+///
+/// Field reference lists are where an encoder that reasons its way to the
+/// answer goes wrong: a P field's list alternates parities through the
+/// frames ordered by `FrameNumWrap` (8.2.4.2.5), the second field of a
+/// frame may name the first, and whether it does depends on what the
+/// sliding window unmarked after that first field. So nothing here derives
+/// a list. Each field's slice header is written, read back through the
+/// production parser, and handed to the decoder's `compute_poc`,
+/// `build_ref_lists` and `Dpb::store` — the functions the conformance
+/// suite's field streams run through — and the encoder predicts from
+/// whichever reconstructed field index 0 of those lists names.
+struct Fields<S: Sample> {
+    /// The field coded, and displayed, first.
+    order: FieldOrder,
+    /// The SPS every access unit carries, as the decoder parses it.
+    sps: crate::h264::Sps,
+    /// The PPS likewise.
+    pps: crate::h264::Pps,
+    /// The decoder's DPB and POC state after the last committed frame.
+    model: RefModel,
+    /// Reconstructed reference frames, by the id of the `SharedFrame` the
+    /// model's entry for them carries.
+    stored: Vec<StoredFrame<S>>,
+}
+
+/// The decoder-side reference state an interlaced encoder runs. Forked
+/// into each attempt ([`RefModel::fork`]) and kept only by the attempt that
+/// is committed, so a re-coded frame leaves no trace in it.
+struct RefModel {
+    /// The decoded picture buffer, its entries plane-less stand-ins.
+    dpb: Dpb<u8>,
+    /// POC bookkeeping across pictures.
+    poc: PocState,
+    /// The id the next frame's `SharedFrame` takes.
+    next_id: u64,
+}
+
+impl RefModel {
+    /// A copy to run an attempt against: the same entries (the stand-in
+    /// frames shared, which is what the DPB compares), the same marking and
+    /// POC state, no pending output.
+    fn fork(&self) -> RefModel {
+        let d = &self.dpb;
+        let mut dpb = Dpb::new();
+        dpb.pics = d
+            .pics
+            .iter()
+            .map(|p| DecodedPic {
+                frame: p.frame.clone(),
+                poc: p.poc,
+                field_poc: p.field_poc,
+                fields: p.fields,
+                frame_num: p.frame_num,
+                frame_num_wrap: p.frame_num_wrap,
+                long_term_frame_idx: p.long_term_frame_idx,
+                mark: p.mark,
+                needed_for_output: p.needed_for_output,
+                awaiting_field: p.awaiting_field,
+                non_existing: p.non_existing,
+                decode_index: p.decode_index,
+            })
+            .collect();
+        dpb.capacity = d.capacity;
+        dpb.num_reorder = d.num_reorder;
+        dpb.max_long_term_frame_idx = d.max_long_term_frame_idx;
+        dpb.crop = d.crop;
+        RefModel { dpb, poc: self.poc.clone(), next_id: self.next_id }
+    }
+}
+
+/// One reconstructed frame of an interlaced stream, field by field.
+struct StoredFrame<S: Sample> {
+    /// The id of the model's stand-in for it.
+    id: u64,
+    /// Top and bottom field, once coded.
+    fields: [Option<StoredField<S>>; 2],
+}
+
+/// One reconstructed field: its planes at field size, borders replicated,
+/// and its motion in the decoder's layout — what a later B field reads as
+/// colocated motion.
+struct StoredField<S: Sample> {
+    planes: Vec<syn::Recon<S>>,
+    motion: super::h264_pic::PicMotion,
+}
+
+/// What a field attempt leaves for `commit`: the forked model after both
+/// fields, the frame it coded, and each field's kind and macroblock record
+/// for the census.
+struct FieldsOut<S: Sample> {
+    model: RefModel,
+    frame: StoredFrame<S>,
+    census: Vec<(Kind, Vec<crate::h264::mb::MbInfo>)>,
 }
 
 /// One coded picture, before anything about it has been kept — the
@@ -165,6 +269,9 @@ struct Attempt<S: Sample> {
     recon: Vec<syn::Recon<S>>,
     /// The picture's motion in the decoder's layout.
     motion: super::h264_pic::PicMotion,
+    /// An interlaced frame's two fields, when it was coded as field
+    /// pictures (`recon` and `motion` are then empty).
+    fields: Option<FieldsOut<S>>,
 }
 
 /// How many macroblocks of each kind the stream's pictures took, per
@@ -202,6 +309,10 @@ pub struct ShapeCensus {
     pub wp_won: [u64; 3],
     /// The same, higher weighted than plain: the fit's model check failing.
     pub wp_lost: [u64; 3],
+    /// Field pictures coded — two per frame of an interlaced stream coded
+    /// as fields, and what proves a field row coded fields rather than
+    /// declaring an interlaced sequence over frames.
+    pub field_pictures: u64,
 }
 
 impl ShapeCensus {
@@ -380,7 +491,34 @@ impl<S: Sample> Core<S> {
                     cfg.height, cfg.chroma
                 )));
             }
-            return Err(Error::unsupported("H.264 encode: interlaced coding (encoder in progress)"));
+            match cfg.field_coding {
+                FieldCoding::Field => {}
+                FieldCoding::Paff => {
+                    return Err(Error::unsupported(
+                        "H.264 encode: picture-adaptive frame/field coding (encoder in progress; field coding codes every frame as two fields)",
+                    ));
+                }
+                FieldCoding::Mbaff => {
+                    return Err(Error::unsupported(
+                        "H.264 encode: macroblock-adaptive frame/field coding (encoder in progress)",
+                    ));
+                }
+            }
+            if cfg.rate == RateControl::Lossless {
+                return Err(Error::unsupported(
+                    "H.264 encode: interlaced lossless coding (encoder in progress: the PCM and all-skip paths code frames)",
+                ));
+            }
+            if cfg.cpb_ms > 0 {
+                return Err(Error::unsupported(
+                    "H.264 encode: a coded picture buffer over interlaced coding (encoder in progress: every field is an access unit to the HRD)",
+                ));
+            }
+            if cfg.weighted_pred {
+                return Err(Error::unsupported(
+                    "H.264 encode: weighted prediction over interlaced coding (encoder in progress)",
+                ));
+            }
         }
         if cfg.weighted_pred && cfg.rate == RateControl::Lossless {
             // A lossless stream's inter pictures are all-skip copies of
@@ -461,7 +599,27 @@ impl<S: Sample> Core<S> {
             RateControl::ConstantQp(q) => q.min(51),
             RateControl::Lossless | RateControl::Bitrate { .. } => 26,
         };
+        // The interlaced state: the parameter sets as the decoder reads
+        // them, and an empty reference model. The SPS is the one every
+        // access unit writes (no buffer: interlaced coding refuses one).
+        let fields = match cfg.interlace {
+            None => None,
+            Some(order) => {
+                let sps_nal = syn::write_sps(&cfg, &geom, LOG2_MAX_FRAME_NUM, LOG2_MAX_POC_LSB, cpb.as_ref());
+                let sps = crate::h264::Sps::parse(&crate::nal::unescape_rbsp(&sps_nal))?;
+                let look = |_id: u32| Some(sps.clone());
+                let pps = crate::h264::Pps::parse(&crate::nal::unescape_rbsp(&syn::write_pps(&cfg, pps_qp)), &look)?;
+                Some(Fields {
+                    order,
+                    sps,
+                    pps,
+                    model: RefModel { dpb: Dpb::new(), poc: PocState::default(), next_id: 1 },
+                    stored: Vec::new(),
+                })
+            }
+        };
         Ok(Self {
+            fields,
             rc,
             emitted: 0,
             cfg,
@@ -551,7 +709,11 @@ impl<S: Sample> Core<S> {
     fn code_picture(&mut self, c: Coded, src: &[S]) -> Result<Access> {
         let mut qp = self.pick_picture_qp(&c);
         for attempt in 0..super::rc::MAX_ATTEMPTS {
-            let a = self.code_attempt(&c, src, qp)?;
+            let a = if self.fields.is_some() {
+                self.code_attempt_fields(&c, src, qp)?
+            } else {
+                self.code_attempt(&c, src, qp)?
+            };
             let bits = a.access.data.len() as u64 * 8;
             // What the buffer can hand over at this picture's removal time;
             // `None` means no buffer was declared and nothing can fail.
@@ -605,6 +767,29 @@ impl<S: Sample> Core<S> {
     fn commit(&mut self, c: &Coded, a: Attempt<S>, qp: u8) -> Access {
         let idr = c.kind == Kind::Idr;
         self.recon.push(a.rec);
+        if let Some(out) = a.fields {
+            // An interlaced frame: its fields' census, the model the
+            // attempt ran, and the reconstruction kept while the model
+            // still marks it — the frame counters exactly as a frame's.
+            for (kind, mbs) in &out.census {
+                self.census.add(*kind, mbs, qp, super::h264_pic::WeightCensus::default());
+                self.census.field_pictures += 1;
+            }
+            if idr {
+                self.frame_num = 0;
+                self.idr_pic_id ^= 1;
+                self.last_bp_encode = c.encode;
+            }
+            let f = self.fields.as_mut().expect("a field attempt comes from an interlaced encoder");
+            f.model = out.model;
+            if c.reference {
+                self.frame_num = (self.frame_num + 1) & ((1 << LOG2_MAX_FRAME_NUM) - 1);
+                f.stored.push(out.frame);
+            }
+            let model = &f.model;
+            f.stored.retain(|s| model.dpb.pics.iter().any(|p| p.frame.id == s.id && p.is_ref()));
+            return a.access;
+        }
         self.census.add(c.kind, &a.motion.info.mbs, qp, a.motion.weighting);
         if idr {
             // The attempt wrote `frame_num` 0 for an IDR; the count
@@ -1036,6 +1221,257 @@ impl<S: Sample> Core<S> {
             rec: cropped,
             recon,
             motion,
+            fields: None,
+        })
+    }
+
+    /// The rows of field `parity` (0 top, 1 bottom) of a source frame, plane
+    /// by plane, laid out as a picture of half the height — row `r` of the
+    /// field is row `2r + parity` of the frame, in every plane and every
+    /// chroma format (an interlaced frame's chroma rows alternate fields
+    /// exactly as its luma rows do).
+    fn field_source(&self, src: &[S], parity: usize) -> Vec<S> {
+        let mut out = Vec::with_capacity(src.len() / 2);
+        let mut off = 0usize;
+        for &(w, h) in &self.plane_dims {
+            let (w, h) = (w as usize, h as usize);
+            for r in 0..h / 2 {
+                let row = off + (2 * r + parity) * w;
+                out.extend_from_slice(&src[row..row + w]);
+            }
+            off += w * h;
+        }
+        out
+    }
+
+    /// Code one interlaced frame as its two field pictures, keeping
+    /// nothing: the parameter sets, then each field — in the frame's field
+    /// order — as a slice NAL of its own.
+    ///
+    /// Each field is typed from the frame: an IDR frame's first field is
+    /// the IDR and its second a non-IDR P field predicting from the first
+    /// (an IDR marks every other picture unused, so a second IDR field
+    /// would unpair the frame); a P or B frame's fields are both P or both
+    /// B. Both fields carry the frame's `frame_num`; the first takes the
+    /// frame's POC and the second the next one, which is what orders them.
+    ///
+    /// The reference each field predicts from is index 0 of the lists the
+    /// decoder builds for it (see [`Fields`]), and a 4:2:0 field predicting
+    /// from the other parity takes Table 8-10's chroma offset.
+    fn code_attempt_fields(&self, c: &Coded, src: &[S], qp: u8) -> Result<Attempt<S>> {
+        let f = self.fields.as_ref().expect("an interlaced encoder carries its field state");
+        let g = self.geom;
+        let idr = c.kind == Kind::Idr;
+        let cabac = self.cfg.entropy == Entropy::Cabac;
+        let mut model = f.model.fork();
+        let mut out = Vec::new();
+        out.extend_from_slice(&syn::annexb(
+            syn::NAL_SPS,
+            3,
+            &syn::write_sps(&self.cfg, &g, LOG2_MAX_FRAME_NUM, LOG2_MAX_POC_LSB, self.cpb.as_ref()),
+        ));
+        out.extend_from_slice(&syn::annexb(syn::NAL_PPS, 3, &syn::write_pps(&self.cfg, self.pps_qp)));
+        if idr {
+            if let Some(m) = self.cfg.mastering_display.as_ref() {
+                out.extend_from_slice(&syn::annexb(syn::NAL_SEI, 0, &syn::write_mastering_display_sei(m)));
+            }
+            if let Some(cl) = self.cfg.content_light.as_ref() {
+                out.extend_from_slice(&syn::annexb(syn::NAL_SEI, 0, &syn::write_content_light_level_sei(cl)));
+            }
+        }
+        let frame_num = if idr { 0 } else { self.frame_num };
+        let id = model.next_id;
+        model.next_id += 1;
+        // The model's stand-in for this frame: both fields' entries are one
+        // DPB entry, found by this shared frame.
+        let shared = Arc::new(SharedFrame::new(Frame::<u8>::empty(), id, true));
+        let mut cur = StoredFrame::<S> { id, fields: [None, None] };
+        let mut census = Vec::with_capacity(2);
+        for k in 0..2usize {
+            let parity = match f.order {
+                FieldOrder::TopFirst => k,
+                FieldOrder::BottomFirst => 1 - k,
+            };
+            let kind = match (k, c.kind) {
+                (1, Kind::Idr | Kind::I) => Kind::P,
+                (_, kind) => kind,
+            };
+            let nal_type = if kind == Kind::Idr { syn::NAL_IDR } else { syn::NAL_SLICE };
+            let nal_ref_idc = if c.reference { 3 } else { 0 };
+            let header = syn::SliceHeader {
+                kind,
+                frame_num,
+                idr_pic_id: self.idr_pic_id,
+                poc_lsb: ((c.poc + k as i32) as u32) & ((1 << LOG2_MAX_POC_LSB) - 1),
+                qp,
+                log2_max_frame_num: LOG2_MAX_FRAME_NUM,
+                log2_max_poc_lsb: LOG2_MAX_POC_LSB,
+                reference: c.reference,
+                deblock: true,
+                cabac,
+                direct_spatial: kind == Kind::B,
+                pred_weights: None,
+                interlaced: true,
+                bottom_field: Some(parity == 1),
+                delta_poc_bottom: 0,
+            };
+            // The header as the decoder reads it: written alone, closed, and
+            // parsed by the production slice header parser.
+            let hdr = {
+                let mut hw = BitWriter::new();
+                syn::write_slice_header(&header, self.pps_qp, &mut hw);
+                hw.rbsp_trailing_bits();
+                let nal = syn::annexb(nal_type, nal_ref_idc, &hw.into_nal());
+                let nh = crate::nal::H264NalHeader::parse(&nal[4..])
+                    .ok_or_else(|| Error::bitstream("H.264 encode: a field's own NAL header does not parse"))?;
+                let rbsp = crate::nal::unescape_rbsp(&nal[4..]);
+                let (h, _, _) = crate::h264::SliceHeader::parse(&rbsp, nh, &|_id: u32| Some(f.pps.clone()), &|_id: u32| {
+                    Some(f.sps.clone())
+                })?;
+                h
+            };
+            // The decoder's picture start: an IDR, or an empty buffer,
+            // (re)sizes the DPB from the SPS; then the field's POC.
+            if hdr.is_idr() || model.dpb.pics.is_empty() {
+                model.dpb.configure(&f.sps);
+            }
+            let (top, bottom) = crate::h264::dpb::compute_poc(&f.sps, &hdr, &mut model.poc);
+            let poc = if parity == 0 { top } else { bottom };
+            // Index 0 of each list the slice predicts from, as (frame id,
+            // field parity).
+            let mut ref0: [Option<(u64, usize)>; 2] = [None, None];
+            if !kind.is_intra() {
+                let rl = crate::h264::dpb::build_ref_lists(&mut model.dpb, &f.sps, &hdr, poc, parity as u8)?;
+                for (l, r) in ref0.iter_mut().enumerate().take(if kind == Kind::B { 2 } else { 1 }) {
+                    let (i, par) = rl.lists[l].first().copied().unwrap_or(crate::h264::dpb::MISSING_REF);
+                    if i >= model.dpb.pics.len() {
+                        return Err(Error::bitstream(format!(
+                            "H.264 encode: field {k} of picture {} has no reference at index 0 of list {l}",
+                            c.poc
+                        )));
+                    }
+                    *r = Some((model.dpb.pics[i].frame.id, par as usize));
+                }
+            }
+            let field_of = |r: Option<(u64, usize)>| -> Result<&StoredField<S>> {
+                let (rid, par) = r.expect("an inter field has its list 0 (and a B field its list 1)");
+                let frame = if rid == cur.id { Some(&cur) } else { f.stored.iter().find(|s| s.id == rid) };
+                frame.and_then(|fr| fr.fields[par].as_ref()).ok_or_else(|| {
+                    Error::bitstream("H.264 encode: the reference model names a field that was never reconstructed")
+                })
+            };
+            // Table 8-10: a 4:2:0 field predicting from the other parity
+            // offsets its vertical chroma vector by a quarter chroma sample.
+            let dy = |r: Option<(u64, usize)>| match r {
+                Some((_, rp)) if g.chroma == crate::ChromaFormat::Yuv420 && rp != parity => {
+                    if parity == 1 { 2 } else { -2 }
+                }
+                _ => 0,
+            };
+            let gf = syn::Geometry { chroma_mv_dy: [dy(ref0[0]), dy(ref0[1])], ..g.field() };
+
+            let fsrc = self.field_source(src, parity);
+            let mut planes = Vec::with_capacity(self.plane_dims.len());
+            let mut off = 0usize;
+            for &(w, h) in &self.plane_dims {
+                let n = (w * (h / 2)) as usize;
+                planes.push(syn::Plane { data: &fsrc[off..off + n], stride: w as usize, width: w, height: h / 2 });
+                off += n;
+            }
+            let (cw, ch) = gf.chroma_mb();
+            let mut recon: Vec<syn::Recon<S>> =
+                vec![syn::recon_plane(gf.coded_width, gf.coded_height, crate::h264::frame::LUMA_PAD)];
+            if cw != 0 {
+                let pad = if self.cfg.chroma == crate::ChromaFormat::Yuv444 {
+                    crate::h264::frame::LUMA_PAD
+                } else {
+                    crate::h264::frame::CHROMA_PAD
+                };
+                recon.push(syn::recon_plane(gf.mbs_wide * cw, gf.mbs_high * ch, pad));
+                recon.push(syn::recon_plane(gf.mbs_wide * cw, gf.mbs_high * ch, pad));
+            }
+
+            let mut w = BitWriter::with_capacity(self.frame_bytes / 2 + 256);
+            syn::write_slice_header(&header, self.pps_qp, &mut w);
+            let motion = match kind {
+                Kind::Idr | Kind::I => {
+                    if cabac {
+                        super::h264_cabac_mb::write_intra_picture_cabac(&mut w, &gf, &self.tools, qp, &planes, &mut recon)
+                    } else {
+                        let m = super::h264_cavlc_mb::write_intra_picture(&mut w, &gf, &self.tools, qp, &planes, &mut recon);
+                        w.rbsp_trailing_bits();
+                        m
+                    }
+                }
+                Kind::P => {
+                    let r = field_of(ref0[0])?;
+                    if cabac {
+                        super::h264_cabac_mb::write_p_picture_cabac(&mut w, &gf, &self.tools, qp, &planes, &mut recon, &r.planes, None)
+                    } else {
+                        let m = super::h264_cavlc_mb::write_p_picture(&mut w, &gf, &self.tools, qp, &planes, &mut recon, &r.planes, None);
+                        w.rbsp_trailing_bits();
+                        m
+                    }
+                }
+                Kind::B => {
+                    let (r0, r1) = (field_of(ref0[0])?, field_of(ref0[1])?);
+                    let refs2 = [&r0.planes[..], &r1.planes[..]];
+                    if cabac {
+                        super::h264_cabac_mb::write_b_picture_cabac(&mut w, &gf, &self.tools, qp, &planes, &mut recon, refs2, &r1.motion)
+                    } else {
+                        let m = super::h264_cavlc_mb::write_b_picture(&mut w, &gf, &self.tools, qp, &planes, &mut recon, refs2, &r1.motion);
+                        w.rbsp_trailing_bits();
+                        m
+                    }
+                }
+            };
+            out.extend_from_slice(&syn::annexb(nal_type, nal_ref_idc, &w.into_nal()));
+
+            // The decoder's picture end: its frame_num bookkeeping, then the
+            // field stored and marked into the entry it shares with its pair.
+            model.poc.prev_frame_num = frame_num;
+            model.poc.prev_had_mmco5 = false;
+            if hdr.is_reference() {
+                model.poc.prev_ref_frame_num = frame_num;
+            }
+            let pic = DecodedPic {
+                frame: shared.clone(),
+                poc,
+                field_poc: if parity == 0 { [poc, i32::MAX] } else { [i32::MAX, poc] },
+                fields: 1 << parity,
+                frame_num,
+                frame_num_wrap: frame_num as i32,
+                long_term_frame_idx: 0,
+                mark: [RefMark::Unused; 2],
+                needed_for_output: true,
+                awaiting_field: false,
+                non_existing: false,
+                decode_index: c.encode,
+            };
+            model.dpb.store(pic, &hdr, &f.sps, false, parity as u8)?;
+            model.dpb.output.clear();
+
+            crate::encode::h264_me::prepare_reference(&mut recon);
+            census.push((kind, motion.info.mbs.clone()));
+            cur.fields[parity] = Some(StoredField { planes: recon, motion });
+        }
+
+        // The frame a decoder outputs: the two fields' rows interleaved,
+        // cropped to the displayed size.
+        let mut rec = Vec::with_capacity(self.frame_bytes);
+        for (i, &(dw, dh)) in self.plane_dims.iter().enumerate() {
+            for y in 0..dh as usize {
+                let p = &cur.fields[y % 2].as_ref().expect("both fields were coded").planes[i];
+                let row = (y / 2 + p.pad) * p.stride + p.pad;
+                crate::encode::pack_row(&p.data[row..row + dw as usize], &mut rec);
+            }
+        }
+        Ok(Attempt {
+            access: Access { data: out, keyframe: idr, poc: c.poc, encode_index: c.encode, display: c.display },
+            rec,
+            recon: Vec::new(),
+            motion: super::h264_pic::PicMotion::new(0, 0),
+            fields: Some(FieldsOut { model, frame: cur, census }),
         })
     }
 
@@ -1713,6 +2149,97 @@ mod tests {
             .expect("weighted prediction on a lossless stream must refuse");
         assert!(format!("{err}").contains("weighted prediction"), "{err}");
     }
+    /// `count` interlaced frames of `w` by `h` at `bit_depth`, packed as the
+    /// encoder takes them: every row of a frame drawn at its own field's
+    /// instant — the top field at time `2f`, the bottom at `2f + 1` — from a
+    /// texture moving three samples right and one down per field, so the
+    /// two fields of a frame disagree the way captured interlaced video's
+    /// do. Chroma rows alternate fields as luma rows do. Deeper than 8 bits
+    /// the low bits carry a ramp, so the depth is really used.
+    fn interlaced_frames(w: usize, h: usize, chroma: ChromaFormat, bit_depth: u32, count: usize) -> Vec<Vec<u8>> {
+        let (sw, sh) = match chroma {
+            ChromaFormat::Yuv420 => (2usize, 2usize),
+            ChromaFormat::Yuv422 => (2, 1),
+            _ => (1, 1),
+        };
+        let (cw, ch) = if chroma == ChromaFormat::Monochrome { (0, 0) } else { (w / sw, h / sh) };
+        let shift = bit_depth - 8;
+        let at = |x: usize, y: usize, t: usize, c: usize| -> u32 {
+            let (x, y) = (x + 3 * t, y + t);
+            ((x * 7 + y * 13 + (x * y) / 5 + c * 37) % 200) as u32 + 28
+        };
+        (0..count)
+            .map(|f| {
+                let mut s: Vec<u32> = Vec::with_capacity(w * h + 2 * cw * ch);
+                for y in 0..h {
+                    for x in 0..w {
+                        s.push(at(x, y, 2 * f + y % 2, 0));
+                    }
+                }
+                for c in 1..3 {
+                    for y in 0..ch {
+                        for x in 0..cw {
+                            s.push(at(x * sw, y * sh, 2 * f + y % 2, c) / 2 + 64);
+                        }
+                    }
+                }
+                if shift == 0 {
+                    s.iter().map(|&v| v as u8).collect()
+                } else {
+                    s.iter()
+                        .enumerate()
+                        .flat_map(|(i, &v)| (((v << shift) | (i as u32 & ((1 << shift) - 1))) as u16).to_le_bytes())
+                        .collect()
+                }
+            })
+            .collect()
+    }
+
+    /// Every frame coded as two field pictures round-trips through the
+    /// production decoder (SELF, in process — the decoder pairs the fields
+    /// and outputs the frame): I, P and B frames, both entropy coders, both
+    /// field orders, every chroma format, one and two reference frames,
+    /// the 8x8 transform and the sub-partitions, at 8 and 10 bits. The
+    /// census proves fields were coded, two per frame, and that the inter
+    /// paths ran.
+    #[test]
+    fn field_pictures_round_trip_through_the_decoder() {
+        use crate::encode::{FieldCoding, FieldOrder};
+        for (chroma, bit_depth, bframes, entropy, tools, order, max_refs) in [
+            (ChromaFormat::Yuv420, 8u32, 0u32, Entropy::Cabac, false, FieldOrder::TopFirst, 1u32),
+            (ChromaFormat::Yuv420, 8, 0, Entropy::Cavlc, true, FieldOrder::BottomFirst, 1),
+            (ChromaFormat::Yuv420, 8, 2, Entropy::Cabac, true, FieldOrder::TopFirst, 1),
+            (ChromaFormat::Yuv420, 8, 2, Entropy::Cavlc, false, FieldOrder::BottomFirst, 2),
+            (ChromaFormat::Yuv422, 8, 0, Entropy::Cavlc, true, FieldOrder::TopFirst, 2),
+            (ChromaFormat::Yuv444, 8, 2, Entropy::Cabac, false, FieldOrder::BottomFirst, 1),
+            (ChromaFormat::Monochrome, 8, 0, Entropy::Cabac, true, FieldOrder::TopFirst, 1),
+            (ChromaFormat::Yuv420, 10, 2, Entropy::Cabac, true, FieldOrder::BottomFirst, 1),
+        ] {
+            let tag = format!("{chroma:?} {bit_depth}-bit bframes={bframes} {entropy:?} tools={tools} {order:?} refs={max_refs}");
+            let frames = interlaced_frames(64, 64, chroma, bit_depth, 7);
+            let (_, census) = encode_and_self_check(
+                &tag,
+                Config {
+                    gop: 8,
+                    bframes,
+                    entropy,
+                    transform_8x8: tools,
+                    subparts: tools,
+                    max_refs,
+                    interlace: Some(order),
+                    field_coding: FieldCoding::Field,
+                    ..cfg(64, 64, chroma, bit_depth)
+                },
+                &frames,
+            );
+            assert_eq!(census.field_pictures, 2 * frames.len() as u64, "{tag}: two field pictures per frame: {census:?}");
+            assert!(census.counts[1].iter().sum::<u64>() > 0, "{tag}: no P field macroblock: {census:?}");
+            if bframes > 0 {
+                assert!(census.pictures[2] > 0, "{tag}: no B field was coded: {census:?}");
+            }
+        }
+    }
+
     /// Interlaced coding refuses by name what it cannot deliver: a height
     /// an interlaced crop cannot reach (four rows at a time in 4:2:0, two
     /// otherwise), and on H.265 — which has no interlaced coding tools —
