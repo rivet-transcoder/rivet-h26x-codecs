@@ -143,3 +143,26 @@ deep motion10 "testsrc=size=64x64:rate=25"  12 64x64 420 10
 deep detail10 "testsrc2=size=64x64:rate=25"  8 64x64 422 10
 deep detail10 "testsrc2=size=64x64:rate=25"  8 64x64 444 10
 deep detail12 "testsrc2=size=64x64:rate=25"  8 64x64 420 12
+
+# The one clip larger than 64x64, for the H.265 coding quadtree. Every
+# clip above is four 32x32 coding tree blocks (twelve 16x16 ones on the
+# odd clip), so a split decision there sees at most four CTBs of one
+# content each, and a probe of what splitting buys cannot tell a win from
+# the clip's one texture. This is forty CTBs of four unrelated contents in
+# quarters — moving detail (testsrc2), a zooming fractal (mandelbrot),
+# smooth drifting gradients, and static bars with hard vertical edges —
+# so one picture holds regions where a whole 32x32 unit is right beside
+# regions where only 8x8 units are.
+#
+# 256x160 rather than, say, 256x144: the encoder picks the CTB size that
+# pads least, larger on a tie, and 144 is a whole number of 16s but not
+# of 32s — at 256x144 it would choose 16x16 CTBs, where the quadtree can
+# split only once.
+#
+# VISITED ONLY BY ROWS THAT NAME IT (`@big`). Its format token spells the
+# depth, `420p8`, though it is the 8-bit 4:2:0 every token without a
+# suffix means: a token with a depth suffix is what verify_encode.sh and
+# identity_encode.sh skip for every row without an `@` (the deep clips'
+# rule), so this clip's arrival changed no existing row's cost — in every
+# checkout of those scripts, including ones older than the clip.
+gen big    "testsrc2=size=128x80:rate=25,format=yuv420p[a];mandelbrot=size=128x80:rate=25,format=yuv420p[b];gradients=size=128x80:rate=25:c0=0x2050a0:c1=0xe0b040:x0=0:y0=0:x1=127:y1=79:nb_colors=2:seed=1:speed=0.01:type=linear,format=yuv420p[c];smptehdbars=size=128x80:rate=25,format=yuv420p[d];[a][b]hstack=inputs=2[top];[c][d]hstack=inputs=2[bot];[top][bot]vstack=inputs=2" 16 256x160_420p8 yuv420p

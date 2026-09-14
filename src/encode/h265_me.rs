@@ -69,8 +69,10 @@
 //! before deciding not to build them. The numbers are here so the next
 //! reader decides against a bigger corpus rather than re-deriving them.
 //!
-//! - **Prediction-unit partitions, symmetric and AMP.** The encoder codes
-//!   one `PART_2Nx2N` unit per CTB. `tools/partition_opportunity.py`
+//! - **Prediction-unit partitions, symmetric and AMP.** Measured while the
+//!   encoder coded one `PART_2Nx2N` unit per CTB; the coding quadtree now
+//!   splits CTBs into smaller `PART_2Nx2N` units, which takes part of the
+//!   same opportunity by another road. `tools/partition_opportunity.py`
 //!   (integer-sample SAD, ±4, a split must beat the whole block by 5%)
 //!   over the seven 8-bit 4:2:0 clips: 16.2% of blocks would take a
 //!   symmetric split and 13.3% an AMP shape beyond it — but 7.1% and
@@ -108,11 +110,13 @@
 //!
 //! # Scope (v1) — the same deliberately fixed geometry as the intra module
 //!
-//! - **P slices, one reference** (list 0, `ref_idx` 0), `PART_2Nx2N`
-//!   whole-CTU CUs, one CU-sized TU (no transform split — the SPS's
+//! - **P slices, one reference** (list 0, `ref_idx` 0), `PART_2Nx2N` CUs
+//!   — a whole CTB, or a quadtree leaf down to 8x8 through
+//!   `InterPicture::code_ctu_tree` — each with one CU-sized TU (no transform
+//!   split — the SPS's
 //!   maximum transform size equals the CTB size precisely so this shape is
 //!   representable). The quantiser and the weighting are the caller's:
-//!   per-CTB quantisers through `MeCtx::qp`, and list 0's explicit
+//!   per-unit quantisers through `MeCtx::qp`, and list 0's explicit
 //!   weighting through [`InterPicture::wp`] when the slice carries a
 //!   `pred_weight_table` (`Weighting::Default` otherwise; B slices
 //!   always).
@@ -210,7 +214,10 @@
 //! Lagrangian constant for the same reason.
 
 use crate::dsp::hevc_enc::{qbits, quant_offset, quant_scale};
-use crate::encode::h265_intra::{CuDecision, Geo, IntraCtx, chroma_tbs, code_cu_2nx2n_intra, satd_lambda_scale, sub_wh};
+use crate::encode::h265_intra::{
+    CuDecision, Geo, IntraCtx, MIN_CB_LOG2, RegionSave, Srcs, TreeCu, chroma_tbs, code_cu_2nx2n_intra, code_cu_nxn_intra, cu_ssd, restore4, satd_lambda_scale,
+    save4, ssd_lambda, sub_wh,
+};
 use crate::cabac_enc::CabacEncoder;
 use crate::hevc::ctu::{
     PartMode, SplitCuNb, chroma_qp, write_cu_skip_flag, write_inter_pred_idc, write_merge_flag,
@@ -477,8 +484,10 @@ pub struct InterPicture<S: Sample> {
     /// read neighbour motion from here, and the next picture's TMVP would
     /// too if the SPS ever enables it.
     pub recon: Frame<S>,
-    /// log2 of the fixed CU size, 4 or 5.
-    pub log2_cu: u32,
+    /// log2 of the CTB size, 4 or 5. A coding unit is this size or, under
+    /// the coding quadtree, smaller — down to the 8x8 minimum coding block;
+    /// the CU-level calls take their own size.
+    pub log2_ctb: u32,
     /// `ChromaArrayType` (0 monochrome, 1 4:2:0, 2 4:2:2, 3 4:4:4), read
     /// off the parsed SPS. Every chroma decision below — whether chroma
     /// exists, where its transform blocks sit, which QP mapping applies —
@@ -553,7 +562,7 @@ impl<S: Sample> InterPicture<S> {
         InterPicture {
             info,
             recon,
-            log2_cu: sps.log2_ctb_size,
+            log2_ctb: sps.log2_ctb_size,
             cat: sps.chroma_array_type(),
             cur_poc,
             split_depth: 1,
@@ -623,7 +632,7 @@ impl<S: Sample> InterPicture<S> {
         }
     }
 
-    /// Decide and code one CTU (== one 2Nx2N CU) against the references
+    /// Decide and code one CTU as a single 2Nx2N CU against the references
     /// of `RefPicList0`, `refs_l0`, nearest first (borders extended —
     /// `Frame::extend_rows` — exactly as the decoder pads references
     /// before MC reads them).
@@ -650,9 +659,34 @@ impl<S: Sample> InterPicture<S> {
         src_cr: &[S],
         c_stride: usize,
     ) -> InterCuDecision {
-        let n = 1usize << self.log2_cu;
-        let (x0, y0) = (cu_x * n, cu_y * n);
-        let mut out = InterCuDecision { log2_cu: self.log2_cu, bypass: ctx.bypass, qp_y: ctx.qp, ..InterCuDecision::default() };
+        let n = 1usize << self.log2_ctb;
+        self.code_cu(ctx, refs_l0, cu_x * n, cu_y * n, self.log2_ctb, 0, src_y, y_stride, src_cb, src_cr, c_stride)
+    }
+
+    /// [`Self::code_ctu`] for one coding unit of `1 << log2_cu` at luma
+    /// `(x0, y0)` and coding-tree depth `depth` — the whole CTB at depth 0,
+    /// a quadtree leaf below it. Everything the decision derives from its
+    /// neighbours (merge and AMVP candidates, the skip context) comes from
+    /// the decoder-grade state the walk maintains, so a neighbour of any
+    /// size serves; `depth` reaches the rate model only through
+    /// `inter_pred_idc`'s context.
+    #[allow(clippy::too_many_arguments)]
+    pub fn code_cu(
+        &mut self,
+        ctx: &MeCtx<'_, S>,
+        refs_l0: &[&Frame<S>],
+        x0: usize,
+        y0: usize,
+        log2_cu: u32,
+        depth: u32,
+        src_y: &[S],
+        y_stride: usize,
+        src_cb: &[S],
+        src_cr: &[S],
+        c_stride: usize,
+    ) -> InterCuDecision {
+        let n = 1usize << log2_cu;
+        let mut out = InterCuDecision { log2_cu, bypass: ctx.bypass, qp_y: ctx.qp, ..InterCuDecision::default() };
 
         // Mark the CTB as this (single) slice's, as the decoder does at CTB
         // start: `avail_ctx` reads the current CTB's slice address, and
@@ -697,15 +731,15 @@ impl<S: Sample> InterPicture<S> {
         // choice is not free and the cost below counts it.
         //
         // The default is ONE reference, and that is a measured choice.
-        // On this encoder's geometry the choice never has a better
-        // answer: whole-CTU 32x32 coding units average over enough
+        // On whole-CTB units (`max_cu_depth` 0) the choice never has a
+        // better answer: 32x32 coding units average over enough
         // content that one reference always serves them (0 of 140 blocks
         // across the corpus, where the same probe at 16x16 said 6.9% and
         // was answering about a block size this encoder does not code),
         // and two references measured 0.80% worse on every clip, better
-        // on none. `Config::max_refs` opts in; re-run
-        // `tools/multiref_opportunity.py` at the new size the day sub-CU
-        // partitioning lands.
+        // on none. `Config::max_refs` opts in. The coding quadtree now codes
+        // the 16x16 and 8x8 units that probe answered about; it has not
+        // been re-run against them.
         //
         // Full-sample descent from every distinct seed's best, then the
         // two sub-sample rings, per reference.
@@ -722,7 +756,7 @@ impl<S: Sample> InterPicture<S> {
         // occurrence of a (vector, reference) matters (a later duplicate
         // signals strictly more bins for the same prediction).
         let lam = lambda(ctx.qp) * satd_lambda_scale(ctx.bit_depth);
-        let rate = Rate::new(ctx.qp, false, self.log2_cu);
+        let rate = Rate::new_at(ctx.qp, false, log2_cu, depth);
         let mut best_merge: Option<(usize, u32)> = None; // (idx, satd)
         let mut best_merge_cost = f32::INFINITY;
         let mut seen: Vec<(Mv, i8)> = Vec::with_capacity(MAX_MERGE_CAND);
@@ -801,7 +835,7 @@ impl<S: Sample> InterPicture<S> {
         let wp = self.wp_for(chosen_ref);
         predict_block(ctx.dsp, &mut self.scratch, &mut self.recon, x0, y0, n, n, Some((refp, mv)), None, wp);
 
-        let any = self.code_residual_cu(ctx, x0, y0, src, y_stride, src_cb, src_cr, c_stride, &mut out);
+        let any = self.code_residual_cu(ctx, x0, y0, log2_cu, src, y_stride, src_cb, src_cr, c_stride, &mut out);
         out.kind = match (merge_wins, any) {
             (true, false) => InterCuKind::Skip { merge_idx: best_merge.expect("merge_wins").0 as u8 },
             (true, true) => InterCuKind::Merge { merge_idx: best_merge.expect("merge_wins").0 as u8 },
@@ -822,7 +856,7 @@ impl<S: Sample> InterPicture<S> {
         out
     }
 
-    /// Decide and code one CTU (== one 2Nx2N CU) of a **B** picture
+    /// Decide and code one CTU as a single 2Nx2N CU of a **B** picture
     /// against `ref0` (list 0) and `ref1` (list 1), whose borders must be
     /// extended as the decoder pads references before MC reads them.
     ///
@@ -865,9 +899,31 @@ impl<S: Sample> InterPicture<S> {
         src_cr: &[S],
         c_stride: usize,
     ) -> InterCuDecision {
-        let n = 1usize << self.log2_cu;
-        let (x0, y0) = (cu_x * n, cu_y * n);
-        let mut out = InterCuDecision { log2_cu: self.log2_cu, bypass: ctx.bypass, qp_y: ctx.qp, ..InterCuDecision::default() };
+        let n = 1usize << self.log2_ctb;
+        self.code_cu_b(ctx, ref0, ref1, cu_x * n, cu_y * n, self.log2_ctb, 0, src_y, y_stride, src_cb, src_cr, c_stride)
+    }
+
+    /// [`Self::code_ctu_b`] for one coding unit of `1 << log2_cu` at luma
+    /// `(x0, y0)` and coding-tree depth `depth`, as [`Self::code_cu`] is
+    /// to [`Self::code_ctu`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn code_cu_b(
+        &mut self,
+        ctx: &MeCtx<'_, S>,
+        ref0: &Frame<S>,
+        ref1: &Frame<S>,
+        x0: usize,
+        y0: usize,
+        log2_cu: u32,
+        depth: u32,
+        src_y: &[S],
+        y_stride: usize,
+        src_cb: &[S],
+        src_cr: &[S],
+        c_stride: usize,
+    ) -> InterCuDecision {
+        let n = 1usize << log2_cu;
+        let mut out = InterCuDecision { log2_cu, bypass: ctx.bypass, qp_y: ctx.qp, ..InterCuDecision::default() };
 
         let ctb = self.info.ctb_of(x0, y0);
         self.info.ctb_slice_addr[ctb] = 0;
@@ -908,7 +964,7 @@ impl<S: Sample> InterPicture<S> {
         }
 
         let lam = lambda(ctx.qp) * satd_lambda_scale(ctx.bit_depth);
-        let rate = Rate::new(ctx.qp, true, self.log2_cu);
+        let rate = Rate::new_at(ctx.qp, true, log2_cu, depth);
 
         // The three AMVP shapes. `inter_pred_idc` costs two bins for a uni
         // shape and one for BI (the reader stops after a set first bin),
@@ -1014,6 +1070,10 @@ impl<S: Sample> InterPicture<S> {
             fill_motion(&mut self.recon.motion, self.recon.w4, x0, y0, n, n, MotionInfo::INTRA);
             let w4 = self.info.w4;
             PicInfo::fill4(&mut self.info.pred_mode, w4, x0, y0, n, n, 1);
+            // Never skipped — and under the quadtree the area may still
+            // hold a skip mark from a trial that lost, which the P walk's
+            // identical fill already clears.
+            PicInfo::fill4(&mut self.info.skip, w4, x0, y0, n, n, 0);
             return out;
         }
 
@@ -1023,7 +1083,7 @@ impl<S: Sample> InterPicture<S> {
         let r1 = (ref_pair[1] >= 0).then_some((ref1, mv_pair[1]));
         predict_block(ctx.dsp, &mut self.scratch, &mut self.recon, x0, y0, n, n, r0, r1, [Weighting::Default; 3]);
 
-        let any = self.code_residual_cu(ctx, x0, y0, src, y_stride, src_cb, src_cr, c_stride, &mut out);
+        let any = self.code_residual_cu(ctx, x0, y0, log2_cu, src, y_stride, src_cb, src_cr, c_stride, &mut out);
         out.kind = match (merge_wins, any) {
             (true, false) => InterCuKind::Skip { merge_idx: best_merge.expect("merge_wins").0 as u8 },
             (true, true) => InterCuKind::Merge { merge_idx: best_merge.expect("merge_wins").0 as u8 },
@@ -1046,7 +1106,7 @@ impl<S: Sample> InterPicture<S> {
         out
     }
 
-    /// The residual of one whole-CTU CU, luma then every chroma TB this
+    /// The residual of one 2Nx2N CU, luma then every chroma TB this
     /// format carries, each reconstructed in place through the decoder's
     /// inverse path. Fills `cbf_luma`, `cbf_chroma`, `cbf_chroma_bot`,
     /// `rqt_root_cbf` and the coefficient arrays; returns `rqt_root_cbf`.
@@ -1063,6 +1123,7 @@ impl<S: Sample> InterPicture<S> {
         ctx: &MeCtx<'_, S>,
         x0: usize,
         y0: usize,
+        log2_cu: u32,
         src: &[S],
         y_stride: usize,
         src_cb: &[S],
@@ -1071,7 +1132,7 @@ impl<S: Sample> InterPicture<S> {
         out: &mut InterCuDecision,
     ) -> bool {
         let qp_l = ctx.qp + 6 * (ctx.bit_depth as i32 - 8);
-        let nz_l = code_residual_inter(ctx, &mut self.recon.y, x0, y0, self.log2_cu, qp_l, src, y_stride, &mut out.luma);
+        let nz_l = code_residual_inter(ctx, &mut self.recon.y, x0, y0, log2_cu, qp_l, src, y_stride, &mut out.luma);
         let mut nz_c = 0u32;
         if self.cat != 0 {
             // QpC: Table 8-10 for 4:2:0, `Min(qPi, 51)` otherwise — the
@@ -1087,7 +1148,7 @@ impl<S: Sample> InterPicture<S> {
             // `yct = yc + t * nc` pair. Anchors come back in *luma*
             // coordinates; dividing by (SubWidthC, SubHeightC) puts them on
             // the chroma plane, which is also how the source is addressed.
-            let (tbs, ntb, log2c) = chroma_tbs(self.cat, x0, y0, self.log2_cu);
+            let (tbs, ntb, log2c) = chroma_tbs(self.cat, x0, y0, log2_cu);
             let nc2 = 1usize << (2 * log2c);
             for comp in 0..2usize {
                 let plane = if comp == 0 { &mut self.recon.cb } else { &mut self.recon.cr };
@@ -1156,8 +1217,26 @@ impl<S: Sample> InterPicture<S> {
         src_cr: &[S],
         c_stride: usize,
     ) -> CuDecision {
-        let n = 1usize << self.log2_cu;
-        let (x0, y0) = (cu_x * n, cu_y * n);
+        let n = 1usize << self.log2_ctb;
+        self.code_cu_intra(ctx, cu_x * n, cu_y * n, self.log2_ctb, src_y, y_stride, src_cb, src_cr, c_stride)
+    }
+
+    /// [`Self::code_ctu_intra`] for one coding unit of `1 << log2_cu` at
+    /// luma `(x0, y0)`: the CU [`Self::code_cu`] or [`Self::code_cu_b`]
+    /// answered [`InterCuKind::UseIntra`] for, called immediately after.
+    #[allow(clippy::too_many_arguments)]
+    pub fn code_cu_intra(
+        &mut self,
+        ctx: &MeCtx<'_, S>,
+        x0: usize,
+        y0: usize,
+        log2_cu: u32,
+        src_y: &[S],
+        y_stride: usize,
+        src_cb: &[S],
+        src_cr: &[S],
+        c_stride: usize,
+    ) -> CuDecision {
         // Split the borrows: the mode grid is written, the pred-mode grid
         // is read, and both live in `info` beside each other.
         let PicInfo { intra_mode, pred_mode, .. } = &mut self.info;
@@ -1172,12 +1251,160 @@ impl<S: Sample> InterPicture<S> {
             self.split_depth,
             x0,
             y0,
+            log2_cu,
             src_y,
             y_stride,
             src_cb,
             src_cr,
             c_stride,
         )
+    }
+
+    /// Decide and code the CTB at `(cu_x, cu_y)` (CTB units) of a P or B
+    /// picture as a coding quadtree — the walk and the cost of
+    /// [`super::h265_intra::IntraPicture::code_ctu_tree`] over this
+    /// picture's units: every node coded whole by the inter decision
+    /// ([`Self::code_cu`] or [`Self::code_cu_b`], handing over to
+    /// [`Self::code_cu_intra`] where it answers [`InterCuKind::UseIntra`])
+    /// and then split, the cheaper kept.
+    ///
+    /// A trial here leaves more behind than an intra one: beside the
+    /// samples, the motion grid and the `pred_mode`, `skip` and
+    /// `intra_mode` marks the candidate derivations read. All of it is put
+    /// back when the whole node wins (`TrialSave`), over exactly the
+    /// node's area — and nothing outside it is ever written — so the next
+    /// unit's merge and AMVP lists are built from the winners alone, as a
+    /// decoder builds them from what it parsed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn code_ctu_tree(
+        &mut self,
+        ctx: &MeCtx<'_, S>,
+        want: &dyn Fn(usize, usize, u32) -> i32,
+        max_depth: u32,
+        refs: TreeRefs<'_, S>,
+        cu_x: usize,
+        cu_y: usize,
+        src: &Srcs<'_, S>,
+    ) -> Vec<TreeCu<PCuDecision>> {
+        let log2 = self.log2_ctb;
+        let mut out = Vec::new();
+        self.tree_node(ctx, want, max_depth, refs, cu_x << log2, cu_y << log2, log2, 0, src, &mut out);
+        out
+    }
+
+    /// One node of [`Self::code_ctu_tree`]: returns its cost, having
+    /// pushed its winning units onto `out`.
+    #[allow(clippy::too_many_arguments)]
+    fn tree_node(
+        &mut self,
+        ctx: &MeCtx<'_, S>,
+        want: &dyn Fn(usize, usize, u32) -> i32,
+        max_depth: u32,
+        refs: TreeRefs<'_, S>,
+        x0: usize,
+        y0: usize,
+        log2: u32,
+        depth: u32,
+        src: &Srcs<'_, S>,
+        out: &mut Vec<TreeCu<PCuDecision>>,
+    ) -> f64 {
+        let qp = want(x0, y0, log2);
+        let cctx = IntraCtx { qp, ..*ctx };
+        let init = if matches!(refs, TreeRefs::B(..)) { 2 } else { 1 };
+        let lam = ssd_lambda(qp, ctx.bit_depth);
+        let (d, ssd, unit_bits) = self.tree_leaf(&cctx, refs, x0, y0, log2, depth, src);
+        let flag = if log2 > MIN_CB_LOG2 { crate::encode::h265::split_flag_bits(init, qp, false) } else { 0.0 };
+        let bits = unit_bits + flag;
+        let j_whole = ssd as f64 + lam * f64::from(bits);
+        if depth >= max_depth || log2 <= MIN_CB_LOG2 {
+            out.push(TreeCu { x0, y0, log2, depth, bits, d });
+            return j_whole;
+        }
+        let n = 1usize << log2;
+        let saved = TrialSave::take(self, x0, y0, n);
+        let mark = out.len();
+        let mut j_split = lam * f64::from(crate::encode::h265::split_flag_bits(init, qp, true));
+        let half = n / 2;
+        for i in 0..4 {
+            if j_split > j_whole {
+                break;
+            }
+            j_split += self.tree_node(ctx, want, max_depth, refs, x0 + (i & 1) * half, y0 + (i >> 1) * half, log2 - 1, depth + 1, src, out);
+        }
+        if j_whole <= j_split {
+            saved.put(self, x0, y0, n);
+            out.truncate(mark);
+            out.push(TreeCu { x0, y0, log2, depth, bits, d });
+            j_whole
+        } else {
+            j_split
+        }
+    }
+
+    /// Code the unit of `1 << log2` at `(x0, y0)` whole, as a quadtree
+    /// leaf: the decision (inter, or the intra one it handed over to), its
+    /// reconstruction SSD, and its counted syntax bits without the
+    /// `split_cu_flag`.
+    #[allow(clippy::too_many_arguments)]
+    fn tree_leaf(
+        &mut self,
+        ctx: &MeCtx<'_, S>,
+        refs: TreeRefs<'_, S>,
+        x0: usize,
+        y0: usize,
+        log2: u32,
+        depth: u32,
+        src: &Srcs<'_, S>,
+    ) -> (PCuDecision, u64, f32) {
+        let (d, nref, is_b) = match refs {
+            TreeRefs::P(l0) => {
+                (self.code_cu(ctx, l0, x0, y0, log2, depth, src.y, src.y_stride, src.cb, src.cr, src.c_stride), l0.len() as u32, false)
+            }
+            TreeRefs::B(r0, r1) => (self.code_cu_b(ctx, r0, r1, x0, y0, log2, depth, src.y, src.y_stride, src.cb, src.cr, src.c_stride), 1, true),
+        };
+        let coded = if matches!(d.kind, InterCuKind::UseIntra) {
+            PCuDecision::Intra(Box::new(self.code_cu_intra(ctx, x0, y0, log2, src.y, src.y_stride, src.cb, src.cr, src.c_stride)))
+        } else {
+            PCuDecision::Inter(d)
+        };
+        let n = 1usize << log2;
+        let ssd = cu_ssd(ctx, &self.recon, self.cat, x0, y0, n, src);
+        let bits = crate::encode::h265::p_cu_bits(&coded, self.cat, ctx.qp, ctx.bypass, is_b, nref, depth);
+        // An intra unit at the minimum coding block has a second shape, as
+        // in an I picture: code `PART_NxN` too and keep the cheaper, the
+        // loser's state put back from a copy.
+        if log2 == MIN_CB_LOG2 && matches!(coded, PCuDecision::Intra(_)) {
+            let saved = TrialSave::take(self, x0, y0, n);
+            let nxn = PCuDecision::Intra(Box::new(self.code_cu_intra_nxn(ctx, x0, y0, src.y, src.y_stride, src.cb, src.cr, src.c_stride)));
+            let ssd_n = cu_ssd(ctx, &self.recon, self.cat, x0, y0, n, src);
+            let bits_n = crate::encode::h265::p_cu_bits(&nxn, self.cat, ctx.qp, ctx.bypass, is_b, nref, depth);
+            let lam = ssd_lambda(ctx.qp, ctx.bit_depth);
+            if ssd_n as f64 + lam * f64::from(bits_n) < ssd as f64 + lam * f64::from(bits) {
+                return (nxn, ssd_n, bits_n);
+            }
+            saved.put(self, x0, y0, n);
+        }
+        (coded, ssd, bits)
+    }
+
+    /// The `PART_NxN` alternative to [`Self::code_cu_intra`] for an 8x8 unit
+    /// the inter decision handed over: `code_cu_nxn_intra` over this
+    /// picture's state, as `code_cu_intra` runs `code_cu_2nx2n_intra`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn code_cu_intra_nxn(
+        &mut self,
+        ctx: &MeCtx<'_, S>,
+        x0: usize,
+        y0: usize,
+        src_y: &[S],
+        y_stride: usize,
+        src_cb: &[S],
+        src_cr: &[S],
+        c_stride: usize,
+    ) -> CuDecision {
+        let PicInfo { intra_mode, pred_mode, .. } = &mut self.info;
+        let (intra_mode, pred_mode) = (&mut intra_mode[..], &pred_mode[..]);
+        code_cu_nxn_intra(ctx, self.geo, &mut self.recon, intra_mode, Some(pred_mode), &mut self.intra_scratch, x0, y0, src_y, y_stride, src_cb, src_cr, c_stride)
     }
 
     /// Greedy small-diamond SAD descent at full-sample positions, seeded
@@ -1290,8 +1517,8 @@ impl<S: Sample> InterPicture<S> {
     /// and with this picture's, so the caller can count whether the
     /// table's fit helped the vectors the search actually chose.
     #[allow(clippy::too_many_arguments)]
-    pub fn weighting_gain(&mut self, ctx: &MeCtx<'_, S>, refp: &Frame<S>, r: usize, x0: usize, y0: usize, src_y: &[S], y_stride: usize, mv: Mv) -> (u32, u32) {
-        let n = 1usize << self.log2_cu;
+    pub fn weighting_gain(&mut self, ctx: &MeCtx<'_, S>, refp: &Frame<S>, r: usize, x0: usize, y0: usize, log2_cu: u32, src_y: &[S], y_stride: usize, mv: Mv) -> (u32, u32) {
+        let n = 1usize << log2_cu;
         let src = &src_y[y0 * y_stride + x0..];
         let wp = self.wp_for(r)[0];
         let plain = self.satd_at_weighted(ctx, &refp.y, x0, y0, n, src, y_stride, mv, Weighting::Default);
@@ -1326,6 +1553,57 @@ impl<S: Sample> InterPicture<S> {
         let max = (1i32 << bd) - 1;
         (ctx.dsp.bi)(spred, n, spred14, spred14_b, n, n, 15 - bd as i32, max);
         (ctx.dist.satd)(src, src_stride, spred, n, n, n)
+    }
+}
+
+/// The references a coding-quadtree walk predicts from.
+pub enum TreeRefs<'r, S: Sample> {
+    /// A P slice's `RefPicList0`, nearest first.
+    P(&'r [&'r Frame<S>]),
+    /// A B slice's list-0 and list-1 anchors.
+    B(&'r Frame<S>, &'r Frame<S>),
+}
+
+impl<S: Sample> Clone for TreeRefs<'_, S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<S: Sample> Copy for TreeRefs<'_, S> {}
+
+/// Everything a coding trial over a square region of an inter picture
+/// writes, as the trial left it: the samples, the motion grid, and the
+/// `pred_mode`, `skip` and `intra_mode` marks. See
+/// [`InterPicture::code_ctu_tree`].
+struct TrialSave<S: Sample> {
+    planes: RegionSave<S>,
+    motion: Vec<MotionInfo>,
+    pred_mode: Vec<u8>,
+    skip: Vec<u8>,
+    intra_mode: Vec<u8>,
+}
+
+impl<S: Sample> TrialSave<S> {
+    fn take(pic: &InterPicture<S>, x0: usize, y0: usize, n: usize) -> Self {
+        let w4 = pic.info.w4;
+        TrialSave {
+            planes: RegionSave::take(&pic.recon, pic.cat, x0, y0, n),
+            motion: save4(&pic.recon.motion, pic.recon.w4, x0, y0, n),
+            pred_mode: save4(&pic.info.pred_mode, w4, x0, y0, n),
+            skip: save4(&pic.info.skip, w4, x0, y0, n),
+            intra_mode: save4(&pic.info.intra_mode, w4, x0, y0, n),
+        }
+    }
+
+    fn put(&self, pic: &mut InterPicture<S>, x0: usize, y0: usize, n: usize) {
+        let w4 = pic.info.w4;
+        self.planes.put(&mut pic.recon, pic.cat, x0, y0, n);
+        let mw4 = pic.recon.w4;
+        restore4(&mut pic.recon.motion, mw4, x0, y0, n, &self.motion);
+        restore4(&mut pic.info.pred_mode, w4, x0, y0, n, &self.pred_mode);
+        restore4(&mut pic.info.skip, w4, x0, y0, n, &self.skip);
+        restore4(&mut pic.info.intra_mode, w4, x0, y0, n, &self.intra_mode);
     }
 }
 
@@ -1434,14 +1712,26 @@ fn lambda(qp: i32) -> f32 {
 pub(crate) struct Rate {
     /// The slice's initial contexts, cloned per pricing.
     cx: Contexts,
-    /// log2 of the CU size, for `inter_pred_idc`'s block dimensions.
+    /// log2 of the CU size, for `inter_pred_idc`'s block dimensions and
+    /// for whether `split_cu_flag` is coded at all (not at the 8x8
+    /// minimum coding block).
     log2_cu: u32,
+    /// The CU's coding-tree depth, `CtDepth` — the context of
+    /// `inter_pred_idc`'s first bin.
+    depth: u32,
 }
 
 impl Rate {
     /// `init_type` as `code_inter_picture` derives it: 1 for P, 2 for B.
+    #[cfg(test)]
     pub(crate) fn new(qp: i32, is_b: bool, log2_cu: u32) -> Self {
-        Rate { cx: Contexts::new(if is_b { 2 } else { 1 }, qp), log2_cu }
+        Self::new_at(qp, is_b, log2_cu, 0)
+    }
+
+    /// The rate model for a `1 << log2_cu` CU at coding-tree depth
+    /// `depth` of a P (`is_b` false) or B slice at quantiser `qp`.
+    pub(crate) fn new_at(qp: i32, is_b: bool, log2_cu: u32, depth: u32) -> Self {
+        Rate { cx: Contexts::new(if is_b { 2 } else { 1 }, qp), log2_cu, depth }
     }
 
     /// Run `f` over a counting encoder and a private copy of the contexts.
@@ -1460,16 +1750,20 @@ impl Rate {
     /// The elements every inter CU spells before its shape diverges:
     /// `split_cu_flag` then `cu_skip_flag`. `nb` is the neutral neighbour
     /// context described on [`Rate`].
-    fn prefix(e: &mut CabacEncoder<'static>, cx: &mut Contexts, skip: bool) {
-        let nb = SplitCuNb { left_depth: None, above_depth: None };
-        write_split_cu_flag(e, cx, &nb, 0, false);
+    fn prefix(&self, e: &mut CabacEncoder<'static>, cx: &mut Contexts, skip: bool) {
+        // `split_cu_flag` exists only above the 8x8 minimum coding block;
+        // at it the reader infers the leaf and takes no bin.
+        if self.log2_cu > 3 {
+            let nb = SplitCuNb { left_depth: None, above_depth: None };
+            write_split_cu_flag(e, cx, &nb, self.depth, false);
+        }
         write_cu_skip_flag(e, cx, None, None, skip);
     }
 
     /// `cu_skip_flag` 1 and a `merge_idx`; the reader infers the rest.
     pub(crate) fn skip(&self, merge_idx: u8) -> f32 {
         self.count(|e, cx| {
-            Self::prefix(e, cx, true);
+            self.prefix(e, cx, true);
             write_merge_idx(e, cx, MAX_MERGE_CAND as u32, u32::from(merge_idx));
         })
     }
@@ -1478,7 +1772,7 @@ impl Rate {
     /// infers it — so nothing stands in for it here either.
     pub(crate) fn merge(&self, merge_idx: u8) -> f32 {
         self.count(|e, cx| {
-            Self::prefix(e, cx, false);
+            self.prefix(e, cx, false);
             write_pred_mode_flag(e, cx, false);
             write_part_mode_inter(e, cx, PartMode::P2Nx2N);
             write_merge_flag(e, cx, true);
@@ -1504,7 +1798,7 @@ impl Rate {
     /// is what keeps single-reference streams byte-identical.
     pub(crate) fn amvp_ref(&self, mvd: Mv, mvp_flag: u8, root_cbf: bool, nref: u32, ref_idx: u32) -> f32 {
         self.count(|e, cx| {
-            Self::prefix(e, cx, false);
+            self.prefix(e, cx, false);
             write_pred_mode_flag(e, cx, false);
             write_part_mode_inter(e, cx, PartMode::P2Nx2N);
             write_merge_flag(e, cx, false);
@@ -1523,11 +1817,11 @@ impl Rate {
     pub(crate) fn amvp_b(&self, idc: u8, mvd: [Mv; 2], mvp_flag: [u8; 2], root_cbf: bool) -> f32 {
         let n = 1i32 << self.log2_cu;
         self.count(|e, cx| {
-            Self::prefix(e, cx, false);
+            self.prefix(e, cx, false);
             write_pred_mode_flag(e, cx, false);
             write_part_mode_inter(e, cx, PartMode::P2Nx2N);
             write_merge_flag(e, cx, false);
-            write_inter_pred_idc(e, cx, n, n, 0, u32::from(idc));
+            write_inter_pred_idc(e, cx, n, n, self.depth, u32::from(idc));
             for list in 0..2usize {
                 let uses = match idc {
                     0 => list == 0,

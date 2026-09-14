@@ -366,6 +366,16 @@ pub struct Config {
     /// HDR10 content light level, likewise an SEI in every IDR / IRAP
     /// access unit, or `None` for none.
     pub content_light: Option<ContentLightLevel>,
+    /// H.265 only: how many levels the coding quadtree may split a coding
+    /// tree block into smaller coding units. 0 codes one unit per CTB —
+    /// the geometry every stream had before the quadtree existed, and
+    /// byte-identical to it; 1 lets a unit halve once; 2 twice. A split
+    /// never goes below the 8x8 minimum coding block the SPS declares, so a
+    /// 16x16 CTB (the encoder chooses one for small or oddly sized
+    /// pictures) splits at most once whatever this asks, and the census
+    /// line reports the depths each picture kind actually took. Every node
+    /// is a rate-distortion decision, which costs encode time.
+    pub max_cu_depth: u32,
 }
 
 impl Default for Config {
@@ -393,6 +403,7 @@ impl Default for Config {
             chroma_loc: None,
             mastering_display: None,
             content_light: None,
+            max_cu_depth: 0,
         }
     }
 }
@@ -428,6 +439,11 @@ impl Config {
         if self.chroma_loc.is_some() && self.chroma != ChromaFormat::Yuv420 {
             return Err(crate::Error::unsupported(
                 "encode: chroma_loc is a 4:2:0 siting (E.2.1: chroma_loc_info_present_flag should be 0 for any other format)",
+            ));
+        }
+        if self.max_cu_depth > 2 {
+            return Err(crate::Error::unsupported(
+                "encode: max_cu_depth above 2 (a coding tree block of at most 32x32 reaches the 8x8 minimum coding block in two splits)",
             ));
         }
         Ok(())

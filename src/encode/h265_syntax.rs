@@ -96,9 +96,10 @@ impl Geometry {
         let log2_min_cb = 3;
         // The coded picture is a whole number of CTUs, with the conformance
         // window cropping the rest — not the minimal legal size, which only
-        // needs a multiple of the minimum coding block. Whole CTUs because
-        // the intra decision machinery codes exactly one CU per CTU and
-        // cannot express the quadtree shapes a partial edge CTU needs; the
+        // needs a multiple of the minimum coding block. Whole CTUs because a
+        // partial edge CTU needs the splits the reader infers at the
+        // picture edge, which the decision machinery does not produce — it
+        // codes a whole CTB, or a quadtree of it by choice; the
         // padding costs a few edge blocks of replicated content, and the
         // window hides them. The standard's CTB floor is 16 (an 8x8 CTB is
         // illegal — this crate's own SPS parser rejects it, which is how
@@ -454,10 +455,10 @@ pub fn write_sps(cfg: &Config, g: &Geometry, log2_max_poc_lsb: u32, cpb: Option<
     w.ue(0); // log2_min_luma_transform_block_size_minus2 -> 4x4
     // The maximum transform size equals the CTB size (the CTB is at most 32,
     // which is also the standard's largest transform), so a 2Nx2N CU can
-    // carry a single CU-sized TU — which is the only transform tree the
-    // intra decision module produces. The previous value, one below the CTB,
-    // would have forced an inferred transform split under every whole-CTU
-    // CU and made that shape unrepresentable.
+    // carry a single CU-sized TU — the unsplit transform tree every unit may
+    // take. The previous value, one below the CTB, would have forced an
+    // inferred transform split under every CTB-sized CU and made that shape
+    // unrepresentable.
     w.ue(g.log2_ctb - 2); // log2_diff_max_min_luma_transform_block_size
     w.ue(2); // max_transform_hierarchy_depth_inter
     w.ue(2); // max_transform_hierarchy_depth_intra

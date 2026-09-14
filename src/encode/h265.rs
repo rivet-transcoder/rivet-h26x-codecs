@@ -16,11 +16,86 @@
 //! already needs the coding-tree writer, and this module refuses at exactly
 //! that point until it exists. The parameter sets above it are written and
 //! proven against the crate's own conformance-tested parsers.
+//!
+//! # The coding quadtree
+//!
+//! `Config::max_cu_depth` (0 by default) lets a CTB split into smaller
+//! coding units, down to the 8x8 minimum coding block. Every node is a
+//! rate-distortion decision — the node coded whole against the node coded
+//! as four children, each side's cost its reconstruction's SSD plus the
+//! Lagrangian times the bits the production writer counts for its syntax
+//! (`IntraPicture::code_ctu_tree`, `InterPicture::code_ctu_tree`) — and at
+//! 8x8 an intra unit also weighs `PART_NxN`. The units are kept placed, in
+//! decode order (`TreeCu`); the quadtree is read back from the placements
+//! to be written (`write_tree`) and walked by the quantiser chain
+//! (`QgChain`), which follows the reader's quantisation groups at any group
+//! and unit size. At 0 every CTB is one unit, and the stream is the one this
+//! encoder wrote before the quadtree existed.
+//!
+//! ## Measured (2026-09-14), and the proposal on the default
+//!
+//! One binary, `--cu-depth` the only difference, BD-rate by
+//! `tools/bd_rate.py`'s method (QP 22/27/32/37, luma PSNR of the encoder's
+//! own reconstruction) over the eleven 8-bit clips of the encode corpus.
+//! Control: depth 0 encoded twice is byte-identical at every point.
+//!
+//! ```text
+//!   BD-rate against depth 0, mean of 11 clips
+//!                  depth 1    depth 2
+//!   all-intra      -19.0%     -29.2%
+//!   IP             -15.8%     -36.5%
+//!   IPB            -15.7%     -36.3%
+//!
+//!   depth 2, IP, per clip: big (256x160) -58.2%, motion -55.6%,
+//!   detail 400/420/422/444 -47.3/-45.7/-45.1/-40.2%, cut -42.4%,
+//!   fade -31.0%, static -27.6%, odd -8.4% (16x16 CTBs: depth 1 is its
+//!   limit), grad -0.1% (smooth gradients split almost nowhere)
+//! ```
+//!
+//! The gate's rows at their own quantisers agree: `hevc-cu2-ipb` is 30.4%
+//! smaller than `hevc-cqp-ipb` at +1.95 dB (mean over eleven clips),
+//! `hevc-cu2-intra` 24.9% smaller at +1.41 dB, `hevc-cu2-40-ip` 5.9%
+//! smaller at +0.53 dB, lossless IPB 33.0% smaller. The model check holds:
+//! what the split decisions priced the coded units at is within +4.5% to
+//! +9.7% of the slice data they took on every lossy configuration (census
+//! `model_bits` over `coded_bits`; the neutral-context prices run a little
+//! high, never low).
+//!
+//! Encode time, per-process CPU seconds on one pinned core, five
+//! interleaved rounds, median of paired ratios against depth 0, on
+//! workloads long enough for the CPU clock to resolve (the detail and cut
+//! clips repeated to 960 frames, the 256x160 clip to 256). The control, a
+//! second depth-0 run in every round, came out at 0.94–1.02: on a shared
+//! machine, differences under about 10% are not resolved.
+//!
+//! ```text
+//!                      depth 1   depth 2
+//!   detail  all-intra   1.97x     2.91x
+//!   cut     all-intra   2.01x     3.09x
+//!   big     all-intra   1.73x     2.75x
+//!   detail  IPB         2.61x     5.96x
+//!   cut     IPB         2.27x     4.50x
+//!   big     IPB         2.33x     5.09x
+//! ```
+//!
+//! Inter pictures pay more than intra ones because a whole-CTB inter unit
+//! is cheap — one motion search, mostly skips — while every node below it
+//! runs a search of its own.
+//!
+//! **Proposal, for the lead to decide: make `max_cu_depth` default to 2.**
+//! It buys a third of the bits at equal quality (-29% all-intra, -36% IP)
+//! for three to six times the CPU — a larger saving than every other tool
+//! this encoder has put together, on every clip but the flat gradient,
+//! where it costs nothing but time. If encode throughput is what binds —
+//! rivet's software tier runs this encoder inline — depth 1 is the middle
+//! of the road: half the saving (-19% / -16%) for about twice the CPU. The
+//! default stays 0 in this commit, because flipping it moves every H.265
+//! stream the gate knows.
 
 use super::gop::{Coded, Kind, Scheduler};
 use super::h265_deblock::{deblock_inter_picture, deblock_picture};
-use super::h265_intra::{CuDecision, IntraCtx, IntraPicture};
-use super::h265_me::{InterCuDecision, InterCuKind, InterPicture, PCuDecision, MAX_MERGE_CAND};
+use super::h265_intra::{CuDecision, IntraCtx, IntraPicture, MIN_CB_LOG2, Srcs, TreeCu};
+use super::h265_me::{InterCuDecision, InterCuKind, InterPicture, PCuDecision, TreeRefs, MAX_MERGE_CAND};
 use super::rc::{PicKind, RateController};
 use super::h265_sao::{SaoPlan, sao_picture};
 use super::aq;
@@ -35,6 +110,7 @@ use crate::dsp::hevc::HevcDsp;
 use crate::dsp::hevc_enc::HevcEncDsp;
 use crate::dsp::Cpu;
 use crate::hevc::ctx::Contexts;
+use crate::hevc::pic::PicInfo;
 use crate::sample::Sample;
 use crate::hevc::ctu::{
     SaoCtx, SaoMergeNb, SplitCuNb, qp_y_from_pred, qp_y_pred_from, write_cbf_chroma, write_cbf_luma, write_cu_qp_delta,
@@ -42,7 +118,7 @@ use crate::hevc::ctu::{
     write_cu_transquant_bypass_flag, write_merge_flag, write_merge_idx, write_mvd,
     write_inter_pred_idc, write_mvp_flag, write_part_mode_inter, write_pred_mode_flag,
     write_ref_idx, write_rqt_root_cbf,
-    write_intra_chroma_pred_mode, write_mpm_idx, write_prev_intra_luma_pred_flag,
+    write_intra_chroma_pred_mode, write_mpm_idx, write_part_mode_intra, write_prev_intra_luma_pred_flag,
     write_rem_intra_luma_pred_mode, write_split_cu_flag, write_split_transform_flag,
 };
 use crate::hevc::residual::{ResidualParams, residual_scan_idx, write_residual};
@@ -324,13 +400,17 @@ impl<S: Sample> Core<S> {
                 "H.265 encode: adaptive quantisation on a lossless picture (no quantiser to adapt)",
             ));
         }
+        let g = syn::Geometry::new(&cfg);
         // Adaptive quantisation is the one thing that varies the
         // quantiser below the slice, so it is what turns the PPS switch
-        // on; the group is the CTB, the granularity the decision makes.
+        // on. The group is the CTB where every CTB is one coding unit —
+        // the granularity that decision has — and half the CTB once the
+        // coding quadtree may split it, so that a group can follow the
+        // units it holds without a delta per 8x8 unit.
         // Weighted prediction sets the P-slice flag and no other: every
         // P slice then carries a table, B slices stay default.
         let pps_opts = PpsOptions {
-            cu_qp_delta_depth: (cfg.aq_strength > 0.0).then_some(0),
+            cu_qp_delta_depth: (cfg.aq_strength > 0.0).then_some(u32::from(tree_depth(&cfg, &g) > 0)),
             weighted_pred: cfg.weighted_pred,
             ..PpsOptions::default()
         };
@@ -342,7 +422,6 @@ impl<S: Sample> Core<S> {
             2 * (cfg.width as usize).div_ceil(sw as usize)
                 * (cfg.height as usize).div_ceil(sh as usize)
         };
-        let g = syn::Geometry::new(&cfg);
         // The PPS quantiser: the constant one where there is one, and the
         // middle of the road where the controller will vary it per picture.
         // Its only effect on the stream is the size of each
@@ -502,12 +581,6 @@ impl<S: Sample> Core<S> {
         Ok(out)
     }
 
-    /// Code one picture.
-    ///
-    /// The real path is all-intra 4:2:0 at a constant QP: one CU per CTU
-    /// (the geometry guarantees whole CTUs of 16 or 32), decided by the
-    /// intra machinery and serialised through the coding-tree writers that
-    /// live beside their readers. Everything else refuses by name.
     /// Code one picture, re-coding it at a higher quantiser if it will not
     /// fit the buffer this stream declares.
     ///
@@ -764,54 +837,76 @@ impl<S: Sample> Core<S> {
         // The decisions also outlive the loop for the deblocker, which
         // derives its boundary strengths from them exactly as a decoder
         // derives them from what it just parsed.
-        let mut decisions = Vec::with_capacity(wc * hc);
-        // Per-CTB quantisers, when adaptive quantisation asks for them:
-        // each CTB codes at the picture quantiser plus its offset, and
-        // the chain settles what a decoder will actually hold for it —
-        // the offset only if the CTB carries a cbf to hang the delta on.
-        let offsets = self.aq_offsets(&py, cw, ch);
-        let mut chain = QpChain::new(i32::from(qp), bit_depth);
+        // Per-unit quantisers, when adaptive quantisation asks for them:
+        // each unit codes at the picture quantiser plus the offset its
+        // quantisation group wants, and the chain settles what a decoder
+        // will actually hold for it — the offset only where a unit of the
+        // group carries a cbf to hang the delta on.
+        //
+        // Without a tree (`max_cu_depth` 0) every CTB is one unit and one
+        // group, coded by `code_ctu` exactly as before the quadtree
+        // existed; with one, `code_ctu_tree` decides the split at every
+        // node.
+        let max_depth = self.tree_depth();
+        let log2_qg = self.log2_qg();
+        let offsets = self.aq_offsets(&py, cw, ch, log2_qg);
+        let want = |x: usize, y: usize, log2: u32| cu_want(qp, offsets.as_deref(), cw, log2_qg, x, y, log2);
+        let src = Srcs { y: &py, y_stride: cw, cb: &pcb, cr: &pcr, c_stride: ccw };
+        let mut cus: Vec<TreeCu<CuDecision>> = Vec::with_capacity(wc * hc);
+        let mut ctu_start = Vec::with_capacity(wc * hc + 1);
         for cy in 0..hc {
             for cxu in 0..wc {
-                let want = ctb_qp(qp, offsets.as_deref(), cy * wc + cxu);
-                let cctx = IntraCtx { qp: want, ..ictx };
-                let mut d = pic.code_ctu(&cctx, cxu, cy, &py, cw, &pcb, &pcr, ccw);
-                if offsets.is_some() {
-                    d.qp_y = chain.settle(want, d.any_cbf());
+                ctu_start.push(cus.len());
+                if max_depth > 0 {
+                    cus.extend(pic.code_ctu_tree(&ictx, &want, max_depth, cxu, cy, &src));
+                    continue;
                 }
-                decisions.push(d);
+                let (x0, y0) = (cxu << g.log2_ctb, cy << g.log2_ctb);
+                let cctx = IntraCtx { qp: want(x0, y0, g.log2_ctb), ..ictx };
+                let d = pic.code_ctu(&cctx, cxu, cy, &py, cw, &pcb, &pcr, ccw);
+                cus.push(TreeCu { x0, y0, log2: g.log2_ctb, depth: 0, bits: 0.0, d });
             }
+        }
+        ctu_start.push(cus.len());
+        if offsets.is_some() {
+            let mut chain = QgChain::new(i32::from(qp), bit_depth, &g, log2_qg);
+            settle_tree(&mut chain, &mut cus, &ctu_start, &g, &want);
         }
         // After the whole picture reconstructs — intra prediction reads
         // unfiltered neighbours — and before the crop, because the
         // filtered planes are what a decoder emits and therefore what SELF
         // compares against. Bypass CUs are exempt sample for sample, so
         // lossless stays exact with the filter on.
-        let mut info = deblock_picture(&ictx, &mut pic, &decisions);
+        let mut info = deblock_picture(&ictx, &mut pic, &cus);
         // Then SAO, over the deblocked samples, which is the order 8.7
         // fixes and the order `decoder.rs` applies them in.
         let plan = self.cfg.sao.then(|| {
             let (sps, pps) = parsed_sets(&self.cfg, &g, i32::from(qp), bypass, deblock, self.cpb.as_ref(), &self.pps_opts);
             sao_picture(&ictx, &mut pic.recon, &mut info, &sps, &pps, &py, cw, &pcb, &pcr, ccw)
         });
-        let mut census = KindCensus::of_intra(&decisions, i32::from(qp));
+        let mut census = KindCensus::of_intra(&cus, i32::from(qp));
         {
             let mut e = CabacEncoder::new(&mut w);
             // The writer's own copy of the quantiser chain: it must spell
             // the delta against the same prediction the decision pass
             // settled with, and a decoder derives that prediction from
             // the stream alone.
-            let mut chain = QpChain::new(i32::from(qp), bit_depth);
+            let mut chain = offsets.is_some().then(|| QgChain::new(i32::from(qp), bit_depth, &g, log2_qg));
+            let mut tc = TreeCtx::new(&g);
+            let start = e.position();
             for cy in 0..hc {
                 for cxu in 0..wc {
                     let addr = cy * wc + cxu;
                     write_sao_for(&mut e, &mut cx, plan.as_ref(), addr, cxu, cy, bit_depth, cat);
-                    let d = &decisions[addr];
-                    let delta = offsets.is_some().then(|| chain.spell(d.qp_y, d.any_cbf())).flatten();
-                    census.qp_delta += u64::from(delta.is_some());
-                    write_ctu_intra(&mut e, &mut cx, d, cxu, cy, bypass, cat, delta);
+                    let ctu = &cus[ctu_start[addr]..ctu_start[addr + 1]];
+                    census.qp_delta += write_tree(&mut e, &mut cx, ctu, (cxu << g.log2_ctb, cy << g.log2_ctb), g.log2_ctb, &mut tc, chain.as_mut(), &mut |e, cx, cu, _, _, delta| {
+                        write_cu_intra_i(e, cx, &cu.d, bypass, cat, delta)
+                    });
                     e.encode_terminate(u32::from(cy == hc - 1 && cxu == wc - 1));
                 }
+            }
+            if max_depth > 0 {
+                census.coded_bits += e.position() - start;
             }
         }
         w.align_zero();
@@ -884,8 +979,9 @@ impl<S: Sample> Core<S> {
         }
     }
 
-    /// Code one inter picture — P or B: every CTU one inter CU, decided against the
-    /// single stored reference and serialised through the coding-tree
+    /// Code one inter picture — P or B: every CTU one coding unit, or a
+    /// coding quadtree of them under `max_cu_depth`, decided against the
+    /// references and serialised through the coding-tree
     /// writers that live beside their readers.
     ///
     /// The two halves meet here and nowhere else. The decision module
@@ -1077,23 +1173,32 @@ impl<S: Sample> Core<S> {
         // The initialisation type the decoder derives when cabac_init_flag
         // is absent, which the PPS guarantees: 1 for a P slice, 2 for a B.
         let mut cx = Contexts::new(if c.kind == Kind::B { 2 } else { 1 }, qp as i32);
-        // cu_skip_flag's context counts *skipped* available neighbours, so
-        // the walk carries what it decided, one entry per CTU.
-        let mut skipped = vec![false; wc * hc];
         // The decisions outlive the loop: the deblocker derives its
         // boundary strengths from them, as a decoder does from what it
-        // has just parsed.
-        let mut decisions = Vec::with_capacity(wc * hc);
-        // Decide and reconstruct first; serialise below. See the same
-        // split in `code_picture` for why SAO forces it.
-        // Per-CTB quantisers, exactly as the intra path derives and
+        // has just parsed. Decide and reconstruct first; serialise below.
+        // See the same split in `code_picture` for why SAO forces it.
+        // Per-unit quantisers, exactly as the intra path derives and
         // settles them.
-        let offsets = self.aq_offsets(&py, cw, ch);
-        let mut chain = QpChain::new(i32::from(qp), bit_depth);
+        let max_depth = self.tree_depth();
+        let log2_qg = self.log2_qg();
+        let offsets = self.aq_offsets(&py, cw, ch, log2_qg);
+        let want = |x: usize, y: usize, log2: u32| cu_want(qp, offsets.as_deref(), cw, log2_qg, x, y, log2);
+        let src = Srcs { y: &py, y_stride: cw, cb: &pcb, cr: &pcr, c_stride: ccw };
+        let refs = match future {
+            Some(r1) if c.kind == Kind::B => TreeRefs::B(past, r1),
+            _ => TreeRefs::P(&l0),
+        };
+        let mut cus: Vec<TreeCu<PCuDecision>> = Vec::with_capacity(wc * hc);
+        let mut ctu_start = Vec::with_capacity(wc * hc + 1);
         for cy in 0..hc {
             for cxu in 0..wc {
-                let want = ctb_qp(qp, offsets.as_deref(), cy * wc + cxu);
-                let cctx = IntraCtx { qp: want, ..mctx };
+                ctu_start.push(cus.len());
+                if max_depth > 0 {
+                    cus.extend(pic.code_ctu_tree(&mctx, &want, max_depth, refs, cxu, cy, &src));
+                    continue;
+                }
+                let (x0, y0) = (cxu << g.log2_ctb, cy << g.log2_ctb);
+                let cctx = IntraCtx { qp: want(x0, y0, g.log2_ctb), ..mctx };
                 let d = match future {
                     Some(r1) if c.kind == Kind::B => {
                         pic.code_ctu_b(&cctx, past, r1, cxu, cy, &py, cw, &pcb, &pcr, ccw)
@@ -1107,18 +1212,18 @@ impl<S: Sample> Core<S> {
                 // I slice runs, reading the inter neighbours already
                 // reconstructed beside it, which the PPS's
                 // `constrained_intra_pred_flag` 0 makes references.
-                let mut coded = if matches!(d.kind, InterCuKind::UseIntra) {
+                let coded = if matches!(d.kind, InterCuKind::UseIntra) {
                     PCuDecision::Intra(Box::new(pic.code_ctu_intra(&cctx, cxu, cy, &py, cw, &pcb, &pcr, ccw)))
                 } else {
                     PCuDecision::Inter(d)
                 };
-                if offsets.is_some() {
-                    let q = chain.settle(want, coded.any_cbf());
-                    coded.set_qp_y(q);
-                }
-                skipped[cy * wc + cxu] = matches!(&coded, PCuDecision::Inter(d) if matches!(d.kind, InterCuKind::Skip { .. }));
-                decisions.push(coded);
+                cus.push(TreeCu { x0, y0, log2: g.log2_ctb, depth: 0, bits: 0.0, d: coded });
             }
+        }
+        ctu_start.push(cus.len());
+        if offsets.is_some() {
+            let mut chain = QgChain::new(i32::from(qp), bit_depth, &g, log2_qg);
+            settle_tree(&mut chain, &mut cus, &ctu_start, &g, &want);
         }
         // The weighting's model check, counted rather than asserted: the
         // fit predicted that scaling the reference lowers the residual
@@ -1131,15 +1236,13 @@ impl<S: Sample> Core<S> {
         if let Some((_, fits)) = &wp {
             if fits.iter().any(|f| f[0].used()) {
                 wp_stats.0 = 1;
-                let n = 1usize << g.log2_ctb;
-                for (addr, d) in decisions.iter().enumerate() {
-                    let PCuDecision::Inter(d) = d else { continue };
+                for cu in &cus {
+                    let PCuDecision::Inter(d) = &cu.d else { continue };
                     if d.ref_idx < 0 || !fits[d.ref_idx as usize][0].used() {
                         continue;
                     }
-                    let (x0, y0) = ((addr % wc) * n, (addr / wc) * n);
                     let r = d.ref_idx as usize;
-                    let (plain, weighted) = pic.weighting_gain(&mctx, l0[r], r, x0, y0, &py, cw, d.mv);
+                    let (plain, weighted) = pic.weighting_gain(&mctx, l0[r], r, cu.x0, cu.y0, cu.log2, &py, cw, d.mv);
                     wp_stats.1 += u64::from(weighted < plain);
                     wp_stats.2 += u64::from(weighted > plain);
                 }
@@ -1151,7 +1254,7 @@ impl<S: Sample> Core<S> {
         // the filtered planes are what a decoder emits and therefore what
         // SELF compares against. This picture becomes the next one's
         // reference filtered, which is what a decoder's DPB holds.
-        deblock_inter_picture(&mctx, &mut pic, &decisions);
+        deblock_inter_picture(&mctx, &mut pic, &cus);
         // Then SAO, over the deblocked samples. `InterPicture` already
         // holds the decoder-grade state both filters read, so unlike the
         // intra path there is nothing to hand across.
@@ -1159,28 +1262,33 @@ impl<S: Sample> Core<S> {
             let InterPicture { info, recon, .. } = &mut pic;
             sao_picture(&mctx, recon, info, &sps, &pps, &py, cw, &pcb, &pcr, ccw)
         });
-        let mut census = KindCensus::of_inter(&decisions, i32::from(qp));
+        let mut census = KindCensus::of_inter(&cus, i32::from(qp));
         census.wp_on += wp_stats.0;
         census.wp_won += wp_stats.1;
         census.wp_lost += wp_stats.2;
         {
             let mut e = CabacEncoder::new(&mut w);
-            let mut chain = QpChain::new(i32::from(qp), bit_depth);
+            let mut chain = offsets.is_some().then(|| QgChain::new(i32::from(qp), bit_depth, &g, log2_qg));
+            // cu_skip_flag's context counts *skipped* available
+            // neighbours and split_cu_flag's counts deeper ones; the tree
+            // context carries both, per 4x4, as the units are written.
+            let mut tc = TreeCtx::new(&g);
+            let nref = l0.len() as u32;
+            let start = e.position();
             for cy in 0..hc {
                 for cxu in 0..wc {
                     let addr = cy * wc + cxu;
-                    let left = (cxu > 0).then(|| skipped[addr - 1]);
-                    let above = (cy > 0).then(|| skipped[addr - wc]);
                     write_sao_for(&mut e, &mut cx, plan.as_ref(), addr, cxu, cy, bit_depth, cat);
-                    let pd = &decisions[addr];
-                    let delta = offsets.is_some().then(|| chain.spell(pd.qp_y(), pd.any_cbf())).flatten();
-                    census.qp_delta += u64::from(delta.is_some());
-                    match pd {
-                        PCuDecision::Inter(d) => write_cu_inter(&mut e, &mut cx, d, left, above, cat, bypass, delta, l0.len() as u32),
-                        PCuDecision::Intra(d) => write_cu_intra_in_p(&mut e, &mut cx, d, left, above, cat, bypass, delta),
-                    }
+                    let ctu = &cus[ctu_start[addr]..ctu_start[addr + 1]];
+                    census.qp_delta += write_tree(&mut e, &mut cx, ctu, (cxu << g.log2_ctb, cy << g.log2_ctb), g.log2_ctb, &mut tc, chain.as_mut(), &mut |e, cx, cu, left, above, delta| match &cu.d {
+                        PCuDecision::Inter(d) => write_cu_inter(e, cx, d, left, above, cat, bypass, delta, nref, cu.depth),
+                        PCuDecision::Intra(d) => write_cu_intra_in_p(e, cx, d, left, above, cat, bypass, delta),
+                    });
                     e.encode_terminate(u32::from(cy == hc - 1 && cxu == wc - 1));
                 }
+            }
+            if max_depth > 0 {
+                census.coded_bits += e.position() - start;
             }
         }
         w.align_zero();
@@ -1219,13 +1327,26 @@ impl<S: Sample> Core<S> {
         })
     }
 
-    /// The per-CTB quantiser offsets adaptive quantisation wants for a
-    /// picture whose padded luma plane is `py` (`cw` by `ch`), or `None`
-    /// when it is off — in which case nothing below varies the quantiser
+    /// The quantiser offsets adaptive quantisation wants for a picture
+    /// whose padded luma plane is `py` (`cw` by `ch`), one per quantisation
+    /// group of `1 << log2_qg` in raster order, or `None` when it is off — in which case nothing below varies the quantiser
     /// and the decisions keep the context's. Reads the configuration
     /// only: an attempt stays free of writes to `self`.
-    fn aq_offsets(&self, py: &[S], cw: usize, ch: usize) -> Option<Vec<i32>> {
-        (self.cfg.aq_strength > 0.0).then(|| aq::ctb_offsets(py, cw, cw, ch, self.geom.log2_ctb, self.cfg.bit_depth, self.cfg.aq_strength))
+    fn aq_offsets(&self, py: &[S], cw: usize, ch: usize, log2_qg: u32) -> Option<Vec<i32>> {
+        (self.cfg.aq_strength > 0.0).then(|| aq::ctb_offsets(py, cw, cw, ch, log2_qg, self.cfg.bit_depth, self.cfg.aq_strength))
+    }
+
+    /// How many quadtree levels below the CTB this stream's units may
+    /// split — see [`tree_depth`].
+    fn tree_depth(&self) -> u32 {
+        tree_depth(&self.cfg, &self.geom)
+    }
+
+    /// log2 of the quantisation group this stream's PPS declares: the CTB
+    /// less `diff_cu_qp_delta_depth` — the CTB itself when no depth is
+    /// declared, where no unit carries a delta at all.
+    fn log2_qg(&self) -> u32 {
+        self.geom.log2_ctb - self.pps_opts.cu_qp_delta_depth.unwrap_or(0)
     }
 }
 
@@ -1328,79 +1449,397 @@ impl PicCost {
     }
 }
 
-/// The quantiser CTB `addr` codes at: the picture's, plus its offset when
-/// the picture varies it, held to the range the encoder's quantiser
-/// takes.
-fn ctb_qp(pic_qp: u8, offsets: Option<&[i32]>, addr: usize) -> i32 {
-    match offsets {
-        Some(o) => (i32::from(pic_qp) + o[addr]).clamp(0, 51),
-        None => i32::from(pic_qp),
-    }
+/// How many quadtree levels below the CTB a stream coded under `cfg` at
+/// geometry `g` may split: what `max_cu_depth` asks, held above the 8x8
+/// minimum coding block — so a 16x16 CTB splits at most once.
+fn tree_depth(cfg: &Config, g: &syn::Geometry) -> u32 {
+    cfg.max_cu_depth.min(g.log2_ctb - MIN_CB_LOG2)
 }
 
-/// The encoder's mirror of the reader's quantisation-group state, at the
-/// geometry this encoder codes: one CU per CTB and a group per CTB
-/// (`diff_cu_qp_delta_depth` 0).
+/// The quantiser the unit of `1 << log2` at `(x0, y0)` codes at: the
+/// picture's, plus — when the picture varies it — the offset of the
+/// quantisation group the unit belongs to, held to the range the encoder's
+/// quantiser takes. `offsets` holds one offset per group of `1 << log2_qg`
+/// in raster order over a picture `width` samples wide.
 ///
-/// What the reader does, and what this therefore has to reproduce
-/// (`coding_quadtree` / `transform_unit`, and 8.6.1):
+/// A unit no larger than a group belongs to the group that contains it. A
+/// unit larger than a group *is* its own group in the reader's walk (the
+/// quantisation group restarts at every quadtree node at least the group
+/// size), so it takes the rounded mean of the offsets it covers — the one
+/// quantiser a single delta can give it.
+fn cu_want(pic_qp: u8, offsets: Option<&[i32]>, width: usize, log2_qg: u32, x0: usize, y0: usize, log2: u32) -> i32 {
+    let Some(o) = offsets else { return i32::from(pic_qp) };
+    let wq = width >> log2_qg;
+    let (gx, gy) = (x0 >> log2_qg, y0 >> log2_qg);
+    let off = if log2 <= log2_qg {
+        o[gy * wq + gx]
+    } else {
+        let k = 1usize << (log2 - log2_qg);
+        let sum: i32 = (0..k * k).map(|i| o[(gy + i / k) * wq + gx + i % k]).sum();
+        (f64::from(sum) / (k * k) as f64).round() as i32
+    };
+    (i32::from(pic_qp) + off).clamp(0, 51)
+}
+
+/// The encoder's mirror of the reader's quantisation-group state
+/// (`coding_quadtree` / `transform_unit`, and 8.6.1), for any group size
+/// and any unit size.
 ///
-/// - A group's `qPY_PREV` is `SliceQpY` for the first group of the slice
-///   and the `QpY` of the previous group's last CU after that; its
-///   `qPY_PRED` averages the left and above groups' `QpY` where those lie
-///   inside the same CTB, taking `qPY_PREV` for each that does not. With
-///   a group per CTB neither ever does, so the prediction is `qPY_PREV`
-///   — but the arithmetic is still the reader's own [`qp_y_pred_from`],
-///   called with both neighbours absent, so that the day the group
-///   shrinks this stops being true loudly rather than silently.
-/// - A CU whose tree carries a cbf codes one `cu_qp_delta`, and its
-///   `QpY` is `qPY_PRED + CuQpDeltaVal` wrapped ([`qp_y_from_pred`]).
-/// - A CU with no coded cbf codes no delta and **holds the predicted
-///   quantiser**, whatever the encoder wanted for it. The encoder does
-///   not get to choose there, and its deblocker must filter that CU at
-///   the predicted value because a decoder's will.
+/// What the reader does, and what this therefore has to reproduce:
 ///
-/// Two copies of this run per picture — one while deciding, one while
-/// writing — and both must land on the same numbers; `settle` records
-/// what a decoder will hold and `spell` asserts the writer's view agrees.
-struct QpChain {
+/// - A group starts at every quadtree node at least the group size
+///   (`log2_cb >= Log2CtbSize - diff_cu_qp_delta_depth`): `IsCuQpDeltaCoded`
+///   and `CuQpDeltaVal` reset, and the group's `qPY_PREV` is `SliceQpY` for
+///   the first group of the slice and otherwise the `QpY` of the last unit
+///   of the group before. That last value is taken where a node's
+///   bottom-right corner lands on the group grid ([`QgChain::leave`]).
+/// - Every unit's `qPY_PRED` averages the `QpY` of the units left of and
+///   above its **group's** top-left corner, each where it lies inside the
+///   same CTB, taking `qPY_PREV` for each that does not — the reader's own
+///   [`qp_y_pred_from`]. Every unit of a group therefore shares one
+///   prediction.
+/// - The first unit of a group whose tree carries a coded cbf codes the
+///   group's one `cu_qp_delta`; that unit and every later one of the group
+///   hold `qPY_PRED + CuQpDeltaVal` wrapped ([`qp_y_from_pred`]).
+/// - A unit before that one — no cbf, no delta yet — holds the prediction,
+///   **whatever the encoder wanted for it**, and so does every unit of a
+///   group that never codes a cbf. The deblocker must filter those units
+///   at that value, because a decoder's will.
+///
+/// Two copies run per picture — one over the decided units ([`settle_tree`])
+/// and one while writing ([`write_tree`]) — and both must land on the same
+/// numbers; `settle` records what a decoder will hold and `spell` asserts
+/// the writer's view agrees.
+struct QgChain {
     slice_qp: i32,
     bit_depth: u32,
-    /// `QpY` of the last CU coded, `None` before the first group.
-    last: Option<i32>,
+    log2_ctb: u32,
+    log2_qg: u32,
+    /// Width of `qp_map` in 4x4 blocks.
+    w4: usize,
+    /// No group has started yet: the first takes `SliceQpY`.
+    first: bool,
+    /// `QpY` of the last unit of the last group to end.
+    prev: i32,
+    /// The current group's top-left corner, and its `qPY_PREV`.
+    qg: (usize, usize),
+    qg_prev: i32,
+    /// `IsCuQpDeltaCoded` and `CuQpDeltaVal` of the current group.
+    coded: bool,
+    delta: i32,
+    /// `QpY` of the unit settled or spelled last.
+    last: i32,
+    /// `QpY` per 4x4 over the picture, filled unit by unit — what a later
+    /// group's prediction reads to its left and above.
+    qp_map: Vec<i8>,
 }
 
-impl QpChain {
-    fn new(slice_qp: i32, bit_depth: u32) -> Self {
-        QpChain { slice_qp, bit_depth, last: None }
+impl QgChain {
+    fn new(slice_qp: i32, bit_depth: u32, g: &syn::Geometry, log2_qg: u32) -> Self {
+        let (w4, h4) = (g.coded_width as usize / 4, g.coded_height as usize / 4);
+        QgChain {
+            slice_qp,
+            bit_depth,
+            log2_ctb: g.log2_ctb,
+            log2_qg,
+            w4,
+            first: true,
+            prev: slice_qp,
+            qg: (0, 0),
+            qg_prev: slice_qp,
+            coded: false,
+            delta: 0,
+            last: slice_qp,
+            qp_map: vec![0; w4 * h4],
+        }
     }
 
-    /// `qPY_PRED` for the next CTB.
-    fn pred(&self) -> i32 {
-        qp_y_pred_from(None, None, self.last.unwrap_or(self.slice_qp))
+    /// A quadtree node of `1 << log2` at `(x0, y0)` begins.
+    fn enter(&mut self, x0: usize, y0: usize, log2: u32) {
+        if log2 >= self.log2_qg {
+            self.coded = false;
+            self.delta = 0;
+            self.qg = (x0, y0);
+            self.qg_prev = if self.first { self.slice_qp } else { self.prev };
+            self.first = false;
+        }
     }
 
-    /// Decision side: the CTB was coded at `want` and carries a cbf or
-    /// not. Returns the `QpY` a decoder will hold for it, which is `want`
-    /// only if a delta can be coded.
-    fn settle(&mut self, want: i32, has_cbf: bool) -> i32 {
-        let pred = self.pred();
-        let qp_y = if has_cbf { qp_y_from_pred(pred, want - pred, self.bit_depth) } else { pred };
-        debug_assert!(!has_cbf || qp_y == want, "a coded delta must land the quantiser where the CTB was coded ({want}), not {qp_y}");
-        self.last = Some(qp_y);
+    /// A quadtree node of `1 << log2` at `(x0, y0)` ends.
+    fn leave(&mut self, x0: usize, y0: usize, log2: u32) {
+        let mask = (1usize << self.log2_qg) - 1;
+        let size = 1usize << log2;
+        if (x0 + size) & mask == 0 && (y0 + size) & mask == 0 {
+            self.prev = self.last;
+        }
+    }
+
+    /// `qPY_PRED` for a unit at `(x0, y0)` of the current group.
+    fn pred(&self, x0: usize, y0: usize) -> i32 {
+        let (xq, yq) = self.qg;
+        let ctb = |x: usize, y: usize| (x >> self.log2_ctb, y >> self.log2_ctb);
+        let here = ctb(x0, y0);
+        let at = |x: usize, y: usize| i32::from(self.qp_map[(y >> 2) * self.w4 + (x >> 2)]);
+        let qa = (xq > 0 && ctb(xq - 1, yq) == here).then(|| at(xq - 1, yq));
+        let qb = (yq > 0 && ctb(xq, yq - 1) == here).then(|| at(xq, yq - 1));
+        qp_y_pred_from(qa, qb, self.qg_prev)
+    }
+
+    fn hold(&mut self, x0: usize, y0: usize, log2: u32, qp_y: i32) {
+        let n = 1usize << log2;
+        PicInfo::fill4(&mut self.qp_map, self.w4, x0, y0, n, n, qp_y as i8);
+        self.last = qp_y;
+    }
+
+    /// Decision side: the unit of `1 << log2` at `(x0, y0)` was coded at
+    /// `want` and carries a cbf or not. Returns the `QpY` a decoder will
+    /// hold for it.
+    fn settle(&mut self, x0: usize, y0: usize, log2: u32, want: i32, has_cbf: bool) -> i32 {
+        let pred = self.pred(x0, y0);
+        if has_cbf && !self.coded {
+            self.coded = true;
+            self.delta = want - pred;
+        }
+        let qp_y = qp_y_from_pred(pred, self.delta, self.bit_depth);
+        debug_assert!(!has_cbf || qp_y == want, "a unit with a cbf must hold the quantiser it was coded at ({want}), not {qp_y}");
+        self.hold(x0, y0, log2, qp_y);
         qp_y
     }
 
-    /// Writer side: the `CuQpDeltaVal` to spell for a CTB whose decision
-    /// holds `qp_y`, or `None` when it carries no cbf and a decoder reads
-    /// none — in which case the decision must already hold the
-    /// prediction, and that is checked rather than assumed.
-    fn spell(&mut self, qp_y: i32, has_cbf: bool) -> Option<i32> {
-        let pred = self.pred();
-        debug_assert!(has_cbf || qp_y == pred, "a residual-free CTB must hold the predicted quantiser {pred}, not {qp_y}");
-        self.last = Some(qp_y);
-        has_cbf.then_some(qp_y - pred)
+    /// Writer side: the `CuQpDeltaVal` to spell in the unit whose decision
+    /// holds `qp_y`, or `None` where the reader reads none — and in that
+    /// case the decision must already hold what the chain derives, which
+    /// is checked rather than assumed.
+    fn spell(&mut self, x0: usize, y0: usize, log2: u32, qp_y: i32, has_cbf: bool) -> Option<i32> {
+        let pred = self.pred(x0, y0);
+        let spelled = if has_cbf && !self.coded {
+            self.coded = true;
+            self.delta = qp_y - pred;
+            Some(self.delta)
+        } else {
+            None
+        };
+        debug_assert_eq!(
+            qp_y_from_pred(pred, self.delta, self.bit_depth),
+            qp_y,
+            "the writer's chain disagrees with the quantiser the decision settled at ({x0},{y0})"
+        );
+        self.hold(x0, y0, log2, qp_y);
+        spelled
     }
+}
+
+/// What the coding-tree walk needs to know about a coded unit, whatever
+/// its kind.
+trait CodedUnit {
+    fn qp_y(&self) -> i32;
+    fn set_qp_y(&mut self, qp_y: i32);
+    fn any_cbf(&self) -> bool;
+    fn skipped(&self) -> bool;
+}
+
+impl CodedUnit for CuDecision {
+    fn qp_y(&self) -> i32 {
+        self.qp_y
+    }
+    fn set_qp_y(&mut self, qp_y: i32) {
+        self.qp_y = qp_y;
+    }
+    fn any_cbf(&self) -> bool {
+        CuDecision::any_cbf(self)
+    }
+    fn skipped(&self) -> bool {
+        false
+    }
+}
+
+impl CodedUnit for PCuDecision {
+    fn qp_y(&self) -> i32 {
+        PCuDecision::qp_y(self)
+    }
+    fn set_qp_y(&mut self, qp_y: i32) {
+        PCuDecision::set_qp_y(self, qp_y)
+    }
+    fn any_cbf(&self) -> bool {
+        PCuDecision::any_cbf(self)
+    }
+    fn skipped(&self) -> bool {
+        matches!(self, PCuDecision::Inter(d) if matches!(d.kind, InterCuKind::Skip { .. }))
+    }
+}
+
+/// One step of the reader's walk over a CTB's coding quadtree, in the
+/// order `coding_quadtree` takes them.
+enum TreeStep {
+    /// A node begins: its `split_cu_flag` is coded here (above the minimum
+    /// coding block), and a quantisation group may start.
+    Enter { x0: usize, y0: usize, log2: u32, depth: u32, split: bool },
+    /// The coding unit at this index of the CTB's units.
+    Unit(usize),
+    /// The node ends: a quantisation group may end.
+    Leave { x0: usize, y0: usize, log2: u32 },
+}
+
+/// The walk over one CTB's units, read back from their placements: a node
+/// is a leaf exactly when the next unit covers it whole. The units must
+/// tile the CTB in z-scan order, which every tree decision produces.
+fn tree_steps<D>(ctu: &[TreeCu<D>], (x_ctb, y_ctb): (usize, usize), log2_ctb: u32) -> Vec<TreeStep> {
+    fn node<D>(ctu: &[TreeCu<D>], idx: &mut usize, x0: usize, y0: usize, log2: u32, depth: u32, out: &mut Vec<TreeStep>) {
+        let cu = &ctu[*idx];
+        let leaf = cu.x0 == x0 && cu.y0 == y0 && cu.log2 == log2;
+        debug_assert!(leaf || (cu.log2 < log2 && log2 > MIN_CB_LOG2), "units do not tile the node of {} at ({x0},{y0})", 1 << log2);
+        out.push(TreeStep::Enter { x0, y0, log2, depth, split: !leaf });
+        if leaf {
+            debug_assert_eq!(cu.depth, depth, "a unit's recorded depth disagrees with its place in the tree");
+            out.push(TreeStep::Unit(*idx));
+            *idx += 1;
+        } else {
+            let half = 1usize << (log2 - 1);
+            for i in 0..4 {
+                node(ctu, idx, x0 + (i & 1) * half, y0 + (i >> 1) * half, log2 - 1, depth + 1, out);
+            }
+        }
+        out.push(TreeStep::Leave { x0, y0, log2 });
+    }
+    let mut out = Vec::with_capacity(3 * ctu.len() + 8);
+    let mut idx = 0;
+    node(ctu, &mut idx, x_ctb, y_ctb, log2_ctb, 0, &mut out);
+    assert_eq!(idx, ctu.len(), "units left over after the CTB's quadtree was walked");
+    out
+}
+
+/// Settle every unit's `QpY` in decode order through `chain` — see
+/// [`QgChain`]. `want` is the quantiser each unit was coded at.
+fn settle_tree<D: CodedUnit>(chain: &mut QgChain, cus: &mut [TreeCu<D>], ctu_start: &[usize], g: &syn::Geometry, want: &dyn Fn(usize, usize, u32) -> i32) {
+    let wc = g.ctbs_wide as usize;
+    for (k, range) in ctu_start.windows(2).enumerate() {
+        let ctu = &mut cus[range[0]..range[1]];
+        let at = ((k % wc) << g.log2_ctb, (k / wc) << g.log2_ctb);
+        for step in tree_steps(ctu, at, g.log2_ctb) {
+            match step {
+                TreeStep::Enter { x0, y0, log2, .. } => chain.enter(x0, y0, log2),
+                TreeStep::Unit(i) => {
+                    let cu = &mut ctu[i];
+                    let q = chain.settle(cu.x0, cu.y0, cu.log2, want(cu.x0, cu.y0, cu.log2), cu.d.any_cbf());
+                    cu.d.set_qp_y(q);
+                }
+                TreeStep::Leave { x0, y0, log2 } => chain.leave(x0, y0, log2),
+            }
+        }
+    }
+}
+
+/// The per-4x4 facts the coding-tree syntax's neighbour contexts read, as
+/// the writer accumulates them: `CtDepth` for `split_cu_flag`, and
+/// `cu_skip_flag` for itself. In one slice and one tile the left and above
+/// neighbours of any unit inside the picture are already written, so
+/// availability is the picture edge.
+struct TreeCtx {
+    w4: usize,
+    ct_depth: Vec<u8>,
+    skip: Vec<u8>,
+}
+
+impl TreeCtx {
+    fn new(g: &syn::Geometry) -> Self {
+        let (w4, h4) = (g.coded_width as usize / 4, g.coded_height as usize / 4);
+        TreeCtx { w4, ct_depth: vec![0; w4 * h4], skip: vec![0; w4 * h4] }
+    }
+
+    fn at(&self, grid: &[u8], x: usize, y: usize) -> u8 {
+        grid[(y >> 2) * self.w4 + (x >> 2)]
+    }
+}
+
+/// A leaf writer for [`write_tree`]: the unit, its left and above
+/// neighbours' `cu_skip_flag` where available, and the `CuQpDeltaVal` to
+/// spell in it.
+type LeafWriter<'a, D> = dyn FnMut(&mut CabacEncoder<'_>, &mut Contexts, &TreeCu<D>, Option<bool>, Option<bool>, Option<i32>) + 'a;
+
+/// Write one CTB's coding quadtree: every node's `split_cu_flag` in the
+/// reader's order with the reader's neighbour-depth context, each unit
+/// through `leaf`, and the quantiser chain walked alongside. Returns how
+/// many `cu_qp_delta`s were spelled.
+#[allow(clippy::too_many_arguments)]
+fn write_tree<D: CodedUnit>(
+    e: &mut CabacEncoder,
+    cx: &mut Contexts,
+    ctu: &[TreeCu<D>],
+    at: (usize, usize),
+    log2_ctb: u32,
+    tc: &mut TreeCtx,
+    mut chain: Option<&mut QgChain>,
+    leaf: &mut LeafWriter<'_, D>,
+) -> u64 {
+    let mut deltas = 0;
+    for step in tree_steps(ctu, at, log2_ctb) {
+        match step {
+            TreeStep::Enter { x0, y0, log2, depth, split } => {
+                if log2 > MIN_CB_LOG2 {
+                    let nb = SplitCuNb {
+                        left_depth: (x0 > 0).then(|| tc.at(&tc.ct_depth, x0 - 1, y0)),
+                        above_depth: (y0 > 0).then(|| tc.at(&tc.ct_depth, x0, y0 - 1)),
+                    };
+                    write_split_cu_flag(e, cx, &nb, depth, split);
+                }
+                if let Some(ch) = chain.as_deref_mut() {
+                    ch.enter(x0, y0, log2);
+                }
+            }
+            TreeStep::Unit(i) => {
+                let cu = &ctu[i];
+                let delta = chain.as_deref_mut().and_then(|ch| ch.spell(cu.x0, cu.y0, cu.log2, cu.d.qp_y(), cu.d.any_cbf()));
+                deltas += u64::from(delta.is_some());
+                let left = (cu.x0 > 0).then(|| tc.at(&tc.skip, cu.x0 - 1, cu.y0) != 0);
+                let above = (cu.y0 > 0).then(|| tc.at(&tc.skip, cu.x0, cu.y0 - 1) != 0);
+                leaf(e, cx, cu, left, above, delta);
+                let n = 1usize << cu.log2;
+                PicInfo::fill4(&mut tc.ct_depth, tc.w4, cu.x0, cu.y0, n, n, cu.depth as u8);
+                PicInfo::fill4(&mut tc.skip, tc.w4, cu.x0, cu.y0, n, n, u8::from(cu.d.skipped()));
+            }
+            TreeStep::Leave { x0, y0, log2 } => {
+                if let Some(ch) = chain.as_deref_mut() {
+                    ch.leave(x0, y0, log2);
+                }
+            }
+        }
+    }
+    deltas
+}
+
+/// The price of one `split_cu_flag` bin, in fractional bits, under a
+/// slice's initial contexts (`init_type` 0 for I, 1 for P, 2 for B) and the
+/// neutral neighbour context — the terms every other counted price in this
+/// encoder is taken in (see `h265_me::Rate`).
+pub(crate) fn split_flag_bits(init_type: usize, qp: i32, split: bool) -> f32 {
+    let mut cx = Contexts::new(init_type, qp);
+    let mut e = CabacEncoder::counting();
+    write_split_cu_flag(&mut e, &mut cx, &SplitCuNb { left_depth: None, above_depth: None }, 0, split);
+    e.fractional_bits() as f32
+}
+
+/// What an I-slice intra unit's syntax costs through the production
+/// writer, in fractional bits under the slice's initial contexts: the
+/// quadtree's rate term, residual included.
+pub(crate) fn intra_cu_bits(d: &CuDecision, cat: u32, qp: i32, pps_bypass: bool) -> f32 {
+    let mut cx = Contexts::new(0, qp);
+    let mut e = CabacEncoder::counting();
+    write_cu_intra_i(&mut e, &mut cx, d, pps_bypass, cat, None);
+    e.fractional_bits() as f32
+}
+
+/// The same for a unit of a P (`is_b` false) or B slice, inter or intra,
+/// with neutral skip contexts, `nref` active list-0 references and the
+/// unit at quadtree depth `depth`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn p_cu_bits(d: &PCuDecision, cat: u32, qp: i32, pps_bypass: bool, is_b: bool, nref: u32, depth: u32) -> f32 {
+    let mut cx = Contexts::new(if is_b { 2 } else { 1 }, qp);
+    let mut e = CabacEncoder::counting();
+    match d {
+        PCuDecision::Inter(d) => write_cu_inter(&mut e, &mut cx, d, None, None, cat, pps_bypass, None, nref, depth),
+        PCuDecision::Intra(d) => write_cu_intra_in_p(&mut e, &mut cx, d, None, None, cat, pps_bypass, None),
+    }
+    e.fractional_bits() as f32
 }
 
 /// What the H.265 encoder's pictures were made of, by picture kind — the
@@ -1467,29 +1906,52 @@ pub struct KindCensus {
     /// nearest (`ref_idx` 1 or more) — the choice multi-reference
     /// prediction exists for, taken.
     pub ref_older: u64,
+    /// Intra units coded `PART_NxN`: four 4x4 blocks at the 8x8 minimum.
+    pub nxn: u64,
+    /// Coding units at quadtree depth 1: one split below the CTB.
+    pub depth1: u64,
+    /// Coding units at quadtree depth 2: two splits below — 8x8 at a 32x32
+    /// CTB.
+    pub depth2: u64,
+    /// The model check on the quadtree's rate term: the bits its decisions
+    /// priced the coded units at (each unit's syntax and its own
+    /// `split_cu_flag`, under the slice's initial contexts), rounded — to
+    /// set beside `coded_bits`. The split nodes' own flags, one per split,
+    /// and the SAO parameters are not in it. 0 without a tree.
+    pub model_bits: u64,
+    /// What the slice data of those pictures actually took, in bits, SAO
+    /// and quantiser deltas included. 0 without a tree.
+    pub coded_bits: u64,
 }
 
 impl KindCensus {
-    fn of_intra(decisions: &[CuDecision], pic_qp: i32) -> Self {
+    fn of_intra(cus: &[TreeCu<CuDecision>], pic_qp: i32) -> Self {
         let mut c = KindCensus::default();
-        for d in decisions {
+        for cu in cus {
+            let d = &cu.d;
             c.cus += 1;
             c.intra += 1;
             c.split_tu += u64::from(d.split_tu);
+            c.nxn += u64::from(d.nxn);
             c.qp_moved += u64::from(d.qp_y != pic_qp);
+            c.count_depth(cu.depth);
         }
+        c.model_bits = model_bits(cus);
         c
     }
 
-    fn of_inter(decisions: &[PCuDecision], pic_qp: i32) -> Self {
+    fn of_inter(cus: &[TreeCu<PCuDecision>], pic_qp: i32) -> Self {
         let mut c = KindCensus::default();
-        for pd in decisions {
+        for cu in cus {
+            let pd = &cu.d;
             c.cus += 1;
             c.qp_moved += u64::from(pd.qp_y() != pic_qp);
+            c.count_depth(cu.depth);
             match pd {
                 PCuDecision::Intra(d) => {
                     c.intra += 1;
                     c.split_tu += u64::from(d.split_tu);
+                    c.nxn += u64::from(d.nxn);
                 }
                 PCuDecision::Inter(d) => {
                     match d.kind {
@@ -1503,7 +1965,13 @@ impl KindCensus {
                 }
             }
         }
+        c.model_bits = model_bits(cus);
         c
+    }
+
+    fn count_depth(&mut self, depth: u32) {
+        self.depth1 += u64::from(depth == 1);
+        self.depth2 += u64::from(depth == 2);
     }
 
     /// Fold `other` into this tally.
@@ -1521,6 +1989,11 @@ impl KindCensus {
         self.wp_won += other.wp_won;
         self.wp_lost += other.wp_lost;
         self.ref_older += other.ref_older;
+        self.nxn += other.nxn;
+        self.depth1 += other.depth1;
+        self.depth2 += other.depth2;
+        self.model_bits += other.model_bits;
+        self.coded_bits += other.coded_bits;
     }
 
     /// The nonzero counters, named, for a census line.
@@ -1539,11 +2012,22 @@ impl KindCensus {
             ("wp_won", self.wp_won),
             ("wp_lost", self.wp_lost),
             ("ref_older", self.ref_older),
+            ("nxn", self.nxn),
+            ("depth1", self.depth1),
+            ("depth2", self.depth2),
+            ("model_bits", self.model_bits),
+            ("coded_bits", self.coded_bits),
         ]
         .into_iter()
         .filter(|&(_, n)| n != 0)
         .collect()
     }
+}
+
+/// The rate the tree decisions priced a picture's units at, rounded to
+/// bits — see [`KindCensus::model_bits`].
+fn model_bits<D>(cus: &[TreeCu<D>]) -> u64 {
+    cus.iter().map(|cu| f64::from(cu.bits)).sum::<f64>().round() as u64
 }
 
 /// The slice header's SAO switches for a picture coded with `sao` set:
@@ -1605,7 +2089,8 @@ fn write_sao_for(e: &mut CabacEncoder, cx: &mut Contexts, plan: Option<&SaoPlan>
     write_sao(e, cx, &sctx, &nb, plan.merges[addr], &plan.params[addr]);
 }
 
-/// Serialise one inter coding unit - one whole-CTU `PART_2Nx2N` CU, in the
+/// Serialise one inter coding unit - a `PART_2Nx2N` CU of whatever size the
+/// coding quadtree gave it - in the
 /// reader's element order (`coding_unit` / `prediction_unit`).
 ///
 /// Which elements exist depends on the shape, and two of them the decoder
@@ -1639,17 +2124,13 @@ fn write_cu_inter(
     pps_bypass: bool,
     qp_delta: Option<i32>,
     nref: u32,
+    depth: u32,
 ) {
     let log2 = d.log2_cu;
     debug_assert!(pps_bypass || !d.bypass, "a bypass CU is unspellable unless the PPS enables the flag");
     debug_assert!(u32::from(d.ref_idx.max(0) as u8) < nref.max(1), "a CU naming a reference beyond the active list");
-    // One CU per CTU, so the coding quadtree never splits and the flag is
-    // coded exactly once, false - the same shape the intra writer spells.
-    let nb = SplitCuNb {
-        left_depth: left_skip.map(|_| 0),
-        above_depth: above_skip.map(|_| 0),
-    };
-    write_split_cu_flag(e, cx, &nb, 0, false);
+    // The unit's `split_cu_flag`, and the quadtree above it, are the
+    // tree walk's to write (`write_tree`); this spells the coding unit.
     // cu_transquant_bypass_flag is the CU's VERY FIRST bin - `coding_unit`
     // reads it before cu_skip_flag, so even a skipped CU spells one, and
     // it is present exactly when the PPS sets
@@ -1704,9 +2185,10 @@ fn write_cu_inter(
             // than grouped by element. No ref_idx in either list: each
             // declares exactly one active reference. See
             // `write_inter_pred_idc`'s docblock for the `w + h != 12`
-            // reading; a whole-CTU CU is never 12 and is always CtDepth 0.
+            // reading; a 2Nx2N unit of 8x8 or more is never 12, and the
+            // first bin's context is the unit's CtDepth.
             let n = 1i32 << log2;
-            write_inter_pred_idc(e, cx, n, n, 0, u32::from(idc));
+            write_inter_pred_idc(e, cx, n, n, depth, u32::from(idc));
             for list in 0..2usize {
                 let uses = match idc {
                     0 => list == 0,
@@ -1834,18 +2316,33 @@ fn write_cu_inter(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_ctu_intra(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, ctu_x: usize, ctu_y: usize, pps_bypass: bool, cat: u32, qp_delta: Option<i32>) {
     debug_assert!(pps_bypass || !d.bypass, "a bypass CU is unspellable unless the PPS enables the flag");
-    // Every coded neighbour has depth 0 (one CU per CTU), and in a single
-    // slice availability is picture geometry.
+    // A whole-CTB unit: every coded neighbour has depth 0, and in a single
+    // slice availability is picture geometry. (The quadtree walk writes its
+    // own flags with the real neighbour depths; this serves the rate model.)
     let nb = SplitCuNb {
         left_depth: (ctu_x > 0).then_some(0),
         above_depth: (ctu_y > 0).then_some(0),
     };
     write_split_cu_flag(e, cx, &nb, 0, false);
+    write_cu_intra_i(e, cx, d, pps_bypass, cat, qp_delta);
+}
+
+/// One intra coding unit of an **I** slice, without the quadtree around
+/// it: what [`write_ctu_intra`] spells after its `split_cu_flag`, and what
+/// the quadtree walk spells for every unit of an I picture.
+pub(crate) fn write_cu_intra_i(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, pps_bypass: bool, cat: u32, qp_delta: Option<i32>) {
+    debug_assert!(pps_bypass || !d.bypass, "a bypass CU is unspellable unless the PPS enables the flag");
     // An I slice reads no `cu_skip_flag` and no `pred_mode_flag` — both
     // are gated on `slice_type != I` (ctu.rs:405, ctu.rs:434) — so the
     // CU starts at the bypass flag.
     if pps_bypass {
         write_cu_transquant_bypass_flag(e, cx, d.bypass);
+    }
+    // `part_mode` exists for an intra unit only at the minimum coding
+    // block — the reader's `!intra || log2_cb == MinCbLog2SizeY` gate —
+    // where it says 2Nx2N or NxN; above it 2Nx2N is inferred.
+    if d.log2_cu == MIN_CB_LOG2 {
+        write_part_mode_intra(e, cx, d.nxn);
     }
     write_cu_intra_body(e, cx, d, cat, qp_delta);
 }
@@ -1883,11 +2380,6 @@ fn write_cu_intra_in_p(
     qp_delta: Option<i32>,
 ) {
     debug_assert!(pps_bypass || !d.bypass, "a bypass CU is unspellable unless the PPS enables the flag");
-    let nb = SplitCuNb {
-        left_depth: left_skip.map(|_| 0),
-        above_depth: above_skip.map(|_| 0),
-    };
-    write_split_cu_flag(e, cx, &nb, 0, false);
     // `coding_unit` reads cu_transquant_bypass_flag BEFORE cu_skip_flag,
     // so it comes first here too.
     if pps_bypass {
@@ -1895,6 +2387,10 @@ fn write_cu_intra_in_p(
     }
     write_cu_skip_flag(e, cx, left_skip, above_skip, false);
     write_pred_mode_flag(e, cx, true);
+    // As in an I slice: `part_mode` at the minimum coding block only.
+    if d.log2_cu == MIN_CB_LOG2 {
+        write_part_mode_intra(e, cx, d.nxn);
+    }
     write_cu_intra_body(e, cx, d, cat, qp_delta);
 }
 
@@ -1924,8 +2420,12 @@ fn write_cu_intra_in_p(
 /// end is a caller bug and is asserted.
 fn write_cu_intra_body(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, cat: u32, qp_delta: Option<i32>) {
     let log2 = d.log2_cu;
-    debug_assert!((4..=5).contains(&log2), "one CU per CTU wants CTB 16 or 32");
-    debug_assert!(!d.nxn, "PART_NxN exists only at the minimum CU size");
+    debug_assert!((MIN_CB_LOG2..=5).contains(&log2), "a coding unit is 8x8 to 32x32");
+    debug_assert!(!d.nxn || log2 == MIN_CB_LOG2, "PART_NxN exists only at the minimum CU size");
+    if d.nxn {
+        write_cu_intra_nxn_body(e, cx, d, cat, qp_delta);
+        return;
+    }
     let mut pending = qp_delta;
 
     let syn0 = d.luma_syntax[0];
@@ -2090,6 +2590,111 @@ fn write_cu_intra_body(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, 
             }
         }
     }
+}
+
+/// The `PART_NxN` intra coding unit proper, at the 8x8 minimum coding
+/// block: [`write_cu_intra_body`]'s twin for the four-block shape, in the
+/// reader's element order.
+///
+/// - `prev_intra_luma_pred_flag` for all four blocks, and only then each
+///   block's `mpm_idx` or `rem_intra_luma_pred_mode` — `coding_unit` reads
+///   the flags in one loop and the payloads in the next.
+/// - `intra_chroma_pred_mode` once, or at 4:4:4 four times in z-order
+///   (`nc = if cat == 3 { npu } else { 1 }`); never in monochrome.
+/// - The transform tree's root, 8x8, splits by inference (`IntraSplitFlag`)
+///   and codes no split flag. Its chroma cbfs are coded there — both 4:2:2
+///   bins, the `log2 == 3` arm.
+/// - Four 4x4 children, which code no split flag (the 4x4 minimum). At
+///   4:4:4 each codes its own chroma cbfs under the root's gate; at 4:2:0
+///   and 4:2:2 they inherit the root's (`log2 == 2` inherits). Each codes
+///   `cbf_luma`; then the quantiser delta, if it is the first unit with a
+///   coded cbf — which at 4:2:0 and 4:2:2 counts the INHERITED chroma bins,
+///   so a set root chroma bin puts the delta in the first child whatever
+///   its luma holds; then its luma residual; then chroma — its own 4x4
+///   blocks at 4:4:4, Cb then Cr under its own block's chroma mode, and at
+///   4:2:0 and 4:2:2 the CU's chroma once, after the fourth child
+///   (`blk_idx == 3`).
+fn write_cu_intra_nxn_body(e: &mut CabacEncoder, cx: &mut Contexts, d: &CuDecision, cat: u32, qp_delta: Option<i32>) {
+    let mut pending = qp_delta;
+    for pb in 0..4 {
+        write_prev_intra_luma_pred_flag(e, cx, d.luma_syntax[pb].prev_flag);
+    }
+    for pb in 0..4 {
+        let syn = d.luma_syntax[pb];
+        if syn.prev_flag {
+            write_mpm_idx(e, u32::from(syn.mpm_idx));
+        } else {
+            write_rem_intra_luma_pred_mode(e, u32::from(syn.rem));
+        }
+    }
+    match cat {
+        0 => {}
+        3 => {
+            for pb in 0..4 {
+                write_intra_chroma_pred_mode(e, cx, u32::from(d.chroma_syntax_nxn[pb]));
+            }
+        }
+        _ => write_intra_chroma_pred_mode(e, cx, u32::from(d.chroma_syntax)),
+    }
+    let params = |c_idx: usize, mode: u8| ResidualParams {
+        log2_size: 2,
+        c_idx,
+        scan_idx: residual_scan_idx(true, 2, c_idx, cat, u32::from(mode)),
+        bypass: d.bypass,
+        transform_skip_allowed: false,
+        sign_hiding: false,
+        intra: true,
+        pred_mode_intra: u32::from(mode),
+        ts_context: false,
+        implicit_rdpcm: false,
+        explicit_rdpcm: false,
+        persistent_rice: false,
+        trace: false,
+    };
+    if cat != 0 {
+        for comp in 0..2 {
+            write_cbf_chroma(e, cx, 0, d.cbf_chroma[comp]);
+            if cat == 2 {
+                write_cbf_chroma(e, cx, 0, d.cbf_chroma_bot[comp]);
+            }
+        }
+    }
+    let inherited = cat != 0 && cat != 3 && (0..2).any(|comp| d.cbf_chroma[comp] || d.cbf_chroma_bot[comp]);
+    for i in 0..4 {
+        if cat == 3 {
+            for comp in 0..2 {
+                if d.cbf_chroma[comp] {
+                    write_cbf_chroma(e, cx, 1, d.cbf_chroma_tu[comp][i]);
+                }
+            }
+        }
+        write_cbf_luma(e, cx, 1, d.cbf_luma[4 * i]);
+        let child_chroma = if cat == 3 { (0..2).any(|comp| d.cbf_chroma_tu[comp][i]) } else { inherited };
+        if pending.is_some() && (d.cbf_luma[4 * i] || child_chroma) {
+            write_cu_qp_delta(e, cx, pending.take().expect("checked"));
+        }
+        if d.cbf_luma[4 * i] {
+            write_residual(e, cx, &params(0, d.luma_modes[i]), &d.luma[16 * i..16 * i + 16]);
+        }
+        if cat == 3 {
+            for comp in 0..2 {
+                if d.cbf_chroma_tu[comp][i] {
+                    write_residual(e, cx, &params(comp + 1, d.chroma_mode_nxn[i]), &d.chroma[comp][16 * i..16 * i + 16]);
+                }
+            }
+        } else if cat != 0 && i == 3 {
+            for comp in 0..2 {
+                let pair = if cat == 2 { 2 } else { 1 };
+                for t in 0..pair {
+                    let cbf = if t == 0 { d.cbf_chroma[comp] } else { d.cbf_chroma_bot[comp] };
+                    if cbf {
+                        write_residual(e, cx, &params(comp + 1, d.chroma_mode), &d.chroma[comp][t * 16..(t + 1) * 16]);
+                    }
+                }
+            }
+        }
+    }
+    debug_assert!(pending.is_none(), "a quantiser delta was handed to an NxN CU with no coded cbf");
 }
 
 #[cfg(test)]
@@ -2384,7 +2989,7 @@ mod tests {
     /// stay one each), under weighted prediction (an entry per
     /// reference), and at 10 bits. The census says how often the older
     /// reference was chosen, which is reported rather than asserted:
-    /// at this encoder's block size the honest answer is usually zero.
+    /// on whole-CTB units the honest answer is usually zero.
     /// At the default of one reference the stream is what it always was.
     #[test]
     fn two_references_round_trip_and_the_default_is_unchanged() {
@@ -2700,7 +3305,11 @@ mod tests {
         let emitted = |d: &InterCuDecision, qp: i32| -> f32 {
             let mut cx = Contexts::new(1, qp);
             let mut e = CabacEncoder::counting();
-            write_cu_inter(&mut e, &mut cx, d, None, None, 1, false, None, 1);
+            // The unit's `split_cu_flag`, which the tree walk writes
+            // ahead of every unit above the minimum coding block, at the
+            // neutral neighbour context `Rate` prices it in.
+            write_split_cu_flag(&mut e, &mut cx, &SplitCuNb { left_depth: None, above_depth: None }, 0, false);
+            write_cu_inter(&mut e, &mut cx, d, None, None, 1, false, None, 1, 0);
             e.fractional_bits() as f32
         };
 
@@ -3603,6 +4212,190 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A hashed noise value for a sample position — content that is busy
+    /// everywhere yet the same wherever the same position is asked for,
+    /// so a moving picture can carry it.
+    fn hash2(x: i32, y: i32) -> u32 {
+        let mut v = (x as u32).wrapping_mul(0x9e37_79b1) ^ (y as u32).wrapping_mul(0x85eb_ca77);
+        v ^= v >> 15;
+        v = v.wrapping_mul(0x2c1b_3c6d);
+        v ^= v >> 12;
+        v
+    }
+
+    /// Pictures built for the coding quadtree to take every depth. Each
+    /// 32x32 region is one of four kinds, walking with its position: busy
+    /// throughout (nothing for a split to isolate), flat with a busy
+    /// 16x16 island in one quadrant (one split isolates it), flat with a
+    /// busy 8x8 island inside a quadrant (only the second split does),
+    /// and a gradient crossed by a moving edge. The busy content drifts a
+    /// sample per picture so inter pictures carry residual, and chroma
+    /// follows luma's structure so the chroma trees vary too. At depth
+    /// above 8 every low bit is used.
+    fn tree_frames(w: usize, h: usize, chroma: ChromaFormat, bit_depth: u32, count: usize) -> Vec<Vec<u8>> {
+        let (sw, sh) = match chroma {
+            ChromaFormat::Yuv420 => (2usize, 2usize),
+            ChromaFormat::Yuv422 => (2, 1),
+            _ => (1, 1),
+        };
+        let (cw, ch) = if chroma == ChromaFormat::Monochrome { (0, 0) } else { (w / sw, h / sh) };
+        let shift = bit_depth - 8;
+        let luma = |x: usize, y: usize, f: usize| -> u32 {
+            let (lx, ly) = (x % 32, y % 32);
+            let busy = || 40 + hash2(x as i32 - f as i32, y as i32) % 150;
+            let v = match ((x / 32) + 2 * (y / 32)) % 4 {
+                0 => busy(),
+                1 if lx >= 16 && ly >= 16 => busy(),
+                1 => 120,
+                2 if (24..32).contains(&lx) && (8..16).contains(&ly) => busy(),
+                2 => 90,
+                _ => 40 + (x as u32 + y as u32 / 2) + if (x + 2 * f) % 32 < 12 { 60 } else { 0 },
+            };
+            v.min(255)
+        };
+        (0..count)
+            .map(|f| {
+                let mut samples: Vec<u32> = Vec::with_capacity(w * h + 2 * cw * ch);
+                let low = |x: usize, y: usize, c: u32| hash2(x as i32 + 7 * c as i32, y as i32 + f as i32) & ((1u32 << shift) - 1);
+                for y in 0..h {
+                    for x in 0..w {
+                        samples.push((luma(x, y, f) << shift) | low(x, y, 0));
+                    }
+                }
+                for c in 1..=2u32 {
+                    for y in 0..ch {
+                        for x in 0..cw {
+                            let base = 96 + (luma(x * sw, y * sh, f) >> 3) + 8 * c;
+                            samples.push((base.min(255) << shift) | low(x, y, c));
+                        }
+                    }
+                }
+                if shift == 0 {
+                    samples.iter().map(|&v| v as u8).collect()
+                } else {
+                    samples.iter().flat_map(|&v| (v as u16).to_le_bytes()).collect()
+                }
+            })
+            .collect()
+    }
+
+    /// The coding quadtree codes and round-trips — intra, P and B, every
+    /// chroma format, 10 bits, adaptive quantisation over quantisation
+    /// groups smaller than the CTB, lossless, and a 16x16-CTB picture —
+    /// and takes both split depths in every picture kind: a round trip
+    /// over units that never split would prove only the unsplit syntax it
+    /// already had.
+    ///
+    /// The model check rides along: what the split decisions priced the
+    /// coded units at must be within a factor of two of the slice data
+    /// the pictures actually took.
+    #[test]
+    fn the_coding_quadtree_takes_every_depth_and_round_trips() {
+        use super::super::RateControl::{ConstantQp, Lossless};
+        let mut total = [KindCensus::default(); 3];
+        // PART_NxN units per chroma format, by ChromaArrayType.
+        let mut nxn_by_format = [0u64; 4];
+        for (w, h, chroma, bit_depth, gop, bframes, rate, aq_strength, max_cu_depth) in [
+            (64usize, 64usize, ChromaFormat::Yuv420, 8u32, 0u32, 0u32, ConstantQp(30), 0.0f32, 2u32),
+            (64, 64, ChromaFormat::Yuv420, 8, 8, 2, ConstantQp(30), 0.0, 2),
+            (64, 64, ChromaFormat::Yuv420, 8, 8, 2, ConstantQp(30), 0.0, 1),
+            (64, 64, ChromaFormat::Yuv422, 8, 8, 0, ConstantQp(40), 0.0, 2),
+            (64, 64, ChromaFormat::Yuv422, 8, 0, 0, ConstantQp(26), 0.0, 2),
+            (64, 64, ChromaFormat::Yuv444, 8, 8, 2, ConstantQp(30), 0.0, 2),
+            (64, 64, ChromaFormat::Monochrome, 8, 8, 0, ConstantQp(30), 0.0, 2),
+            (64, 64, ChromaFormat::Yuv420, 10, 8, 2, ConstantQp(30), 0.0, 2),
+            (64, 64, ChromaFormat::Yuv420, 8, 8, 2, ConstantQp(30), 2.0, 2),
+            (64, 64, ChromaFormat::Yuv444, 8, 8, 0, ConstantQp(26), 2.0, 1),
+            (64, 64, ChromaFormat::Yuv420, 8, 8, 2, Lossless, 0.0, 2),
+            (48, 40, ChromaFormat::Yuv420, 8, 8, 0, ConstantQp(30), 2.0, 2),
+        ] {
+            let tag = format!("{w}x{h} {chroma:?} {bit_depth}-bit gop={gop} bframes={bframes} {rate:?} aq={aq_strength} depth={max_cu_depth}");
+            let frames = tree_frames(w, h, chroma, bit_depth, 6);
+            let config = Config { gop, bframes, bit_depth, rate, aq_strength, max_cu_depth, ..cfg(w as u32, h as u32, chroma) };
+            let mut e = H265Encoder::new(config.clone()).unwrap_or_else(|err| panic!("{tag}: {err}"));
+            let mut units = Vec::new();
+            for f in &frames {
+                units.extend(e.push(f).unwrap_or_else(|err| panic!("{tag}: {err}")));
+            }
+            units.extend(e.flush().unwrap());
+            assert_eq!(units.len(), frames.len(), "{tag}");
+            let census = *e.census();
+
+            // SELF, through the production decoder, display order against
+            // coding order through each access unit's stream-wide display
+            // index — not `poc / 2`, which an all-intra stream resets at
+            // every picture (each is an IDR at POC 0).
+            let mut dec = crate::hevc::HevcDecoder::new();
+            for u in &units {
+                dec.push_annexb(&u.data).unwrap_or_else(|err| panic!("{tag}: the decoder rejected the stream: {err}"));
+            }
+            dec.flush().unwrap();
+            let mut by_display = vec![None; units.len()];
+            for u in &units {
+                by_display[u.display as usize] = Some(u.encode_index as usize);
+            }
+            for (i, coded) in by_display.iter().enumerate() {
+                let want = &e.reconstructions()[coded.unwrap_or_else(|| panic!("{tag}: display index {i} never coded"))];
+                let got = dec.next_picture().unwrap_or_else(|| panic!("{tag}: picture {i} missing"));
+                assert!(got.into_packed() == *want, "{tag}: picture {i} decoded differently than the encoder reconstructed it");
+                if rate == Lossless {
+                    assert!(*want == frames[i], "{tag}: picture {i} is not lossless");
+                }
+            }
+
+            if aq_strength > 0.0 {
+                assert!(census.by_kind.iter().map(|k| k.qp_delta).sum::<u64>() > 0, "{tag}: no unit coded a cu_qp_delta");
+                assert!(census.by_kind.iter().map(|k| k.qp_moved).sum::<u64>() > 0, "{tag}: no unit left the picture quantiser");
+            }
+            let g = syn::Geometry::new(&config);
+            if g.log2_ctb == 4 || max_cu_depth == 1 {
+                assert!(census.by_kind.iter().all(|k| k.depth2 == 0), "{tag}: split twice where one split reaches the limit: {census:?}");
+                assert!(census.by_kind.iter().any(|k| k.depth1 > 0), "{tag}: never split at all: {census:?}");
+            }
+            for (t, k) in total.iter_mut().zip(census.by_kind.iter()) {
+                t.add(k);
+            }
+            let cat = match chroma {
+                ChromaFormat::Monochrome => 0,
+                ChromaFormat::Yuv420 => 1,
+                ChromaFormat::Yuv422 => 2,
+                ChromaFormat::Yuv444 => 3,
+            };
+            nxn_by_format[cat] += census.by_kind.iter().map(|k| k.nxn).sum::<u64>();
+        }
+        assert!(nxn_by_format.iter().all(|&n| n > 0), "PART_NxN was not taken in every chroma format (by ChromaArrayType): {nxn_by_format:?}");
+        assert!(total[0].nxn > 0 && total[1].nxn + total[2].nxn > 0, "PART_NxN never taken in an I picture or never inside a P/B one: {total:?}");
+        for (slot, name) in [(0usize, "I"), (1, "P"), (2, "B")] {
+            let t = &total[slot];
+            assert!(t.depth1 > 0 && t.depth2 > 0, "{name} pictures never took both split depths: {t:?}");
+            let (m, c) = (t.model_bits as f64, t.coded_bits as f64);
+            assert!(m > 0.5 * c && m < 2.0 * c, "{name} pictures: the split decisions priced {m} bits for {c} coded");
+        }
+
+        // A tree changes the stream; no tree is the stream before it.
+        let frames = tree_frames(64, 64, ChromaFormat::Yuv420, 8, 3);
+        let encode = |max_cu_depth: u32| -> Vec<u8> {
+            let mut e = H265Encoder::new(Config { gop: 8, max_cu_depth, ..cfg(64, 64, ChromaFormat::Yuv420) }).unwrap();
+            let mut out = Vec::new();
+            for f in &frames {
+                for u in e.push(f).unwrap() {
+                    out.extend_from_slice(&u.data);
+                }
+            }
+            for u in e.flush().unwrap() {
+                out.extend_from_slice(&u.data);
+            }
+            out
+        };
+        assert_eq!(encode(0), encode(Config::default().max_cu_depth), "the default must be no tree");
+        assert_ne!(encode(0), encode(2), "a depth-2 tree changed nothing on content built to split");
+
+        // Deeper than the minimum coding block allows at any CTB is refused
+        // by name rather than clamped.
+        let err = H265Encoder::new(Config { max_cu_depth: 3, ..cfg(64, 64, ChromaFormat::Yuv420) }).err().expect("depth 3 must refuse");
+        assert!(format!("{err}").contains("max_cu_depth"), "{err}");
     }
 
     /// A source sample above the declared depth is refused by name, not
