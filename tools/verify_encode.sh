@@ -45,6 +45,29 @@
 #               The test that a rate row is worth having: replace the
 #               controller with a constant quantiser and it must go red.
 #
+#   4b. SUSTAINED  The band is blind to a controller that converges and
+#               then stops steering. That happened: rc.rs concluded from one
+#               quantiser move that the content ignored the quantiser, held
+#               it for the rest of the clip, and spent a third to a half of
+#               the plan on every picture after - H.265 cut at 96 kbps ended
+#               at 0.83x, H.264 at 128 kbps at 0.89x, ten of the eighteen
+#               cut-clip rate cells between 0.81x and 0.95x, all green.
+#               So on a clip long enough to converge (at least RATE_WINDOW
+#               GOPs after the first; of this corpus only src_cut, 12 GOPs)
+#               every RATE_WINDOW consecutive GOPs after the first must
+#               spend within [RATE_WINDOW_LO, RATE_WINDOW_HI] of target,
+#               measured from the stream's own access units (gop_spend_of).
+#               The first GOP is exempt for the reason the band is wide.
+#
+#               Thresholds from the measured distribution (2026-09-14, the
+#               18 cut-clip rate cells): after the fix every 3-GOP window
+#               lies in [0.93, 1.07]; single GOPs dip to 0.86 after the cut,
+#               which is why the window is three. On the pre-fix encoder
+#               (h26x d88e24a) the nine cells the rule froze bottom out at
+#               0.56 to 0.79. 0.85 sits between the two, and the ceiling is
+#               its reciprocal, 1.18. Its mutation: the pre-fix encoder must
+#               fail those nine cells and nothing else.
+#
 #   5. BUFFER   Only for --cpb-ms rows. A stream that underflows the coded
 #               picture buffer it declares is non-conforming - determined
 #               integer arithmetic, not a judgement - so unlike RATE this
@@ -735,6 +758,26 @@ one() {
         echo "RATE-FAIL   $tag: achieved $(printf '%.2f' "$ratio")x of target, outside [0.50, 2.00]"
         return 1
       fi
+      # 4b. SUSTAINED. On a clip long enough to converge, the spend over
+      # every RATE_WINDOW consecutive GOPs after the first must sit inside
+      # [RATE_WINDOW_LO, RATE_WINDOW_HI] of target (see 4 above).
+      pics=$(sed -n 's/^\([0-9]*\) pictures, [0-9]* bytes$/\1/p' "$OUT/$base.$name.enc.log" | tail -1)
+      if ! out=$(gop_spend_of "$bs" "$ratio" "$pics"); then
+        echo "RATE-FAIL   $tag: $out"
+        return 1
+      fi
+      verdict=$(echo "$out" | awk -v w="$RATE_WINDOW" -v lo="$RATE_WINDOW_LO" -v hi="$RATE_WINDOW_HI" '{
+        if (NF < w + 1) { print "short"; exit }
+        for (i = 2; i + w - 1 <= NF; i++) {
+          s = 0; for (j = i; j < i + w; j++) s += $j
+          if (s / w < lo || s / w > hi) { printf "GOPs %d-%d of %d spent %.2fx of target, outside [%.2f, %.2f] (per GOP: %s)\n", i, i + w - 1, NF, s / w, lo, hi, $0; exit }
+        }
+        print "held"
+      }')
+      case "$verdict" in
+        short|held) ;;
+        *) echo "RATE-FAIL   $tag: $verdict"; return 1 ;;
+      esac
       ;;
   esac
 
@@ -935,8 +978,67 @@ quality_verdict() {
     else print "held"
   }'
 }
-export -f one ffpix psnr_of planes_psnr_of quality_verdict chroma_of depth_of frame_bytes
-export ENC DEC HRD FFMPEG FFPROBE OUT PARAM_SETS VUI_PROBE H26X_SPEED_TABLE JOBS QBASE QTOL
+# Property 4b's measurement: each GOP's spend against the target, from the
+# bytes of the stream alone. Splits the Annex-B stream into access units
+# (H.264 or H.265, told apart by the first NAL: an SPS or a VPS), cuts it
+# into GOPs at keyframes in coding order, and prints one number per GOP:
+# its bits per picture over the clip's bits per picture, times the ratio
+# the encoder reported for the whole clip. So the numbers are relative to
+# the target without this script knowing the frame rate, and they average
+# to the encoder's own ratio. The split is checked against the file size
+# and against the encoder's picture count, and a mismatch is a failure —
+# a splitter that miscounted would otherwise measure the wrong pictures
+# and pass.
+gop_spend_of() {
+  python - "$1" "$2" "$3" <<'PY'
+import sys
+data = open(sys.argv[1], "rb").read()
+ratio, pictures = float(sys.argv[2]), int(sys.argv[3] or 0)
+starts = []
+i = data.find(b"\x00\x00\x01")
+while i >= 0:
+    starts.append((i - 1 if i > 0 and data[i - 1] == 0 else i, i + 3))
+    i = data.find(b"\x00\x00\x01", i + 3)
+h264 = bool(starts) and data[starts[0][1]] & 0x1F == 7
+units, begin, vcl_seen, key = [], 0, False, False
+for k, (s, h) in enumerate(starts):
+    end = starts[k + 1][0] if k + 1 < len(starts) else len(data)
+    if h264:
+        t = data[h] & 0x1F
+        vcl = 1 <= t <= 5
+        first = vcl and h + 1 < end and data[h + 1] & 0x80
+        opens = t in (6, 7, 8, 9, 14, 15, 16, 17, 18)
+        is_key = t == 5
+    else:
+        t = (data[h] >> 1) & 0x3F
+        vcl = t <= 31
+        first = vcl and h + 2 < end and data[h + 2] & 0x80
+        opens = 32 <= t <= 39 or 41 <= t <= 44 or 48 <= t <= 55
+        is_key = 16 <= t <= 21
+    if vcl_seen and (first or (not vcl and opens)):
+        units.append((s - begin, key))
+        begin, vcl_seen, key = s, False, False
+    vcl_seen |= bool(vcl)
+    key |= is_key
+units.append((len(data) - begin, key))
+if len(units) != pictures or sum(u for u, _ in units) != len(data):
+    print(f"the stream splits into {len(units)} access units of {sum(u for u, _ in units)} bytes; the encoder reported {pictures} pictures in {len(data)}")
+    sys.exit(1)
+gops = []
+for size, is_key in units:
+    if is_key or not gops:
+        gops.append([])
+    gops[-1].append(size)
+per_picture = len(data) / len(units)
+print(" ".join(f"{ratio * sum(g) / len(g) / per_picture:.3f}" for g in gops))
+PY
+}
+# Property 4b's thresholds (see 4).
+RATE_WINDOW=${RATE_WINDOW:-3}
+RATE_WINDOW_LO=${RATE_WINDOW_LO:-0.85}
+RATE_WINDOW_HI=${RATE_WINDOW_HI:-1.18}
+export -f one ffpix psnr_of planes_psnr_of quality_verdict chroma_of depth_of frame_bytes gop_spend_of
+export ENC DEC HRD FFMPEG FFPROBE OUT PARAM_SETS VUI_PROBE H26X_SPEED_TABLE JOBS QBASE QTOL RATE_WINDOW RATE_WINDOW_LO RATE_WINDOW_HI
 
 echo "== encode verification =="
 results="$OUT/results.txt"
