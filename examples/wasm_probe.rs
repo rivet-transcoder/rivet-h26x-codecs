@@ -19,6 +19,11 @@
 //! Exported deliberately small: wasm has no argv and no files, so the caller
 //! allocates, copies the stream in, and reads the answer out.
 
+// Every export takes pointers into wasm linear memory from its only caller,
+// the JavaScript host in `tools/wasm.sh`, which an `unsafe` marker on an
+// `extern "C"` function says nothing to.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 use std::alloc::{Layout, alloc};
 
 /// FNV-1a, as in `tests/decode.rs`.
