@@ -342,6 +342,24 @@ fi
 # picture carries an offset, so that regression cannot pass the gate. The corpus has no deep or non-4:2:0
 # fade, so the @p10 rows prove the syntax at depth; a deep, 4:2:2, 4:4:4 and
 # monochrome fade run in the unit test.
+#
+# The hevc-wp*-ipb rows are H.265's weighted bi-prediction. With --wpred and
+# B pictures the PPS sets weighted_bipred_flag and every B slice carries a
+# table with an entry for each list's anchor (encode::h265_wp's fit), which
+# the B walk's one-list and bi predictions apply. So every H.265 --wpred row
+# with --bframes moved when that landed — `hevc-wp-ipb@fade` and
+# `hevc-cu0-wp-ipb@fade` included — and no IP row did (no B picture, no
+# flag). Against the encoder before it (P weighted, B default) on the fade at
+# --bframes 2: -6.8% bytes at QP 26, +0.7% at QP 40 with PSNR up, BD-rate
+# -4.6% over QP 22..40, and only the B slices and the PPS differ. The
+# untagged rows show the skip: at QP 26 no fit is used on a clip that does
+# not fade, the reconstruction is the default-weighted one to the byte, and
+# the stream is a table of defaults (about ten bits a B slice) larger. At
+# QP 40 a few B pictures of those clips take a weighting, mostly chroma, as
+# the P rows do. The corpus has no deep fade, so the @p10 row is the syntax
+# at depth (a 10-bit fade with B pictures round-trips in the unit test); the
+# @wpoff rows put an offset in both lists; refs2 mixes a two-entry P table
+# with one-entry B lists; the ABR row runs the fit under a lookahead.
 CONFIGS=${CONFIGS:-"
 lossless-intra|--codec h264 --lossless --gop 0
 cqp-intra|--codec h264 --qp 26 --gop 0
@@ -490,6 +508,13 @@ hevc-cu2-intra@big|--codec h265 --qp 26 --gop 0 --cu-depth 2
 hevc-cu2-ipb@big|--codec h265 --qp 26 --gop 8 --bframes 2 --cu-depth 2
 hevc-cu2-aq40-ipb@big|--codec h265 --qp 40 --gop 8 --bframes 2 --aq 1.0 --cu-depth 2
 hevc-cu2-40-sao-ip@big|--codec h265 --qp 40 --gop 8 --sao --cu-depth 2
+hevc-wp40-ipb|--codec h265 --qp 40 --gop 8 --bframes 2 --wpred
+hevc-wp-sao-ipb|--codec h265 --qp 26 --gop 8 --bframes 2 --sao --wpred
+hevc10-wp-ipb@p10|--codec h265 --qp 26 --gop 8 --bframes 2 --wpred
+hevc-wpoff-ipb@wpoff|--codec h265 --qp 26 --gop 8 --bframes 2 --wpred
+hevc-wpoff40-ipb@wpoff|--codec h265 --qp 40 --gop 8 --bframes 2 --wpred
+hevc-wp-refs2-ipb@fade|--codec h265 --qp 26 --gop 8 --bframes 2 --refs 2 --wpred
+hevc-wp-abr-la-ipb-64k@fade|--codec h265 --bitrate 64000 --gop 8 --bframes 2 --lookahead 4 --wpred
 "}
 
 # Split a clip's format token into its chroma format and sample depth:
