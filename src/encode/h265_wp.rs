@@ -51,8 +51,15 @@
 //! bounds what the table can buy a bi unit. Measured on the corpus fade
 //! at `--bframes 2` against default B weighting: at QP 26 the B pictures
 //! skip 51 units where they skipped 3 and the stream is 6.8% smaller; at
-//! QP 40 the model check loses 13 of the 38 units it scores and the
-//! stream is 0.7% larger at a slightly higher PSNR.
+//! QP 40 the model check loses 13 of the 38 units it scores.
+//!
+//! So the fit is not the last word for a B picture. The picture coder
+//! codes a B picture whose table weights something a second time under a
+//! table of defaults and keeps the cheaper by SSD plus λ·bits, and a
+//! weighted list's whole-sample search scores on the weighted reference.
+//! With both, against default B weighting over QP 22..40: the fade -4.7%
+//! BD-rate (QP 40 +0.46% bytes at +0.04 dB), the gain-and-offset fade -5.6%
+//! (QP 40 +0.15%).
 
 use crate::hevc::frame::Plane16;
 use crate::hevc::slice::{PredWeightTable, WeightEntry};

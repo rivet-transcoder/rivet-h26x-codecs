@@ -546,6 +546,16 @@ pub struct InterPicture<S: Sample> {
     /// by [`Self::code_cu_b`]'s search, its merge and bi scoring and its
     /// final prediction. The P walk does not read it.
     pub wp_b: [[Weighting; 3]; 3],
+    /// The luma plane each list's full-sample search scores against in a
+    /// weighted B picture: the list's reference with its luma weighting
+    /// applied sample by sample, or `None` where the list's luma is
+    /// unweighted and the search reads the reference itself. The search is
+    /// a SAD over whole samples, and a reference a gain or an offset away
+    /// from the picture flattens that landscape — an offset of 24 on the
+    /// test grating defeats it outright — so a weighted list searches what
+    /// it will predict from. Set by [`Self::set_b_weights`]; the
+    /// sub-sample refinement and the prediction still read the reference.
+    pub search_b: [Option<Plane16<S>>; 2],
 }
 
 impl<S: Sample> InterPicture<S> {
@@ -588,6 +598,7 @@ impl<S: Sample> InterPicture<S> {
             spred: vec![S::default(); nmax],
             wp: Vec::new(),
             wp_b: [[Weighting::Default; 3]; 3],
+            search_b: [None, None],
         }
     }
 
@@ -597,12 +608,22 @@ impl<S: Sample> InterPicture<S> {
         self.wp.get(r).copied().unwrap_or([Weighting::Default; 3])
     }
 
-    /// Weight this B picture's predictions by its slice's table `t`: each
+    /// Weight this B picture's predictions by its slice's table `t`, whose
+    /// list-0 and list-1 references are `ref0` and `ref1`: each
     /// `inter_pred_idc`'s entry of [`Self::wp_b`] as the reader derives it
     /// — `explicit_weighting` for reference 0 of the lists that
-    /// prediction uses, `[0, -1]`, `[-1, 0]` and `[0, 0]`.
-    pub fn set_b_weights(&mut self, t: &PredWeightTable, bit_depth_luma: u32, bit_depth_chroma: u32) {
+    /// prediction uses, `[0, -1]`, `[-1, 0]` and `[0, 0]` — and, for each
+    /// list whose luma entry is not the default, the plane its full-sample
+    /// search scores against ([`Self::search_b`]).
+    pub fn set_b_weights(&mut self, t: &PredWeightTable, bit_depth_luma: u32, bit_depth_chroma: u32, ref0: &Frame<S>, ref1: &Frame<S>) {
         self.wp_b = [[0, -1], [-1, 0], [0, 0]].map(|r| explicit_weighting(t, bit_depth_luma, bit_depth_chroma, r));
+        for (list, rf) in [ref0, ref1].into_iter().enumerate() {
+            let (w, o) = t.lists[list][0].luma;
+            self.search_b[list] = match self.wp_b[list][0] {
+                Weighting::Explicit { log2_wd, .. } if (w, o) != (1 << t.luma_log2_denom, 0) => Some(weighted_search_plane(&rf.y, bit_depth_luma, log2_wd, w, o)),
+                _ => None,
+            };
+        }
     }
 
     /// The weighting a B prediction from the lists `ref_idx` uses carries
@@ -989,7 +1010,10 @@ impl<S: Sample> InterPicture<S> {
             let plane = if list == 0 { &ref0.y } else { &ref1.y };
             let mut seeds: Vec<Mv> = vec![Mv::ZERO, mvp[list][0], mvp[list][1]];
             seeds.extend(merge.iter().filter(|c| c.ref_idx[list] == 0).map(|c| c.mv[list]));
-            let full = self.search_full(ctx, plane, x0, y0, n, src, y_stride, &seeds);
+            // Whole samples are searched on the weighted reference where the
+            // list is weighted (`search_b`), the sub-sample rings below on
+            // the reference itself under the weighted scoring.
+            let full = self.search_full(ctx, self.search_b[list].as_ref().unwrap_or(plane), x0, y0, n, src, y_stride, &seeds);
             // Scored under the weighting a one-list prediction from this
             // list carries, so the vector is chosen for the prediction
             // that will be made.
@@ -1634,6 +1658,24 @@ impl<S: Sample> InterPicture<S> {
         }
         (ctx.dist.satd)(src, src_stride, spred, n, n, n)
     }
+}
+
+/// `refp` with an explicit luma weighting applied to every sample, border
+/// included: 8.5.3.3.4.3's one-list formula at a whole-sample vector — the
+/// sample at 14 bits (`<< (14 - bitDepth)`), then `((p * w + 2^(log2WD -
+/// 1)) >> log2WD) + o`, clipped — with `log2WD`, `w` and `o` as
+/// `explicit_weighting` derives them. The plane a weighted list's
+/// full-sample search scores against ([`InterPicture::search_b`]): a search
+/// only ranks candidates, and at whole samples this is exactly the
+/// prediction `predict_block` would make.
+fn weighted_search_plane<S: Sample>(refp: &Plane16<S>, bit_depth: u32, log2_wd: i32, w: i32, o: i32) -> Plane16<S> {
+    let mut out = refp.clone();
+    let (shift, max, round) = (14 - bit_depth as i32, (1i32 << bit_depth) - 1, 1i32 << (log2_wd - 1));
+    for v in out.data.iter_mut() {
+        let p = (((v.to_i32() << shift) * w + round) >> log2_wd) + o;
+        *v = S::from_i32(p.clamp(0, max));
+    }
+    out
 }
 
 /// The references a coding-quadtree walk predicts from.
@@ -2433,16 +2475,43 @@ mod tests {
     /// weights, or weighted one list with the other's entry, diverges from
     /// the replay, which derives its weighting from the table through the
     /// reader's own `explicit_weighting`.
+    ///
+    /// The second table carries offsets alone, large and of opposite signs.
+    /// A one-list search scored without the weighting then sees each
+    /// candidate a full offset from the source in every sample, and the
+    /// AMVP one-list shapes lose to the weighted merge and bi candidates
+    /// that score as the prediction will be made — so the PRED_L0 / PRED_L1
+    /// guards fail on a refinement that forgot the weights, which the gentle
+    /// table alone let pass. The table is usable at all only because the
+    /// whole-sample search scores on the weighted reference
+    /// (`InterPicture::search_b`): searched on the reference itself, an
+    /// offset this size flattens the grating's SAD landscape and the
+    /// unmutated walk misses the one-list shapes too, while an offset of 12
+    /// leaves the search working and the two scorings choosing alike.
     #[test]
     fn every_weighted_b_decision_replays_through_an_independent_decoder_state() {
-        let table = weighted_b_table();
-        for chroma in [ChromaFormat::Monochrome, ChromaFormat::Yuv420, ChromaFormat::Yuv422, ChromaFormat::Yuv444] {
-            let mut seen_idc = [false; 3];
-            for scen in [BScenario::Uni0, BScenario::Uni1, BScenario::Bi] {
-                replay_b_one_format(chroma, scen, &mut seen_idc, Some(&table));
+        for (name, table) in [("gain and offset", weighted_b_table()), ("offsets", offset_b_table())] {
+            for chroma in [ChromaFormat::Monochrome, ChromaFormat::Yuv420, ChromaFormat::Yuv422, ChromaFormat::Yuv444] {
+                let mut seen_idc = [false; 3];
+                for scen in [BScenario::Uni0, BScenario::Uni1, BScenario::Bi] {
+                    replay_b_one_format(chroma, scen, &mut seen_idc, Some(&table));
+                }
+                assert!(seen_idc[0], "{chroma:?} weighted ({name}): no CU ever coded PRED_L0 through AMVP");
+                assert!(seen_idc[1], "{chroma:?} weighted ({name}): no CU ever coded PRED_L1 through AMVP");
             }
-            assert!(seen_idc[0], "{chroma:?} weighted: no CU ever coded PRED_L0 through AMVP");
-            assert!(seen_idc[1], "{chroma:?} weighted: no CU ever coded PRED_L1 through AMVP");
+        }
+    }
+
+    /// A B slice's table of offsets only, large and of opposite signs per
+    /// list (+24 and -24 in luma, smaller in chroma), at unit gain. The
+    /// fixture's luma lies in 28..=139, so the inverse (`unweight`) never
+    /// clips and the weighted prediction reproduces the content.
+    fn offset_b_table() -> crate::hevc::slice::PredWeightTable {
+        use crate::hevc::slice::{PredWeightTable, WeightEntry};
+        PredWeightTable {
+            luma_log2_denom: 6,
+            chroma_log2_denom: 6,
+            lists: [vec![WeightEntry { luma: (64, 24), chroma: [(64, 8), (64, 8)] }], vec![WeightEntry { luma: (64, -24), chroma: [(64, -8), (64, -8)] }]],
         }
     }
 
@@ -2564,7 +2633,7 @@ mod tests {
         // PRED_L1 guards go red; the replay derives its own weighting from
         // each decision's reference indices.
         if let Some(t) = weights {
-            pic.set_b_weights(t, 8, 8);
+            pic.set_b_weights(t, 8, 8, &ref0, &ref1);
         }
         let mut decisions = Vec::new();
         for cy in 0..h / n {

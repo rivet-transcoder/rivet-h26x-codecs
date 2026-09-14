@@ -92,7 +92,7 @@
 
 use super::gop::{Coded, Kind, Scheduler};
 use super::h265_deblock::{deblock_inter_picture, deblock_picture};
-use super::h265_intra::{CuDecision, IntraCtx, IntraPicture, MIN_CB_LOG2, Srcs, TreeCu};
+use super::h265_intra::{CuDecision, IntraCtx, IntraPicture, MIN_CB_LOG2, Srcs, TreeCu, ssd_lambda};
 use super::h265_me::{InterCuDecision, InterCuKind, InterPicture, PCuDecision, TreeRefs, MAX_MERGE_CAND};
 use super::rc::{Insensitivity, PicKind, RateController};
 use super::h265_sao::{SaoPlan, sao_picture};
@@ -274,6 +274,10 @@ struct Attempt<S: Sample> {
     /// What this picture's CUs were coded as, added to the encoder's
     /// census only if the attempt is kept.
     census: KindCensus,
+    /// A B picture coded under a fitted `pred_weight_table` that weights
+    /// something: the attempt `code_attempt` prices against the same
+    /// picture under a table of defaults. False for every other attempt.
+    b_fitted: bool,
 }
 
 /// The POC LSB width the SPS declares. Fixed and generous, as on the H.264
@@ -701,6 +705,33 @@ impl<S: Sample> Core<S> {
         (mine, window)
     }
 
+    /// Sum of squared differences between the display area of `f` and the
+    /// source picture `src` (planar, display size), over every component.
+    fn display_ssd(&self, f: &crate::hevc::frame::Frame<S>, src: &[S]) -> u64 {
+        let (dw, dh) = (self.cfg.width as usize, self.cfg.height as usize);
+        let (sw, sh) = match self.cfg.chroma {
+            crate::ChromaFormat::Yuv420 => (2usize, 2usize),
+            crate::ChromaFormat::Yuv422 => (2, 1),
+            _ => (1, 1),
+        };
+        let (cdw, cdh) = (dw.div_ceil(sw), dh.div_ceil(sh));
+        let plane = |p: &crate::hevc::frame::Plane16<S>, s: &[S], w: usize, h: usize| -> u64 {
+            let o = p.origin();
+            (0..h)
+                .map(|y| {
+                    let row = &p.data[o + y * p.stride..];
+                    (0..w).map(|x| u64::from(row[x].to_i32().abs_diff(s[y * w + x].to_i32())).pow(2)).sum::<u64>()
+                })
+                .sum()
+        };
+        let mut ssd = plane(&f.y, &src[..dw * dh], dw, dh);
+        if self.cfg.chroma != crate::ChromaFormat::Monochrome {
+            ssd += plane(&f.cb, &src[dw * dh..dw * dh + cdw * cdh], cdw, cdh);
+            ssd += plane(&f.cr, &src[dw * dh + cdw * cdh..], cdw, cdh);
+        }
+        ssd
+    }
+
     /// Code one picture at a given quantiser, keeping nothing.
     fn code_attempt(&mut self, c: Coded, src: &[S], qp: u8, bypass: bool) -> Result<Attempt<S>> {
         let g = self.geom;
@@ -718,7 +749,27 @@ impl<S: Sample> Core<S> {
         // caller and escalated by it, so an attempt cannot quietly pick a
         // different one than the buffer arithmetic is reasoning about.
         if c.kind != Kind::Idr {
-            return self.code_inter_picture(c, src, qp, bypass);
+            let fitted = self.code_inter_picture(c, src, qp, bypass, true)?;
+            if !fitted.b_fitted {
+                return Ok(fitted);
+            }
+            // A B picture's fitted table is priced, not trusted. The fit is
+            // judged at zero motion one list at a time, while a bi unit
+            // predicts from the average of both weighted anchors — which on
+            // a fade the default average is often already as near — so the
+            // table can cost its bits and steer the search for little. The
+            // picture is coded again under a table of defaults, and the
+            // cheaper of the two is kept: the SSD of its reconstruction plus
+            // the bits of its access unit, at the Lagrangian every
+            // SSD-against-bits choice in this encoder uses.
+            let mut plain = self.code_inter_picture(c, src, qp, bypass, false)?;
+            let lam = ssd_lambda(i32::from(qp), self.cfg.bit_depth);
+            let cost = |a: &Attempt<S>| self.display_ssd(&a.frame, src) as f64 + lam * (a.access.data.len() * 8) as f64;
+            if cost(&plain) < cost(&fitted) {
+                plain.census.wp_rd_default += 1;
+                return Ok(plain);
+            }
+            return Ok(fitted);
         }
 
         // Sources at coded size, edge-replicated: the coded picture is a
@@ -962,6 +1013,7 @@ impl<S: Sample> Core<S> {
             frame: pic.recon,
             clears_refs: true,
             census,
+            b_fitted: false,
         })
     }
 
@@ -1009,7 +1061,11 @@ impl<S: Sample> Core<S> {
     /// most sharply that a non-skip 2Nx2N merge CU never codes
     /// `rqt_root_cbf` (the reader infers it true), which is why a merge
     /// with nothing left to code must be spelled as a skip instead.
-    fn code_inter_picture(&mut self, c: Coded, src: &[S], qp: u8, bypass: bool) -> Result<Attempt<S>> {
+    ///
+    /// `fit_b` false codes a B picture under a table of defaults whatever
+    /// its fit says: the alternative `code_attempt` prices a fitted table
+    /// against. It changes nothing for a P picture.
+    fn code_inter_picture(&mut self, c: Coded, src: &[S], qp: u8, bypass: bool, fit_b: bool) -> Result<Attempt<S>> {
         let g = self.geom;
         let pps_qp = self.pps_qp;
         let (dw, dh) = (self.cfg.width as usize, self.cfg.height as usize);
@@ -1128,6 +1184,12 @@ impl<S: Sample> Core<S> {
         let wp = weighted.then(|| {
             let identity = h265_wp::PlaneFit::identity(0);
             let fit = |rf: &&crate::hevc::frame::Frame<S>| -> [h265_wp::PlaneFit; 3] {
+                // A B picture's default-weighted alternative: no fit, so
+                // every entry is the default and the walk predicts with
+                // default weighting.
+                if c.kind == Kind::B && !fit_b {
+                    return [identity; 3];
+                }
                 let luma = h265_wp::fit_plane(&src[..dw * dh], dw, &rf.y, dw, dh, bit_depth);
                 let (cb, cr) = if cat != 0 {
                     (
@@ -1158,7 +1220,7 @@ impl<S: Sample> Core<S> {
             // 8.5.3.3.4.2), so it leaves the walk on default weighting and
             // its fused kernels.
             (Some((t, fits)), Kind::B) if fits.iter().flatten().any(|f| f.iter().any(h265_wp::PlaneFit::used)) => {
-                pic.set_b_weights(t, bit_depth, bit_depth);
+                pic.set_b_weights(t, bit_depth, bit_depth, past, future.expect("a B picture has a future anchor (checked above)"));
             }
             _ => {}
         }
@@ -1369,6 +1431,7 @@ impl<S: Sample> Core<S> {
             frame: pic.recon,
             clears_refs: false,
             census,
+            b_fitted: c.kind == Kind::B && wp.as_ref().is_some_and(|(_, fits)| fits.iter().flatten().any(|f| f.iter().any(h265_wp::PlaneFit::used))),
         })
     }
 
@@ -1968,6 +2031,9 @@ pub struct KindCensus {
     /// The same, higher weighted than plain — the fit's prediction
     /// failing.
     pub wp_lost: u64,
+    /// B pictures whose fitted table lost the picture-level check to a
+    /// table of defaults (SSD plus λ·bits), and were kept default-weighted.
+    pub wp_rd_default: u64,
     /// Inter CUs predicted from a list-0 reference other than the
     /// nearest (`ref_idx` 1 or more) — the choice multi-reference
     /// prediction exists for, taken.
@@ -2054,6 +2120,7 @@ impl KindCensus {
         self.wp_on += other.wp_on;
         self.wp_won += other.wp_won;
         self.wp_lost += other.wp_lost;
+        self.wp_rd_default += other.wp_rd_default;
         self.ref_older += other.ref_older;
         self.nxn += other.nxn;
         self.depth1 += other.depth1;
@@ -2077,6 +2144,7 @@ impl KindCensus {
             ("wp_on", self.wp_on),
             ("wp_won", self.wp_won),
             ("wp_lost", self.wp_lost),
+            ("wp_rd_default", self.wp_rd_default),
             ("ref_older", self.ref_older),
             ("nxn", self.nxn),
             ("depth1", self.depth1),
@@ -3084,6 +3152,39 @@ mod tests {
         let (without, _) = encode(false);
         assert_eq!(census.by_kind[1].wp_on, 0, "a held clip chose a weighting: {:?}", census.by_kind[1]);
         assert!(with >= without && with <= without + 2 * held.len(), "the table of defaults should cost bits, not bytes: {with} against {without}");
+    }
+
+    /// The picture-level check between a B picture's fitted table and a
+    /// table of defaults (`code_attempt`) keeps each where it pays. On the
+    /// fade with two B pictures between anchors — a third and two thirds of
+    /// the way, where default bi-prediction's even average is at the wrong
+    /// level — every fitted table is kept at QP 26. With one B picture, at
+    /// the midpoint default bi-prediction already averages to, and at QP 40,
+    /// where the table's bits weigh most, some B pictures are coded
+    /// default-weighted. A check with its comparison inverted fails both.
+    #[test]
+    fn a_b_pictures_table_is_kept_only_where_it_pays() {
+        let frames = fade_frames(ChromaFormat::Yuv420, 8, 8);
+        let run = |bframes: u32, qp: u8| -> KindCensus {
+            let mut e = H265Encoder::new(Config {
+                gop: 8,
+                bframes,
+                weighted_pred: true,
+                rate: super::super::RateControl::ConstantQp(qp),
+                ..cfg(64, 64, ChromaFormat::Yuv420)
+            })
+            .unwrap();
+            for f in &frames {
+                e.push(f).unwrap();
+            }
+            e.flush().unwrap();
+            e.census().by_kind[2]
+        };
+        let kept = run(2, 26);
+        assert!(kept.wp_on > 0, "bframes=2 QP 26: no B picture took a fitted table: {kept:?}");
+        assert_eq!(kept.wp_rd_default, 0, "bframes=2 QP 26: a fitted table lost to the defaults: {kept:?}");
+        let mid = run(1, 40);
+        assert!(mid.wp_rd_default > 0, "bframes=1 QP 40: every fitted table was kept: {mid:?}");
     }
 
     /// Two references: every P slice declares two active references in
