@@ -77,7 +77,7 @@ io.open(path, 'w', encoding='utf-8', newline='').write(s.replace(a, b, 1))
 PY
   then
     echo "     SKIPPED: anchor not applied"
-    mv -f "$file.mutbak" "$file"
+    mv -f "$file.mutbak" "$file" && touch "$file"
     _MUTATE_SKIPPED=$((_MUTATE_SKIPPED + 1))
     return
   fi
@@ -96,7 +96,7 @@ PY
     _MUTATE_MISSED=$((_MUTATE_MISSED + 1))
     _MUTATE_MISSED_NAMES+=("$name")
   fi
-  mv -f "$file.mutbak" "$file"
+  mv -f "$file.mutbak" "$file" && touch "$file"
 }
 
 mutate_report() {
@@ -114,6 +114,6 @@ mutate_report() {
     echo
     echo "    WARNING: leftover snapshots — the files beside them are MUTATED:"
     echo "$stray" | sed 's/^/      /'
-    echo "    restore each with: mv -f F.mutbak F"
+    echo "    restore each with: mv -f F.mutbak F && touch F"
   fi
 }
