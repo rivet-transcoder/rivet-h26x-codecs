@@ -19,6 +19,16 @@
 //! feature string by a literal, because they are not the same thing: the AVX
 //! instantiation compiles the SSE4.1 primitive set with `enable = "avx"` to
 //! get VEX encoding, so it passes `("avx", sse41)`.
+//!
+//! What this is *not* is an MSRV or `unsafe` shim, and no toolchain version
+//! retires it: `pblendvb`, `pmovzxbw` and `pminsd` are SSE4.1 *hardware*, and
+//! a CPU without them has to be handed the two- or three-instruction sequence
+//! instead. The toolchain-dependent part was the `unsafe {}` block each
+//! primitive used to wrap its intrinsics in, and Rust 1.87 retired those: the
+//! `#[target_feature]` a primitive is compiled with makes its intrinsics safe
+//! to call (see the note above the module declarations in `dsp`). The
+//! primitives stay `unsafe fn`, because calling one from code that has not
+//! established `$feat` is exactly what the caller has to vouch for.
 
 /// Expand the level-dependent primitives for `$feat` / `$lvl`.
 ///
