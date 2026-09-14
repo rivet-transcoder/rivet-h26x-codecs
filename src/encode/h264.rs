@@ -285,6 +285,17 @@ struct FieldsOut<S: Sample> {
     census: Vec<(Kind, Vec<crate::h264::mb::MbInfo>)>,
     /// The frame was coded as one frame picture rather than two fields.
     frame_coded: bool,
+    /// An MBAFF frame's macroblock pairs, `[frame, field]`.
+    pairs: [u64; 2],
+}
+
+/// A stored frame's two fields as the planes a field macroblock predicts
+/// from.
+fn stored_fields<S: Sample>(r: &StoredFrame<S>) -> [&[syn::Recon<S>]; 2] {
+    [
+        &r.fields[0].as_ref().expect("a stored frame carries both fields").planes[..],
+        &r.fields[1].as_ref().expect("a stored frame carries both fields").planes[..],
+    ]
 }
 
 impl<S: Sample> Fields<S> {
@@ -468,6 +479,12 @@ pub struct ShapeCensus {
     /// coding chose to code whole. With [`ShapeCensus::field_pictures`],
     /// what proves the decision chose both ways.
     pub frame_pictures: u64,
+    /// MBAFF macroblock pairs coded as field macroblocks.
+    pub field_pairs: u64,
+    /// MBAFF macroblock pairs coded as frame macroblocks. With
+    /// [`ShapeCensus::field_pairs`], what proves the pair decision chose
+    /// both ways.
+    pub frame_pairs: u64,
 }
 
 impl ShapeCensus {
@@ -647,12 +664,12 @@ impl<S: Sample> Core<S> {
                 )));
             }
             match cfg.field_coding {
-                FieldCoding::Field | FieldCoding::Paff => {}
-                FieldCoding::Mbaff => {
+                FieldCoding::Mbaff if cfg.chroma == crate::ChromaFormat::Yuv444 => {
                     return Err(Error::unsupported(
-                        "H.264 encode: macroblock-adaptive frame/field coding (encoder in progress)",
+                        "H.264 encode: MBAFF 4:4:4 (the decoder's MBAFF loop filter does not filter luma-style chroma, so the stream could not be held to it)",
                     ));
                 }
+                FieldCoding::Field | FieldCoding::Paff | FieldCoding::Mbaff => {}
             }
             if cfg.rate == RateControl::Lossless {
                 return Err(Error::unsupported(
@@ -862,6 +879,7 @@ impl<S: Sample> Core<S> {
             let a = match (self.fields.is_some(), self.cfg.field_coding) {
                 (false, _) => self.code_attempt(&c, src, qp)?,
                 (true, FieldCoding::Field) => self.code_attempt_fields(&c, src, qp)?,
+                (true, FieldCoding::Mbaff) => self.code_attempt_ilace_frame(&c, src, qp)?,
                 (true, _) => self.code_attempt_paff(&c, src, qp)?,
             };
             let bits = a.access.data.len() as u64 * 8;
@@ -929,6 +947,8 @@ impl<S: Sample> Core<S> {
                     self.census.field_pictures += 1;
                 }
             }
+            self.census.frame_pairs += out.pairs[0];
+            self.census.field_pairs += out.pairs[1];
             if idr {
                 self.frame_num = 0;
                 self.idr_pic_id ^= 1;
@@ -1602,7 +1622,7 @@ impl<S: Sample> Core<S> {
             rec,
             recon: Vec::new(),
             motion: super::h264_pic::PicMotion::new(0, 0),
-            fields: Some(FieldsOut { model, frame: cur, census, frame_coded: false }),
+            fields: Some(FieldsOut { model, frame: cur, census, frame_coded: false, pairs: [0; 2] }),
         })
     }
 
@@ -1720,7 +1740,58 @@ impl<S: Sample> Core<S> {
 
         let mut w = BitWriter::with_capacity(self.frame_bytes + 256);
         syn::write_slice_header(&header, self.pps_qp, &mut w);
-        let motion = match kind {
+        let motion = if g.mbaff {
+            // An MBAFF frame: every reference as its frame and its two
+            // fields, the colocated view mapped for an MBAFF current
+            // picture, the pairs decided and written by the MBAFF walk.
+            let mrefs = match kind {
+                Kind::Idr | Kind::I => super::h264_pic::MbaffRefs::Intra,
+                Kind::P => {
+                    let r = frame_of(ref0[0])?;
+                    super::h264_pic::MbaffRefs::P { frame: &r.frame, fields: stored_fields(r) }
+                }
+                Kind::B => {
+                    let (r0, r1) = (frame_of(ref0[0])?, frame_of(ref0[1])?);
+                    super::h264_pic::MbaffRefs::B {
+                        frame: [&r0.frame, &r1.frame],
+                        fields: [stored_fields(r0), stored_fields(r1)],
+                        col: super::h264_pic::Colocated {
+                            frame: &r1.col,
+                            map: crate::h264::recon::ColMap {
+                                cur_parity: PARITY_FRAME,
+                                col_parity: PARITY_FRAME,
+                                cur_poc: poc,
+                                cur_mbaff: true,
+                                mb_width: g.mbs_wide as usize,
+                            },
+                        },
+                    }
+                }
+            };
+            let slice = match kind {
+                Kind::Idr | Kind::I => crate::h264::SliceType::I,
+                Kind::P => crate::h264::SliceType::P,
+                Kind::B => crate::h264::SliceType::B,
+            };
+            if cabac {
+                let m = {
+                    let mut mw = super::h264_cabac_mb::MbaffCabac::new(&mut w, &g, &self.tools, qp, slice);
+                    super::h264_pic::code_mbaff_picture(&g, &self.tools, qp, &planes, &mut recon, mrefs, &mut mw)
+                };
+                w.align_zero();
+                m
+            } else {
+                let m = {
+                    let mut mw = super::h264_cavlc_mb::MbaffCavlc::new(&mut w, &g, &self.tools, slice);
+                    let m = super::h264_pic::code_mbaff_picture(&g, &self.tools, qp, &planes, &mut recon, mrefs, &mut mw);
+                    mw.finish();
+                    m
+                };
+                w.rbsp_trailing_bits();
+                m
+            }
+        } else {
+        match kind {
             Kind::Idr | Kind::I => {
                 if cabac {
                     super::h264_cabac_mb::write_intra_picture_cabac(&mut w, &g, &self.tools, qp, &planes, &mut recon)
@@ -1761,6 +1832,7 @@ impl<S: Sample> Core<S> {
                     m
                 }
             }
+        }
         };
         out.extend_from_slice(&syn::annexb(nal_type, nal_ref_idc, &w.into_nal()));
         model_store(&mut model, &f.sps, &hdr, &shared, frame_num, PARITY_FRAME, poc, [top, bottom], c.encode)?;
@@ -1780,7 +1852,8 @@ impl<S: Sample> Core<S> {
         col.mb_height = g.mbs_high as usize;
         col.motion = motion.frame.motion.clone();
         col.mb_intra = motion.frame.mb_intra.clone();
-        col.mb_field = vec![false; n];
+        col.mb_field = if g.mbaff { motion.frame.mb_field.clone() } else { vec![false; n] };
+        col.mbaff = g.mbaff;
         col.field_poc = [top, bottom];
         let fields = [0usize, 1].map(|p| {
             Some(StoredField { planes: extract_field(&recon, p), motion: super::h264_pic::PicMotion::new(0, 0) })
@@ -1791,7 +1864,13 @@ impl<S: Sample> Core<S> {
             rec,
             recon: Vec::new(),
             motion: super::h264_pic::PicMotion::new(0, 0),
-            fields: Some(FieldsOut { model, frame: StoredFrame { id, fields, frame: recon, col }, census, frame_coded: true }),
+            fields: Some(FieldsOut {
+                model,
+                frame: StoredFrame { id, fields, frame: recon, col },
+                census,
+                frame_coded: true,
+                pairs: motion.pairs,
+            }),
         })
     }
 
@@ -2633,6 +2712,62 @@ mod tests {
         }
         assert!(totals[0][0] > 0, "no field picture chosen on interlaced content: {totals:?}");
         assert!(totals[1][1] > 0, "no frame picture chosen on progressive content: {totals:?}");
+    }
+
+    /// MBAFF frames round-trip through the production decoder — I, P and B
+    /// frames, both entropy coders, both field orders, 4:2:0, 4:2:2 and
+    /// monochrome, the 8x8 transform and the sub-partitions, 8 and 10 bits
+    /// — and the pair decision chooses both ways: field pairs somewhere on
+    /// interlaced content, frame pairs somewhere on progressive content
+    /// stored as fields. 4:4:4 refuses by name.
+    #[test]
+    fn mbaff_round_trips_and_chooses_both_kinds_of_pair() {
+        use crate::encode::{FieldCoding, FieldOrder};
+        let mut totals = [[0u64; 2]; 2]; // [content][frame pairs, field pairs]
+        for (content, gap) in [(0usize, 1usize), (1, 0)] {
+            for (chroma, bit_depth, gop, bframes, entropy, tools, order) in [
+                (ChromaFormat::Yuv420, 8u32, 0u32, 0u32, Entropy::Cabac, false, FieldOrder::TopFirst),
+                (ChromaFormat::Yuv420, 8, 0, 0, Entropy::Cavlc, true, FieldOrder::BottomFirst),
+                (ChromaFormat::Yuv420, 8, 8, 0, Entropy::Cabac, true, FieldOrder::TopFirst),
+                (ChromaFormat::Yuv420, 8, 8, 0, Entropy::Cavlc, false, FieldOrder::BottomFirst),
+                (ChromaFormat::Yuv420, 8, 8, 2, Entropy::Cabac, true, FieldOrder::BottomFirst),
+                (ChromaFormat::Yuv420, 8, 8, 2, Entropy::Cavlc, true, FieldOrder::TopFirst),
+                (ChromaFormat::Yuv422, 8, 8, 2, Entropy::Cabac, false, FieldOrder::TopFirst),
+                (ChromaFormat::Monochrome, 8, 8, 0, Entropy::Cavlc, true, FieldOrder::BottomFirst),
+                (ChromaFormat::Yuv420, 10, 8, 2, Entropy::Cabac, true, FieldOrder::TopFirst),
+            ] {
+                let tag = format!("gap {gap} {chroma:?} {bit_depth}-bit gop {gop} bframes={bframes} {entropy:?} tools={tools} {order:?}");
+                let frames = woven_frames(64, 64, chroma, bit_depth, 6, gap);
+                let (_, census) = encode_and_self_check(
+                    &tag,
+                    Config {
+                        gop,
+                        bframes,
+                        entropy,
+                        transform_8x8: tools,
+                        subparts: tools,
+                        interlace: Some(order),
+                        field_coding: FieldCoding::Mbaff,
+                        ..cfg(64, 64, chroma, bit_depth)
+                    },
+                    &frames,
+                );
+                assert_eq!(census.frame_pictures, frames.len() as u64, "{tag}: every frame an MBAFF frame: {census:?}");
+                assert_eq!(census.frame_pairs + census.field_pairs, 8 * frames.len() as u64, "{tag}: eight pairs per frame: {census:?}");
+                totals[content][0] += census.frame_pairs;
+                totals[content][1] += census.field_pairs;
+            }
+        }
+        assert!(totals[0][1] > 0, "no field pair chosen on interlaced content: {totals:?}");
+        assert!(totals[1][0] > 0, "no frame pair chosen on progressive content: {totals:?}");
+        let err = H264Encoder::new(Config {
+            interlace: Some(FieldOrder::TopFirst),
+            field_coding: FieldCoding::Mbaff,
+            ..cfg(64, 64, ChromaFormat::Yuv444, 8)
+        })
+        .err()
+        .expect("MBAFF 4:4:4 refuses");
+        assert!(format!("{err}").contains("MBAFF 4:4:4"), "{err}");
     }
 
     /// Interlaced coding refuses by name what it cannot deliver: a height

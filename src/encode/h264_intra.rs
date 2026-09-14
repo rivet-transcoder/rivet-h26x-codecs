@@ -1165,6 +1165,34 @@ pub fn code_macroblock<S: Sample>(
     left_modes: &[Option<u8>; 4],
     top_modes: &[Option<u8>; 4],
 ) -> (MbDecision, [u8; 16]) {
+    code_macroblock_modes8(
+        ctx, rec, mb_x, mb_y, src_luma, luma_stride, src_chroma, chroma_stride, mb, left_modes, top_modes, left_modes,
+    )
+}
+
+/// [`code_macroblock`] with the left modes an 8x8 block predicts from
+/// given apart from a 4x4 block's. 8.3.2.1 reads an `I_4x4` left
+/// neighbour's mode from a sub-block of the neighbouring 8x8 fixed by `n`,
+/// which outside MBAFF is the block on the edge — the same array — and in
+/// an MBAFF frame need not be: a field macroblock beside a frame pair
+/// takes the neighbouring 8x8's top-right sub-block where its row maps to
+/// the bottom one. The MBAFF walk derives both arrays; everything else
+/// passes one twice.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn code_macroblock_modes8<S: Sample>(
+    ctx: &IntraCtx<S>,
+    rec: &mut [Recon<S>],
+    mb_x: usize,
+    mb_y: usize,
+    src_luma: &[S],
+    luma_stride: usize,
+    src_chroma: [&[S]; 2],
+    chroma_stride: usize,
+    mb: MbAvail,
+    left_modes: &[Option<u8>; 4],
+    top_modes: &[Option<u8>; 4],
+    left_modes8: &[Option<u8>; 4],
+) -> (MbDecision, [u8; 16]) {
     let (px, py) = (mb_x * 16, mb_y * 16);
     let soff = py * luma_stride + px;
     let mut out = MbDecision::default();
@@ -1210,7 +1238,7 @@ pub fn code_macroblock<S: Sample>(
             &src_luma[soff..],
             luma_stride,
             mb,
-            left_modes,
+            left_modes8,
             top_modes,
             &mut out8,
         );
@@ -1258,7 +1286,7 @@ pub fn code_macroblock<S: Sample>(
             &src_luma[soff..],
             luma_stride,
             mb,
-            left_modes,
+            left_modes8,
             top_modes,
             &mut redo,
         );

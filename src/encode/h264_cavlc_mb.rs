@@ -31,8 +31,10 @@ use crate::bitwriter::BitWriter;
 use crate::encode::h264_intra::{MbDecision, MbKind};
 use crate::encode::h264_me::{BDecision, BMbKind, InterDecision, InterMbKind};
 use crate::encode::h264_pic::{
-    BMb, Colocated, IntraTools, PMb, PicMotion, code_b_picture, code_intra_picture, code_p_picture,
+    BMb, CodedPair, Colocated, IntraTools, PMb, PairMb, PairWriter, PicMotion, code_b_picture, code_intra_picture,
+    code_p_picture,
 };
+use crate::h264::mb::MbNeighbours;
 use crate::encode::h264_syntax::{Geometry, Plane, Recon};
 use crate::h264::cavlc::{SCAN8_SUB, SCAN8_SUB_FIELD, SCAN_CHROMA_DC, part_index_of, write_residual_block_cavlc};
 use crate::h264::mb::SubMbShape;
@@ -306,6 +308,7 @@ pub(crate) fn sub_mb_type_p(shape: SubMbShape) -> u32 {
 /// encoder's slice headers always declare one. The `debug_assert` is the
 /// tripwire for the day that stops being true.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn write_p16_macroblock(
     w: &mut BitWriter,
     dec: &InterDecision,
@@ -314,6 +317,7 @@ fn write_p16_macroblock(
     left: bool,
     top: bool,
     t8x8_mode: bool,
+    ref_idx_zeros: bool,
 ) {
     debug_assert!(
         !matches!(dec.kind, InterMbKind::PSkip | InterMbKind::UseIntra),
@@ -331,7 +335,15 @@ fn write_p16_macroblock(
     }
     // `ref_idx_l0` is absent throughout: one active reference, so the
     // reader infers 0 for every partition (7.3.5.1). That is the second
-    // pass, and it has nothing to write.
+    // pass, and it has nothing to write — except for a field macroblock of
+    // an MBAFF frame, whose list holds each frame's two fields, and whose
+    // te(v) index over two entries is one inverted bit (`read_ref_idx`).
+    if ref_idx_zeros {
+        let parts = if dec.kind == InterMbKind::P8x8 { 4 } else { dec.kind.parts().len() };
+        for _ in 0..parts {
+            w.te(0, 1);
+        }
+    }
     //
     // Then one mvd per prediction rectangle, x then y, in syntax order.
     let mut rects = [(0usize, 0usize, 0usize, 0usize); 16];
@@ -658,7 +670,7 @@ pub fn write_p_picture<S: Sample>(
         PMb::Coded(dec) => {
             w.ue(skip_run);
             skip_run = 0;
-            write_p16_macroblock(w, dec, &mut st, mb_x, mb_x > 0, mb_y > 0, t8x8);
+            write_p16_macroblock(w, dec, &mut st, mb_x, mb_x > 0, mb_y > 0, t8x8, false);
         }
         PMb::Intra(idec) => {
             w.ue(skip_run);
@@ -685,6 +697,7 @@ pub fn write_p_picture<S: Sample>(
 /// `B_Direct_8x8` sub-macroblock, whose `sub_mb_type` of 0 is all it
 /// spells.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn write_b_macroblock(
     w: &mut BitWriter,
     dec: &BDecision,
@@ -693,6 +706,7 @@ fn write_b_macroblock(
     left: bool,
     top: bool,
     t8x8_mode: bool,
+    ref_idx_zeros: bool,
 ) {
     debug_assert!(
         !matches!(dec.kind, BMbKind::BSkip | BMbKind::UseIntra),
@@ -708,6 +722,26 @@ fn write_b_macroblock(
         // before any motion.
         for part in 0..4 {
             w.ue(dec.sub_mb_type(part));
+        }
+    }
+    // An MBAFF field macroblock's reference indices, all 0 (see
+    // `write_p16_macroblock`): per list, per partition that uses the list
+    // and is not direct, before any mvd.
+    if ref_idx_zeros && dec.kind != BMbKind::BDirect16 {
+        for list in 0..2 {
+            if dec.kind == BMbKind::B8x8 {
+                for part in 0..4 {
+                    if !dec.is_direct_part(part) && dec.used(part)[list] {
+                        w.te(0, 1);
+                    }
+                }
+            } else {
+                for &(x, y, _, _) in crate::h264::cavlc::mb_partitions(dec.kind.dec_kind()) {
+                    if dec.used(part_index_of(x, y))[list] {
+                        w.te(0, 1);
+                    }
+                }
+            }
         }
     }
     if dec.kind != BMbKind::BDirect16 {
@@ -797,7 +831,7 @@ pub fn write_b_picture<S: Sample>(
         BMb::Direct(dec) | BMb::Explicit(dec) => {
             w.ue(skip_run);
             skip_run = 0;
-            write_b_macroblock(w, dec, &mut st, mb_x, mb_x > 0, mb_y > 0, t8x8);
+            write_b_macroblock(w, dec, &mut st, mb_x, mb_x > 0, mb_y > 0, t8x8, false);
         }
         BMb::Intra(idec) => {
             w.ue(skip_run);
@@ -811,6 +845,184 @@ pub fn write_b_picture<S: Sample>(
         w.ue(skip_run);
     }
     fmbs
+}
+
+/// The nonzero counts one written macroblock leaves for the `nC` of the
+/// macroblocks after it — what the reader stores: each 4x4 block's
+/// `TotalCoeff` (the four sub-scans' under the 8x8 transform, the AC
+/// blocks' for Intra_16x16), zero for every block of an uncoded 8x8, for
+/// chroma AC below a chroma pattern of 2, and for a skipped macroblock.
+#[derive(Clone, Copy)]
+struct MbCounts {
+    luma: [u8; 16],
+    chroma: [[u8; 16]; 2],
+}
+
+impl MbCounts {
+    const SKIP: MbCounts = MbCounts { luma: [0; 16], chroma: [[0; 16]; 2] };
+
+    fn of(cbp_luma: u8, cbp_chroma: u8, nz_luma: &[u8; 16], nz_chroma: &[[u8; 16]; 2]) -> Self {
+        let mut luma = [0u8; 16];
+        for (r, v) in luma.iter_mut().enumerate() {
+            if cbp_luma & (1 << ((r / 8) * 2 + (r % 4) / 2)) != 0 {
+                *v = nz_luma[r];
+            }
+        }
+        MbCounts { luma, chroma: if cbp_chroma == 2 { *nz_chroma } else { [[0; 16]; 2] } }
+    }
+
+    fn of_mb(mb: &PairMb) -> Self {
+        match mb {
+            PairMb::Intra(d) | PairMb::PIntra(d) | PairMb::BIntra(d) => Self::of(d.cbp_luma, d.cbp_chroma, &d.nz_luma, &d.nz_chroma),
+            PairMb::P(d) => Self::of(d.cbp_luma, d.cbp_chroma, &d.nz_luma, &d.nz_chroma),
+            PairMb::B(d) => Self::of(d.cbp_luma, d.cbp_chroma, &d.nz_luma, &d.nz_chroma),
+        }
+    }
+}
+
+/// Write one MBAFF pair in CAVLC: the decoder's CAVLC MBAFF slice loop
+/// (src/h264/decoder.rs) mirrored. A skipped macroblock extends
+/// `mb_skip_run`; a coded one is preceded by the run, then — for a top
+/// macroblock, or a bottom one whose top was skipped — the pair's
+/// `mb_field_decoding_flag`, then its layer, with every `nC` read from the
+/// blocks the decoder's MBAFF neighbour derivation names and, for a field
+/// macroblock, the field scans and its reference indices. Returns the two
+/// macroblocks' counts.
+#[allow(clippy::too_many_arguments)]
+fn write_pair_cavlc(
+    w: &mut BitWriter,
+    skip_run: &mut u32,
+    base: &[Option<MbCounts>],
+    pair: &CodedPair,
+    pm: &PicMotion,
+    inter: bool,
+    rows: usize,
+    t8x8: bool,
+) -> [MbCounts; 2] {
+    let mbw = pm.info.mb_width;
+    let (top, bot) = (pair.top, pair.top + mbw);
+    let mut local: [Option<MbCounts>; 2] = [None, None];
+    for b in 0..2 {
+        let addr = top + b * mbw;
+        let mb = &pair.mbs[b];
+        if mb.is_skip() {
+            *skip_run += 1;
+            local[b] = Some(MbCounts::SKIP);
+            continue;
+        }
+        if inter {
+            w.ue(*skip_run);
+            *skip_run = 0;
+        }
+        if b == 0 || pair.mbs[0].is_skip() {
+            w.flag(pair.field); // mb_field_decoding_flag
+        }
+        let mut nb = MbNeighbours::default();
+        nb.derive_mbaff_into(&pm.info, addr, 0, pair.field);
+        let mut st = NzState::new(1, rows, false);
+        st.field = pair.field;
+        {
+            let get = |a: usize| -> MbCounts {
+                (if a == top {
+                    local[0]
+                } else if a == bot {
+                    local[1]
+                } else {
+                    base[a]
+                })
+                .expect("an MBAFF neighbour is written before it is read")
+            };
+            for k in 0..4 {
+                if let Some((a, blk)) = nb.block(-1, k as i32) {
+                    st.left_luma[0][k] = get(a).luma[blk];
+                }
+                if let Some((a, blk)) = nb.block(k as i32, -1) {
+                    st.top_luma[0][k] = get(a).luma[blk];
+                }
+            }
+            for r in 0..rows {
+                if let Some((a, cblk)) = nb.block_c(-1, r as i32, rows as i32) {
+                    for comp in 0..2 {
+                        st.left_chroma[comp][r] = get(a).chroma[comp][cblk];
+                    }
+                }
+            }
+            if rows > 0 {
+                for c in 0..2 {
+                    if let Some((a, cblk)) = nb.block_c(c as i32, -1, rows as i32) {
+                        for comp in 0..2 {
+                            st.top_chroma[comp][c] = get(a).chroma[comp][cblk];
+                        }
+                    }
+                }
+            }
+        }
+        let (left, above) = (nb.a.is_some(), nb.b.is_some());
+        match mb {
+            PairMb::Intra(d) => write_macroblock(w, d, &mut st, 0, left, above, 0, t8x8),
+            PairMb::PIntra(d) => write_macroblock(w, d, &mut st, 0, left, above, 5, t8x8),
+            PairMb::BIntra(d) => write_macroblock(w, d, &mut st, 0, left, above, 23, t8x8),
+            PairMb::P(d) => write_p16_macroblock(w, d, &mut st, 0, left, above, t8x8, pair.field),
+            PairMb::B(d) => write_b_macroblock(w, d, &mut st, 0, left, above, t8x8, pair.field),
+        }
+        local[b] = Some(MbCounts::of_mb(mb));
+    }
+    [local[0].expect("written"), local[1].expect("written")]
+}
+
+/// The CAVLC slice data of an MBAFF picture, written pair by pair as the
+/// walk decides each, every macroblock's counts kept by storage address.
+/// [`MbaffCavlc::finish`] writes a trailing skip run; the caller closes the
+/// RBSP.
+pub(crate) struct MbaffCavlc<'w> {
+    w: &'w mut BitWriter,
+    counts: Vec<Option<MbCounts>>,
+    skip_run: u32,
+    inter: bool,
+    rows: usize,
+    t8x8: bool,
+}
+
+impl<'w> MbaffCavlc<'w> {
+    /// Begin the slice data of an MBAFF picture of `slice` type.
+    pub(crate) fn new<S: Sample>(w: &'w mut BitWriter, g: &Geometry, tools: &IntraTools<S>, slice: crate::h264::SliceType) -> Self {
+        let rows = match g.chroma {
+            crate::picture::ChromaFormat::Yuv420 => 2,
+            crate::picture::ChromaFormat::Yuv422 => 4,
+            _ => 0,
+        };
+        MbaffCavlc {
+            w,
+            counts: vec![None; (g.mbs_wide * g.mbs_high) as usize],
+            skip_run: 0,
+            inter: !slice.is_intra(),
+            rows,
+            t8x8: tools.transform_8x8,
+        }
+    }
+
+    /// The run of skips the slice ends in, if it ends in skips.
+    pub(crate) fn finish(self) {
+        if self.skip_run > 0 {
+            self.w.ue(self.skip_run);
+        }
+    }
+}
+
+impl PairWriter for MbaffCavlc<'_> {
+    fn trial_bits(&self, pair: &CodedPair, pm: &PicMotion) -> u64 {
+        let mut w = BitWriter::new();
+        let mut run = self.skip_run;
+        let _ = write_pair_cavlc(&mut w, &mut run, &self.counts, pair, pm, self.inter, self.rows, self.t8x8);
+        w.position()
+    }
+
+    fn write_pair(&mut self, pair: &CodedPair, pm: &PicMotion) {
+        let c = write_pair_cavlc(self.w, &mut self.skip_run, &self.counts, pair, pm, self.inter, self.rows, self.t8x8);
+        let mbw = pm.info.mb_width;
+        self.counts[pair.top] = Some(c[0]);
+        self.counts[pair.top + mbw] = Some(c[1]);
+    }
 }
 
 #[cfg(test)]
@@ -923,7 +1135,7 @@ mod tests {
 
             let mut st = NzState::new(1, 2, false);
             let mut w = BitWriter::new();
-            write_p16_macroblock(&mut w, &dec, &mut st, 0, false, false, false);
+            write_p16_macroblock(&mut w, &dec, &mut st, 0, false, false, false, false);
             w.rbsp_trailing_bits();
             let rbsp = w.into_rbsp();
 
@@ -1010,7 +1222,7 @@ mod tests {
         for dec in &cases {
             let mut st = NzState::new(1, 2, false);
             let mut w = BitWriter::new();
-            write_b_macroblock(&mut w, dec, &mut st, 0, false, false, false);
+            write_b_macroblock(&mut w, dec, &mut st, 0, false, false, false, false);
             w.rbsp_trailing_bits();
             let rbsp = w.into_rbsp();
 
@@ -1640,7 +1852,7 @@ mod tests {
 
             let mut st = NzState::new(1, 2, false);
             let mut w = BitWriter::new();
-            write_p16_macroblock(&mut w, &dec, &mut st, 0, false, false, true);
+            write_p16_macroblock(&mut w, &dec, &mut st, 0, false, false, true, false);
             w.rbsp_trailing_bits();
             let rbsp = w.into_rbsp();
 

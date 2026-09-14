@@ -333,6 +333,17 @@ impl MbMotionState {
         self.done = 0;
     }
 
+    /// [`MbMotionState::start`] for macroblock `addr` of an MBAFF frame, a
+    /// field macroblock when `field`: its neighbours through the decoder's
+    /// Table 6-4 derivation (`derive_mbaff_into`), which `gather` then reads
+    /// with the field / frame scaling of 8.4.1.3.1.
+    pub fn start_mbaff(&mut self, frame: &Frame<u8>, info: &PicInfo, addr: usize, field: bool, nb: &mut MbNeighbours) {
+        nb.derive_mbaff_into(info, addr, 0, field);
+        self.cache.gather(nb, frame, info);
+        self.cur = [[BlockMotion::default(); 16]; 2];
+        self.done = 0;
+    }
+
     /// Clear the macroblock's own derived motion, keeping the gathered
     /// neighbours. Trying one partition shape and then another means
     /// deriving over the same neighbours twice, and the second trial must
@@ -2354,6 +2365,8 @@ pub fn code_macroblock_b<S: Sample>(
     st: &mut MbMotionState,
     col: &Colocated,
     addr: usize,
+    field_mb: bool,
+    mb_parity: u8,
 ) -> BDecision {
     let (px, py) = (mb_x * 16, mb_y * 16);
     let soff = py * luma_stride + px;
@@ -2362,9 +2375,9 @@ pub fn code_macroblock_b<S: Sample>(
 
     // Direct: derived once, a candidate in itself and the motion any
     // `B_Direct_8x8` sub-macroblock takes.
-    // Outside MBAFF every macroblock is its picture's kind: the parity is
-    // the picture's.
-    let direct = spatial_direct(st, col, addr, false, col.map.cur_parity);
+    // `field_mb` / `mb_parity`: an MBAFF field macroblock and its parity;
+    // outside MBAFF every macroblock is its picture's kind.
+    let direct = spatial_direct(st, col, addr, field_mb, mb_parity);
     let (dref, dmv) = direct;
     let dused = [dref[0] >= 0, dref[1] >= 0];
     let ddir = (dused[0] as u8) * PRED_L0 + (dused[1] as u8) * PRED_L1;

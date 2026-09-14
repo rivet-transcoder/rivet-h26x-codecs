@@ -513,6 +513,14 @@ h264-paff-ipb@interlace|--codec h264 --qp 26 --gop 8 --bframes 2 --interlace bff
 h264-paff-cavlc-ipb@interlace|--codec h264 --qp 26 --gop 8 --bframes 2 --cavlc --interlace tff --field-coding paff
 h264-paff40-cavlc-t8x8-subparts-ip@interlace|--codec h264 --qp 40 --gop 8 --cavlc --t8x8 --subparts --interlace bff --field-coding paff
 h264-10-paff-ipb@p10|--codec h264 --qp 26 --gop 8 --bframes 2 --interlace bff --field-coding paff
+h264-mbaff-intra@interlace|--codec h264 --qp 26 --gop 0 --interlace tff --field-coding mbaff
+h264-mbaff-ip@interlace|--codec h264 --qp 26 --gop 8 --interlace tff --field-coding mbaff
+h264-mbaff-cavlc-ip@interlace|--codec h264 --qp 26 --gop 8 --cavlc --interlace bff --field-coding mbaff
+h264-mbaff-ipb@interlace|--codec h264 --qp 26 --gop 8 --bframes 2 --interlace bff --field-coding mbaff
+h264-mbaff-cavlc-ipb@interlace|--codec h264 --qp 26 --gop 8 --bframes 2 --cavlc --interlace tff --field-coding mbaff
+h264-mbaff40-t8x8-subparts-ipb@interlace|--codec h264 --qp 40 --gop 8 --bframes 2 --t8x8 --subparts --interlace tff --field-coding mbaff
+h264-mbaff-cavlc40-t8x8-subparts-ip@interlace|--codec h264 --qp 40 --gop 8 --cavlc --t8x8 --subparts --interlace bff --field-coding mbaff
+h264-10-mbaff-ipb@420p10|--codec h264 --qp 26 --gop 8 --bframes 2 --interlace tff --field-coding mbaff
 "}
 
 # Split a clip's format token into its chroma format and sample depth:
