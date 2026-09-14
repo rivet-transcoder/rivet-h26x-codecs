@@ -2208,7 +2208,8 @@ mod tests {
         // above neighbour is outside the picture and is DC either way.
         let geo = Geo::new(4, 64, 64, 1);
         let mut modes = vec![1u8; geo.w4 * (64 / 4)];
-        let left = (0 >> 2) * geo.w4 + (15 >> 2);
+        let (x, y) = (15, 0);
+        let left = (y >> 2) * geo.w4 + (x >> 2);
         modes[left] = 10;
         let mut pred_mode = vec![1u8; modes.len()];
 
