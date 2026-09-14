@@ -121,6 +121,23 @@ gen fade   "testsrc2=size=32x64:rate=25,format=yuv420p[a];color=c=0x808080:size=
 # clips and only rows tagged `@wpoff` visit it.
 gen wpoff  "testsrc2=size=32x64:rate=25,format=yuv420p[a];color=c=0x808080:size=32x64:rate=25,format=yuv420p[b];[a][b]hstack=inputs=2,geq=lum='max(0,p(X,Y)*(1-N/16)-3*N)':cb='p(X,Y)':cr='p(X,Y)'" 12 64x64_420p8 yuv420p
 
+# The settling shot: 24 frames of moving testsrc2, then its frame 24 held
+# for the remaining 72 — motion that stops, a pause, a slate after a pan.
+# Ninety-six frames so the rate gate's sustained-spend property (4b) sees
+# twelve GOPs at the gate's usual length and forty-eight at two.
+#
+# It exists for rate control's insensitivity verdict (encode::rc), which no
+# other clip reaches: once the picture holds, every P picture is a skip
+# that costs the same bits at any quantiser above the keyframe's, so a
+# controller under its target lowers the P quantiser into bits that do not
+# answer — the silent walk, the raised picture that stays silent, the
+# verdict and its probes. The moving head matters: it lets the P quantiser
+# converge high before the hold, so the walk down is a real one rather than
+# a first picture already at the floor, and short GOPs keep the keyframes
+# able to spend what the held P pictures cannot. `p8` keeps untagged rows
+# off it; only `@settle` rows visit it.
+gen settle "testsrc2=size=64x64:rate=25,split=2[s0][s1];[s0]trim=end_frame=24,setpts=PTS-STARTPTS[a];[s1]trim=start_frame=24:end_frame=25,setpts=PTS-STARTPTS,loop=loop=71:size=1:start=0,setpts=N/25/TB[b];[a][b]concat=n=2:v=1:a=0" 96 64x64_420p8 yuv420p
+
 # Deep samples. The format token grows a depth suffix — `420p10` — which
 # verify_encode.sh splits into `--format 420 --depth 10` and maps to
 # ffmpeg's `yuv420p10le` for the CROSS decode; a token without a suffix is

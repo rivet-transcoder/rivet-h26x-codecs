@@ -53,7 +53,8 @@
 #               at 0.83x, H.264 at 128 kbps at 0.89x, ten of the eighteen
 #               cut-clip rate cells between 0.81x and 0.95x, all green.
 #               So on a clip long enough to converge (at least RATE_WINDOW
-#               GOPs after the first; of this corpus only src_cut, 12 GOPs)
+#               GOPs after the first; of this corpus src_cut, 12 GOPs, and
+#               src_settle, 48 at the two-picture GOP of its rows)
 #               every RATE_WINDOW consecutive GOPs after the first must
 #               spend within [RATE_WINDOW_LO, RATE_WINDOW_HI] of target,
 #               measured from the stream's own access units (gop_spend_of).
@@ -67,6 +68,36 @@
 #               0.56 to 0.79. 0.85 sits between the two, and the ceiling is
 #               its reciprocal, 1.18. Its mutation: the pre-fix encoder must
 #               fail those nine cells and nothing else.
+#
+#   4c. VERDICT  Only for --bitrate rows whose name carries `-verdict`. The
+#               insensitivity rule has three paths - a verdict, the probe
+#               below its floor, the release - and when it was rewritten no
+#               cell of this corpus reached the first, so every property
+#               above was silent about it. The encoder reports what the rule
+#               did ("rate: insensitivity verdicts V, probes P, releases R")
+#               and a `-verdict` row must show V >= 1 and P >= 1.
+#
+#               The rows are H.264 at a two-picture GOP on src_settle (24
+#               frames of motion, then one frame held for 72): once the
+#               picture holds, every P picture is a skip whose bits do not
+#               answer the quantiser, and the P quantiser, converged high on
+#               the motion, walks down into them - silent walk, silent
+#               raised picture, verdict, then a silent probe every ninth P.
+#               The GOP is two so the keyframes can spend what the held P
+#               pictures cannot, which keeps these rows inside 4b too (every
+#               3-GOP window 0.90 to 1.07, 2026-09-14). A release is not
+#               asserted: every configuration measured whose verdict was
+#               released - motion resuming, or a probe that answered - then
+#               spent the budget the hold had left, correctly, above 4b's
+#               ceiling. The release path is held by encode::rc's tests.
+#               H.265 is absent for a measured reason: its P picture after
+#               each keyframe codes that keyframe's noise, the bits alternate
+#               between GOPs and the walk restarts; no H.265 configuration
+#               measured reached a verdict inside 4b.
+#
+#               Its mutation: a rule that never turns a confirmed walk into
+#               a verdict must fail both rows, and so must one that never
+#               probes.
 #
 #   5. BUFFER   Only for --cpb-ms rows. A stream that underflows the coded
 #               picture buffer it declares is non-conforming - determined
@@ -648,6 +679,8 @@ h264-10-mbaff-ipb@420p10|--codec h264 --qp 26 --gop 8 --bframes 2 --interlace tf
 h264-10-paff-cavlc-ip@ilace10|--codec h264 --qp 26 --gop 8 --cavlc --interlace tff --field-coding paff
 h264-10-mbaff-ip@ilace10|--codec h264 --qp 26 --gop 8 --interlace tff --field-coding mbaff
 h264-10-mbaff-cavlc-ipb@ilace10|--codec h264 --qp 26 --gop 8 --bframes 2 --cavlc --interlace bff --field-coding mbaff
+h264-verdict-g2-192k@settle|--codec h264 --bitrate 192000 --gop 2
+h264-verdict-g2-256k@settle|--codec h264 --bitrate 256000 --gop 2
 "}
 
 # Split a clip's format token into its chroma format and sample depth:
@@ -777,6 +810,18 @@ one() {
       case "$verdict" in
         short|held) ;;
         *) echo "RATE-FAIL   $tag: $verdict"; return 1 ;;
+      esac
+      # 4c. VERDICT. A `-verdict` row was built to reach the insensitivity
+      # verdict: it must report one, and a probe (see 4c above).
+      case "$name" in
+        *-verdict*)
+          ins=$(sed -n 's/^rate: insensitivity verdicts \([0-9]*\), probes \([0-9]*\), releases \([0-9]*\)$/\1 \2 \3/p' "$OUT/$base.$name.enc.log" | tail -1)
+          read -r ins_v ins_p ins_r <<< "$ins"
+          if [ -z "$ins" ] || [ "$ins_v" -lt 1 ] || [ "$ins_p" -lt 1 ]; then
+            echo "RATE-FAIL   $tag: insensitivity verdicts ${ins_v:-unreported}, probes ${ins_p:-unreported} (releases ${ins_r:-unreported}); a -verdict row must reach at least one verdict and one probe"
+            return 1
+          fi
+          ;;
       esac
       ;;
   esac
