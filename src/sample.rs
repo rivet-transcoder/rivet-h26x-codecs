@@ -48,7 +48,7 @@ impl Sample for u16 {
     fn install_simd(dsp: &mut crate::dsp::hevc::HevcDsp<Self>, cpu: crate::dsp::Cpu) {
         crate::dsp::hevc::install_simd_u16(dsp, cpu);
     }
-    fn install_h264_simd(_dsp: &mut crate::dsp::h264::H264Dsp<Self>, _cpu: crate::dsp::Cpu) {
-        // No 16-bit H.264 SIMD kernels yet: the scalar table stands.
+    fn install_h264_simd(dsp: &mut crate::dsp::h264::H264Dsp<Self>, cpu: crate::dsp::Cpu) {
+        crate::dsp::h264::install_simd_u16(dsp, cpu);
     }
 }

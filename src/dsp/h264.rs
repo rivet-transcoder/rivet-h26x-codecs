@@ -1,8 +1,11 @@
 //! H.264 kernels: quarter-sample luma interpolation (8.4.2.2.1), chroma
 //! bilinear interpolation (8.4.2.2.2), sample combination and weighting
 //! (8.4.2.3), generic over the sample type (`u8` for 8-bit streams, `u16`
-//! above). Scalar reference here; SIMD versions for 8-bit planes are
-//! installed by `super::h264_avx2` (x86-64) / `super::h264_neon` (AArch64).
+//! above). Scalar reference here; the SIMD versions are installed by
+//! [`install_simd_u8`] and [`install_simd_u16`] from the per-architecture
+//! modules (`super::h264_x86_128` and `super::h264_avx2` on x86-64,
+//! `super::h264_neon` on AArch64, `super::h264_wasm128` on wasm, and each
+//! one's `_u16` twin).
 //!
 //! Prediction blocks are samples at every stage in H.264 (each interpolation
 //! position rounds and clips to a sample), so kernels produce sample blocks
@@ -11,7 +14,7 @@
 //! its size: a kernel may read and write the whole 16-sample row, so the SIMD
 //! versions need no tail handling for 4- and 8-wide blocks. Kernels that clip
 //! take the sample maximum (`(1 << BitDepth) - 1`); the 8-bit SIMD kernels
-//! ignore it.
+//! ignore it, and the 16-bit ones choose their arithmetic by it.
 
 use super::Cpu;
 use crate::sample::Sample;
@@ -260,6 +263,69 @@ pub fn install_simd_u8(d: &mut H264Dsp<u8>, cpu: Cpu) {
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     if cpu.simd128 {
         super::h264_wasm128::install(d);
+    }
+}
+
+/// SIMD kernels for 16-bit sample planes: High 10, High 4:2:2 and High
+/// 4:4:4 streams, 9 to 14 bits, and the deep encoder's reconstruction. The
+/// same ladder as the 8-bit table, with arithmetic that is exact at every
+/// depth H.264 allows (see `super::h264_x86_128_u16`).
+#[allow(unused_variables)]
+pub fn install_simd_u16(d: &mut H264Dsp<u16>, cpu: Cpu) {
+    #[cfg(target_arch = "x86_64")]
+    super::h264_x86_128_u16::install(d, cpu);
+    // No AVX-512 here either, for the 8-bit table's reason: H.264 rows are
+    // at most sixteen samples, which one 256-bit vector of u16 already holds.
+    #[cfg(target_arch = "x86_64")]
+    if cpu.avx2 {
+        super::h264_avx2_u16::install(d);
+    }
+    #[cfg(target_arch = "aarch64")]
+    if cpu.neon {
+        super::h264_neon_u16::install(d);
+    }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    if cpu.simd128 {
+        super::h264_wasm128_u16::install(d);
+    }
+}
+
+/// Range guards shared by the 16-bit-sample SIMD tiers of this table.
+///
+/// Those kernels are exact over everything an H.264 stream can make them
+/// compute — samples of up to 14 bits, and the thresholds, tC0 and weights
+/// that go with them — and not beyond, because their i16 lanes are sized to
+/// that range. A call outside it, which no conforming stream makes but a
+/// caller could, goes to the scalar reference. These are the tests every
+/// tier applies, so that every tier refuses the same calls.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
+pub(crate) mod simd16 {
+    /// The largest sample maximum the kernels are exact for: 14 bits, the
+    /// deepest H.264 allows.
+    pub(crate) const DEEPEST: i32 = (1 << 14) - 1;
+
+    /// The largest tC0 the bS < 4 filters take: `p0 + tC` must stay inside
+    /// i16 for a 14-bit `p0`. A conforming 14-bit stream's is at most 1600.
+    const TC0_LIMIT: i16 = 16381;
+
+    /// Whether a bS < 4 loop-filter call is inside the kernels' range.
+    #[inline(always)]
+    pub(crate) fn normal_in_range(alpha: i32, beta: i32, tc0: &[i16; 4], max: i32) -> bool {
+        strong_in_range(alpha, beta, max) && tc0.iter().all(|&t| t <= TC0_LIMIT)
+    }
+
+    /// Whether a bS 4 loop-filter call is inside the kernels' range.
+    #[inline(always)]
+    pub(crate) fn strong_in_range(alpha: i32, beta: i32, max: i32) -> bool {
+        (1..=DEEPEST).contains(&max) && (0..=DEEPEST).contains(&alpha) && (0..=DEEPEST).contains(&beta)
+    }
+
+    /// Whether weighted prediction's arguments are inside the kernels' range:
+    /// samples that are positive i16, weights that are i16, and a
+    /// denominator and offsets a stream can carry.
+    #[inline(always)]
+    pub(crate) fn weights_in_range(log_wd: i32, ws: [i32; 2], os: [i32; 2], max: i32) -> bool {
+        (1..=32767).contains(&max) && (0..=14).contains(&log_wd) && ws.iter().all(|&w| w as i16 as i32 == w) && os.iter().all(|&o| o.unsigned_abs() <= 1 << 20)
     }
 }
 

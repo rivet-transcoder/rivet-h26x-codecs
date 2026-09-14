@@ -16,6 +16,8 @@ pub mod h264;
 pub mod h264_enc;
 pub mod hevc;
 pub mod hevc_enc;
+#[doc(hidden)]
+pub mod u16_sweep;
 // The SIMD modules wrap their intrinsics in `unsafe {}` blocks: required on
 // the crate's MSRV, redundant (and warned about) on toolchains where
 // target-feature intrinsics became safe to call inside `#[target_feature]`
@@ -27,10 +29,19 @@ pub(crate) mod x86_compat;
 pub(crate) mod h264_x86_128;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_unsafe)]
+pub(crate) mod h264_x86_128_u16;
+#[cfg(target_arch = "x86_64")]
+#[allow(unused_unsafe)]
 pub(crate) mod h264_avx2;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_unsafe)]
+pub(crate) mod h264_avx2_u16;
+#[cfg(target_arch = "x86_64")]
+#[allow(unused_unsafe)]
 pub(crate) mod distortion_x86;
+#[cfg(target_arch = "x86_64")]
+#[allow(unused_unsafe)]
+pub(crate) mod distortion_x86_u16;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_unsafe)]
 pub(crate) mod hevc_enc_x86;
@@ -39,9 +50,17 @@ pub(crate) mod hevc_enc_x86;
 pub(crate) mod distortion_neon;
 #[cfg(target_arch = "aarch64")]
 #[allow(unused_unsafe)]
+pub(crate) mod distortion_neon_u16;
+#[cfg(target_arch = "aarch64")]
+#[allow(unused_unsafe)]
 pub(crate) mod h264_neon;
+#[cfg(target_arch = "aarch64")]
+#[allow(unused_unsafe)]
+pub(crate) mod h264_neon_u16;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod h264_wasm128;
+#[cfg(target_arch = "wasm32")]
+pub(crate) mod h264_wasm128_u16;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_unsafe)]
 pub(crate) mod hevc_x86_128;
@@ -75,6 +94,8 @@ pub(crate) mod neon_dotprod;
 pub(crate) mod hevc_enc_neon;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod distortion_wasm128;
+#[cfg(target_arch = "wasm32")]
+pub(crate) mod distortion_wasm128_u16;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod hevc_enc_wasm128;
 

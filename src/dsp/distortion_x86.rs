@@ -809,22 +809,22 @@ mod tests {
     }
 
     /// `DistortionDsp::new` reaches these through the sample-type dispatch,
-    /// and a u16 table must be left scalar by it.
+    /// and does not hand the 8-bit kernels to a 16-bit table (that one has
+    /// its own, `distortion_x86_u16`).
     #[test]
-    fn new_installs_for_u8_only() {
+    fn new_installs_the_kernels_of_its_sample_type() {
         let cpu = Cpu::detect();
         let d8 = DistortionDsp::<u8>::new(cpu);
-        let d16 = DistortionDsp::<u16>::new(cpu);
-        let s16 = DistortionDsp::<u16>::scalar();
         if cpu.sse2 {
             assert!(
                 d8.sad as usize != DistortionDsp::<u8>::scalar().sad as usize,
                 "u8 sad still scalar"
             );
         }
-        assert_eq!(d16.sad as usize, s16.sad as usize);
-        assert_eq!(d16.satd as usize, s16.satd as usize);
-        assert_eq!(d16.ssd as usize, s16.ssd as usize);
+        let d16 = DistortionDsp::<u16>::new(cpu);
+        type Sad8 = crate::dsp::distortion::SadFn<u8>;
+        let ours = [sse2::sad as Sad8 as usize, ssse3::sad as Sad8 as usize, avx::sad as Sad8 as usize];
+        assert!(!ours.contains(&(d16.sad as usize)), "a u16 table took an 8-bit kernel");
     }
 
     /// Cycles per call, scalar against each rung, over the shapes the
