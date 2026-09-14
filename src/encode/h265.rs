@@ -1213,7 +1213,7 @@ impl<S: Sample> Core<S> {
             // 8.5.3.3.4.2), so it leaves the walk on default weighting and
             // its fused kernels.
             (Some((t, fits)), Kind::B) if fits.iter().flatten().any(|f| f.iter().any(h265_wp::PlaneFit::used)) => {
-                pic.set_b_weights(t, bit_depth, bit_depth);
+                pic.set_b_weights(t, bit_depth, bit_depth, past, future.expect("a B picture has a future anchor (checked above)"));
             }
             _ => {}
         }
