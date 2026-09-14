@@ -303,9 +303,14 @@ fi
 # is indexed per macroblock now), and deep rows at 10 and 12 bits.
 #
 # The h264-wp rows are H.264's explicit weighted prediction for P slices.
-# Only the fade clip changes brightness, so it carries them; the one row over
-# every 8-bit clip is where the fit has to decline (h26xenc's `wp` line counts
-# the P pictures that took a weighting). The corpus has no deep or non-4:2:0
+# Only the fade clip changes brightness, so it carries most of them. Two rows
+# run over every 8-bit clip, for opposite reasons. At QP 26 the fit has to
+# decline on content that does not fade (h26xenc's `wp` line counts the P
+# pictures that took a weighting: none on detail, motion or static). At QP 40
+# it does not decline: a reconstruction that coarse has drifted in level from
+# its source, the fit takes a weighting to correct it (21 of 84 P pictures on
+# the cut clip at QP 38), and that is the weighted path on content the fade
+# rows never show it — a row at QP 26 alone proved it only on the fade. The corpus has no deep or non-4:2:0
 # fade, so the @p10 rows prove the syntax at depth; a deep, 4:2:2, 4:4:4 and
 # monochrome fade run in the unit test.
 CONFIGS=${CONFIGS:-"
@@ -413,7 +418,7 @@ h264-12-aq40-ip@p12|--codec h264 --qp 40 --gop 8 --aq 1.0
 h264-wp-ip|--codec h264 --qp 26 --gop 8 --wpred
 h264-wp-cavlc-ip@fade|--codec h264 --qp 26 --gop 8 --cavlc --wpred
 h264-wp-ipb@fade|--codec h264 --qp 26 --gop 8 --bframes 2 --wpred
-h264-wp40-ip@fade|--codec h264 --qp 40 --gop 8 --wpred
+h264-wp40-ip|--codec h264 --qp 40 --gop 8 --wpred
 h264-wp40-cavlc-ip@fade|--codec h264 --qp 40 --gop 8 --cavlc --wpred
 h264-wp-t8x8-subparts-ip@fade|--codec h264 --qp 26 --gop 8 --t8x8 --subparts --wpred
 h264-wp-aq-ip@fade|--codec h264 --qp 26 --gop 8 --aq 1.0 --wpred
