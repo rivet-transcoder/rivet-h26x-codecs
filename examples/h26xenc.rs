@@ -406,7 +406,7 @@ fn main() {
     // field pictures the frames were coded as.
     if interlaced {
         let c = enc.shape_census();
-        eprintln!("interlace: {} field pictures", c.field_pictures);
+        eprintln!("interlace: {} field pictures, {} frame pictures", c.field_pictures, c.frame_pictures);
     }
 }
 
