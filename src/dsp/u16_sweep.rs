@@ -6,11 +6,10 @@
 //! six-tap, chroma bilinear) and keep the loop filter's sums in the unsigned
 //! domain up to 14; the distortion kernels, which are told no depth at all,
 //! choose per block from the samples they read. A sweep at one depth checks
-//! one of those paths. So these run every table at depths on both sides of
-//! every switch — 9, 10, 12 and 14 bits for H.264, 9 to 16 for the
-//! distortion metrics — over uniform samples and over inputs built to reach
-//! each kernel's widest intermediate, and compare every output with the
-//! scalar reference.
+//! one of those paths. So these run every table at every depth — 9 to 14
+//! bits for H.264, 9 to 16 for the distortion metrics — over uniform samples
+//! and over inputs built to reach each kernel's widest intermediate and each
+//! side of each switch, and compare every output with the scalar reference.
 //!
 //! One sweep serves every architecture: the x86 rungs' unit tests, the NEON
 //! tests the arm64 CI runners execute, and the wasm probe
@@ -26,14 +25,15 @@
 use super::distortion::DistortionDsp;
 use super::h264::{H264Dsp, NO_DC, PRED_STRIDE};
 
-/// The depths the H.264 sweeps run at: each side of the kernels' 10-bit
-/// switch, and 12 and 14 bits for the range of the wide paths.
-pub const H264_DEPTHS: [u32; 4] = [9, 10, 12, 14];
+/// The depths the H.264 sweeps run at: every one above 8 bits that H.264
+/// allows. The kernels switch arithmetic at 10 bits, but a path chosen by a
+/// threshold is only shown exact at the depths it is run at — one that held
+/// at 10 and at 12 could still fail at 11.
+pub const H264_DEPTHS: [u32; 6] = [9, 10, 11, 12, 13, 14];
 
-/// The depths the distortion sweep runs at: each side of SATD's 11-bit
-/// switch, and on to the 16 bits the metrics accept although no encoder
-/// produces them.
-pub const DISTORTION_DEPTHS: [u32; 6] = [9, 10, 11, 12, 14, 16];
+/// The depths the distortion sweep runs at: every one from 9 bits to the 16
+/// the metrics accept, although no encoder produces more than 14.
+pub const DISTORTION_DEPTHS: [u32; 8] = [9, 10, 11, 12, 13, 14, 15, 16];
 
 /// The LCG the 8-bit kernel tests use.
 struct Rng(u64);
@@ -184,9 +184,12 @@ const CHROMA_SIZES: [(usize, usize); 8] = [(2, 2), (2, 4), (4, 2), (4, 4), (4, 8
 /// A `64 x 64` plane for the chroma sweep, by `mode`: uniform (0); the rails
 /// (1); all `max`, the largest weighted sum (2); rows alternately of at most
 /// ten bits and of the full depth, so that a kernel that picks its
-/// arithmetic per row switches inside one block (3); and 16-bit samples,
-/// which no H.264 stream has but which the kernel, taking no `max`, must
-/// still get right (4).
+/// arithmetic per row switches inside one block (3); samples of at most
+/// eleven bits — past the ten whose weighted sum fits u16, so that a kernel
+/// whose narrow test let one more bit through would be caught, which uniform
+/// rows at 12 bits and above almost never do (4); and 16-bit samples, which
+/// no H.264 stream has but which the kernel, taking no `max`, must still get
+/// right (5).
 fn chroma_plane(rng: &mut Rng, mode: u32, max: i32) -> Vec<u16> {
     (0..64 * 64)
         .map(|i| match mode {
@@ -206,6 +209,7 @@ fn chroma_plane(rng: &mut Rng, mode: u32, max: i32) -> Vec<u16> {
                     rng.sample(max)
                 }
             }
+            4 => rng.sample(max.min(2047)),
             _ => rng.next() as u16,
         })
         .collect()
@@ -218,7 +222,7 @@ pub fn h264_chroma(tables: &[(&str, H264Dsp<u16>)]) -> Result<u64, String> {
     let mut n = 0;
     for bd in H264_DEPTHS {
         let max = (1i32 << bd) - 1;
-        let modes = if bd == 14 { 5 } else { 4 };
+        let modes = if bd == 14 { 6 } else { 5 };
         for mode in 0..modes {
             let plane = chroma_plane(&mut rng, mode, max);
             let src = &plane[5 * 64 + 5..];

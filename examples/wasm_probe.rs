@@ -795,7 +795,7 @@ pub extern "C" fn h26x_selftest() -> u32 {
     }
 
     // The 16-bit table — High 10, 4:2:2 and 4:4:4 decode — through the same
-    // sweeps its native tiers' tests run, at 9, 10, 12 and 14 bits (8); and
+    // sweeps its native tiers' tests run, at every depth from 9 to 14 (8); and
     // a simd128 build whose 16-bit table took no kernel, which would make
     // that sweep compare the reference with itself (16).
     {

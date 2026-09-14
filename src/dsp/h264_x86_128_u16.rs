@@ -50,7 +50,7 @@
 //! A kernel that is given `max` hands anything deeper than 14 bits, which
 //! H.264 does not have, to the scalar reference rather than guess; so does
 //! one whose other arguments leave the range a stream can produce. The tests
-//! check every rung against the scalar reference at 9, 10, 12 and 14 bits,
+//! check every rung against the scalar reference at every depth from 9 to 14,
 //! over uniform samples and over inputs built to reach each kernel's widest
 //! intermediate (`super::u16_sweep`).
 
