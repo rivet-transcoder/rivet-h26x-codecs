@@ -395,8 +395,12 @@ pub struct IntraCtx<'a, S: Sample> {
 /// that both slice types run one spelling of the intra decision.
 #[derive(Clone, Copy)]
 pub(crate) struct Geo {
-    /// log2 of the CU == CTB size.
-    pub(crate) log2_cu: u32,
+    /// log2 of the CTB size — the unit of the raster walk, of the z-scan
+    /// availability order and of the MPM derivation's above-CTB-row rule.
+    /// A coding unit may be smaller: its own size travels with the call
+    /// that codes it, because under the coding quadtree one CTB holds CUs
+    /// of several sizes.
+    pub(crate) log2_ctb: u32,
     /// CTUs per row.
     pub(crate) wc: usize,
     /// 4x4 blocks per row.
@@ -417,8 +421,8 @@ impl Geo {
     /// computed here rather than at each call site, because a `wc` or a
     /// `w4` that disagrees with the picture silently corrupts every
     /// availability answer instead of failing.
-    pub(crate) fn new(log2_cu: u32, width: usize, height: usize, cat: u32) -> Self {
-        Geo { log2_cu, wc: width >> log2_cu, w4: width / 4, width, height, cat }
+    pub(crate) fn new(log2_ctb: u32, width: usize, height: usize, cat: u32) -> Self {
+        Geo { log2_ctb, wc: width >> log2_ctb, w4: width / 4, width, height, cat }
     }
 }
 
@@ -432,8 +436,10 @@ pub struct IntraPicture<S: Sample> {
     /// reads it; the in-loop filters (not this module's concern) would run
     /// over a copy of it afterwards.
     pub recon: Frame<S>,
-    /// log2 of the fixed CU size, 3..=5.
-    pub log2_cu: u32,
+    /// log2 of the CTB size, 3..=5 (3 is test-only geometry: the
+    /// standard's CTB floor is 16). Coding units are this size, or smaller
+    /// under the coding quadtree.
+    pub log2_ctb: u32,
     /// How deep the `PART_2Nx2N` transform-split search may go — what
     /// used to be `try_split`, grown a level:
     /// - `0` — never split (a single CU-sized TU always);
@@ -497,7 +503,7 @@ impl<S: Sample> IntraPicture<S> {
         let h4 = height / 4;
         IntraPicture {
             recon: Frame::new(width, height, chroma, bit_depth),
-            log2_cu,
+            log2_ctb: log2_cu,
             split_depth: 0,
             // 1 (DC) everywhere, as the decoder initialises intra_mode; the
             // availability test keeps uncoded entries from ever being read.
@@ -526,7 +532,7 @@ impl<S: Sample> IntraPicture<S> {
     ) -> CuDecision {
         let geo = self.geo;
         let split_depth = self.split_depth;
-        let n = 1usize << geo.log2_cu;
+        let n = 1usize << geo.log2_ctb;
         let (x0, y0) = (cu_x * n, cu_y * n);
         // Monochrome codes no chroma at all — the reader's chroma work is
         // uniformly gated on `chroma_array_type != 0` (the mode syntax in
@@ -541,10 +547,10 @@ impl<S: Sample> IntraPicture<S> {
         } else {
             (&src_cb[..0], &src_cr[..0])
         };
-        let mut out = CuDecision { log2_cu: geo.log2_cu, bypass: ctx.bypass, qp_y: ctx.qp, ..CuDecision::default() };
+        let mut out = CuDecision { log2_cu: geo.log2_ctb, bypass: ctx.bypass, qp_y: ctx.qp, ..CuDecision::default() };
 
         let IntraPicture { recon, modes, scratch, .. } = self;
-        if geo.log2_cu == 3 {
+        if geo.log2_ctb == 3 {
             // PART_NxN: four 4x4 luma PBs/TUs (the DST path) and one 4x4
             // chroma TU pair. No transform-split choice exists here — the
             // tree is forced by IntraSplitFlag.
@@ -617,7 +623,7 @@ impl<S: Sample> IntraPicture<S> {
                 }
             }
         } else {
-            return code_cu_2nx2n_intra(ctx, geo, recon, modes, None, scratch, split_depth, x0, y0, src_y, y_stride, src_cb, src_cr, c_stride);
+            return code_cu_2nx2n_intra(ctx, geo, recon, modes, None, scratch, split_depth, x0, y0, geo.log2_ctb, src_y, y_stride, src_cb, src_cr, c_stride);
         }
         out
     }
@@ -669,13 +675,14 @@ pub(crate) fn code_cu_2nx2n_intra<S: Sample>(
     split_depth: u32,
     x0: usize,
     y0: usize,
+    log2_cu: u32,
     src_y: &[S],
     y_stride: usize,
     src_cb: &[S],
     src_cr: &[S],
     c_stride: usize,
 ) -> CuDecision {
-    let n = 1usize << geo.log2_cu;
+    let n = 1usize << log2_cu;
     // The chroma sources at this CU, or empty slices in monochrome —
     // where every chroma step below is skipped and they are never
     // indexed, mirroring the reader's uniform `chroma_array_type != 0`
@@ -687,7 +694,7 @@ pub(crate) fn code_cu_2nx2n_intra<S: Sample>(
     } else {
         (&src_cb[..0], &src_cr[..0])
     };
-    let mut out = CuDecision { log2_cu: geo.log2_cu, bypass: ctx.bypass, qp_y: ctx.qp, ..CuDecision::default() };
+    let mut out = CuDecision { log2_cu, bypass: ctx.bypass, qp_y: ctx.qp, ..CuDecision::default() };
     // PART_2Nx2N. The luma mode is chosen once, by SATD on the
     // unsplit CU-sized prediction, and both transform structures
     // reuse it — a per-structure mode search would be fairer and
@@ -695,7 +702,7 @@ pub(crate) fn code_cu_2nx2n_intra<S: Sample>(
     // chroma mode likewise, on the parent-size prediction.
     let cands = mpm_candidates(geo, modes, pred_mode, x0, y0);
     let soff = y0 * y_stride + x0;
-    let mode = search_luma_mode(ctx, geo, &mut recon.y, scratch, x0, y0, geo.log2_cu, &src_y[soff..], y_stride, cands);
+    let mode = search_luma_mode(ctx, geo, &mut recon.y, scratch, x0, y0, log2_cu, &src_y[soff..], y_stride, cands);
     out.luma_modes = [mode; 4];
     out.luma_syntax[0] = as_syntax(mode, cands);
     PicInfo::fill4(modes, geo.w4, x0, y0, n, n, mode);
@@ -708,7 +715,7 @@ pub(crate) fn code_cu_2nx2n_intra<S: Sample>(
             scratch,
             x0,
             y0,
-            geo.log2_cu,
+            log2_cu,
             mode,
             scb,
             scr,
@@ -728,7 +735,7 @@ pub(crate) fn code_cu_2nx2n_intra<S: Sample>(
     // recomputed, the way the H.264 side puts back the I_4x4
     // coding its I_16x16 trials overwrote.
     let (ssd_u, _nz_u) = code_cu_2nx2n(
-        ctx, geo, recon, scratch, x0, y0, mode, cmode, false, [false; 4], &src_y[soff..], y_stride, scb, scr, c_stride, &mut out,
+        ctx, geo, recon, scratch, x0, y0, log2_cu, mode, cmode, false, [false; 4], &src_y[soff..], y_stride, scb, scr, c_stride, &mut out,
     );
     if split_depth >= 1 {
         assert!(split_depth <= 2, "split_depth {split_depth} above the SPS transform depth of 2");
@@ -747,13 +754,13 @@ pub(crate) fn code_cu_2nx2n_intra<S: Sample>(
         clear_for_trial(&mut out, true);
         let mut ssd_s = 0u64;
         for i in 0..4 {
-            let (mut ssd_i, mut nz_i) = code_child(ctx, geo, recon, scratch, x0, y0, i, false, mode, cmode, &src_y[soff..], y_stride, scb, scr, c_stride, &mut out);
+            let (mut ssd_i, mut nz_i) = code_child(ctx, geo, recon, scratch, x0, y0, log2_cu, i, false, mode, cmode, &src_y[soff..], y_stride, scb, scr, c_stride, &mut out);
             if split_depth >= 2 {
                 let cost_a = ssd_i as f32 + lam * cu_bits(&out, geo.cat, ctx.qp, ctx.bypass);
-                let (ssd_b, nz_b) = code_child(ctx, geo, recon, scratch, x0, y0, i, true, mode, cmode, &src_y[soff..], y_stride, scb, scr, c_stride, &mut out);
+                let (ssd_b, nz_b) = code_child(ctx, geo, recon, scratch, x0, y0, log2_cu, i, true, mode, cmode, &src_y[soff..], y_stride, scb, scr, c_stride, &mut out);
                 let cost_b = ssd_b as f32 + lam * cu_bits(&out, geo.cat, ctx.qp, ctx.bypass);
                 if cost_a <= cost_b {
-                    let (sa, na) = code_child(ctx, geo, recon, scratch, x0, y0, i, false, mode, cmode, &src_y[soff..], y_stride, scb, scr, c_stride, &mut out);
+                    let (sa, na) = code_child(ctx, geo, recon, scratch, x0, y0, log2_cu, i, false, mode, cmode, &src_y[soff..], y_stride, scb, scr, c_stride, &mut out);
                     ssd_i = sa;
                     nz_i = na;
                 } else {
@@ -772,7 +779,7 @@ pub(crate) fn code_cu_2nx2n_intra<S: Sample>(
         let cost_s = ssd_s as f32 + lam * cu_bits(&out, geo.cat, ctx.qp, ctx.bypass);
         if cost_u <= cost_s {
             let _ = code_cu_2nx2n(
-                ctx, geo, recon, scratch, x0, y0, mode, cmode, false, [false; 4], &src_y[soff..], y_stride, scb, scr, c_stride, &mut out,
+                ctx, geo, recon, scratch, x0, y0, log2_cu, mode, cmode, false, [false; 4], &src_y[soff..], y_stride, scb, scr, c_stride, &mut out,
             );
         }
     }
@@ -842,12 +849,12 @@ fn decoded_before(geo: Geo, xc: usize, yc: usize, xn: i32, yn: i32) -> bool {
         return false;
     }
     let (xn, yn) = (xn as usize, yn as usize);
-    let ctb_c = (yc >> geo.log2_cu) * geo.wc + (xc >> geo.log2_cu);
-    let ctb_n = (yn >> geo.log2_cu) * geo.wc + (xn >> geo.log2_cu);
+    let ctb_c = (yc >> geo.log2_ctb) * geo.wc + (xc >> geo.log2_ctb);
+    let ctb_n = (yn >> geo.log2_ctb) * geo.wc + (xn >> geo.log2_ctb);
     if ctb_n != ctb_c {
         return ctb_n < ctb_c;
     }
-    z_within_ctb(geo.log2_cu, xn, yn) <= z_within_ctb(geo.log2_cu, xc, yc)
+    z_within_ctb(geo.log2_ctb, xn, yn) <= z_within_ctb(geo.log2_ctb, xc, yc)
 }
 
 /// Fill the per-sample reference availability for a transform block at
@@ -904,7 +911,7 @@ fn mpm_candidates(geo: Geo, modes: &[u8], pred_mode: Option<&[u8]>, xp: usize, y
         if pred_mode.is_some_and(|p| p[i] != 1) {
             return 1;
         }
-        if is_above && (yn as usize) < (yp >> geo.log2_cu) << geo.log2_cu {
+        if is_above && (yn as usize) < (yp >> geo.log2_ctb) << geo.log2_ctb {
             return 1;
         }
         modes[i] as u32
@@ -1666,6 +1673,7 @@ fn code_child<S: Sample>(
     sc: &mut IntraScratch,
     x0: usize,
     y0: usize,
+    log2_cu: u32,
     i: usize,
     deeper: bool,
     mode: u8,
@@ -1677,7 +1685,7 @@ fn code_child<S: Sample>(
     c_stride: usize,
     out: &mut CuDecision,
 ) -> (u64, u32) {
-    let n = 1usize << geo.log2_cu;
+    let n = 1usize << log2_cu;
     let h = n / 2;
     let q = h * h;
     let (tx, ty) = (x0 + (i & 1) * h, y0 + (i >> 1) * h);
@@ -1691,7 +1699,7 @@ fn code_child<S: Sample>(
     }
     if !deeper {
         let soff = (ty - y0) * y_stride + (tx - x0);
-        let nz = code_luma_tb(ctx, geo, &mut recon.y, sc, tx, ty, geo.log2_cu - 1, mode, &src_y[soff..], y_stride, &mut out.luma[i * q..(i + 1) * q]);
+        let nz = code_luma_tb(ctx, geo, &mut recon.y, sc, tx, ty, log2_cu - 1, mode, &src_y[soff..], y_stride, &mut out.luma[i * q..(i + 1) * q]);
         out.cbf_luma[4 * i] = nz != 0;
         nz_total += nz;
     } else {
@@ -1701,7 +1709,7 @@ fn code_child<S: Sample>(
             let (lx, ly) = (tx + (j & 1) * hh, ty + (j >> 1) * hh);
             let soff = (ly - y0) * y_stride + (lx - x0);
             let base = i * q + j * qq;
-            let nz = code_luma_tb(ctx, geo, &mut recon.y, sc, lx, ly, geo.log2_cu - 2, mode, &src_y[soff..], y_stride, &mut out.luma[base..base + qq]);
+            let nz = code_luma_tb(ctx, geo, &mut recon.y, sc, lx, ly, log2_cu - 2, mode, &src_y[soff..], y_stride, &mut out.luma[base..base + qq]);
             out.cbf_luma[4 * i + j] = nz != 0;
             nz_total += nz;
         }
@@ -1711,7 +1719,7 @@ fn code_child<S: Sample>(
     if geo.cat != 0 {
         let (sw, sh) = sub_wh(geo.cat);
         let ac4 = (n / sw) * (n / sh) / 4;
-        let per_leaf = deeper && (geo.log2_cu - 2 > 2 || geo.cat == 3);
+        let per_leaf = deeper && (log2_cu - 2 > 2 || geo.cat == 3);
         for comp in 0..2 {
             out.chroma[comp][i * ac4..(i + 1) * ac4].fill(0);
             out.cbf_chroma_tu[comp][i] = false;
@@ -1724,7 +1732,7 @@ fn code_child<S: Sample>(
         if !per_leaf {
             // Chroma once at the child's size: an unsplit child, or the
             // blk_idx == 3 shape over 4x4 luma leaves.
-            let (tbs, ntb, log2c) = chroma_tbs(geo.cat, tx, ty, geo.log2_cu - 1);
+            let (tbs, ntb, log2c) = chroma_tbs(geo.cat, tx, ty, log2_cu - 1);
             let qtb = 1usize << (2 * log2c);
             for (comp, plane) in [&mut recon.cb, &mut recon.cr].into_iter().enumerate() {
                 let src = if comp == 0 { src_cb } else { src_cr };
@@ -1749,7 +1757,7 @@ fn code_child<S: Sample>(
                 let src = if comp == 0 { src_cb } else { src_cr };
                 for j in 0..4 {
                     let (lx, ly) = (tx + (j & 1) * hh, ty + (j >> 1) * hh);
-                    let (tbs, ntb, log2c) = chroma_tbs(geo.cat, lx, ly, geo.log2_cu - 2);
+                    let (tbs, ntb, log2c) = chroma_tbs(geo.cat, lx, ly, log2_cu - 2);
                     let qtb = 1usize << (2 * log2c);
                     for (k, &(ax, ay)) in tbs[..ntb].iter().enumerate() {
                         let soff = (ay - y0) / sh * c_stride + (ax - x0) / sw;
@@ -1803,6 +1811,7 @@ fn code_cu_2nx2n<S: Sample>(
     sc: &mut IntraScratch,
     x0: usize,
     y0: usize,
+    log2_cu: u32,
     mode: u8,
     chroma_mode: u8,
     split: bool,
@@ -1814,13 +1823,13 @@ fn code_cu_2nx2n<S: Sample>(
     c_stride: usize,
     out: &mut CuDecision,
 ) -> (u64, u32) {
-    let n = 1usize << geo.log2_cu;
+    let n = 1usize << log2_cu;
     clear_for_trial(out, split);
     let mut nz_total = 0u32;
 
     if split {
         for (i, &deeper) in split_child.iter().enumerate() {
-            let (_, nz) = code_child(ctx, geo, recon, sc, x0, y0, i, deeper, mode, chroma_mode, src_y, y_stride, src_cb, src_cr, c_stride, out);
+            let (_, nz) = code_child(ctx, geo, recon, sc, x0, y0, log2_cu, i, deeper, mode, chroma_mode, src_y, y_stride, src_cb, src_cr, c_stride, out);
             nz_total += nz;
         }
         if geo.cat != 0 {
@@ -1834,12 +1843,12 @@ fn code_cu_2nx2n<S: Sample>(
             }
         }
     } else {
-        let nz = code_luma_tb(ctx, geo, &mut recon.y, sc, x0, y0, geo.log2_cu, mode, src_y, y_stride, &mut out.luma[..n * n]);
+        let nz = code_luma_tb(ctx, geo, &mut recon.y, sc, x0, y0, log2_cu, mode, src_y, y_stride, &mut out.luma[..n * n]);
         out.cbf_luma[0] = nz != 0;
         nz_total += nz;
         if geo.cat != 0 {
             let (sw, sh) = sub_wh(geo.cat);
-            let (tbs, ntb, log2c) = chroma_tbs(geo.cat, x0, y0, geo.log2_cu);
+            let (tbs, ntb, log2c) = chroma_tbs(geo.cat, x0, y0, log2_cu);
             let qtb = 1usize << (2 * log2c);
             for (comp, plane) in [&mut recon.cb, &mut recon.cr].into_iter().enumerate() {
                 let src = if comp == 0 { src_cb } else { src_cr };
@@ -2093,7 +2102,7 @@ mod tests {
     /// 8x8 CTUs (so the within-CTB z-order has two levels to get wrong).
     #[test]
     fn availability_follows_the_z_scan_order() {
-        let geo = Geo { log2_cu: 3, wc: 2, w4: 4, width: 16, height: 16, cat: 1 };
+        let geo = Geo { log2_ctb: 3, wc: 2, w4: 4, width: 16, height: 16, cat: 1 };
         // TU1 of CTU (0,0), at (4,0): its left column is TU0, decoded.
         assert!(decoded_before(geo, 4, 0, 3, 0));
         // Its below-left samples are TU2's, which come later in z-order.
@@ -2155,7 +2164,7 @@ mod tests {
 
             let (pw, ph) = (sps.width as usize, sps.height as usize);
             let geo = Geo {
-                log2_cu: sps.log2_ctb_size,
+                log2_ctb: sps.log2_ctb_size,
                 wc: sps.pic_width_in_ctbs() as usize,
                 w4: pw.div_ceil(4),
                 width: pw,
@@ -2905,7 +2914,7 @@ mod tests {
             d.chroma_syntax = 4;
             d.chroma_mode = chroma_mode_for(geo.cat, 4, mode);
             PicInfo::fill4(modes, geo.w4, 0, 0, n, n, mode);
-            let _ = code_cu_2nx2n(&ctx, geo, recon, scratch, 0, 0, mode, d.chroma_mode, true, [false; 4], &y, w, &cbs, &crs, w / 2, &mut d);
+            let _ = code_cu_2nx2n(&ctx, geo, recon, scratch, 0, 0, log2_cu, mode, d.chroma_mode, true, [false; 4], &y, w, &cbs, &crs, w / 2, &mut d);
             assert!(d.split_tu);
             let replayed = replay(&ctx, w, h, log2_cu, ChromaFormat::Yuv420, &[d]);
             assert_planes_equal(&pic.recon, &replayed, log2_cu, qp);
@@ -3053,7 +3062,7 @@ mod tests {
             d.chroma_mode = chroma_mode_for(geo.cat, 4, mode);
             PicInfo::fill4(modes, geo.w4, 0, 0, n, n, mode);
             let shape = [true, false, false, true];
-            let _ = code_cu_2nx2n(&ctx, geo, recon, scratch, 0, 0, mode, d.chroma_mode, true, shape, &y, w, &cbs, &crs, c_stride, &mut d);
+            let _ = code_cu_2nx2n(&ctx, geo, recon, scratch, 0, 0, log2_cu, mode, d.chroma_mode, true, shape, &y, w, &cbs, &crs, c_stride, &mut d);
             assert_eq!(d.split_child, shape);
 
             // The cbf bookkeeping of the depth-2 shape, against the level
@@ -3130,7 +3139,7 @@ mod tests {
             d.chroma_syntax = 4;
             d.chroma_mode = chroma_mode_for(geo.cat, 4, mode);
             PicInfo::fill4(modes, geo.w4, 0, 0, n, n, mode);
-            let (ssd, _) = code_cu_2nx2n(&ctx, geo, recon, scratch, 0, 0, mode, d.chroma_mode, true, [true; 4], &y, w, &cbs, &crs, cw, &mut d);
+            let (ssd, _) = code_cu_2nx2n(&ctx, geo, recon, scratch, 0, 0, log2_cu, mode, d.chroma_mode, true, [true; 4], &y, w, &cbs, &crs, cw, &mut d);
             assert_eq!(ssd, 0, "log2_cu={log2_cu} {chroma:?}: depth-2 bypass is not exact");
             let replayed = replay(&ctx, w, h, log2_cu, chroma, &[d]);
             assert_planes_equal(&pic.recon, &replayed, log2_cu, 26);
@@ -3169,7 +3178,7 @@ mod tests {
             d.chroma_syntax = 4;
             d.chroma_mode = chroma_mode_for(geo.cat, 4, mode);
             PicInfo::fill4(modes, geo.w4, 0, 0, n, n, mode);
-            let (ssd, _) = code_cu_2nx2n(&ctx, geo, recon, scratch, 0, 0, mode, d.chroma_mode, true, [false; 4], &y, w, &cbs, &crs, w / 2, &mut d);
+            let (ssd, _) = code_cu_2nx2n(&ctx, geo, recon, scratch, 0, 0, log2_cu, mode, d.chroma_mode, true, [false; 4], &y, w, &cbs, &crs, w / 2, &mut d);
             assert!(d.split_tu);
             assert_eq!(ssd, 0, "log2_cu={log2_cu}: bypass with a split is not exact");
             let replayed = replay(&ctx, w, h, log2_cu, ChromaFormat::Yuv420, &[d]);

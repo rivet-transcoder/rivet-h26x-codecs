@@ -1139,7 +1139,7 @@ impl<S: Sample> Core<S> {
                     }
                     let (x0, y0) = ((addr % wc) * n, (addr / wc) * n);
                     let r = d.ref_idx as usize;
-                    let (plain, weighted) = pic.weighting_gain(&mctx, l0[r], r, x0, y0, &py, cw, d.mv);
+                    let (plain, weighted) = pic.weighting_gain(&mctx, l0[r], r, x0, y0, g.log2_ctb, &py, cw, d.mv);
                     wp_stats.1 += u64::from(weighted < plain);
                     wp_stats.2 += u64::from(weighted > plain);
                 }

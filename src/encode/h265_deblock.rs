@@ -105,8 +105,8 @@ pub fn deblock_picture<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &mut IntraPicture<
 /// gives every one of its edges boundary strength 2 (8.7.2.4
 /// short-circuits on intra before it looks at cbf or motion).
 pub fn deblock_inter_picture<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &mut InterPicture<S>, decisions: &[PCuDecision]) {
-    let n = 1usize << pic.log2_cu;
-    let (wc, hc) = (pic.recon.width >> pic.log2_cu, pic.recon.height >> pic.log2_cu);
+    let n = 1usize << pic.log2_ctb;
+    let (wc, hc) = (pic.recon.width >> pic.log2_ctb, pic.recon.height >> pic.log2_ctb);
     let w4 = pic.recon.width / 4;
     let mut di = 0;
     for cy in 0..hc {
@@ -259,7 +259,7 @@ fn run_filter<S: Sample>(ctx: &IntraCtx<'_, S>, recon: &mut Frame<S>, info: &Pic
 /// against `Geometry`'s own construction.
 fn build_info<S: Sample>(pic: &IntraPicture<S>, decisions: &[CuDecision]) -> PicInfo {
     let (w, h) = (pic.recon.width, pic.recon.height);
-    let log2 = pic.log2_cu;
+    let log2 = pic.log2_ctb;
     let n = 1usize << log2;
     let (w4, h4) = (w / 4, h / 4);
     let (wc, hc) = (w >> log2, h >> log2);
@@ -557,10 +557,10 @@ mod tests {
         PicInfo::fill4(&mut pic.info.pred_mode, w4, 0, 0, w, h, 0u8);
         let mi = MotionInfo { mv: [Mv::ZERO, Mv::ZERO], ref_delta: [1, 0], ref_idx: [0, -1], flags: 0, pad: 0 };
         fill_motion(&mut pic.recon.motion, w4, 0, 0, w, h, mi);
-        let n = 1usize << pic.log2_cu;
-        let count = (w >> pic.log2_cu) * (h >> pic.log2_cu);
+        let n = 1usize << pic.log2_ctb;
+        let count = (w >> pic.log2_ctb) * (h >> pic.log2_ctb);
         let _ = n;
-        let decisions = vec![PCuDecision::Inter(InterCuDecision { log2_cu: pic.log2_cu, ..InterCuDecision::default() }); count];
+        let decisions = vec![PCuDecision::Inter(InterCuDecision { log2_cu: pic.log2_ctb, ..InterCuDecision::default() }); count];
         (pic, decisions)
     }
 
