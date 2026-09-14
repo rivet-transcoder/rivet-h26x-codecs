@@ -89,6 +89,34 @@
 //! every clip but the flat gradient, where it costs nothing but time. A
 //! caller whose encode throughput binds asks for `Some(1)` — half the
 //! saving (-19% / -16%) for about twice the CPU — or `Some(0)`.
+//!
+//! ## Chroma (2026-09-14)
+//!
+//! Per-plane BD-rate against depth 0 — Y, Cb, Cr and YUV weighted 6:1:1 —
+//! mean of ten clips (eight 4:2:0, detail 4:2:2 and 4:4:4), over QP 22-40
+//! and again over QP 34-43, where an equal-QP chroma floor first flagged
+//! the quadtree:
+//!
+//! ```text
+//!                   QP 22-40 (Y Cb Cr YUV)     QP 34-43 (Y Cb Cr YUV)
+//!   all-intra      -27.3 -23.0 -23.5 -26.3    -19.8 -12.1 -13.6 -18.1
+//!   IP             -32.6 -31.7 -32.3 -32.5    -16.1 -17.0 -10.6 -16.9
+//!   IP before      -32.5 -31.3 -31.9 -32.3    -16.0 -16.6  -7.9 -16.6
+//! ```
+//!
+//! The IP rows are the one change the measurement led to: pictures that may
+//! be predicted from weigh chroma in the split cost (`h265_intra::cu_ssd`),
+//! and every plane of both ranges gained; intra streams are unchanged by
+//! it. What stayed: at QP 40 all-intra the quadtree codes chroma 1 to 1.7 dB
+//! below depth 0 at the same QP, for 15-23% fewer bytes — `rdoq_trim`
+//! prices chroma at the luma Lagrangian, and 8x8 units bring many 4x4
+//! chroma blocks to trim. Every re-weighting of that tried (HM's weight,
+//! its square root, 4x4 blocks only, no chroma trims) moved BD-rate from
+//! luma to chroma and lost on YUV. Still positive in a chroma plane, and
+//! known: the flat gradient in IP (Cb +0.8% at QP 22-40, Cb and Cr far
+//! above at 34-43), whose rate points lie within 1% of each other so that
+//! BD-rate cannot rank them, and the 50x34 clip's IP Cr at QP 34-43
+//! (+1.1%).
 
 use super::gop::{Coded, Kind, Scheduler};
 use super::h265_deblock::{deblock_inter_picture, deblock_picture};
