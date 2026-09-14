@@ -36,6 +36,23 @@
 //! half does not gets one compromise line. The fit is over the whole
 //! picture and the check is over the whole picture, which is exactly
 //! the granularity the syntax offers.
+//!
+//! # B slices
+//!
+//! A B slice's table carries an entry for each list's reference — list
+//! 0's past anchor and list 1's future one — each fitted as above against
+//! its own anchor, so on a fade the two gains sit on either side of the
+//! identity. The same two entries serve both kinds of B prediction:
+//! explicit bi-prediction is `(p0 * w0 + p1 * w1 + ((o0 + o1 + 1) <<
+//! log2WD)) >> (log2WD + 1)`, the average of the two one-list weighted
+//! predictions, so where each fit brings its anchor to the picture's
+//! level their average is at it too. On a linear fade the default average
+//! of a brighter and a darker anchor is already near that level, which
+//! bounds what the table can buy a bi unit. Measured on the corpus fade
+//! at `--bframes 2` against default B weighting: at QP 26 the B pictures
+//! skip 51 units where they skipped 3 and the stream is 6.8% smaller; at
+//! QP 40 the model check loses 13 of the 38 units it scores and the
+//! stream is 0.7% larger at a slightly higher PSNR.
 
 use crate::hevc::frame::Plane16;
 use crate::hevc::slice::{PredWeightTable, WeightEntry};
@@ -181,10 +198,10 @@ pub(crate) fn entry_for(fits: [PlaneFit; 3], bit_depth_luma: u32, bit_depth_chro
     WeightEntry { luma: comp(&fits[0], bit_depth_luma), chroma: [comp(&fits[1], bit_depth_chroma), comp(&fits[2], bit_depth_chroma)] }
 }
 
-/// A P slice's table from its list-0 entries, one per reference in
-/// `RefPicList0` order.
-pub(crate) fn table_for(entries: Vec<WeightEntry>) -> PredWeightTable {
-    PredWeightTable { luma_log2_denom: LOG2_DENOM, chroma_log2_denom: LOG2_DENOM, lists: [entries, Vec::new()] }
+/// A slice's table from its entries, one per reference in each list's
+/// order: `RefPicList0`, then `RefPicList1`, which a P slice leaves empty.
+pub(crate) fn table_for(lists: [Vec<WeightEntry>; 2]) -> PredWeightTable {
+    PredWeightTable { luma_log2_denom: LOG2_DENOM, chroma_log2_denom: LOG2_DENOM, lists }
 }
 
 #[cfg(test)]
@@ -248,6 +265,35 @@ mod tests {
         let flat = Frame::<u8>::new(32, 24, ChromaFormat::Monochrome, 8).y;
         let f = fit_plane(&cur, 32, &flat, 32, 24, 8);
         assert!(!f.used(), "{f:?}");
+    }
+
+    /// A B picture between two anchors of a fade: the list-0 anchor is
+    /// brighter than the picture and the list-1 anchor darker, so each
+    /// list fits its own gain — below the identity for one, above it for
+    /// the other — both are used, and the table carries each in its own
+    /// list. Between two copies of the picture itself neither list fits
+    /// anything and the table is the defaults.
+    #[test]
+    fn a_b_picture_fits_each_anchor_its_own_gain() {
+        let bright = reference();
+        let mut dark = Frame::<u8>::new(32, 24, ChromaFormat::Monochrome, 8).y;
+        let o = dark.origin();
+        for (i, v) in scaled(&bright, 32, 24, 0.5, 0.0).into_iter().enumerate() {
+            dark.data[o + (i / 32) * dark.stride + i % 32] = v;
+        }
+        let cur = scaled(&bright, 32, 24, 0.75, 0.0);
+        let (f0, f1) = (fit_plane(&cur, 32, &bright, 32, 24, 8), fit_plane(&cur, 32, &dark, 32, 24, 8));
+        assert_eq!(f0.weight, 48, "list 0, the brighter anchor: {f0:?}");
+        assert!((95..=97).contains(&f1.weight), "list 1, the darker anchor, wants a gain of one and a half: {f1:?}");
+        assert!(f0.used() && f1.used(), "{f0:?} {f1:?}");
+        let id = PlaneFit::identity(1);
+        let t = table_for([vec![entry_for([f0, id, id], 8, 8)], vec![entry_for([f1, id, id], 8, 8)]]);
+        assert_eq!((t.lists[0][0].luma.0, t.lists[1][0].luma.0), (f0.weight, f1.weight), "{t:?}");
+
+        let held = fit_plane(&scaled(&bright, 32, 24, 1.0, 0.0), 32, &bright, 32, 24, 8);
+        assert!(!held.used(), "{held:?}");
+        let t = table_for([vec![entry_for([held, id, id], 8, 8)], vec![entry_for([held, id, id], 8, 8)]]);
+        assert!(t.lists.iter().flatten().all(|e| e.luma == (64, 0) && e.chroma == [(64, 0); 2]), "{t:?}");
     }
 
     /// Ten-bit samples: the offset is fitted in samples and carried in
