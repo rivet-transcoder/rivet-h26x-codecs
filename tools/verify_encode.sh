@@ -310,7 +310,13 @@ fi
 # it does not decline: a reconstruction that coarse has drifted in level from
 # its source, the fit takes a weighting to correct it (21 of 84 P pictures on
 # the cut clip at QP 38), and that is the weighted path on content the fade
-# rows never show it — a row at QP 26 alone proved it only on the fade. The corpus has no deep or non-4:2:0
+# rows never show it — a row at QP 26 alone proved it only on the fade.
+#
+# The fade is a pure gain, so the offsets its weighting carries round to zero,
+# and a writer that flipped the sign of every weighting offset failed only 11
+# of the 25 weighted cells. The `@wpoff` rows visit the gain-and-offset fade
+# (src_wpoff_64x64_420p8, see make_encode_sources.sh), where every weighted P
+# picture carries an offset, so that regression cannot pass the gate. The corpus has no deep or non-4:2:0
 # fade, so the @p10 rows prove the syntax at depth; a deep, 4:2:2, 4:4:4 and
 # monochrome fade run in the unit test.
 CONFIGS=${CONFIGS:-"
@@ -425,6 +431,10 @@ h264-wp-aq-ip@fade|--codec h264 --qp 26 --gop 8 --aq 1.0 --wpred
 h264-wp-abr-64k@fade|--codec h264 --bitrate 64000 --gop 8 --wpred
 h264-10-wp-ip@p10|--codec h264 --qp 26 --gop 8 --wpred
 h264-10-wp-cavlc-ipb@p10|--codec h264 --qp 26 --gop 8 --bframes 2 --cavlc --wpred
+h264-wpoff-ip@wpoff|--codec h264 --qp 26 --gop 8 --wpred
+h264-wpoff-cavlc-ipb@wpoff|--codec h264 --qp 26 --gop 8 --bframes 2 --cavlc --wpred
+h264-wpoff40-ip@wpoff|--codec h264 --qp 40 --gop 8 --wpred
+hevc-wpoff-ip@wpoff|--codec h265 --qp 26 --gop 8 --wpred
 cqp-ip-srgb-pc|--codec h264 --qp 26 --gop 8 --color 1:13:6 --full-range
 abr-64k-cpb-p3@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8 --color 12:17:6 --chroma-loc 1
 hevc-vbv-125-hdr10@src_cut|--codec h265 --bitrate 64000 --cpb-ms 125 --gop 8 --color 9:16:9
