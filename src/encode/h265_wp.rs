@@ -36,6 +36,23 @@
 //! half does not gets one compromise line. The fit is over the whole
 //! picture and the check is over the whole picture, which is exactly
 //! the granularity the syntax offers.
+//!
+//! # B slices
+//!
+//! A B slice's table carries an entry for each list's reference — list
+//! 0's past anchor and list 1's future one — each fitted as above against
+//! its own anchor, so on a fade the two gains sit on either side of the
+//! identity. The same two entries serve both kinds of B prediction:
+//! explicit bi-prediction is `(p0 * w0 + p1 * w1 + ((o0 + o1 + 1) <<
+//! log2WD)) >> (log2WD + 1)`, the average of the two one-list weighted
+//! predictions, so where each fit brings its anchor to the picture's
+//! level their average is at it too. On a linear fade the default average
+//! of a brighter and a darker anchor is already near that level, which
+//! bounds what the table can buy a bi unit. Measured on the corpus fade
+//! at `--bframes 2` against default B weighting: at QP 26 the B pictures
+//! skip 51 units where they skipped 3 and the stream is 6.8% smaller; at
+//! QP 40 the model check loses 13 of the 38 units it scores and the
+//! stream is 0.7% larger at a slightly higher PSNR.
 
 use crate::hevc::frame::Plane16;
 use crate::hevc::slice::{PredWeightTable, WeightEntry};
