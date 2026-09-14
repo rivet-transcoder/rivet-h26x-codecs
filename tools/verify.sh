@@ -75,7 +75,7 @@ while read -r f m; do
   [ -f "$f" ] || { echo "MISSING  $f"; bad=$((bad + 1)); continue; }
   g=$(H26X_THREADS=4 "$DEC" "$f" 2>/dev/null | md5sum | cut -c1-32)
   if [ "$g" = "$m" ]; then ok=$((ok + 1)); else echo "MISMATCH $f  $g != $m"; bad=$((bad + 1)); fi
-done < "$GOLD"
+done < <(tr -d '\r' < "$GOLD")  # a CRLF checkout must not turn every golden line into a MISMATCH
 echo "fixtures: $ok matched, $bad failed"
 [ "$bad" = 0 ] || fail=1
 
