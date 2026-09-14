@@ -356,8 +356,10 @@ fi
 # not fade, the reconstruction is the default-weighted one to the byte, and
 # the stream is a table of defaults (about ten bits a B slice) larger. At
 # QP 40 a few B pictures of those clips take a weighting, mostly chroma, as
-# the P rows do. The corpus has no deep fade, so the @p10 row is the syntax
-# at depth (a 10-bit fade with B pictures round-trips in the unit test); the
+# the P rows do. The corpus has no deep fade, so the @p10 row is mostly the
+# syntax at depth: no fit is used on the three detail10 clips (the
+# reconstruction is the default-weighted one), motion10 takes a weighting in
+# a B picture, and a 10-bit fade with B pictures runs in the unit test; the
 # @wpoff rows put an offset in both lists; refs2 mixes a two-entry P table
 # with one-entry B lists; the ABR row runs the fit under a lookahead.
 CONFIGS=${CONFIGS:-"
