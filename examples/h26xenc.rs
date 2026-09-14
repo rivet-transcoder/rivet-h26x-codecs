@@ -283,6 +283,11 @@ fn main() {
         if let Some(err) = enc.plan_error() {
             eprintln!("rate: plan error {err:.2} steps per picture");
         }
+        // What the insensitivity rule did. The gate parses this line: the
+        // rows built to reach a verdict must show one, and a probe.
+        if let Some(i) = enc.rate_insensitivity() {
+            eprintln!("rate: insensitivity verdicts {}, probes {}, releases {}", i.verdicts, i.probes, i.releases);
+        }
         // The coding-unit census, the H.265 twin of the H.264 shape line
         // below: a row turns a feature on, this says whether the clip
         // took it.
@@ -363,6 +368,10 @@ fn main() {
     }
     if enc.recodes() != 0 {
         eprintln!("rate: {} extra codings to fit the declared buffer", enc.recodes());
+    }
+    // Parsed by the gate, as on the H.265 path.
+    if let Some(i) = enc.rate_insensitivity() {
+        eprintln!("rate: insensitivity verdicts {}, probes {}, releases {}", i.verdicts, i.probes, i.releases);
     }
     // The shape census: which macroblock kinds each picture type took.
     // A row turns a shape on; only this line says whether the clip took
