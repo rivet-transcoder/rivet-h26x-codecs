@@ -414,7 +414,6 @@ impl<S: Sample> Core<S> {
             cu_qp_delta_depth: (cfg.aq_strength > 0.0).then_some(u32::from(tree_depth(&cfg, &g) > 0)),
             weighted_pred: cfg.weighted_pred,
             weighted_bipred: cfg.weighted_pred && cfg.bframes > 0,
-            ..PpsOptions::default()
         };
         let (sw, sh) = cfg.chroma.subsampling();
         let luma = cfg.width as usize * cfg.height as usize;
@@ -2948,7 +2947,8 @@ mod tests {
     /// CU by CU (`wp_won` above `wp_lost`, the model check), the stream
     /// is markedly smaller than the same encode without it, and it
     /// round-trips through the decoder — at every chroma format, with B
-    /// pictures (which stay default-weighted), and at 10 bits. On a held
+    /// pictures (weighted from both anchors, chosen and holding CU by CU
+    /// like the P ones), and at 10 bits. On a held
     /// clip the fit is the identity: the table is all defaults, `wp_on`
     /// is 0, and the stream is the unweighted one plus a few table bits
     /// per slice.
@@ -2980,6 +2980,13 @@ mod tests {
             let p = &census.by_kind[1];
             assert!(p.wp_on > 0, "{tag}: no P picture chose a weighting: {p:?}");
             assert!(p.wp_won > p.wp_lost, "{tag}: the fit lost more CUs than it won: {p:?}");
+            if bframes > 0 {
+                // The B pictures between the fade's anchors are weighted
+                // too, or the B round trip below proves default weighting.
+                let b = &census.by_kind[2];
+                assert!(b.wp_on > 0, "{tag}: no B picture chose a weighting: {b:?}");
+                assert!(b.wp_won > b.wp_lost, "{tag}: the B fit lost more CUs than it won: {b:?}");
+            }
             assert!(
                 (bytes(&with) as f64) < (bytes(&without) as f64) * 0.9,
                 "{tag}: weighting saved little on a fade: {} against {} bytes",
