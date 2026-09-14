@@ -598,7 +598,9 @@ pub extern "C" fn h26x_hevc_dsp_check() -> u32 {
 
 /// Compare every H.264 kernel of the installed table against the scalar
 /// reference over randomised inputs, returning a bitmask of the groups that
-/// disagreed: 1 = interpolation/combination, 2 = deblocking, 4 = transforms.
+/// disagreed: 1 = interpolation/combination, 2 = deblocking, 4 = transforms,
+/// 8 = the 16-bit table (every kernel, at 9 to 14 bits), 16 = a simd128
+/// build whose 16-bit table took no kernel.
 ///
 /// Zero means every comparison agreed. In a build without `+simd128` the
 /// installed table *is* the scalar reference and the sweep is vacuous —
@@ -792,7 +794,31 @@ pub extern "C" fn h26x_selftest() -> u32 {
         }
     }
 
+    // The 16-bit table — High 10, 4:2:2 and 4:4:4 decode — through the same
+    // sweeps its native tiers' tests run, at 9, 10, 12 and 14 bits (8); and
+    // a simd128 build whose 16-bit table took no kernel, which would make
+    // that sweep compare the reference with itself (16).
+    {
+        let cpu = Cpu::detect();
+        let d16 = h264_u16_table(cpu);
+        if h26x::dsp::u16_sweep::h264(&[("simd128", d16)]).is_err() {
+            fail |= 8;
+        }
+        let s16 = h264_u16_table(Cpu::SCALAR);
+        if cpu.simd128 && d16.qpel[10] as usize == s16.qpel[10] as usize {
+            fail |= 16;
+        }
+    }
+
     fail
+}
+
+/// The 16-bit H.264 table, built by one outlined function so that the two
+/// tables `h26x_selftest` compares come from one copy of the construction
+/// (see `dist_table` for why that matters on wasm).
+#[inline(never)]
+fn h264_u16_table(cpu: h26x::dsp::Cpu) -> h26x::dsp::h264::H264Dsp<u16> {
+    h26x::dsp::h264::H264Dsp::<u16>::new(cpu)
 }
 
 // ----------------------------------------------------------------------
@@ -810,7 +836,8 @@ pub extern "C" fn h26x_selftest() -> u32 {
 /// Which encode-side entries the installed tables replaced, as a bitmask:
 /// 1 = `distortion.sad`, 2 = `distortion.satd`, 4 = `distortion.ssd`,
 /// 8 = `hevc_enc.fdct` (all four), 16 = `hevc_enc.fdst4`, 32 =
-/// `hevc_enc.quant`.
+/// `hevc_enc.quant`, and 64 / 128 / 256 = the 16-bit `distortion` table's
+/// `sad` / `satd` / `ssd`.
 ///
 /// The encode sweep below compares the installed table with the scalar
 /// one, and a build whose tier installed nothing would agree with itself
@@ -831,6 +858,11 @@ pub extern "C" fn h26x_enc_installed() -> u32 {
     m |= ((0..4).all(|i| h.fdct[i] as usize != hs.fdct[i] as usize) as u32) << 3;
     m |= ((h.fdst4 as usize != hs.fdst4 as usize) as u32) << 4;
     m |= ((h.quant as usize != hs.quant as usize) as u32) << 5;
+    let d16s = dist16_table(h26x::dsp::Cpu::SCALAR);
+    let d16 = dist16_table(cpu);
+    m |= ((d16.sad as usize != d16s.sad as usize) as u32) << 6;
+    m |= ((d16.satd as usize != d16s.satd as usize) as u32) << 7;
+    m |= ((d16.ssd as usize != d16s.ssd as usize) as u32) << 8;
     m
 }
 
@@ -842,6 +874,11 @@ pub extern "C" fn h26x_enc_installed() -> u32 {
 #[inline(never)]
 fn dist_table(cpu: h26x::dsp::Cpu) -> h26x::dsp::distortion::DistortionDsp<u8> {
     h26x::dsp::distortion::DistortionDsp::<u8>::new(cpu)
+}
+
+#[inline(never)]
+fn dist16_table(cpu: h26x::dsp::Cpu) -> h26x::dsp::distortion::DistortionDsp<u16> {
+    h26x::dsp::distortion::DistortionDsp::<u16>::new(cpu)
 }
 
 #[inline(never)]
@@ -917,7 +954,8 @@ fn residual_block(seed: &mut u64, n: usize, bit_depth: u32) -> Vec<i16> {
 /// distortion metrics and the H.265 forward transforms and quantiser —
 /// against the scalar reference over randomised inputs, returning a
 /// bitmask of the groups that disagreed: 1 = sad, 2 = satd, 4 = ssd, 8 =
-/// fdct, 16 = fdst4, 32 = quant (the same bits as `h26x_enc_installed`).
+/// fdct, 16 = fdst4, 32 = quant (the same bits as `h26x_enc_installed`),
+/// 64 = the 16-bit distortion table.
 ///
 /// The trials mirror the x86 modules' tests: 24 rounds over the sixteen
 /// distortion shapes with random strides and offsets; 40 rounds of each
@@ -955,6 +993,11 @@ pub extern "C" fn h26x_enc_dsp_check() -> u32 {
         fail |= ((d.sad)(&a, 64, &b, 64, 64, 64) != 255 * 4096) as u32;
         fail |= (((d.satd)(&a, 64, &b, 64, 64, 64) != 256 * ((16 * 255 + 1) >> 1)) as u32) << 1;
         fail |= (((d.ssd)(&a, 64, &b, 64, 64, 64) != 255u64 * 255 * 4096) as u32) << 2;
+    }
+    // The 16-bit table, through the sweep its native tiers' tests run, at 9
+    // to 16 bits.
+    if h26x::dsp::u16_sweep::distortion(&[("simd128", dist16_table(cpu))]).is_err() {
+        fail |= 64;
     }
 
     let s = HevcEncDsp::scalar();
