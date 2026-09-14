@@ -221,7 +221,7 @@ use crate::encode::h265_intra::{
 };
 use crate::cabac_enc::CabacEncoder;
 use crate::hevc::ctu::{
-    PartMode, SplitCuNb, chroma_qp, write_cu_skip_flag, write_inter_pred_idc, write_merge_flag,
+    PartMode, SplitCuNb, chroma_qp, explicit_weighting, write_cu_skip_flag, write_inter_pred_idc, write_merge_flag,
     write_merge_idx, write_mvd, write_mvp_flag, write_part_mode_inter, write_pred_mode_flag,
     write_ref_idx, write_rqt_root_cbf, write_split_cu_flag,
 };
@@ -233,6 +233,7 @@ use crate::hevc::mvpred::{Cand, PuPos, RefCtx, amvp, merge_candidate};
 use crate::hevc::pic::{Geometry, PicInfo};
 use crate::hevc::pps::Pps;
 use crate::hevc::residual::{ScalingSource, scale_coefficients};
+use crate::hevc::slice::PredWeightTable;
 use crate::hevc::sps::Sps;
 use crate::sample::Sample;
 
@@ -594,6 +595,14 @@ impl<S: Sample> InterPicture<S> {
     /// default when the slice has no table.
     fn wp_for(&self, r: usize) -> [Weighting; 3] {
         self.wp.get(r).copied().unwrap_or([Weighting::Default; 3])
+    }
+
+    /// Weight this B picture's predictions by its slice's table `t`: each
+    /// `inter_pred_idc`'s entry of [`Self::wp_b`] as the reader derives it
+    /// — `explicit_weighting` for reference 0 of the lists that
+    /// prediction uses, `[0, -1]`, `[-1, 0]` and `[0, 0]`.
+    pub fn set_b_weights(&mut self, t: &PredWeightTable, bit_depth_luma: u32, bit_depth_chroma: u32) {
+        self.wp_b = [[0, -1], [-1, 0], [0, 0]].map(|r| explicit_weighting(t, bit_depth_luma, bit_depth_chroma, r));
     }
 
     /// The weighting a B prediction from the lists `ref_idx` uses carries
@@ -2549,7 +2558,14 @@ mod tests {
         let (sw, _) = sub_wh(cat);
         let c_stride = if cat == 0 { 0 } else { w / sw };
         let mut pic = InterPicture::new(&sps, &pps, 2);
-        pic.wp_b = [[0, -1], [-1, 0], [0, 0]].map(weighting);
+        // The production mapping from the table to each prediction's
+        // weighting — so a mapping that bound a list to the other's entry
+        // makes one-list prediction lose everywhere and the PRED_L0 /
+        // PRED_L1 guards go red; the replay derives its own weighting from
+        // each decision's reference indices.
+        if let Some(t) = weights {
+            pic.set_b_weights(t, 8, 8);
+        }
         let mut decisions = Vec::new();
         for cy in 0..h / n {
             for cx in 0..w / n {

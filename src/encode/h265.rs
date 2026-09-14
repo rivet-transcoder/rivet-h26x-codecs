@@ -1142,7 +1142,7 @@ impl<S: Sample> Core<S> {
             // 8.5.3.3.4.2), so it leaves the walk on default weighting and
             // its fused kernels.
             (Some((t, fits)), Kind::B) if fits.iter().flatten().any(|f| f.iter().any(h265_wp::PlaneFit::used)) => {
-                pic.wp_b = [[0, -1], [-1, 0], [0, 0]].map(|r| explicit_weighting(t, bit_depth, bit_depth, r));
+                pic.set_b_weights(t, bit_depth, bit_depth);
             }
             _ => {}
         }
