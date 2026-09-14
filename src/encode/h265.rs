@@ -117,6 +117,42 @@
 //! above at 34-43), whose rate points lie within 1% of each other so that
 //! BD-rate cannot rank them, and the 50x34 clip's IP Cr at QP 34-43
 //! (+1.1%).
+//!
+//! ## CTB size (2026-09-14)
+//!
+//! Under the coding quadtree every picture codes 32x32 CTBs, partial along
+//! the right and bottom edges, and the coded size is the smallest legal
+//! one — whole 8x8 minimum coding blocks (`h265_syntax::Geometry::new`,
+//! `tree_steps`). The rule before picked 16 or 32, whichever padded less,
+//! so 1280x720, 3840x2160 and 640x360 coded 16x16 CTBs, where the quadtree
+//! can split once and depth 2 buys nothing. One binary, 16 frames, QP
+//! 22/27/32/37, against that rule (bytes summed over the QPs; BD-rate of
+//! luma and of YUV 6:1:1; per-process CPU seconds):
+//!
+//! ```text
+//!                          CTB 32 padded to whole CTBs     CTB 32 partial at the edges
+//!                          bytes  BD Y  BD YUV  CPU        bytes  BD Y  BD YUV  CPU
+//!   1280x720  testsrc2 I   -3.3%  -5.4   -6.2  1.00x       -3.2%  -5.3   -6.2  0.96x
+//!                      IP  -6.2%  -7.4   -8.5  0.82x       -6.1%  -7.4   -8.5  0.83x
+//!             natural  I   -3.6%  -4.8   -5.7  1.41x       -4.6%  -5.8   -6.7  1.35x
+//!                      IP -22.9% -28.5  -29.0  0.93x      -24.0% -29.4  -29.8  0.88x
+//!   3840x2160 testsrc2 I   -4.4%  -7.4   -8.8  0.82x       -4.4%  -7.4   -8.8  0.82x
+//!                      IP  -6.3%  -8.0   -9.8  0.65x       -6.3%  -8.0   -9.8  0.64x
+//!             natural  I  -16.1% -18.8  -22.3  1.03x      -16.5% -19.1  -22.6  1.03x
+//!                      IP -38.8% -45.2  -46.5  0.85x      -39.1% -45.4  -46.7  0.84x
+//! ```
+//!
+//! Partial CTBs code the fewest bytes of the three everywhere — by up to a
+//! point on the natural 720p clip, whose padded bottom rows were replicated
+//! content the coder still paid for — at the same CPU. The 1280x720 CPU
+//! figures overlap other encoding on the machine and carry that noise; the
+//! 3840x2160 ones do not. At `max_cu_depth` 0 a whole-CTB unit cannot be
+//! partial, so that geometry keeps the old rule.
+//!
+//! The quantisation group adaptive quantisation uses follows the stream:
+//! the CTB in an all-intra stream, half the CTB where pictures are
+//! predicted from others (`Core::new` records the measurement; CTB groups
+//! in every stream regressed the fading clip in IP and IPB).
 
 use super::gop::{Coded, Kind, Scheduler};
 use super::h265_deblock::{deblock_inter_picture, deblock_picture};

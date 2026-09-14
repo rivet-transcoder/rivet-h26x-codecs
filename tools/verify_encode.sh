@@ -358,9 +358,9 @@ EXCLUSIVE_TOKENS="ilace"
 # The quadtree's mutations, each run once against these rows: the split
 # decision ignored by the writer, the split_cu_flag neighbour context
 # reported at depth 0, and the quantiser prediction read at the unit
-# instead of its quantisation group all fail SELF (the last is invisible
-# on the odd clip, whose 8x8 groups are the minimum unit — the AQ rows on
-# detail, cut and @big carry it); 4:4:4 PART_NxN's four chroma modes
+# instead of its quantisation group all fail SELF (the last re-run with
+# 32x32 CTBs at every size: 7 of 7 AQ cells, on odd, cut, detail and
+# @big); 4:4:4 PART_NxN's four chroma modes
 # written in reverse fails SELF on the 4:4:4 clips.
 #
 # Nothing below this line may be a comment. CONFIGS is a quoted string, so
