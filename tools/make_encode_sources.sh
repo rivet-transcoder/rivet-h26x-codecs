@@ -78,7 +78,7 @@ gen() { # name filter frames fmt pix
   echo "made $out ($(stat -c %s "$out") bytes)"
 }
 
-gen grad   "gradients=size=64x64:rate=25"                     8 64x64_420 yuv420p
+gen grad   "gradients=size=64x64:rate=25:c0=0x2050a0:c1=0xe0b040:x0=0:y0=0:x1=63:y1=63:nb_colors=2:seed=1:speed=0.01:type=linear"                     8 64x64_420 yuv420p
 gen detail "testsrc2=size=64x64:rate=25"                      8 64x64_420 yuv420p
 gen motion "testsrc=size=64x64:rate=25"                      12 64x64_420 yuv420p
 gen detail "testsrc2=size=64x64:rate=25"                      8 64x64_422 yuv422p
