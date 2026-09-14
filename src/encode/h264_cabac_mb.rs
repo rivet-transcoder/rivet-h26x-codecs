@@ -38,14 +38,16 @@ use crate::encode::h264_intra::{MbDecision, MbKind};
 use crate::encode::h264_cavlc_mb::sub_mb_type_p;
 use crate::encode::h264_me::{BDecision, BMbKind, InterDecision, InterMbKind};
 use crate::encode::h264_pic::{
-    BMb, IntraTools, PMb, PicMotion, code_b_picture, code_intra_picture, code_p_picture,
+    BMb, CodedPair, Colocated, IntraTools, PMb, PairMb, PicMotion, code_b_picture, code_intra_picture, code_p_picture,
 };
+use crate::h264::mb::MbNeighbours;
 use crate::encode::h264_syntax::{Geometry, Plane, Recon};
 use crate::h264::SliceType;
 use crate::h264::cabac_mb::{
     CabacState, WrittenMb, intra_mb_type_code, write_cbp_cabac, write_intra_pred_modes_cabac,
     write_intra_residual_cabac, write_inter_residual_cabac, write_inter_residual_fields_cabac,
-    CurMbMvd, write_mb_qp_delta_cabac, write_mb_skip_cabac, write_mb_type_b_cabac,
+    CurMbMvd, write_mb_field_cabac, write_mb_qp_delta_cabac, write_mb_skip_cabac, write_mb_type_b_cabac,
+    write_ref_idx_16x16_cabac,
     write_mb_type_i_cabac, write_mb_type_p_cabac, write_mvd_cabac,
     write_sub_mb_type_b_cabac, write_sub_mb_type_p_cabac, write_transform_8x8_cabac,
 };
@@ -56,6 +58,7 @@ use crate::sample::Sample;
 /// What one written macroblock leaves for its neighbours' contexts: the
 /// [`WrittenMb`] the primitives read, plus the two facts that live outside
 /// it — the same trio the reference harness keeps.
+#[derive(Clone, Copy)]
 struct Coded {
     nb: WrittenMb,
     /// `mb_type != I_NxN` (the I-slice `mb_type` first-bin context).
@@ -76,7 +79,10 @@ fn cfi_of(chroma: ChromaFormat) -> u32 {
 }
 
 /// Everything after `mb_type` for an intra macroblock — shared by the
-/// I-slice path and intra-in-P, exactly as the readers share it.
+/// I-slice path and intra-in-P, exactly as the readers share it. `field`:
+/// a field macroblock, whose residual takes the field scans and the
+/// field-coded significance contexts.
+#[allow(clippy::too_many_arguments)]
 fn write_intra_body(
     e: &mut CabacEncoder,
     st: &mut CabacState,
@@ -86,6 +92,7 @@ fn write_intra_body(
     cfi: u32,
     t8x8_mode: bool,
     bit_depth: u32,
+    field: bool,
 ) {
     let chroma = cfi == 1 || cfi == 2;
     let chroma_nb = chroma.then(|| {
@@ -114,7 +121,7 @@ fn write_intra_body(
     if has_residual {
         write_mb_qp_delta_cabac(e, st, d.qp_delta as i32, bit_depth);
         st.prev_qp_delta_nonzero = d.qp_delta != 0;
-        write_intra_residual_cabac(e, st, false, cfi, d, lnb, anb);
+        write_intra_residual_cabac(e, st, field, cfi, d, lnb, anb);
     } else {
         st.prev_qp_delta_nonzero = false;
     }
@@ -134,6 +141,8 @@ fn write_p16_body(
     cfi: u32,
     t8x8_mode: bool,
     bit_depth: u32,
+    field: bool,
+    ref_idx_zeros: bool,
 ) {
     debug_assert!(
         !matches!(d.kind, InterMbKind::PSkip | InterMbKind::UseIntra),
@@ -149,7 +158,20 @@ fn write_p16_body(
             write_sub_mb_type_p_cabac(e, st, sub_mb_type_p(d.sub_shape[part]));
         }
     }
-    // `ref_idx_l0` is absent (one active reference). Then one mvd per
+    // `ref_idx_l0` is absent (one active reference) — except for a field
+    // macroblock of an MBAFF frame, whose list is the frame list's fields,
+    // two per frame, so the reader takes an index per partition
+    // (`parse_mb_cabac`: `layer.field && !ctx.field_pic`). The index is 0,
+    // and so is its first bin's context: refIdxZeroFlagN is 1 for every
+    // neighbouring index this encoder writes (all 0), leaving no
+    // condTermFlag set.
+    if ref_idx_zeros {
+        let parts = if d.kind == InterMbKind::P8x8 { 4 } else { d.kind.parts().len() };
+        for _ in 0..parts {
+            write_ref_idx_16x16_cabac(e, st, None, None, 0);
+        }
+    }
+    // Then one mvd per
     // prediction rectangle, each recorded as it is written so the next
     // rectangle's context can read it — which is what the reader does
     // with `layer.mvd`, and the only reason a sub-partitioned macroblock
@@ -175,7 +197,7 @@ fn write_p16_body(
     if d.cbp_luma != 0 || d.cbp_chroma != 0 {
         write_mb_qp_delta_cabac(e, st, d.qp_delta as i32, bit_depth);
         st.prev_qp_delta_nonzero = d.qp_delta != 0;
-        write_inter_residual_cabac(e, st, false, cfi, d, lnb, anb);
+        write_inter_residual_cabac(e, st, field, cfi, d, lnb, anb);
     } else {
         st.prev_qp_delta_nonzero = false;
     }
@@ -201,6 +223,8 @@ fn write_b_body(
     cfi: u32,
     t8x8_mode: bool,
     bit_depth: u32,
+    field: bool,
+    ref_idx_zeros: bool,
 ) {
     debug_assert!(
         !matches!(d.kind, BMbKind::BSkip | BMbKind::UseIntra),
@@ -213,6 +237,26 @@ fn write_b_body(
     if d.kind == BMbKind::B8x8 {
         for part in 0..4 {
             write_sub_mb_type_b_cabac(e, st, d.sub_mb_type(part));
+        }
+    }
+    // An MBAFF field macroblock's reference indices, all 0 (see
+    // `write_p16_body`): per list, per partition that uses the list and is
+    // not direct, before any mvd.
+    if ref_idx_zeros && d.kind != BMbKind::BDirect16 {
+        for list in 0..2 {
+            if d.kind == BMbKind::B8x8 {
+                for part in 0..4 {
+                    if !d.is_direct_part(part) && d.used(part)[list] {
+                        write_ref_idx_16x16_cabac(e, st, None, None, 0);
+                    }
+                }
+            } else {
+                for &(x, y, _, _) in crate::h264::cavlc::mb_partitions(d.kind.dec_kind()) {
+                    if d.used(part_index_of(x, y))[list] {
+                        write_ref_idx_16x16_cabac(e, st, None, None, 0);
+                    }
+                }
+            }
         }
     }
     if d.kind != BMbKind::BDirect16 {
@@ -246,7 +290,7 @@ fn write_b_body(
         write_mb_qp_delta_cabac(e, st, d.qp_delta as i32, bit_depth);
         st.prev_qp_delta_nonzero = d.qp_delta != 0;
         write_inter_residual_fields_cabac(
-            e, st, false, cfi, d.transform_8x8, d.cbp_luma, &d.nz_luma, &d.luma, d.cbp_chroma,
+            e, st, field, cfi, d.transform_8x8, d.cbp_luma, &d.nz_luma, &d.luma, d.cbp_chroma,
             &d.chroma_dc, &d.chroma_ac, &d.nz_chroma, lnb, anb,
         );
     } else {
@@ -281,7 +325,7 @@ pub fn write_intra_picture_cabac<S: Sample>(
         let above = (mb_y > 0).then(|| &coded[idx - mbw]);
         let inc = left.map_or(0, |m| m.not_nxn as usize) + above.map_or(0, |m| m.not_nxn as usize);
         write_mb_type_i_cabac(&mut e, &mut st, inc, intra_mb_type_code(dec));
-        write_intra_body(&mut e, &mut st, dec, left, above, cfi, t8x8, g.bit_depth);
+        write_intra_body(&mut e, &mut st, dec, left, above, cfi, t8x8, g.bit_depth, g.field_pic);
         coded.push(Coded {
             nb: WrittenMb::from_decision(dec, cfi == 3),
             not_nxn: !dec.kind.is_nxn(),
@@ -340,7 +384,7 @@ pub fn write_p_picture_cabac<S: Sample>(
                 }
             }
             PMb::Coded(dec) => {
-                write_p16_body(&mut e, &mut st, dec, left, above, cfi, t8x8, g.bit_depth);
+                write_p16_body(&mut e, &mut st, dec, left, above, cfi, t8x8, g.bit_depth, g.field_pic, false);
                 Coded {
                     nb: WrittenMb::from_inter_decision(dec, cfi == 3),
                     not_nxn: true,
@@ -351,7 +395,7 @@ pub fn write_p_picture_cabac<S: Sample>(
                 // Intra in a P slice: the same macroblock, `mb_type`
                 // shifted by 5 (Table 7-11's note).
                 write_mb_type_p_cabac(&mut e, &mut st, 5 + intra_mb_type_code(idec));
-                write_intra_body(&mut e, &mut st, idec, left, above, cfi, t8x8, g.bit_depth);
+                write_intra_body(&mut e, &mut st, idec, left, above, cfi, t8x8, g.bit_depth, g.field_pic);
                 Coded {
                     nb: WrittenMb::from_decision(idec, cfi == 3),
                     not_nxn: !idec.kind.is_nxn(),
@@ -384,7 +428,7 @@ pub fn write_b_picture_cabac<S: Sample>(
     planes: &[Plane<'_, S>],
     rec: &mut [Recon<S>],
     refs: [&[Recon<S>]; 2],
-    col: &PicMotion,
+    col: &Colocated,
 ) -> PicMotion {
     let mbw = g.mbs_wide as usize;
     let total = mbw * g.mbs_high as usize;
@@ -417,7 +461,7 @@ pub fn write_b_picture_cabac<S: Sample>(
                 }
             }
             BMb::Direct(dec) | BMb::Explicit(dec) => {
-                write_b_body(&mut e, &mut st, dec, inc, left, above, cfi, t8x8, g.bit_depth);
+                write_b_body(&mut e, &mut st, dec, inc, left, above, cfi, t8x8, g.bit_depth, g.field_pic, false);
                 Coded {
                     nb: WrittenMb::from_b_decision(dec, cfi == 3),
                     not_nxn: true,
@@ -428,7 +472,7 @@ pub fn write_b_picture_cabac<S: Sample>(
                 // Intra in a B slice: the same macroblock behind the B
                 // prefix, `mb_type` shifted by 23.
                 write_mb_type_b_cabac(&mut e, &mut st, inc, 23 + intra_mb_type_code(idec));
-                write_intra_body(&mut e, &mut st, idec, left, above, cfi, t8x8, g.bit_depth);
+                write_intra_body(&mut e, &mut st, idec, left, above, cfi, t8x8, g.bit_depth, g.field_pic);
                 Coded {
                     nb: WrittenMb::from_decision(idec, cfi == 3),
                     not_nxn: !idec.kind.is_nxn(),
@@ -442,6 +486,323 @@ pub fn write_b_picture_cabac<S: Sample>(
     drop(e);
     w.align_zero();
     fmbs
+}
+
+/// What an MBAFF CABAC slice's macroblocks are written under.
+#[derive(Clone, Copy)]
+struct MbaffParams {
+    slice: SliceType,
+    cfi: u32,
+    t8x8: bool,
+    bit_depth: u32,
+    /// Chroma AC block rows per macroblock: 2 (4:2:0), 4 (4:2:2), 0.
+    rows: usize,
+}
+
+/// The written record of storage address `a`: one of the two macroblocks
+/// of the pair being written (`local`, top then bottom), or one written
+/// before it.
+fn mbaff_lookup(base: &[Option<Coded>], local: &[Option<Coded>; 2], top: usize, bot: usize, a: usize) -> Coded {
+    (if a == top {
+        local[0]
+    } else if a == bot {
+        local[1]
+    } else {
+        base[a]
+    })
+    .expect("an MBAFF neighbour is written before it is read")
+}
+
+/// The left and above neighbours an MBAFF macroblock's contexts read, as
+/// the one record per side the progressive primitives take.
+///
+/// In an MBAFF frame a macroblock's neighbouring *blocks* are not one
+/// macroblock's edge: beside a pair of the other kind, the left column of a
+/// frame macroblock alternates between the two field macroblocks, and a
+/// field macroblock's reads the frame pair's two halves (Table 6-4). The
+/// contexts ask two kinds of question, though. The macroblock-level ones —
+/// skip, `mb_type`, the transform flag, the chroma mode, the DC blocks'
+/// coded_block_flags — read the macroblocks the reader calls A and B, and
+/// take those records as they are. The block-level ones read one entry of
+/// the neighbour's edge per row or column: nonzero counts (already gated
+/// by its coded block pattern), the coded block pattern bit of an 8x8, and
+/// the mvd. So each side is that macroblock's record with its edge entries
+/// replaced, row by row and column by column, by the entries of the blocks
+/// the decoder's own `MbNeighbours::block` / `block_c` name — the mvds
+/// scaled across a frame / field boundary as 9.3.3.1.1.7 scales them, and
+/// the macroblock-level skip and intra flags cleared, their effect already
+/// in the entries (a skipped or intra block's mvd and a skipped
+/// macroblock's pattern bits are zero, which is what those flags stood
+/// for).
+fn mbaff_neighbours(
+    nb: &MbNeighbours,
+    info: &crate::h264::mb::PicInfo,
+    base: &[Option<Coded>],
+    local: &[Option<Coded>; 2],
+    top: usize,
+    bot: usize,
+    rows: usize,
+) -> (Option<Coded>, Option<Coded>) {
+    let get = |a: usize| mbaff_lookup(base, local, top, bot, a);
+    let scaled = |a: usize, mv: crate::h264::frame::Mv| -> crate::h264::frame::Mv {
+        let nf = info.mbs[a].field;
+        let y = i32::from(mv.y).abs();
+        let y = if !nb.cur_field && nf {
+            y * 2
+        } else if nb.cur_field && !nf {
+            y / 2
+        } else {
+            y
+        };
+        crate::h264::frame::Mv::new(mv.x.saturating_abs(), y.min(i32::from(i16::MAX)) as i16)
+    };
+    let left = nb.a.map(|a| {
+        let mut v = get(a);
+        v.nb.skip = false;
+        v.nb.intra = false;
+        v.nb.cbp &= !0x0a;
+        for r in 0..4 {
+            let (ma, blk) = nb.block(-1, r as i32).expect("an available pair is whole");
+            let m = get(ma).nb;
+            v.nb.nz_luma[r * 4 + 3] = m.nz_luma[blk];
+            for l in 0..2 {
+                v.nb.mvd[l][r * 4 + 3] = scaled(ma, m.mvd[l][blk]);
+            }
+        }
+        for r8 in 0..2usize {
+            let (ma, blk) = nb.block(-1, 2 * r8 as i32).expect("an available pair is whole");
+            let b8 = (blk / 8) * 2 + (blk % 4) / 2;
+            v.nb.cbp |= ((get(ma).nb.cbp >> b8) & 1) << (2 * r8 + 1);
+        }
+        for r in 0..rows {
+            let (ma, cblk) = nb.block_c(-1, r as i32, rows as i32).expect("an available pair is whole");
+            let m = get(ma).nb;
+            for comp in 0..2 {
+                v.nb.nz_chroma[comp][r * 2 + 1] = m.nz_chroma[comp][cblk];
+            }
+        }
+        v
+    });
+    let above = nb.b.map(|b| {
+        let mut v = get(b);
+        v.nb.skip = false;
+        v.nb.intra = false;
+        v.nb.cbp &= !0x0c;
+        for c in 0..4 {
+            let (ma, blk) = nb.block(c as i32, -1).expect("an available pair is whole");
+            let m = get(ma).nb;
+            v.nb.nz_luma[12 + c] = m.nz_luma[blk];
+            for l in 0..2 {
+                v.nb.mvd[l][12 + c] = scaled(ma, m.mvd[l][blk]);
+            }
+        }
+        for c8 in 0..2usize {
+            let (ma, blk) = nb.block(2 * c8 as i32, -1).expect("an available pair is whole");
+            let b8 = (blk / 8) * 2 + (blk % 4) / 2;
+            v.nb.cbp |= ((get(ma).nb.cbp >> b8) & 1) << (2 + c8);
+        }
+        if rows > 0 {
+            for c in 0..2 {
+                let (ma, cblk) = nb.block_c(c as i32, -1, rows as i32).expect("an available pair is whole");
+                let m = get(ma).nb;
+                for comp in 0..2 {
+                    v.nb.nz_chroma[comp][(rows - 1) * 2 + c] = m.nz_chroma[comp][cblk];
+                }
+            }
+        }
+        v
+    });
+    (left, above)
+}
+
+/// The record a skipped macroblock of a pair leaves.
+fn mbaff_skip_record(mb: &PairMb, cfi: u32) -> Coded {
+    let nb = match mb {
+        PairMb::P(d) => WrittenMb::from_inter_decision(d, cfi == 3),
+        PairMb::B(d) => WrittenMb::from_b_decision(d, cfi == 3),
+        _ => unreachable!("only an inter macroblock skips"),
+    };
+    Coded { nb, not_nxn: true, chroma_nonzero: false }
+}
+
+/// One coded macroblock of an MBAFF pair — `mb_type` through its residual
+/// — its contexts read through the decoder's MBAFF neighbours `nb`
+/// ([`mbaff_neighbours`]) and a field macroblock's reference indices
+/// written. Returns its record.
+#[allow(clippy::too_many_arguments)]
+fn write_mbaff_mb(
+    e: &mut CabacEncoder,
+    st: &mut CabacState,
+    nb: &MbNeighbours,
+    info: &crate::h264::mb::PicInfo,
+    base: &[Option<Coded>],
+    local: &[Option<Coded>; 2],
+    top: usize,
+    bot: usize,
+    mb: &PairMb,
+    field: bool,
+    p: &MbaffParams,
+) -> Coded {
+    let real = |a: Option<usize>| a.map(|a| mbaff_lookup(base, local, top, bot, a));
+    let (ra, rb) = (real(nb.a), real(nb.b));
+    let (left, above) = mbaff_neighbours(nb, info, base, local, top, bot, p.rows);
+    let (l, a) = (left.as_ref(), above.as_ref());
+    let b_inc = |m: Option<Coded>| m.map_or(0, |m| !(m.nb.skip || m.nb.direct) as usize);
+    match mb {
+        PairMb::Intra(d) => {
+            let inc = ra.map_or(0, |m| m.not_nxn as usize) + rb.map_or(0, |m| m.not_nxn as usize);
+            write_mb_type_i_cabac(e, st, inc, intra_mb_type_code(d));
+            write_intra_body(e, st, d, l, a, p.cfi, p.t8x8, p.bit_depth, field);
+            Coded { nb: WrittenMb::from_decision(d, p.cfi == 3), not_nxn: !d.kind.is_nxn(), chroma_nonzero: d.chroma_mode != 0 }
+        }
+        PairMb::PIntra(d) => {
+            write_mb_type_p_cabac(e, st, 5 + intra_mb_type_code(d));
+            write_intra_body(e, st, d, l, a, p.cfi, p.t8x8, p.bit_depth, field);
+            Coded { nb: WrittenMb::from_decision(d, p.cfi == 3), not_nxn: !d.kind.is_nxn(), chroma_nonzero: d.chroma_mode != 0 }
+        }
+        PairMb::BIntra(d) => {
+            write_mb_type_b_cabac(e, st, b_inc(ra) + b_inc(rb), 23 + intra_mb_type_code(d));
+            write_intra_body(e, st, d, l, a, p.cfi, p.t8x8, p.bit_depth, field);
+            Coded { nb: WrittenMb::from_decision(d, p.cfi == 3), not_nxn: !d.kind.is_nxn(), chroma_nonzero: d.chroma_mode != 0 }
+        }
+        PairMb::P(d) => {
+            write_p16_body(e, st, d, l, a, p.cfi, p.t8x8, p.bit_depth, field, field);
+            Coded { nb: WrittenMb::from_inter_decision(d, p.cfi == 3), not_nxn: true, chroma_nonzero: false }
+        }
+        PairMb::B(d) => {
+            write_b_body(e, st, d, b_inc(ra) + b_inc(rb), l, a, p.cfi, p.t8x8, p.bit_depth, field, field);
+            Coded { nb: WrittenMb::from_b_decision(d, p.cfi == 3), not_nxn: true, chroma_nonzero: false }
+        }
+    }
+}
+
+/// Write one MBAFF pair: the decoder's CABAC MBAFF slice loop
+/// (src/h264/decoder.rs) mirrored element for element, returning the two
+/// macroblocks' records.
+///
+/// The order is the loop's, and so are the neighbours each element's
+/// context is derived under. A top macroblock's `mb_skip_flag` is read
+/// before its pair's flag exists, so its neighbours come from the flag the
+/// decoder infers (`infer_mb_field`). A skipped top macroblock makes the
+/// decoder peek the bottom's skip flag straight away — under the inferred
+/// flag too — and when the bottom is coded its `mb_field_decoding_flag`
+/// follows that peek; otherwise the flag comes after the top's skip flag.
+/// There is no `end_of_slice_flag` between a pair's macroblocks, and a pair
+/// of skips has no flag at all (the walk only produces one whose flag is
+/// the inferred one).
+fn write_pair_cabac(
+    e: &mut CabacEncoder,
+    st: &mut CabacState,
+    base: &[Option<Coded>],
+    pair: &CodedPair,
+    pm: &PicMotion,
+    p: &MbaffParams,
+    last: bool,
+) -> [Coded; 2] {
+    let info = &pm.info;
+    let mbw = info.mb_width;
+    let (top, bot) = (pair.top, pair.top + mbw);
+    let mut local: [Option<Coded>; 2] = [None, None];
+    let skip = [pair.mbs[0].is_skip(), pair.mbs[1].is_skip()];
+    let is_b = p.slice.is_b();
+    let rec = |local: &[Option<Coded>; 2], a: Option<usize>| a.map(|a| mbaff_lookup(base, local, top, bot, a).nb);
+    let inferred = crate::h264::decoder::infer_mb_field(info, top, 0);
+    let mut nb = MbNeighbours::default();
+    nb.derive_mbaff_into(info, top, 0, inferred);
+    if !p.slice.is_intra() {
+        let (la, lb) = (rec(&local, nb.a), rec(&local, nb.b));
+        write_mb_skip_cabac(e, st, la.as_ref(), lb.as_ref(), is_b, skip[0]);
+        if skip[0] {
+            st.prev_qp_delta_nonzero = false;
+            local[0] = Some(mbaff_skip_record(&pair.mbs[0], p.cfi));
+            let mut nbb = MbNeighbours::default();
+            nbb.derive_mbaff_into(info, bot, 0, inferred);
+            let (la, lb) = (rec(&local, nbb.a), rec(&local, nbb.b));
+            write_mb_skip_cabac(e, st, la.as_ref(), lb.as_ref(), is_b, skip[1]);
+            if skip[1] {
+                debug_assert_eq!(pair.field, inferred, "a pair of skips carries no flag");
+                st.prev_qp_delta_nonzero = false;
+                local[1] = Some(mbaff_skip_record(&pair.mbs[1], p.cfi));
+            } else {
+                write_mb_field_cabac(e, st, &nbb, pair.field);
+                nb.derive_mbaff_into(info, bot, 0, pair.field);
+                local[1] = Some(write_mbaff_mb(e, st, &nb, info, base, &local, top, bot, &pair.mbs[1], pair.field, p));
+            }
+            e.encode_terminate(last as u32);
+            return [local[0].expect("written"), local[1].expect("written")];
+        }
+    }
+    write_mb_field_cabac(e, st, &nb, pair.field);
+    nb.derive_mbaff_into(info, top, 0, pair.field);
+    local[0] = Some(write_mbaff_mb(e, st, &nb, info, base, &local, top, bot, &pair.mbs[0], pair.field, p));
+    nb.derive_mbaff_into(info, bot, 0, pair.field);
+    if !p.slice.is_intra() {
+        let (la, lb) = (rec(&local, nb.a), rec(&local, nb.b));
+        write_mb_skip_cabac(e, st, la.as_ref(), lb.as_ref(), is_b, skip[1]);
+    }
+    local[1] = Some(if skip[1] {
+        st.prev_qp_delta_nonzero = false;
+        mbaff_skip_record(&pair.mbs[1], p.cfi)
+    } else {
+        write_mbaff_mb(e, st, &nb, info, base, &local, top, bot, &pair.mbs[1], pair.field, p)
+    });
+    e.encode_terminate(last as u32);
+    [local[0].expect("written"), local[1].expect("written")]
+}
+
+/// The CABAC slice data of an MBAFF picture, written pair by pair as the
+/// walk ([`crate::encode::h264_pic`]'s `code_mbaff_picture`) decides each —
+/// one engine from `cabac_alignment_one_bit` to the last pair's terminate,
+/// every macroblock's record kept by storage address for the contexts of
+/// the macroblocks after it. The caller pads the RBSP to a byte after
+/// dropping it.
+pub(crate) struct MbaffCabac<'w> {
+    e: CabacEncoder<'w>,
+    st: CabacState,
+    recs: Vec<Option<Coded>>,
+    p: MbaffParams,
+    pairs: usize,
+    written: usize,
+}
+
+impl<'w> MbaffCabac<'w> {
+    /// Begin the slice data of an MBAFF picture of `slice` type at slice
+    /// quantiser `qp`, after its header.
+    pub(crate) fn new<S: Sample>(w: &'w mut BitWriter, g: &Geometry, tools: &IntraTools<S>, qp: u8, slice: SliceType) -> Self {
+        w.align_one();
+        let rows = match g.chroma {
+            ChromaFormat::Yuv420 => 2,
+            ChromaFormat::Yuv422 => 4,
+            _ => 0,
+        };
+        let n = (g.mbs_wide * g.mbs_high) as usize;
+        MbaffCabac {
+            e: CabacEncoder::new(w),
+            st: CabacState::new(slice, 0, qp as i32),
+            recs: vec![None; n],
+            p: MbaffParams { slice, cfi: cfi_of(g.chroma), t8x8: tools.transform_8x8, bit_depth: g.bit_depth, rows },
+            pairs: n / 2,
+            written: 0,
+        }
+    }
+}
+
+impl crate::encode::h264_pic::PairWriter for MbaffCabac<'_> {
+    fn trial_bits(&self, pair: &CodedPair, pm: &PicMotion) -> u64 {
+        let mut e = CabacEncoder::counting();
+        let mut st = self.st.clone();
+        let _ = write_pair_cabac(&mut e, &mut st, &self.recs, pair, pm, &self.p, false);
+        e.bits_counted()
+    }
+
+    fn write_pair(&mut self, pair: &CodedPair, pm: &PicMotion) {
+        self.written += 1;
+        let last = self.written == self.pairs;
+        let recs = write_pair_cabac(&mut self.e, &mut self.st, &self.recs, pair, pm, &self.p, last);
+        let mbw = pm.info.mb_width;
+        self.recs[pair.top] = Some(recs[0]);
+        self.recs[pair.top + mbw] = Some(recs[1]);
+    }
 }
 
 /// The slice data of an all-skip CABAC inter picture, P or B: one
@@ -584,7 +945,7 @@ mod tests {
                 let cond =
                     |m: Option<&Coded>| m.map_or(0, |m| !(m.nb.skip || m.nb.direct) as usize);
                 let inc = cond(left) + cond(above);
-                write_b_body(&mut e, &mut enc_st, d, inc, left, above, cfi, false, 8);
+                write_b_body(&mut e, &mut enc_st, d, inc, left, above, cfi, false, 8, false, false);
                 coded.push(Coded {
                     nb: WrittenMb::from_b_decision(d, false),
                     not_nxn: true,

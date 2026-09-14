@@ -285,13 +285,34 @@ pub struct Geometry {
     pub chroma: ChromaFormat,
     /// Bits per sample, 8 to 14.
     pub bit_depth: u32,
+    /// The stream is interlaced (`frame_mbs_only_flag` 0): the frame
+    /// height is a whole number of macroblock *pairs*, the SPS counts map
+    /// units of two macroblock rows, and cropping is in field rows.
+    pub interlaced: bool,
+    /// `mb_adaptive_frame_field_flag`.
+    pub mbaff: bool,
+    /// This is the geometry of one *field* picture ([`Geometry::field`]):
+    /// half the frame's rows, its macroblocks field macroblocks — the
+    /// field scans, the field residual contexts, and a loop filter that
+    /// treats horizontal edges as field edges.
+    pub field_pic: bool,
+    /// Per reference list, the vertical chroma vector offset of 8.4.1.4
+    /// (Table 8-10) between this field picture and the field its
+    /// reference index 0 names: 0 for the same parity (and always for a
+    /// frame picture, and outside 4:2:0), −2 for a top field predicting
+    /// from a bottom one, +2 for the reverse — in the eighth-sample units
+    /// the chroma vector is in.
+    pub chroma_mv_dy: [i32; 2],
 }
 
 impl Geometry {
-    /// Derive the coded geometry from a configuration.
+    /// Derive the coded geometry from a configuration. An interlaced one
+    /// rounds the height up to whole macroblock pairs (7.4.2.1.1:
+    /// `FrameHeightInMbs = (2 - frame_mbs_only_flag) * PicHeightInMapUnits`).
     pub fn new(cfg: &Config) -> Self {
+        let interlaced = cfg.interlace.is_some();
         let mbs_wide = cfg.width.div_ceil(16);
-        let mbs_high = cfg.height.div_ceil(16);
+        let mbs_high = if interlaced { cfg.height.div_ceil(32) * 2 } else { cfg.height.div_ceil(16) };
         Self {
             mbs_wide,
             mbs_high,
@@ -301,6 +322,26 @@ impl Geometry {
             height: cfg.height,
             chroma: cfg.chroma,
             bit_depth: cfg.bit_depth,
+            interlaced,
+            mbaff: interlaced && cfg.field_coding == crate::encode::FieldCoding::Mbaff,
+            field_pic: false,
+            chroma_mv_dy: [0; 2],
+        }
+    }
+
+    /// The geometry of one field of this interlaced frame: every other
+    /// row of it, so half the macroblock rows, half the coded height and
+    /// half the displayed height (the height is even — the encoder refuses
+    /// one that is not).
+    pub fn field(&self) -> Geometry {
+        debug_assert!(self.interlaced && self.mbs_high.is_multiple_of(2) && self.height.is_multiple_of(2));
+        Geometry {
+            mbs_high: self.mbs_high / 2,
+            coded_height: self.coded_height / 2,
+            height: self.height / 2,
+            mbaff: false,
+            field_pic: true,
+            ..*self
         }
     }
 
@@ -390,18 +431,31 @@ pub fn write_sps(
     w.ue(cfg.max_refs); // max_num_ref_frames
     w.flag(false); // gaps_in_frame_num_value_allowed_flag
     w.ue(g.mbs_wide - 1);
-    w.ue(g.mbs_high - 1); // frame_mbs_only_flag is 1, so map units are MBs
-    w.flag(true); // frame_mbs_only_flag
+    if g.interlaced {
+        // Map units are macroblock pairs: two rows each.
+        w.ue(g.mbs_high / 2 - 1); // pic_height_in_map_units_minus1
+        w.flag(false); // frame_mbs_only_flag
+        w.flag(g.mbaff); // mb_adaptive_frame_field_flag
+    } else {
+        w.ue(g.mbs_high - 1); // frame_mbs_only_flag is 1, so map units are MBs
+        w.flag(true); // frame_mbs_only_flag
+    }
+    // Required to be 1 when frame_mbs_only_flag is 0 (7.4.2.1.1), and 1
+    // for every stream this encoder writes.
     w.flag(true); // direct_8x8_inference_flag
     // Cropping, because the coded size is rounded up to whole macroblocks and
     // the displayed size is not. The units are chroma samples horizontally
-    // and, for frame pictures, chroma samples vertically.
+    // and, for frame pictures, chroma samples vertically — doubled in an
+    // interlaced stream, which crops in field rows (`CropUnitY = SubHeightC
+    // * (2 - frame_mbs_only_flag)`).
     let (cw, ch) = match g.chroma {
         ChromaFormat::Monochrome => (1, 1),
         ChromaFormat::Yuv420 => (2, 2),
         ChromaFormat::Yuv422 => (2, 1),
         ChromaFormat::Yuv444 => (1, 1),
     };
+    let ch = if g.interlaced { 2 * ch } else { ch };
+    debug_assert!((g.coded_height - g.height).is_multiple_of(ch), "the encoder refuses a height its crop unit cannot reach");
     let right = (g.coded_width - g.width) / cw;
     let bottom = (g.coded_height - g.height) / ch;
     if right != 0 || bottom != 0 {
@@ -429,7 +483,11 @@ pub fn write_pps(cfg: &Config, qp: u8) -> Vec<u8> {
     w.ue(0); // pic_parameter_set_id
     w.ue(0); // seq_parameter_set_id
     w.flag(cfg.entropy == Entropy::Cabac);
-    w.flag(false); // bottom_field_pic_order_in_frame_present_flag
+    // An interlaced frame picture carries its bottom field's POC as a
+    // delta (`delta_pic_order_cnt_bottom`), which is what puts the field
+    // order into a frame picture at all; a progressive stream has no
+    // fields to order and keeps the flag 0.
+    w.flag(cfg.interlace.is_some()); // bottom_field_pic_order_in_frame_present_flag
     w.ue(0); // num_slice_groups_minus1
     w.ue(0); // num_ref_idx_l0_default_active_minus1
     w.ue(0); // num_ref_idx_l1_default_active_minus1
@@ -514,6 +572,17 @@ pub struct SliceHeader {
     /// that sets `weighted_pred_flag`, and `None` for every I and B slice
     /// (`weighted_bipred_idc` is 0).
     pub pred_weights: Option<PredWeights>,
+    /// The SPS writes `frame_mbs_only_flag` 0, so `field_pic_flag` is in
+    /// the header — and, since this encoder's PPS sets
+    /// `bottom_field_pic_order_in_frame_present_flag` for exactly those
+    /// streams, a frame picture's `delta_pic_order_cnt_bottom` too.
+    pub interlaced: bool,
+    /// A field picture's `bottom_field_flag`; `None` for a frame picture.
+    pub bottom_field: Option<bool>,
+    /// `delta_pic_order_cnt_bottom` of an interlaced frame picture: the
+    /// bottom field's POC less the top's, +1 top field first and −1
+    /// bottom field first.
+    pub delta_poc_bottom: i32,
 }
 
 /// `slice_type` for an I, P or B slice, in the "all slices of this picture
@@ -532,11 +601,22 @@ pub fn write_slice_header(h: &SliceHeader, pps_qp: u8, w: &mut BitWriter) {
     w.ue(slice_type_code(h.kind));
     w.ue(0); // pic_parameter_set_id
     w.bits(h.log2_max_frame_num, h.frame_num);
-    // frame_mbs_only_flag is 1, so no field_pic_flag here.
+    if h.interlaced {
+        w.flag(h.bottom_field.is_some()); // field_pic_flag
+        if let Some(bottom) = h.bottom_field {
+            w.flag(bottom); // bottom_field_flag
+        }
+    } else {
+        // frame_mbs_only_flag is 1, so no field_pic_flag here.
+        debug_assert!(h.bottom_field.is_none(), "a progressive stream has no field pictures");
+    }
     if h.kind == Kind::Idr {
         w.ue(h.idr_pic_id);
     }
     w.bits(h.log2_max_poc_lsb, h.poc_lsb);
+    if h.interlaced && h.bottom_field.is_none() {
+        w.se(h.delta_poc_bottom); // delta_pic_order_cnt_bottom
+    }
     if h.kind == Kind::B {
         w.flag(h.direct_spatial); // direct_spatial_mv_pred_flag
     }
@@ -963,6 +1043,128 @@ mod tests {
         }
     }
 
+    /// An interlaced SPS survives the production parser as an interlaced
+    /// stream: `frame_mbs_only_flag` 0, the MBAFF flag as configured, the
+    /// frame height rebuilt from map units of two macroblock rows, and a
+    /// crop — in field rows — that lands on the displayed height. And the
+    /// progressive SPS for the same picture is what it always was.
+    #[test]
+    fn an_interlaced_sps_declares_macroblock_pairs_and_crops_in_field_rows() {
+        use crate::encode::{FieldCoding, FieldOrder};
+        for (w, h, c) in [
+            (64u32, 64u32, ChromaFormat::Yuv420),
+            (64, 60, ChromaFormat::Yuv420),
+            (48, 36, ChromaFormat::Yuv420),
+            (64, 34, ChromaFormat::Yuv422),
+            (64, 50, ChromaFormat::Yuv444),
+            (64, 18, ChromaFormat::Monochrome),
+        ] {
+            for coding in [FieldCoding::Field, FieldCoding::Paff, FieldCoding::Mbaff] {
+                let tag = format!("{w}x{h} {c:?} {coding:?}");
+                let cfg = Config {
+                    width: w,
+                    height: h,
+                    chroma: c,
+                    interlace: Some(FieldOrder::TopFirst),
+                    field_coding: coding,
+                    ..Config::default()
+                };
+                let g = Geometry::new(&cfg);
+                assert!(g.mbs_high.is_multiple_of(2), "{tag}: whole macroblock pairs");
+                let sps = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 16, 16, None)))
+                    .unwrap_or_else(|e| panic!("{tag}: SPS rejected: {e}"));
+                assert!(!sps.frame_mbs_only, "{tag}");
+                assert_eq!(sps.mb_adaptive_frame_field, coding == FieldCoding::Mbaff, "{tag}");
+                assert_eq!(sps.frame_height_in_mbs() * 16, g.coded_height, "{tag}");
+                let (_, _, top, bottom) = sps.crop;
+                assert_eq!(g.coded_height - top - bottom, h, "{tag}: displayed height");
+                let f = g.field();
+                assert_eq!((f.mbs_high * 2, f.coded_height * 2, f.height * 2), (g.mbs_high, g.coded_height, g.height), "{tag}: a field is half the frame");
+                assert!(f.field_pic && !g.field_pic && !f.mbaff, "{tag}");
+                let pps = write_pps(&cfg, 26);
+                let look = |_id: u32| Some(sps.clone());
+                let pps = crate::h264::pps::Pps::parse(&crate::nal::unescape_rbsp(&pps), &look).unwrap();
+                assert!(pps.bottom_field_pic_order_in_frame_present, "{tag}");
+            }
+            let progressive = Config { width: w, height: h, chroma: c, ..Config::default() };
+            let pg = Geometry::new(&progressive);
+            assert!(!pg.interlaced && !pg.mbaff);
+            let sps = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&progressive, &pg, 16, 16, None))).unwrap();
+            assert!(sps.frame_mbs_only);
+            assert_eq!(write_pps(&progressive, 26).len(), 3, "{w}x{h} {c:?}: the progressive PPS is the historical three bytes");
+        }
+    }
+
+    /// Field and frame slice headers of an interlaced stream come back
+    /// through the production slice parser as written: `field_pic_flag`,
+    /// `bottom_field_flag`, a frame picture's `delta_pic_order_cnt_bottom`,
+    /// and everything after them still aligned (the quantiser, which sits
+    /// near the end, arrives intact) — for every slice type, reference and
+    /// not.
+    #[test]
+    fn interlaced_slice_headers_round_trip() {
+        use crate::encode::{FieldCoding, FieldOrder};
+        for (coding, cabac) in [(FieldCoding::Paff, false), (FieldCoding::Paff, true), (FieldCoding::Mbaff, false), (FieldCoding::Mbaff, true)] {
+            // The header's `cabac` has to be the PPS's entropy coder: the
+            // reader takes `cabac_init_idc` from the PPS's word for it.
+            let cfg = Config {
+                width: 64,
+                height: 64,
+                bframes: 2,
+                entropy: if cabac { Entropy::Cabac } else { Entropy::Cavlc },
+                interlace: Some(FieldOrder::BottomFirst),
+                field_coding: coding,
+                ..Config::default()
+            };
+            let g = Geometry::new(&cfg);
+            let sps = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 16, 16, None))).unwrap();
+            let sps_look = |_id: u32| Some(sps.clone());
+            let pps = crate::h264::pps::Pps::parse(&crate::nal::unescape_rbsp(&write_pps(&cfg, 26)), &sps_look).unwrap();
+            let pps_look = |_id: u32| Some(pps.clone());
+            for kind in [Kind::Idr, Kind::I, Kind::P, Kind::B] {
+                for (bottom_field, delta) in [(None, -1), (None, 1), (Some(false), 0), (Some(true), 0)] {
+                    {
+                        let tag = format!("{coding:?} {kind:?} field {bottom_field:?} delta {delta} cabac {cabac}");
+                        let mut w = BitWriter::new();
+                        write_slice_header(
+                            &SliceHeader {
+                                kind,
+                                frame_num: 5,
+                                idr_pic_id: 1,
+                                poc_lsb: 9,
+                                qp: 31,
+                                log2_max_frame_num: 16,
+                                log2_max_poc_lsb: 16,
+                                reference: kind != Kind::B,
+                                deblock: true,
+                                cabac,
+                                direct_spatial: true,
+                                pred_weights: None,
+                                interlaced: true,
+                                bottom_field,
+                                delta_poc_bottom: delta,
+                            },
+                            26,
+                            &mut w,
+                        );
+                        w.rbsp_trailing_bits();
+                        let nal_type = if kind == Kind::Idr { NAL_IDR } else { NAL_SLICE };
+                        let nal = annexb(nal_type, if kind != Kind::B { 3 } else { 0 }, &w.into_nal());
+                        let rbsp = crate::nal::unescape_rbsp(&nal[4..]);
+                        let hdr = crate::nal::H264NalHeader::parse(&nal[4..]).unwrap();
+                        let (parsed, _, _) = crate::h264::slice::SliceHeader::parse(&rbsp, hdr, &pps_look, &sps_look)
+                            .unwrap_or_else(|e| panic!("{tag}: slice header rejected: {e}"));
+                        assert_eq!(parsed.field_pic, bottom_field.is_some(), "{tag}");
+                        assert_eq!(parsed.bottom_field, bottom_field == Some(true), "{tag}");
+                        assert_eq!(parsed.delta_poc_bottom, if bottom_field.is_none() { delta } else { 0 }, "{tag}");
+                        assert_eq!(parsed.mbaff(&sps), coding == FieldCoding::Mbaff && bottom_field.is_none(), "{tag}");
+                        assert_eq!((parsed.frame_num, parsed.poc_lsb, parsed.slice_qp), (5, 9, 31), "{tag}");
+                    }
+                }
+            }
+        }
+    }
+
     /// A slice header written at depth — a lossless picture's slice QP of
     /// zero against a PPS quantiser of 26, and a QP 40 one — comes back
     /// through the production slice parser with the same `SliceQP_Y`. The
@@ -996,6 +1198,9 @@ mod tests {
                         cabac: true,
                         direct_spatial: true,
                         pred_weights: None,
+                        interlaced: false,
+                        bottom_field: None,
+                        delta_poc_bottom: 0,
                     },
                     26,
                     &mut w,
@@ -1205,6 +1410,9 @@ mod tests {
                             cabac: true,
                             direct_spatial: false,
                             pred_weights: Some(PredWeights { table, chroma: has_chroma }),
+                            interlaced: false,
+                            bottom_field: None,
+                            delta_poc_bottom: 0,
                         },
                         26,
                         &mut w,

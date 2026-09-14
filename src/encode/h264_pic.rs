@@ -23,7 +23,7 @@ use crate::dsp::h264::H264Dsp;
 use crate::dsp::h264_enc::{H264EncDsp, Quant};
 use crate::encode::aq;
 use crate::encode::h264_deblock::{deblock_recon, nz_mask_of};
-use crate::encode::h264_intra::{IntraCtx, MbAvail, MbDecision, MbKind, code_macroblock};
+use crate::encode::h264_intra::{IntraCtx, MbAvail, MbDecision, MbKind, code_macroblock, code_macroblock_modes8};
 use crate::encode::h264_me::{
     BDecision, BMbKind, InterDecision, InterMbKind, MbMotionState, PRef, code_macroblock_b,
     code_macroblock_p, weighted_search_plane, weighting_gain,
@@ -137,6 +137,13 @@ pub struct PicMotion {
     /// What the picture's weighted prediction did ([`WeightCensus`]) — the
     /// default for every picture that carried no table.
     pub(crate) weighting: WeightCensus,
+    /// The picture is a field: every macroblock committed is a field
+    /// macroblock, as the decoder's `derive()` records one (`m.field` under
+    /// `ctx.field_pic`).
+    pub(crate) field_pic: bool,
+    /// An MBAFF picture's macroblock pairs, `[frame, field]` — what the
+    /// pair decision chose, for the census.
+    pub(crate) pairs: [u64; 2],
 }
 
 /// What a P picture's explicit weighting did, for the census.
@@ -164,7 +171,7 @@ impl PicMotion {
             vec![BlockMotion::default(); n * 16],
         ];
         frame.mb_intra = vec![false; n];
-        PicMotion { info: PicInfo::new(mbs_wide, mbs_high), frame, weighting: WeightCensus::default() }
+        PicMotion { info: PicInfo::new(mbs_wide, mbs_high), frame, weighting: WeightCensus::default(), field_pic: false, pairs: [0; 2] }
     }
 
     /// Commit one coded macroblock: everything a decoder stores about it
@@ -178,17 +185,58 @@ impl PicMotion {
     pub(crate) fn commit(&mut self, addr: usize, info: MbInfo, mot: &MbMotion) {
         debug_assert!(info.decoded, "a committed macroblock is decoded");
         self.frame.mb_intra[addr] = info.kind.is_intra();
-        self.info.mbs[addr] = info;
+        self.info.mbs[addr] = MbInfo { field: info.field || self.field_pic, ..info };
+        // An MBAFF frame's per-macroblock field flags, where the deblocking
+        // filter and a later picture's colocated derivation read them.
+        if let Some(f) = self.frame.mb_field.get_mut(addr) {
+            *f = info.field;
+        }
         for l in 0..2 {
             self.frame.motion[l][addr * 16..addr * 16 + 16].copy_from_slice(&mot[l]);
         }
     }
 
-    /// The colocated motion of macroblock `addr`, block `blk` (raster
-    /// 4x4), through the decoder's own `colocated_motion` — what a B
-    /// picture's direct derivation reads out of its list-1 reference.
-    pub(crate) fn colocated(&self, addr: usize, blk: usize) -> (Mv, i8) {
-        let (mv, ref_idx, _, _) = crate::h264::mb::colocated_motion(&self.frame, addr, blk);
+}
+
+/// What a B picture's direct prediction reads colocated motion out of —
+/// the frame holding `RefPicList1[0]` — and how the current picture maps
+/// onto it (8.4.1.2.1, Tables 8-6 and 8-8), read through the decoder's own
+/// `colocated_in` and `colocated_motion`: so a field picture over a
+/// field-coded anchor, or any other combination the standard spells out,
+/// reads the block a decoder reads.
+pub struct Colocated<'a> {
+    /// The colocated frame's motion in the decoder's frame-row layout: a
+    /// field picture's macroblock row `r` at frame row `2r + parity` with
+    /// `mb_field` set, and `field_coded`, `mbaff` and `field_poc` as the
+    /// decoder records them.
+    pub(crate) frame: &'a Frame<u8>,
+    /// The current picture's side of the mapping.
+    pub(crate) map: crate::h264::recon::ColMap,
+}
+
+impl<'a> Colocated<'a> {
+    /// A progressive B picture over its progressive list-1 reference: the
+    /// same macroblock, the same corner block.
+    pub(crate) fn progressive(col: &'a PicMotion) -> Self {
+        Colocated {
+            frame: &col.frame,
+            map: crate::h264::recon::ColMap {
+                cur_parity: crate::h264::frame::PARITY_FRAME,
+                col_parity: crate::h264::frame::PARITY_FRAME,
+                cur_poc: 0,
+                cur_mbaff: false,
+                mb_width: col.frame.mb_width,
+            },
+        }
+    }
+
+    /// `(mvCol, refIdxCol)` for 8x8 partition `part` of the macroblock at
+    /// storage address `addr` (`field_mb` / `mb_parity`: an MBAFF field
+    /// macroblock and its parity), under `direct_8x8_inference` — which
+    /// every SPS this encoder writes sets.
+    pub(crate) fn motion(&self, addr: usize, field_mb: bool, mb_parity: u8, part: usize) -> (Mv, i8) {
+        let cb = crate::h264::recon::colocated_in(self.map, self.frame, addr, field_mb, mb_parity, true, part, 0);
+        let (mv, ref_idx, _, _) = crate::h264::mb::colocated_motion(self.frame, cb.addr, cb.blk);
         (mv, ref_idx)
     }
 }
@@ -431,6 +479,8 @@ impl<'a, S: Sample> PicCoding<'a, S> {
             c444: g.chroma == ChromaFormat::Yuv444,
             t8x8: tools.transform_8x8,
             subparts: tools.subparts,
+            field: g.field_pic,
+            chroma_mv_dy: g.chroma_mv_dy,
         };
         let (mbs_wide, mbs_high) = (g.mbs_wide as usize, g.mbs_high as usize);
         let luma_stride = g.coded_width as usize;
@@ -523,6 +573,7 @@ pub(crate) fn code_intra_picture<S: Sample>(
     let (src_y, src_cb, src_cr) = (&pc.src_y[..], &pc.src_cb[..], &pc.src_cr[..]);
 
     let mut pm = PicMotion::new(mbs_wide, mbs_high);
+    pm.field_pic = g.field_pic;
     let mut top_modes: Vec<[Option<u8>; 4]> = vec![[None; 4]; mbs_wide];
     let mut chain = QpChain::new(ctx.qp, g.bit_depth);
     for mb_y in 0..mbs_high {
@@ -640,6 +691,7 @@ pub(crate) fn code_p_picture<S: Sample>(
     // The picture's motion in the decoder's own layout, and the
     // per-macroblock working set its derivations read.
     let mut pm = PicMotion::new(mbs_wide, mbs_high);
+    pm.field_pic = g.field_pic;
     let mut dnb = MbNeighbours::default();
     let mut st = MbMotionState::new();
     let mut chain = QpChain::new(ctx.qp, g.bit_depth);
@@ -790,21 +842,18 @@ pub(crate) fn code_b_picture<S: Sample>(
     planes: &[Plane<'_, S>],
     rec: &mut [Recon<S>],
     refs: [&[Recon<S>]; 2],
-    col: &PicMotion,
+    col: &Colocated,
     mut emit: impl FnMut(usize, usize, BMb<'_>),
 ) -> PicMotion {
     let pc = PicCoding::new(g, tools, qp, planes);
     let ctx = &pc.ctx;
     let (mbs_wide, mbs_high) = (pc.mbs_wide, pc.mbs_high);
     let (src_y, src_cb, src_cr) = (&pc.src_y[..], &pc.src_cb[..], &pc.src_cr[..]);
-    debug_assert_eq!(
-        col.info.mbs.len(),
-        mbs_wide * mbs_high,
-        "the colocated picture is the same size"
-    );
+    debug_assert_eq!(col.frame.mb_width, mbs_wide, "the colocated picture is the same width");
 
     let mut top_modes: Vec<[Option<u8>; 4]> = vec![[None; 4]; mbs_wide];
     let mut pm = PicMotion::new(mbs_wide, mbs_high);
+    pm.field_pic = g.field_pic;
     let mut dnb = MbNeighbours::default();
     let mut st = MbMotionState::new();
     let mut chain = QpChain::new(ctx.qp, g.bit_depth);
@@ -828,6 +877,8 @@ pub(crate) fn code_b_picture<S: Sample>(
                 &mut st,
                 col,
                 addr,
+                false,
+                col.map.cur_parity,
             );
             if dec.kind == BMbKind::UseIntra {
                 let mb = MbAvail {
@@ -926,9 +977,611 @@ pub(crate) fn code_b_picture<S: Sample>(
     pm
 }
 
+// ---------------------------------------------------------------------------
+// MBAFF pictures
+// ---------------------------------------------------------------------------
+
+/// One macroblock of an MBAFF pair as the walk decided it — owned, because
+/// a pair is decided (both ways, then once more for the winner) before
+/// either of its macroblocks is written.
+#[derive(Clone)]
+// The variants are all a macroblock's coefficients (one to two kilobytes);
+// they differ in size by the B decision's second list, and a walk holds two
+// pairs of them at a time, so boxing buys nothing.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum PairMb {
+    /// A macroblock of an I slice.
+    Intra(MbDecision),
+    /// A P slice's skipped or coded inter macroblock.
+    P(InterDecision),
+    /// A P slice's intra macroblock.
+    PIntra(MbDecision),
+    /// A B slice's skipped, direct or explicit macroblock.
+    B(BDecision),
+    /// A B slice's intra macroblock.
+    BIntra(MbDecision),
+}
+
+impl PairMb {
+    /// `P_Skip` or `B_Skip`: nothing is coded but the skip.
+    pub(crate) fn is_skip(&self) -> bool {
+        match self {
+            PairMb::P(d) => d.kind == InterMbKind::PSkip,
+            PairMb::B(d) => d.kind == BMbKind::BSkip,
+            _ => false,
+        }
+    }
+}
+
+/// An MBAFF macroblock pair, decided: the storage address of its top
+/// macroblock, whether it is a field pair, and its two macroblocks, top
+/// first.
+pub(crate) struct CodedPair {
+    /// Storage address (frame row raster) of the top macroblock.
+    pub(crate) top: usize,
+    /// `mb_field_decoding_flag`.
+    pub(crate) field: bool,
+    /// Top, then bottom.
+    pub(crate) mbs: [PairMb; 2],
+}
+
+/// The entropy coder an MBAFF walk writes through. The walk codes every
+/// pair both ways and prices each candidate with what it would cost to
+/// write next — which only the entropy coder can say — before writing the
+/// winner.
+pub(crate) trait PairWriter {
+    /// The bits `pair` would take written now, leaving the writer as it
+    /// is. `pm` holds the pair committed, as the decoder's picture state
+    /// holds a pair while its syntax is read.
+    fn trial_bits(&self, pair: &CodedPair, pm: &PicMotion) -> u64;
+    /// Write `pair`.
+    fn write_pair(&mut self, pair: &CodedPair, pm: &PicMotion);
+}
+
+/// What an MBAFF picture predicts from: each reference as the frame (for
+/// frame macroblocks) and as its two fields (for field macroblocks, whose
+/// reference index 0 names the field of their own parity).
+pub(crate) enum MbaffRefs<'a, S: Sample> {
+    /// An I picture.
+    Intra,
+    /// A P picture's list-0 reference.
+    P {
+        /// The reference frame.
+        frame: &'a [Recon<S>],
+        /// Its top and bottom fields.
+        fields: [&'a [Recon<S>]; 2],
+    },
+    /// A B picture's references and colocated view.
+    B {
+        /// List 0's and list 1's frames.
+        frame: [&'a [Recon<S>]; 2],
+        /// `[list][parity]`.
+        fields: [[&'a [Recon<S>]; 2]; 2],
+        /// The colocated frame, mapped for an MBAFF current picture.
+        col: Colocated<'a>,
+    },
+}
+
+/// The neighbouring intra modes an MBAFF macroblock predicts from, as
+/// `(left, top, left for 8x8 blocks)`: for each 4x4 row the mode of the
+/// block left of it, for each column the block above — through the
+/// decoder's Table 6-4 block neighbours — with `None` where no macroblock
+/// is there and DC (2) for a neighbour that is not `I_NxN`. The third array
+/// is 8.3.2.1's for an 8x8 block (rows 0 and 2): an `I_4x4` left neighbour
+/// gives the top-right sub-block of the neighbouring 8x8, or its
+/// bottom-right (`n` = 3) for block 2 of a frame macroblock beside a field
+/// one — the rule `predicted_intra_mode` applies (src/h264/cavlc.rs), which
+/// the test below holds this to. The above neighbour is always a bottom row,
+/// where 8.3.2.1's `n` = 2 is the block on the edge.
+fn mbaff_edge_modes(nb: &MbNeighbours, info: &PicInfo) -> (EdgeModes, EdgeModes, EdgeModes) {
+    let mode = |a: usize, blk: usize| -> u8 {
+        if matches!(info.mbs[a].kind, DecKind::I4x4 | DecKind::I8x8) { info.intra_modes[a * 16 + blk] } else { 2 }
+    };
+    let left: [Option<u8>; 4] = std::array::from_fn(|r| nb.block(-1, r as i32).map(|(a, blk)| mode(a, blk)));
+    let top: [Option<u8>; 4] = std::array::from_fn(|c| nb.block(c as i32, -1).map(|(a, blk)| mode(a, blk)));
+    let left8: [Option<u8>; 4] = std::array::from_fn(|r| {
+        nb.block(-1, r as i32).map(|(a, blk)| {
+            if info.mbs[a].kind != DecKind::I4x4 {
+                return mode(a, blk);
+            }
+            let (bx8, by8) = ((blk % 4) / 2 * 2, (blk / 4) / 2 * 2);
+            let n3 = nb.mbaff && !nb.cur_field && info.mbs[a].field && r == 2;
+            let (sx, sy) = if n3 { (bx8 + 1, by8 + 1) } else { (bx8 + 1, by8) };
+            info.intra_modes[a * 16 + sy * 4 + sx]
+        })
+    });
+    (left, top, left8)
+}
+
+/// One neighbouring intra mode per 4x4 row or column of a macroblock edge,
+/// `None` where no macroblock is there.
+type EdgeModes = [Option<u8>; 4];
+
+/// Commit an intra macroblock of an MBAFF pair: its quantiser through the
+/// chain, its record (a field macroblock's when `field`), and its modes
+/// where a neighbour's prediction reads them.
+fn commit_intra(pm: &mut PicMotion, chain: &mut QpChain, addr: usize, field: bool, qp: i32, mut dec: MbDecision, modes: &[u8; 16]) -> MbDecision {
+    let q = chain.settle(qp, has_residual(filter_kind(dec.kind), dec.cbp_luma | (dec.cbp_chroma << 4)));
+    dec.qp_delta = q.delta as i8;
+    pm.commit(
+        addr,
+        MbInfo {
+            field,
+            ..coded_info(filter_kind(dec.kind), nz_mask_of(&dec.nz_luma, dec.transform_8x8), dec.transform_8x8, q, [0; 2])
+        },
+        &[[BlockMotion::default(); 16]; 2],
+    );
+    let nxn = dec.kind.is_nxn();
+    for (m, &c) in pm.info.intra_modes[addr * 16..addr * 16 + 16].iter_mut().zip(modes) {
+        *m = if nxn { c } else { 2 };
+    }
+    dec
+}
+
+/// One MBAFF pair's state before it was coded, to undo a candidate.
+struct PairSnap<S: Sample> {
+    planes: Vec<Vec<S>>,
+    info: [MbInfo; 2],
+    motion: [[BlockMotion; 32]; 2],
+    intra: [bool; 2],
+    field: [bool; 2],
+    modes: [u8; 32],
+    prev_qp: i32,
+}
+
+/// The working state of an MBAFF picture walk.
+struct MbaffWalk<'a, 'r, S: Sample> {
+    g: &'a Geometry,
+    pc: PicCoding<'a, S>,
+    /// The padded source's fields: `[parity][plane]`, row `r` of field `p`
+    /// being row `2r + p` of the frame.
+    fsrc: [[Vec<S>; 3]; 2],
+    /// The frame view of the reconstruction.
+    rec: &'r mut [Recon<S>],
+    /// The same reconstruction as its two fields, kept equal to `rec`
+    /// macroblock by macroblock: a frame macroblock predicts intra from the
+    /// frame, a field macroblock from its own field, and every neighbouring
+    /// sample Table 6-4 names lies in the view of the macroblock reading it.
+    views: [Vec<Recon<S>>; 2],
+    pm: PicMotion,
+    chain: QpChain,
+    st: MbMotionState,
+    nb: MbNeighbours,
+    refs: MbaffRefs<'a, S>,
+    /// The multiplier bits are priced at against a squared error.
+    lam: f64,
+}
+
+impl<S: Sample> MbaffWalk<'_, '_, S> {
+    /// A macroblock's size in plane `p`, in samples.
+    fn mb_dims(&self, p: usize) -> (usize, usize) {
+        if p == 0 {
+            (16, 16)
+        } else {
+            let (w, h) = self.g.chroma_mb();
+            (w as usize, h as usize)
+        }
+    }
+
+    /// Copy frame macroblock row `fr`'s samples at column `x` into the
+    /// field views.
+    fn sync_frame_mb(&mut self, x: usize, fr: usize) {
+        for p in 0..self.rec.len() {
+            let (bw, bh) = self.mb_dims(p);
+            for i in 0..bh {
+                let y = fr * bh + i;
+                let s = self.rec[p].offset((x * bw) as isize, y as isize);
+                let d = self.views[y % 2][p].offset((x * bw) as isize, (y / 2) as isize);
+                self.views[y % 2][p].data[d..d + bw].copy_from_slice(&self.rec[p].data[s..s + bw]);
+            }
+        }
+    }
+
+    /// Copy the field macroblock of parity `par` at pair `(x, pr)` from its
+    /// field view into the frame.
+    fn sync_field_mb(&mut self, x: usize, pr: usize, par: usize) {
+        for p in 0..self.rec.len() {
+            let (bw, bh) = self.mb_dims(p);
+            for i in 0..bh {
+                let fy = pr * bh + i;
+                let s = self.views[par][p].offset((x * bw) as isize, fy as isize);
+                let d = self.rec[p].offset((x * bw) as isize, (2 * fy + par) as isize);
+                self.rec[p].data[d..d + bw].copy_from_slice(&self.views[par][p].data[s..s + bw]);
+            }
+        }
+    }
+
+    fn snapshot(&self, x: usize, pr: usize) -> PairSnap<S> {
+        let mbw = self.pc.mbs_wide;
+        let top = 2 * pr * mbw + x;
+        let bot = top + mbw;
+        let planes = (0..self.rec.len())
+            .map(|p| {
+                let (bw, bh) = self.mb_dims(p);
+                let plane = &self.rec[p];
+                let mut v = Vec::with_capacity(2 * bw * bh);
+                for y in 0..2 * bh {
+                    let o = plane.offset((x * bw) as isize, (pr * 2 * bh + y) as isize);
+                    v.extend_from_slice(&plane.data[o..o + bw]);
+                }
+                v
+            })
+            .collect();
+        let mut motion = [[BlockMotion::default(); 32]; 2];
+        let mut modes = [0u8; 32];
+        for (k, a) in [top, bot].into_iter().enumerate() {
+            for (l, m) in motion.iter_mut().enumerate() {
+                m[k * 16..k * 16 + 16].copy_from_slice(&self.pm.frame.motion[l][a * 16..a * 16 + 16]);
+            }
+            modes[k * 16..k * 16 + 16].copy_from_slice(&self.pm.info.intra_modes[a * 16..a * 16 + 16]);
+        }
+        PairSnap {
+            planes,
+            info: [self.pm.info.mbs[top], self.pm.info.mbs[bot]],
+            motion,
+            intra: [self.pm.frame.mb_intra[top], self.pm.frame.mb_intra[bot]],
+            field: [self.pm.frame.mb_field[top], self.pm.frame.mb_field[bot]],
+            modes,
+            prev_qp: self.chain.prev,
+        }
+    }
+
+    fn restore(&mut self, s: &PairSnap<S>, x: usize, pr: usize) {
+        let mbw = self.pc.mbs_wide;
+        let top = 2 * pr * mbw + x;
+        for p in 0..self.rec.len() {
+            let (bw, bh) = self.mb_dims(p);
+            for y in 0..2 * bh {
+                let o = self.rec[p].offset((x * bw) as isize, (pr * 2 * bh + y) as isize);
+                self.rec[p].data[o..o + bw].copy_from_slice(&s.planes[p][y * bw..(y + 1) * bw]);
+            }
+        }
+        for (k, a) in [top, top + mbw].into_iter().enumerate() {
+            self.pm.info.mbs[a] = s.info[k];
+            for l in 0..2 {
+                self.pm.frame.motion[l][a * 16..a * 16 + 16].copy_from_slice(&s.motion[l][k * 16..k * 16 + 16]);
+            }
+            self.pm.frame.mb_intra[a] = s.intra[k];
+            self.pm.frame.mb_field[a] = s.field[k];
+            self.pm.info.intra_modes[a * 16..a * 16 + 16].copy_from_slice(&s.modes[k * 16..k * 16 + 16]);
+        }
+        self.chain.prev = s.prev_qp;
+        self.sync_frame_mb(x, 2 * pr);
+        self.sync_frame_mb(x, 2 * pr + 1);
+    }
+
+    /// A coded candidate's price: the squared error of the pair's
+    /// reconstruction against the source over every plane, plus `lam`
+    /// times what the writer says the pair costs. A pair of skips whose
+    /// flag is not the inferred one cannot be written at all — nothing in
+    /// the stream would carry the flag — and costs infinitely much.
+    fn cost<W: PairWriter>(&self, pair: &CodedPair, inferred: bool, x: usize, pr: usize, writer: &W) -> f64 {
+        if pair.mbs[0].is_skip() && pair.mbs[1].is_skip() && pair.field != inferred {
+            return f64::INFINITY;
+        }
+        let mut ssd = 0u64;
+        for p in 0..self.rec.len() {
+            let (bw, bh) = self.mb_dims(p);
+            let (src, stride) = match p {
+                0 => (&self.pc.src_y, self.pc.luma_stride),
+                1 => (&self.pc.src_cb, self.pc.chroma_stride),
+                _ => (&self.pc.src_cr, self.pc.chroma_stride),
+            };
+            for y in 0..2 * bh {
+                let fy = pr * 2 * bh + y;
+                let o = self.rec[p].offset((x * bw) as isize, fy as isize);
+                for i in 0..bw {
+                    let d = i64::from(src[fy * stride + x * bw + i].to_i32()) - i64::from(self.rec[p].data[o + i].to_i32());
+                    ssd += (d * d) as u64;
+                }
+            }
+        }
+        ssd as f64 + self.lam * writer.trial_bits(pair, &self.pm) as f64
+    }
+
+    /// Code both macroblocks of pair `(x, pr)` as frame or field
+    /// macroblocks, committing each.
+    fn code_pair(&mut self, x: usize, pr: usize, field: bool) -> CodedPair {
+        let top = 2 * pr * self.pc.mbs_wide + x;
+        let mbs = [self.code_mb(x, pr, 0, field), self.code_mb(x, pr, 1, field)];
+        CodedPair { top, field, mbs }
+    }
+
+    /// Decide, reconstruct and commit macroblock `b` (0 top, 1 bottom) of
+    /// pair `(x, pr)` — in the frame view at frame row `2pr + b`, or as a
+    /// field macroblock in field `b`'s view at field row `pr`.
+    fn code_mb(&mut self, x: usize, pr: usize, b: usize, field: bool) -> PairMb {
+        let mbw = self.pc.mbs_wide;
+        let addr = (2 * pr + b) * mbw + x;
+        let (vx, vy) = if field { (x, pr) } else { (x, 2 * pr + b) };
+        let parity = if field { b as u8 } else { crate::h264::frame::PARITY_FRAME };
+        self.nb.derive_mbaff_into(&self.pm.info, addr, 0, field);
+        let avail = MbAvail {
+            left: self.nb.a.is_some(),
+            top: self.nb.b.is_some(),
+            top_left: self.nb.d.is_some(),
+            top_right: self.nb.c.is_some(),
+        };
+        let (left4, top4, left8) = mbaff_edge_modes(&self.nb, &self.pm.info);
+        let ctx = IntraCtx { field, ..self.pc.ctx_at(self.pc.mb_qp(addr)) };
+        let (ls, cs) = (self.pc.luma_stride, self.pc.chroma_stride);
+        let (ys, cbs, crs): (&[S], &[S], &[S]) = if field {
+            (&self.fsrc[b][0], &self.fsrc[b][1], &self.fsrc[b][2])
+        } else {
+            (&self.pc.src_y, &self.pc.src_cb, &self.pc.src_cr)
+        };
+        let rec: &mut [Recon<S>] = if field { &mut self.views[b] } else { &mut *self.rec };
+        let out = match &self.refs {
+            MbaffRefs::Intra => {
+                let (dec, modes) =
+                    code_macroblock_modes8(&ctx, rec, vx, vy, ys, ls, [cbs, crs], cs, avail, &left4, &top4, &left8);
+                PairMb::Intra(commit_intra(&mut self.pm, &mut self.chain, addr, field, ctx.qp, dec, &modes))
+            }
+            MbaffRefs::P { frame, fields } => {
+                let planes = if field { fields[b] } else { *frame };
+                let pref = PRef { planes, search: &planes[0], weighting: Weighting::Default };
+                self.st.start_mbaff(&self.pm.frame, &self.pm.info, addr, field, &mut self.nb);
+                let mut dec = code_macroblock_p(&ctx, rec, &pref, vx, vy, ys, ls, [cbs, crs], cs, &mut self.st);
+                match dec.kind {
+                    InterMbKind::UseIntra => {
+                        let (idec, modes) =
+                            code_macroblock_modes8(&ctx, rec, vx, vy, ys, ls, [cbs, crs], cs, avail, &left4, &top4, &left8);
+                        PairMb::PIntra(commit_intra(&mut self.pm, &mut self.chain, addr, field, ctx.qp, idec, &modes))
+                    }
+                    InterMbKind::PSkip => {
+                        let q = self.chain.settle(ctx.qp, false);
+                        self.pm.commit(addr, MbInfo { field, ..coded_info(DecKind::PSkip, 0, false, q, [0; 2]) }, self.st.motion());
+                        self.pm.info.intra_modes[addr * 16..addr * 16 + 16].fill(2);
+                        PairMb::P(dec)
+                    }
+                    _ => {
+                        let q = self.chain.settle(ctx.qp, has_residual(dec.kind.dec_kind(), dec.cbp_luma | (dec.cbp_chroma << 4)));
+                        dec.qp_delta = q.delta as i8;
+                        let mut rects = [(0usize, 0usize, 0usize, 0usize); 16];
+                        let n = dec.rects(&mut rects);
+                        self.pm.commit(
+                            addr,
+                            MbInfo {
+                                field,
+                                ..coded_info(
+                                    dec.kind.dec_kind(),
+                                    nz_mask_of(&dec.nz_luma, dec.transform_8x8),
+                                    dec.transform_8x8,
+                                    q,
+                                    part_edges_of(&rects[..n]),
+                                )
+                            },
+                            self.st.motion(),
+                        );
+                        self.pm.info.intra_modes[addr * 16..addr * 16 + 16].fill(2);
+                        PairMb::P(dec)
+                    }
+                }
+            }
+            MbaffRefs::B { frame, fields, col } => {
+                let refs2: [&[Recon<S>]; 2] = if field { [fields[0][b], fields[1][b]] } else { *frame };
+                self.st.start_mbaff(&self.pm.frame, &self.pm.info, addr, field, &mut self.nb);
+                let mut dec =
+                    code_macroblock_b(&ctx, rec, refs2, vx, vy, ys, ls, [cbs, crs], cs, &mut self.st, col, addr, field, parity);
+                if dec.kind == BMbKind::UseIntra {
+                    let (idec, modes) =
+                        code_macroblock_modes8(&ctx, rec, vx, vy, ys, ls, [cbs, crs], cs, avail, &left4, &top4, &left8);
+                    PairMb::BIntra(commit_intra(&mut self.pm, &mut self.chain, addr, field, ctx.qp, idec, &modes))
+                } else {
+                    let residual =
+                        dec.kind != BMbKind::BSkip && has_residual(dec.kind.dec_kind(), dec.cbp_luma | (dec.cbp_chroma << 4));
+                    let q = self.chain.settle(ctx.qp, residual);
+                    dec.qp_delta = q.delta as i8;
+                    let mut rects = [(0usize, 0usize, 0usize, 0usize); 16];
+                    let n = dec.rects(&mut rects);
+                    let sub_direct =
+                        if dec.kind == BMbKind::B8x8 { (0..4).map(|p| (dec.is_direct_part(p) as u8) << p).sum() } else { 0 };
+                    self.pm.commit(
+                        addr,
+                        MbInfo {
+                            sub_direct,
+                            field,
+                            ..coded_info(
+                                dec.kind.dec_kind(),
+                                nz_mask_of(&dec.nz_luma, dec.transform_8x8),
+                                dec.transform_8x8,
+                                q,
+                                part_edges_of(&rects[..n]),
+                            )
+                        },
+                        self.st.motion(),
+                    );
+                    self.pm.info.intra_modes[addr * 16..addr * 16 + 16].fill(2);
+                    PairMb::B(dec)
+                }
+            }
+        };
+        if field {
+            self.sync_field_mb(x, pr, b);
+        } else {
+            self.sync_frame_mb(x, 2 * pr + b);
+        }
+        out
+    }
+}
+
+/// Decide, reconstruct and filter an MBAFF frame (`mb_adaptive_frame_field_flag`
+/// 1, `field_pic_flag` 0), pair by pair in decoding order, handing each pair
+/// to `writer`.
+///
+/// Every pair is coded twice — as two frame macroblocks and as two field
+/// macroblocks — each candidate priced by the squared error it leaves plus
+/// the multiplier times the bits its writer says it costs, and the cheaper
+/// is kept (ties to the frame pair), the loser undone. A frame macroblock
+/// is decided in the frame, a field macroblock in its own field: its
+/// source, its reconstruction, and its references are that field's, its
+/// motion in field units, its residual in the field scans. Neighbours,
+/// motion prediction and the skip vector come from the decoder's own MBAFF
+/// derivations (`derive_mbaff_into`, `MotionCache::gather`), a B
+/// macroblock's colocated motion from its AFRM mapping, and the loop filter
+/// runs the decoder's MBAFF pair filter over the frame at the end.
+pub(crate) fn code_mbaff_picture<S: Sample, W: PairWriter>(
+    g: &Geometry,
+    tools: &IntraTools<S>,
+    qp: u8,
+    planes: &[Plane<'_, S>],
+    rec: &mut [Recon<S>],
+    refs: MbaffRefs<'_, S>,
+    writer: &mut W,
+) -> PicMotion {
+    debug_assert!(g.mbaff && !g.field_pic && g.mbs_high.is_multiple_of(2));
+    let pc = PicCoding::new(g, tools, qp, planes);
+    let (mbw, mbh) = (pc.mbs_wide, pc.mbs_high);
+    let field_rows = |data: &[S], stride: usize, parity: usize| -> Vec<S> {
+        if stride == 0 {
+            return Vec::new();
+        }
+        let rows = data.len() / stride;
+        (0..rows / 2).flat_map(|r| data[(2 * r + parity) * stride..(2 * r + parity + 1) * stride].iter().copied()).collect()
+    };
+    let fsrc = [0usize, 1].map(|p| {
+        [
+            field_rows(&pc.src_y, pc.luma_stride, p),
+            field_rows(&pc.src_cb, pc.chroma_stride, p),
+            field_rows(&pc.src_cr, pc.chroma_stride, p),
+        ]
+    });
+    let views = [0usize, 1].map(|_| {
+        rec.iter()
+            .map(|p| crate::encode::h264_syntax::recon_plane(p.width as u32, (p.height / 2) as u32, p.pad))
+            .collect::<Vec<_>>()
+    });
+    let mut pm = PicMotion::new(mbw, mbh);
+    pm.frame.mbaff = true;
+    pm.frame.mb_field = vec![false; mbw * mbh];
+    let lam = f64::from(crate::encode::h264_intra::lambda(i32::from(qp))) * f64::from(1u32 << (2 * (g.bit_depth - 8)));
+    let chain = QpChain::new(pc.ctx.qp, g.bit_depth);
+    let mut walk = MbaffWalk { g, pc, fsrc, rec, views, pm, chain, st: MbMotionState::new(), nb: MbNeighbours::default(), refs, lam };
+    for pr in 0..mbh / 2 {
+        for x in 0..mbw {
+            let top = 2 * pr * mbw + x;
+            let inferred = crate::h264::decoder::infer_mb_field(&walk.pm.info, top, 0);
+            let snap = walk.snapshot(x, pr);
+            let frame_pair = walk.code_pair(x, pr, false);
+            let frame_cost = walk.cost(&frame_pair, inferred, x, pr, writer);
+            walk.restore(&snap, x, pr);
+            let field_pair = walk.code_pair(x, pr, true);
+            let field_cost = walk.cost(&field_pair, inferred, x, pr, writer);
+            let pair = if field_cost < frame_cost {
+                field_pair
+            } else {
+                walk.restore(&snap, x, pr);
+                walk.code_pair(x, pr, false)
+            };
+            walk.pm.pairs[pair.field as usize] += 1;
+            writer.write_pair(&pair, &walk.pm);
+        }
+    }
+    let MbaffWalk { mut pm, rec, .. } = walk;
+    deblock_recon(&tools.dsp, g, &mut pm, rec);
+    pm
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The MBAFF neighbouring modes are the decoder's: for a macroblock of
+    /// every kind (frame or field, top or bottom) beside a left pair of
+    /// either kind whose macroblocks are `I_4x4` with a different mode on
+    /// every block, `I_8x8` or not `I_NxN`, and under an above pair likewise,
+    /// the mode `predicted_intra_mode` derives for a block whose other
+    /// neighbour predicts mode 8 is the one `mbaff_edge_modes` hands the
+    /// intra decision — for 4x4 blocks down the left column and along the
+    /// top row, and for 8x8 blocks 0 and 2 (the `n` = 3 case included).
+    #[test]
+    fn mbaff_neighbouring_modes_are_the_decoders() {
+        use crate::h264::SliceType;
+        use crate::h264::cavlc::predicted_intra_mode;
+        use crate::h264::mb::{MbLayer, SliceCtx};
+        let ctx = SliceCtx {
+            slice_type: SliceType::I,
+            slice_num: 0,
+            num_ref_idx: [0, 0],
+            direct_spatial: false,
+            transform_8x8_mode: true,
+            constrained_intra_pred: false,
+            direct_8x8_inference: true,
+            chroma_format_idc: 1,
+            cabac: true,
+            bit_depth: 8,
+            transform_bypass: false,
+            scaling_plane: 0,
+            x264_old_444: false,
+            field_pic: false,
+            mbaff: true,
+            sp: false,
+            sp_switch: false,
+            sp_qs: 0,
+            sp_qsc: [0; 2],
+        };
+        // Two pairs wide, two pairs high: the current pair at (1, 1), its
+        // left pair at (0, 1) and its above pair at (1, 0).
+        let (mbw, mbh) = (2usize, 4usize);
+        for cur_field in [false, true] {
+            for nb_field in [false, true] {
+                for kind in [DecKind::I4x4, DecKind::I8x8, DecKind::I16x16] {
+                    for bottom in [0usize, 1] {
+                        for side in [0usize, 1] {
+                            // side 0: vary the left pair, fix the above one at mode 8;
+                            // side 1: the reverse.
+                            let mut info = PicInfo::new(mbw, mbh);
+                            let set = |info: &mut PicInfo, addr: usize, k: DecKind, field: bool, varied: bool| {
+                                info.mbs[addr] = MbInfo { kind: k, decoded: true, slice: 0, field, ..MbInfo::default() };
+                                for blk in 0..16 {
+                                    info.intra_modes[addr * 16 + blk] = if !varied {
+                                        8
+                                    } else if k == DecKind::I8x8 {
+                                        ((blk / 8) * 2 + (blk % 4) / 2) as u8 * 3 % 8
+                                    } else {
+                                        (blk as u8 * 5 + addr as u8) % 8
+                                    };
+                                }
+                            };
+                            for b in 0..2 {
+                                set(&mut info, (2 + b) * mbw, if side == 0 { kind } else { DecKind::I4x4 }, nb_field, side == 0);
+                                set(&mut info, b * mbw + 1, if side == 1 { kind } else { DecKind::I4x4 }, nb_field, side == 1);
+                            }
+                            // The current pair's top macroblock, already coded: a
+                            // bottom frame macroblock's above neighbour.
+                            set(&mut info, 2 * mbw + 1, if side == 1 { kind } else { DecKind::I4x4 }, cur_field, side == 1);
+                            let addr = (2 + bottom) * mbw + 1;
+                            let mut nb = MbNeighbours::default();
+                            nb.derive_mbaff_into(&info, addr, 0, cur_field);
+                            let (left, top, left8) = mbaff_edge_modes(&nb, &info);
+                            let mut layer = MbLayer::new(DecKind::I4x4);
+                            layer.intra_modes = [8; 16];
+                            let tag = format!("cur_field {cur_field} nb_field {nb_field} {kind:?} bottom {bottom} side {side}");
+                            if side == 0 {
+                                for (r, got) in left.iter().enumerate() {
+                                    let want = predicted_intra_mode(&info, &layer, &nb, &ctx, 0, r, false);
+                                    assert_eq!(Some(want), got.map(|m| m.min(8)), "{tag}: 4x4 row {r}");
+                                }
+                                for r in [0usize, 2] {
+                                    let want = predicted_intra_mode(&info, &layer, &nb, &ctx, 0, r, true);
+                                    assert_eq!(Some(want), left8[r].map(|m| m.min(8)), "{tag}: 8x8 row {r}");
+                                }
+                            } else {
+                                for (c, got) in top.iter().enumerate() {
+                                    let want = predicted_intra_mode(&info, &layer, &nb, &ctx, c, 0, false);
+                                    assert_eq!(Some(want), got.map(|m| m.min(8)), "{tag}: 4x4 column {c}");
+                                }
+                                for c in [0usize, 2] {
+                                    let want = predicted_intra_mode(&info, &layer, &nb, &ctx, c, 0, true);
+                                    assert_eq!(Some(want), top[c].map(|m| m.min(8)), "{tag}: 8x8 column {c}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /// The chain lands every quantiser the encoder can want from every
     /// prediction, at 8, 10 and 14 bits, with a delta inside the reader's

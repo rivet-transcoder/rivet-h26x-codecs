@@ -116,6 +116,7 @@ fn cat_plane(cat: usize) -> usize {
 }
 
 /// The CABAC slice decoding state carried across macroblocks.
+#[derive(Clone)]
 pub struct CabacState {
     /// The 1024 context variables.
     pub ctx: [Ctx; NUM_CTX],
@@ -195,6 +196,17 @@ pub fn decode_mb_field(c: &mut Cabac, st: &mut CabacState, nb: &MbNeighbours) ->
     let inc = (nb.pair[0].is_some() && nb.pair_field[0]) as usize
         + (nb.pair[1].is_some() && nb.pair_field[1]) as usize;
     bin(c, st, CTX_MB_FIELD + inc) != 0
+}
+
+/// Write `mb_field_decoding_flag`: the exact inverse of [`decode_mb_field`]
+/// — one decision bin whose context counts the left and above macroblock
+/// pairs that are available field pairs, read off the same `MbNeighbours`
+/// the reader reads (which pair-level facts do not depend on the flag the
+/// neighbours were derived under).
+pub(crate) fn write_mb_field_cabac(e: &mut CabacEncoder, st: &mut CabacState, nb: &MbNeighbours, field: bool) {
+    let inc = (nb.pair[0].is_some() && nb.pair_field[0]) as usize
+        + (nb.pair[1].is_some() && nb.pair_field[1]) as usize;
+    e.encode_decision(&mut st.ctx[CTX_MB_FIELD + inc], field as u32);
 }
 
 /// `end_of_slice_flag`.
@@ -2984,6 +2996,46 @@ pub const _PRED_CHECK: (u8, u8, u8) = (PRED_L0, PRED_L1, PRED_BI);
 mod residual_round_trip {
     use super::*;
     use crate::bitwriter::BitWriter;
+
+    /// `mb_field_decoding_flag` round-trips through its reader under every
+    /// neighbour combination its context distinguishes — no pair, a frame
+    /// pair and a field pair on each side — with the context states
+    /// agreeing at the end.
+    #[test]
+    fn mb_field_flag_round_trips() {
+        let sides = [None, Some(false), Some(true)];
+        let mut cases = Vec::new();
+        for (k, &l) in sides.iter().enumerate() {
+            for (j, &a) in sides.iter().enumerate() {
+                for f in [false, true, (k + j) % 2 == 0] {
+                    cases.push((l, a, f));
+                }
+            }
+        }
+        let nb_of = |l: Option<bool>, a: Option<bool>| MbNeighbours {
+            pair: [l.map(|_| 0), a.map(|_| 1), None, None],
+            pair_field: [l.unwrap_or(false), a.unwrap_or(false), false, false],
+            ..MbNeighbours::default()
+        };
+        let mut w = BitWriter::new();
+        let mut enc_st = CabacState::new(SliceType::P, 0, 26);
+        {
+            let mut e = CabacEncoder::new(&mut w);
+            for &(l, a, f) in &cases {
+                write_mb_field_cabac(&mut e, &mut enc_st, &nb_of(l, a), f);
+            }
+            e.encode_terminate(1);
+        }
+        w.align_zero();
+        let data = w.into_rbsp();
+        let mut c = Cabac::new(&data);
+        let mut dec_st = CabacState::new(SliceType::P, 0, 26);
+        for (i, &(l, a, f)) in cases.iter().enumerate() {
+            assert_eq!(decode_mb_field(&mut c, &mut dec_st, &nb_of(l, a)), f, "case {i}: left {l:?} above {a:?}");
+        }
+        assert!(decode_end_of_slice(&mut c));
+        assert_eq!(enc_st.ctx, dec_st.ctx, "context states diverged");
+    }
 
     /// Encode a block, decode it with the production reader, and require the
     /// coefficients, the count and the context states all to come back.

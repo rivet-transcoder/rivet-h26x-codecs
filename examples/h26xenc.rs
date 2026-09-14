@@ -16,7 +16,9 @@
 
 
 use h26x::ChromaFormat;
-use h26x::encode::{ColourDescription, Config, ContentLightLevel, Entropy, MasteringDisplay, RateControl};
+use h26x::encode::{
+    ColourDescription, Config, ContentLightLevel, Entropy, FieldCoding, FieldOrder, MasteringDisplay, RateControl,
+};
 
 /// `G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)` — x265's `master-display`
 /// syntax, in the SEI's units — or `None` for anything else.
@@ -56,6 +58,7 @@ fn die(msg: &str) -> ! {
          \x20      [--fps N] [--cpb-ms N]\n\
          \x20      [--gop N] [--bframes N] [--cavlc] [--t8x8] [--subparts] [--sao]\n\
          \x20      [--aq STRENGTH] [--lookahead N] [--wpred] [--refs N] [--cu-depth N] [--depth N] [--threads N]\n\
+         \x20      [--interlace tff|bff [--field-coding field|paff|mbaff]] (H.264)\n\
          \x20      [--color PRIMARIES:TRANSFER:MATRIX (H.273 codes, e.g. 9:16:9 for HDR10)]\n\
          \x20      [--full-range] [--chroma-loc N (H.273 chroma_sample_loc_type 0..=5)]\n\
          \x20      [--mastering-display G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)] (ST 2086, SEI units)\n\
@@ -138,6 +141,25 @@ fn main() {
             // CTB. Absent, the encoder's default (2); 0 codes one unit per
             // CTB as every stream before the quadtree did.
             "--cu-depth" => cfg.max_cu_depth = Some(val(&mut i, &args, "--cu-depth").parse().unwrap_or_else(|_| die("--cu-depth"))),
+            // H.264 only: the input frames are interlaced, in this field
+            // order, and are coded as interlaced video. H.265 refuses it.
+            "--interlace" => {
+                cfg.interlace = Some(match val(&mut i, &args, "--interlace").as_str() {
+                    "tff" => FieldOrder::TopFirst,
+                    "bff" => FieldOrder::BottomFirst,
+                    _ => die("--interlace wants tff or bff"),
+                })
+            }
+            // With --interlace: every frame as two field pictures, or the
+            // frame/field choice made per picture or per macroblock pair.
+            "--field-coding" => {
+                cfg.field_coding = match val(&mut i, &args, "--field-coding").as_str() {
+                    "field" => FieldCoding::Field,
+                    "paff" => FieldCoding::Paff,
+                    "mbaff" => FieldCoding::Mbaff,
+                    _ => die("--field-coding wants field, paff or mbaff"),
+                }
+            }
             // The VUI colour description, as the three H.273 code points
             // (colour_primaries:transfer_characteristics:matrix_coefficients).
             // Absent, the stream says nothing about colour.
@@ -276,6 +298,7 @@ fn main() {
     }
 
     let aq = cfg.aq_strength > 0.0;
+    let interlaced = cfg.interlace.is_some();
     let wpred = cfg.weighted_pred;
     let mut enc = match h26x::encode::h264::H264Encoder::new(cfg) {
         Ok(e) => e,
@@ -377,6 +400,15 @@ fn main() {
         eprintln!(
             "wp P: {} of {} pictures weighted, {} macroblocks won, {} lost",
             c.wp_on[1], c.pictures[1], c.wp_won[1], c.wp_lost[1]
+        );
+    }
+    // The interlace census, when interlaced coding was asked for: how many
+    // field pictures the frames were coded as.
+    if interlaced {
+        let c = enc.shape_census();
+        eprintln!(
+            "interlace: {} field pictures, {} frame pictures, {} field pairs, {} frame pairs",
+            c.field_pictures, c.frame_pictures, c.field_pairs, c.frame_pairs
         );
     }
 }

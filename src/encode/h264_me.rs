@@ -68,11 +68,11 @@
 use crate::dsp::distortion::DistortionDsp;
 use crate::dsp::h264::{NO_DC, PRED_STRIDE};
 use crate::dsp::h264_enc::{qbits4, quant_offset};
-use crate::encode::h264_pic::PicMotion;
+use crate::encode::h264_pic::Colocated;
 use crate::encode::h264_intra::{
     IntraCtx, code_block_8x8, quad_rasters, reconstruct_8x8, satd_lambda, ssd_lambda,
 };
-use crate::h264::cavlc::sub_block_counts_8x8;
+use crate::h264::cavlc::sub_block_counts_8x8_scan;
 use crate::h264::inter::Weighting;
 use crate::encode::h264_syntax::Recon;
 use crate::sample::Sample;
@@ -81,7 +81,7 @@ use crate::h264::cavlc::{mb_partitions, part_index_of, sub_partition_rect};
 use crate::h264::mb::SubMbShape;
 use crate::h264::mb::{
     MbKind as DecMbKind, MbMotion, MbNeighbours, MotionCache, PRED_BI, PRED_L0, PRED_L1,
-    PicInfo, colocated_block, fill_motion, p_skip_mv, predict_mv,
+    PicInfo, fill_motion, p_skip_mv, predict_mv,
 };
 use crate::h264::transform::{chroma_dc_transform_420, chroma_dc_transform_422};
 
@@ -333,6 +333,17 @@ impl MbMotionState {
         self.done = 0;
     }
 
+    /// [`MbMotionState::start`] for macroblock `addr` of an MBAFF frame, a
+    /// field macroblock when `field`: its neighbours through the decoder's
+    /// Table 6-4 derivation (`derive_mbaff_into`), which `gather` then reads
+    /// with the field / frame scaling of 8.4.1.3.1.
+    pub fn start_mbaff(&mut self, frame: &Frame<u8>, info: &PicInfo, addr: usize, field: bool, nb: &mut MbNeighbours) {
+        nb.derive_mbaff_into(info, addr, 0, field);
+        self.cache.gather(nb, frame, info);
+        self.cur = [[BlockMotion::default(); 16]; 2];
+        self.done = 0;
+    }
+
     /// Clear the macroblock's own derived motion, keeping the gathered
     /// neighbours. Trying one partition shape and then another means
     /// deriving over the same neighbours twice, and the second trial must
@@ -544,9 +555,13 @@ fn luma_pred_into<S: Sample>(
 /// Interpolate one chroma component's prediction (8 wide, `ch` high) for
 /// luma vector `mv` at chroma position `(cx, cy)` into a scratch block,
 /// through the decoder's bilinear kernel. The vector conversion is
-/// `predict_partition`'s (src/h264/inter.rs, 8.4.1.4), progressive frames
-/// only: eighth-sample fractions in 4:2:0; in 4:2:2 the vertical component
-/// is in quarter *chroma* samples, so the fraction doubles.
+/// `predict_partition`'s (src/h264/inter.rs, 8.4.1.4): eighth-sample
+/// fractions in 4:2:0; in 4:2:2 the vertical component is in quarter
+/// *chroma* samples, so the fraction doubles. `dy` is Table 8-10's
+/// vertical offset for a 4:2:0 field predicting from the field of the
+/// other parity (±2 eighths), zero everywhere else — the decoder adds it
+/// to the vertical vector before splitting integer and fraction, and so
+/// does this.
 #[allow(clippy::too_many_arguments)]
 fn chroma_pred_into<S: Sample>(
     ctx: &MeCtx<S>,
@@ -554,6 +569,7 @@ fn chroma_pred_into<S: Sample>(
     cx: i32,
     cy: i32,
     mv: Mv,
+    dy: i32,
     cw: usize,
     ch_h: usize,
     ch: usize,
@@ -561,8 +577,10 @@ fn chroma_pred_into<S: Sample>(
 ) {
     let xci = cx + (mv.x as i32 >> 3);
     let (yci, yf) = if ch == 8 {
-        (cy + (mv.y as i32 >> 3), (mv.y & 7) as i32)
+        let mvcy = mv.y as i32 + dy;
+        (cy + (mvcy >> 3), mvcy & 7)
     } else {
+        debug_assert_eq!(dy, 0, "Table 8-10's offset is a 4:2:0 one");
         (cy + (mv.y as i32 >> 2), ((mv.y & 3) << 1) as i32)
     };
     let xf = (mv.x & 7) as i32;
@@ -836,12 +854,12 @@ fn predict_inter_rect<S: Sample>(
         let off = plane.offset(cx as isize, cy as isize);
         let stride = plane.stride;
         if used[0] && used[1] {
-            chroma_pred_into(ctx, &refs[0][comp + 1], cx as i32, cy as i32, mv[0], cw, crh, h, &mut a);
-            chroma_pred_into(ctx, &refs[1][comp + 1], cx as i32, cy as i32, mv[1], cw, crh, h, &mut b);
+            chroma_pred_into(ctx, &refs[0][comp + 1], cx as i32, cy as i32, mv[0], ctx.chroma_mv_dy[0], cw, crh, h, &mut a);
+            chroma_pred_into(ctx, &refs[1][comp + 1], cx as i32, cy as i32, mv[1], ctx.chroma_mv_dy[1], cw, crh, h, &mut b);
             (ctx.dsp.avg)(&mut plane.data[off..], stride, &a, &b, cw, crh);
         } else {
             let l = if used[0] { 0 } else { 1 };
-            chroma_pred_into(ctx, &refs[l][comp + 1], cx as i32, cy as i32, mv[l], cw, crh, h, &mut a);
+            chroma_pred_into(ctx, &refs[l][comp + 1], cx as i32, cy as i32, mv[l], ctx.chroma_mv_dy[l], cw, crh, h, &mut a);
             put_uni(ctx, &mut plane.data[off..], stride, &a, cw, crh, weighting, comp + 1, l);
         }
     }
@@ -944,7 +962,7 @@ fn code_luma_8x8<S: Sample>(
     debug_assert_eq!(
         out.luma.as_flattened().iter().filter(|&&v| v != 0).count(),
         (0..4)
-            .map(|b| sub_block_counts_8x8(&out.luma.as_flattened()[b * 64..b * 64 + 64])
+            .map(|b| sub_block_counts_8x8_scan(&out.luma.as_flattened()[b * 64..b * 64 + 64], ctx.field)
                 .iter()
                 .map(|&n| n as usize)
                 .sum::<usize>())
@@ -1894,8 +1912,10 @@ pub fn b_sub_mb_type_code(shape: SubMbShape, dir: u8) -> u32 {
 /// satisfied.
 pub fn spatial_direct(
     st: &MbMotionState,
-    col: &PicMotion,
+    col: &Colocated,
     addr: usize,
+    field_mb: bool,
+    mb_parity: u8,
 ) -> ([i8; 2], [[Mv; 2]; 4]) {
     let mut ref_idx = st.direct_ref_idx();
     let mut mvp = [Mv::ZERO; 2];
@@ -1922,8 +1942,7 @@ pub fn spatial_direct(
     // partitioned P one, which is exactly where the tag said to look.
     let mut mv = [[Mv::ZERO; 2]; 4];
     for part in 0..4 {
-        let blk = colocated_block(true, part, 0);
-        let (col_mv, col_ref) = col.colocated(addr, blk);
+        let (col_mv, col_ref) = col.motion(addr, field_mb, mb_parity, part);
         let col_zero =
             col_ref == 0 && (-1..=1).contains(&col_mv.x) && (-1..=1).contains(&col_mv.y);
         for l in 0..2 {
@@ -2344,8 +2363,10 @@ pub fn code_macroblock_b<S: Sample>(
     src_chroma: [&[S]; 2],
     chroma_stride: usize,
     st: &mut MbMotionState,
-    col: &PicMotion,
+    col: &Colocated,
     addr: usize,
+    field_mb: bool,
+    mb_parity: u8,
 ) -> BDecision {
     let (px, py) = (mb_x * 16, mb_y * 16);
     let soff = py * luma_stride + px;
@@ -2354,7 +2375,9 @@ pub fn code_macroblock_b<S: Sample>(
 
     // Direct: derived once, a candidate in itself and the motion any
     // `B_Direct_8x8` sub-macroblock takes.
-    let direct = spatial_direct(st, col, addr);
+    // `field_mb` / `mb_parity`: an MBAFF field macroblock and its parity;
+    // outside MBAFF every macroblock is its picture's kind.
+    let direct = spatial_direct(st, col, addr, field_mb, mb_parity);
     let (dref, dmv) = direct;
     let dused = [dref[0] >= 0, dref[1] >= 0];
     let ddir = (dused[0] as u8) * PRED_L0 + (dused[1] as u8) * PRED_L1;
@@ -2565,6 +2588,8 @@ mod tests {
                 c444: false,
                 t8x8: false,
                 subparts: false,
+                field: false,
+                chroma_mv_dy: [0; 2],
             }
         }
     }
@@ -2958,7 +2983,7 @@ mod tests {
                 // The colocated picture as the encoder now stores one:
                 // real per-4x4 motion, which is what `colocated_motion`
                 // reads.
-                let mut col = PicMotion::new(3, 3);
+                let mut col = crate::encode::h264_pic::PicMotion::new(3, 3);
                 let mut col_mot = [[BlockMotion::default(); 16]; 2];
                 for l in 0..2 {
                     let uses = !col_intra && (l == 1 || !col_list1_only);
@@ -3017,7 +3042,7 @@ mod tests {
                 // Mine, over the same state the picture walk would hold.
                 let mut st = MbMotionState::new();
                 st.start(&frame, &info, cur_addr, &mut dnb);
-                let (got_ref, got_mv) = spatial_direct(&st, &col, cur_addr);
+                let (got_ref, got_mv) = spatial_direct(&st, &Colocated::progressive(&col), cur_addr, false, PARITY_FRAME);
                 assert_eq!(got_ref, want_ref, "mask {mask:04b} draw {draw} ref");
                 // The colocated macroblock here has one motion, so all
                 // four 8x8 answers must agree with the whole-macroblock
@@ -3058,7 +3083,7 @@ mod tests {
         ]);
         let _ = &mut st;
 
-        let mut col = PicMotion::new(3, 3);
+        let mut col = crate::encode::h264_pic::PicMotion::new(3, 3);
         let mut mot = [[BlockMotion::default(); 16]; 2];
         // Upper 16x8 still (colZero true), lower 16x8 moving.
         for blk in 0..16 {
@@ -3081,7 +3106,7 @@ mod tests {
             &mot,
         );
 
-        let (refs, mv) = spatial_direct(&st, &col, 4);
+        let (refs, mv) = spatial_direct(&st, &Colocated::progressive(&col), 4, false, PARITY_FRAME);
         assert_eq!(refs, [0, -1], "one list-0 neighbour gives reference 0 on list 0 only");
         // Partitions 0 and 1 are the upper half: their colocated corners
         // are blocks 0 and 3, both still, so colZeroFlag holds.
@@ -3149,7 +3174,7 @@ mod tests {
             for comp in 0..2 {
                 let plane = &rec[comp + 1];
                 let mut cpred = [0u8; 16 * PRED_STRIDE];
-                chroma_pred_into(&ctx, &refp[comp + 1], 8, 8, mv0, 8, 8, 8, &mut cpred);
+                chroma_pred_into(&ctx, &refp[comp + 1], 8, 8, mv0, 0, 8, 8, 8, &mut cpred);
                 let coff = plane.offset(8, 8);
                 let m = (qp % 6) as usize;
                 let mut dc = [0i32; 4];

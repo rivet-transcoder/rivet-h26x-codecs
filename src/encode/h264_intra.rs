@@ -32,7 +32,7 @@ use crate::dsp::h264::{H264Dsp, NO_DC};
 use crate::dsp::h264_enc::{H264EncDsp, Quant, qbits4, qbits8, quant_offset};
 use crate::encode::h264_syntax::Recon;
 use crate::sample::Sample;
-use crate::h264::cavlc::sub_block_counts_8x8;
+use crate::h264::cavlc::sub_block_counts_8x8_scan;
 use crate::h264::intra::{IntraAvail, predict_4x4, predict_8x8, predict_16x16, predict_chroma};
 use crate::h264::mb::dequant_level;
 use crate::h264::tables::BLK4X4_FROM_RASTER;
@@ -246,6 +246,16 @@ pub struct IntraCtx<'a, S: Sample> {
     /// encoder's own switch, and its only job is to keep the streams that
     /// do not ask for them byte-identical to what came before.
     pub subparts: bool,
+    /// The macroblocks are field macroblocks — a field picture's (or, in
+    /// an MBAFF frame, a field pair's): their residual is read in the
+    /// field scans, so the CAVLC sub-scan counts of an 8x8 block are the
+    /// field sub-scans' (`sub_block_counts_8x8_scan` in src/h264/cavlc.rs).
+    pub field: bool,
+    /// Per reference list, the vertical chroma vector offset every chroma
+    /// prediction from that list's reference 0 takes
+    /// ([`Geometry::chroma_mv_dy`](crate::encode::h264_syntax::Geometry::chroma_mv_dy)):
+    /// zero outside a 4:2:0 field predicting from the opposite parity.
+    pub chroma_mv_dy: [i32; 2],
 }
 
 /// Whether a 4x4 block's top-right neighbour has been reconstructed by the
@@ -360,7 +370,7 @@ pub(crate) fn code_block_8x8<S: Sample>(
     let offset = quant_offset(qbits, intra);
     let mut levels = [0i16; 64];
     let _ = (ctx.enc.quant8)(&coeffs, &mut levels, &ctx.quant.mf8[list8][(qp % 6) as usize], qbits, offset);
-    let counts = sub_block_counts_8x8(&levels);
+    let counts = sub_block_counts_8x8_scan(&levels, ctx.field);
     (levels, counts)
 }
 
@@ -1155,6 +1165,34 @@ pub fn code_macroblock<S: Sample>(
     left_modes: &[Option<u8>; 4],
     top_modes: &[Option<u8>; 4],
 ) -> (MbDecision, [u8; 16]) {
+    code_macroblock_modes8(
+        ctx, rec, mb_x, mb_y, src_luma, luma_stride, src_chroma, chroma_stride, mb, left_modes, top_modes, left_modes,
+    )
+}
+
+/// [`code_macroblock`] with the left modes an 8x8 block predicts from
+/// given apart from a 4x4 block's. 8.3.2.1 reads an `I_4x4` left
+/// neighbour's mode from a sub-block of the neighbouring 8x8 fixed by `n`,
+/// which outside MBAFF is the block on the edge — the same array — and in
+/// an MBAFF frame need not be: a field macroblock beside a frame pair
+/// takes the neighbouring 8x8's top-right sub-block where its row maps to
+/// the bottom one. The MBAFF walk derives both arrays; everything else
+/// passes one twice.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn code_macroblock_modes8<S: Sample>(
+    ctx: &IntraCtx<S>,
+    rec: &mut [Recon<S>],
+    mb_x: usize,
+    mb_y: usize,
+    src_luma: &[S],
+    luma_stride: usize,
+    src_chroma: [&[S]; 2],
+    chroma_stride: usize,
+    mb: MbAvail,
+    left_modes: &[Option<u8>; 4],
+    top_modes: &[Option<u8>; 4],
+    left_modes8: &[Option<u8>; 4],
+) -> (MbDecision, [u8; 16]) {
     let (px, py) = (mb_x * 16, mb_y * 16);
     let soff = py * luma_stride + px;
     let mut out = MbDecision::default();
@@ -1200,7 +1238,7 @@ pub fn code_macroblock<S: Sample>(
             &src_luma[soff..],
             luma_stride,
             mb,
-            left_modes,
+            left_modes8,
             top_modes,
             &mut out8,
         );
@@ -1248,7 +1286,7 @@ pub fn code_macroblock<S: Sample>(
             &src_luma[soff..],
             luma_stride,
             mb,
-            left_modes,
+            left_modes8,
             top_modes,
             &mut redo,
         );
@@ -1499,6 +1537,8 @@ mod tests {
                 c444: true,
                 t8x8: true,
                 subparts: false,
+                field: false,
+                chroma_mv_dy: [0; 2],
             };
             // (the encoder's 8x8 list index, the plane it codes, whether
             // the macroblock is inter, and the QP that plane is coded at)
@@ -1588,6 +1628,8 @@ mod tests {
             c444: false,
             t8x8: false,
             subparts: false,
+            field: false,
+            chroma_mv_dy: [0; 2],
         };
         let mut rec = crate::encode::h264_syntax::recon_plane(32, 32, 16);
         for v in rec.data.iter_mut() {

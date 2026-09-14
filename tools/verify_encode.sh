@@ -221,6 +221,16 @@ if [ -z "$SOURCES" ]; then
   exit 2
 fi
 
+# EXCLUSIVE_TOKENS: a source whose name contains one of these tokens is
+# visited ONLY by rows whose `@` tag contains that same token. A row's tag is
+# otherwise a plain substring of the clip name, so a new clip is visited by
+# every row whose tag happens to occur in its name — a 10-bit clip is spelled
+# `..._420p10` and would join every `@p10` row — and its arrival would change
+# the cost of rows that never asked for it. `ilace`: the 10-bit interlaced
+# clip, src_ilace10_96x96_420p10, visited only by `@ilace10` rows.
+# Defined identically in identity_encode.sh, whose cells must be these.
+EXCLUSIVE_TOKENS="ilace"
+
 # A configuration's name may carry an `@substring` suffix, which restricts
 # it to sources whose filename contains that substring. Rows are not all
 # meaningful on all clips and pretending otherwise costs either coverage or
@@ -362,6 +372,20 @@ fi
 # a B picture, and a 10-bit fade with B pictures runs in the unit test; the
 # @wpoff rows put an offset in both lists; refs2 mixes a two-entry P table
 # with one-entry B lists; the ABR row runs the fit under a lookahead.
+# The h264-paff / h264-mbaff rows are H.264 interlaced coding. They visit the
+# two interlaced clips: src_interlace_96x96_420p8 (`@interlace`: fields 20 ms
+# apart, a scrolling half beside a held one, combed so that PAFF has field
+# pictures to choose), whose `p8` suffix keeps every untagged row off it, and
+# its 10-bit twin src_ilace10_96x96_420p10 (`@ilace10`), whose name carries an
+# EXCLUSIVE_TOKENS token so that no `@p10` row visits it. Two deep rows also
+# code the progressive @p10 / @420p10 clips as interlaced. `field` codes every
+# frame as two field pictures, `paff` and `mbaff` decide per picture and per
+# macroblock pair, and h26xenc's `interlace` census line counts what each cell
+# actually coded. A wrong bottom_field_flag is red under SELF, not CROSS:
+# libavcodec follows the flag exactly as our decoder does, so the two agree on
+# the misread stream while both differ from the encoder's reconstruction.
+# CROSS checks the field reference lists and field-geometry filtering with a
+# decoder that shares none of our code.
 CONFIGS=${CONFIGS:-"
 lossless-intra|--codec h264 --lossless --gop 0
 cqp-intra|--codec h264 --qp 26 --gop 0
@@ -517,6 +541,29 @@ hevc-wpoff-ipb@wpoff|--codec h265 --qp 26 --gop 8 --bframes 2 --wpred
 hevc-wpoff40-ipb@wpoff|--codec h265 --qp 40 --gop 8 --bframes 2 --wpred
 hevc-wp-refs2-ipb@fade|--codec h265 --qp 26 --gop 8 --bframes 2 --refs 2 --wpred
 hevc-wp-abr-la-ipb-64k@fade|--codec h265 --bitrate 64000 --gop 8 --bframes 2 --lookahead 4 --wpred
+h264-paff-field-ip@interlace|--codec h264 --qp 26 --gop 8 --interlace tff --field-coding field
+h264-paff-field-cavlc-ip@interlace|--codec h264 --qp 26 --gop 8 --cavlc --interlace bff --field-coding field
+h264-paff-field-ipb@interlace|--codec h264 --qp 26 --gop 8 --bframes 2 --interlace tff --field-coding field
+h264-paff-field-cavlc-ipb@interlace|--codec h264 --qp 26 --gop 8 --bframes 2 --cavlc --interlace bff --field-coding field
+h264-paff-field40-t8x8-subparts-ipb@interlace|--codec h264 --qp 40 --gop 8 --bframes 2 --t8x8 --subparts --interlace tff --field-coding field
+h264-paff-field-cavlc40-t8x8-subparts-ip@interlace|--codec h264 --qp 40 --gop 8 --cavlc --t8x8 --subparts --interlace bff --field-coding field
+h264-10-paff-field-ipb@p10|--codec h264 --qp 26 --gop 8 --bframes 2 --interlace tff --field-coding field
+h264-paff-ip@interlace|--codec h264 --qp 26 --gop 8 --interlace tff --field-coding paff
+h264-paff-ipb@interlace|--codec h264 --qp 26 --gop 8 --bframes 2 --interlace bff --field-coding paff
+h264-paff-cavlc-ipb@interlace|--codec h264 --qp 26 --gop 8 --bframes 2 --cavlc --interlace tff --field-coding paff
+h264-paff40-cavlc-t8x8-subparts-ip@interlace|--codec h264 --qp 40 --gop 8 --cavlc --t8x8 --subparts --interlace bff --field-coding paff
+h264-10-paff-ipb@ilace10|--codec h264 --qp 26 --gop 8 --bframes 2 --interlace bff --field-coding paff
+h264-mbaff-intra@interlace|--codec h264 --qp 26 --gop 0 --interlace tff --field-coding mbaff
+h264-mbaff-ip@interlace|--codec h264 --qp 26 --gop 8 --interlace tff --field-coding mbaff
+h264-mbaff-cavlc-ip@interlace|--codec h264 --qp 26 --gop 8 --cavlc --interlace bff --field-coding mbaff
+h264-mbaff-ipb@interlace|--codec h264 --qp 26 --gop 8 --bframes 2 --interlace bff --field-coding mbaff
+h264-mbaff-cavlc-ipb@interlace|--codec h264 --qp 26 --gop 8 --bframes 2 --cavlc --interlace tff --field-coding mbaff
+h264-mbaff40-t8x8-subparts-ipb@interlace|--codec h264 --qp 40 --gop 8 --bframes 2 --t8x8 --subparts --interlace tff --field-coding mbaff
+h264-mbaff-cavlc40-t8x8-subparts-ip@interlace|--codec h264 --qp 40 --gop 8 --cavlc --t8x8 --subparts --interlace bff --field-coding mbaff
+h264-10-mbaff-ipb@420p10|--codec h264 --qp 26 --gop 8 --bframes 2 --interlace tff --field-coding mbaff
+h264-10-paff-cavlc-ip@ilace10|--codec h264 --qp 26 --gop 8 --cavlc --interlace tff --field-coding paff
+h264-10-mbaff-ip@ilace10|--codec h264 --qp 26 --gop 8 --interlace tff --field-coding mbaff
+h264-10-mbaff-cavlc-ipb@ilace10|--codec h264 --qp 26 --gop 8 --bframes 2 --cavlc --interlace bff --field-coding mbaff
 "}
 
 # Split a clip's format token into its chroma format and sample depth:
@@ -764,6 +811,9 @@ for src in $SOURCES; do
   # only, and the H.265 rows have their deep twins listed explicitly so
   # the tally says how many deep cells ran rather than folding them in.
   case "$src" in *_[0-9][0-9][0-9]p[0-9]*.yuv) deep=1 ;; *) deep=0 ;; esac
+  # The exclusive tokens (EXCLUSIVE_TOKENS, above) this source carries.
+  excl=
+  for tok in $EXCLUSIVE_TOKENS; do case "$src" in *"$tok"*) excl="$excl $tok" ;; esac; done
   echo "$CONFIGS" | while IFS='|' read -r name flags; do
     [ -z "$name" ] && continue
     # A configuration with no flags is always a mistake — most often a
@@ -778,6 +828,7 @@ for src in $SOURCES; do
     case "$name" in
       *@*)
         pat=${name##*@}
+        for tok in $excl; do case "$pat" in *"$tok"*) ;; *) continue 2 ;; esac; done
         case "$src" in
           *"$pat"*) name=${name%@*} ;;
           *) continue ;;
@@ -785,6 +836,7 @@ for src in $SOURCES; do
         ;;
       *)
         [ "$deep" = 1 ] && continue
+        [ -n "$excl" ] && continue
         ;;
     esac
     echo "$src|$name|$flags"

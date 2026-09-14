@@ -281,18 +281,7 @@ impl<S: Sample> PictureDecoder<S> {
         // MBAFF: the pair's mb_field_decoding_flag (decoded, or inferred from
         // the left / above pair when the pair carries none — 7.4.4).
         let mut pair_field = false;
-        let infer_field = |info: &PicInfo, sa: usize| -> bool {
-            let x = sa % mbw;
-            let pr = (sa / mbw) / 2;
-            let ok = |t: usize| info.mbs[t].decoded && info.mbs[t].slice == slice_num;
-            if x > 0 && ok((2 * pr) * mbw + x - 1) {
-                info.mbs[(2 * pr) * mbw + x - 1].field
-            } else if pr > 0 && ok((2 * pr - 2) * mbw + x) {
-                info.mbs[(2 * pr - 2) * mbw + x].field
-            } else {
-                false
-            }
-        };
+        let infer_field = |info: &PicInfo, sa: usize| -> bool { infer_mb_field(info, sa, slice_num) };
         // Neighbours of the macroblock at storage address `sa`.
         // Luma-like planes and 4:2:0 / 4:2:2 chroma block rows whose
         // neighbouring nonzero counts the entropy decoders read.
@@ -593,6 +582,26 @@ impl<S: Sample> PictureDecoder<S> {
         if let Some(f) = self.field.take() {
             self.frames.give(f);
         }
+    }
+}
+
+/// The inferred `mb_field_decoding_flag` of the macroblock pair holding
+/// storage address `sa` (7.4.4): the left pair's flag when that pair is
+/// available (decoded, in slice `slice`), else the above pair's, else frame.
+/// It is what a pair carrying no flag decodes as, and the flag a top
+/// macroblock's neighbours are derived under before its pair's flag is
+/// read. Crate-visible so the encoder's MBAFF writers derive exactly this.
+pub(crate) fn infer_mb_field(info: &PicInfo, sa: usize, slice: u16) -> bool {
+    let mbw = info.mb_width;
+    let x = sa % mbw;
+    let pr = (sa / mbw) / 2;
+    let ok = |t: usize| info.mbs[t].decoded && info.mbs[t].slice == slice;
+    if x > 0 && ok((2 * pr) * mbw + x - 1) {
+        info.mbs[(2 * pr) * mbw + x - 1].field
+    } else if pr > 0 && ok((2 * pr - 2) * mbw + x) {
+        info.mbs[(2 * pr - 2) * mbw + x].field
+    } else {
+        false
     }
 }
 

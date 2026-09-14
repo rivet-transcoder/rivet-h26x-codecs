@@ -192,6 +192,33 @@ pub struct ContentLightLevel {
     pub max_fall: u16,
 }
 
+/// Which field of an interlaced frame is earlier in time — the order the
+/// two fields were captured in, which is the order they are coded and
+/// displayed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldOrder {
+    /// The top field (the frame's even rows, counting from 0) first.
+    TopFirst,
+    /// The bottom field (the odd rows) first.
+    BottomFirst,
+}
+
+/// How an interlaced H.264 frame is coded (see [`Config::interlace`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldCoding {
+    /// Every frame as two field pictures (`field_pic_flag` 1), in the
+    /// frame's field order — picture-adaptive frame/field coding with the
+    /// choice pinned to fields.
+    Field,
+    /// Picture-adaptive frame/field coding: each frame as one frame
+    /// picture or as two field pictures, chosen by cost.
+    Paff,
+    /// Macroblock-adaptive frame/field coding (`mb_adaptive_frame_field_flag`
+    /// 1): frame pictures whose macroblock pairs are each coded as frame or
+    /// field macroblocks, chosen by cost.
+    Mbaff,
+}
+
 /// Everything the encoder needs that is not a picture.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -389,6 +416,22 @@ pub struct Config {
     /// defaulting to 2 would have made every default configuration one it
     /// refuses.
     pub max_cu_depth: Option<u32>,
+    /// H.264: the source pictures are interlaced frames, in this field
+    /// order, and are coded as interlaced video (`frame_mbs_only_flag` 0)
+    /// the way [`Config::field_coding`] says. `None`, the default, codes
+    /// progressive frames and every stream is byte-identical to one from
+    /// an encoder that never had the switch.
+    ///
+    /// A frame's top field is its even rows and its bottom field its odd
+    /// ones, chroma included. The height must be a whole number of
+    /// cropping units — four rows in 4:2:0, two otherwise — because an
+    /// interlaced stream crops in field rows (7.4.2.1.1's `CropUnitY`).
+    /// H.265 has no interlaced coding tools and refuses the switch by
+    /// name.
+    pub interlace: Option<FieldOrder>,
+    /// H.264, with [`Config::interlace`]: field pictures, picture-adaptive
+    /// or macroblock-adaptive frame/field coding. Ignored without it.
+    pub field_coding: FieldCoding,
 }
 
 impl Default for Config {
@@ -417,6 +460,8 @@ impl Default for Config {
             mastering_display: None,
             content_light: None,
             max_cu_depth: None,
+            interlace: None,
+            field_coding: FieldCoding::Paff,
         }
     }
 }
