@@ -75,7 +75,7 @@ macro_rules! kernels {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn absdiff(a: __m128i, b: __m128i) -> __m128i {
-            unsafe { _mm_or_si128(_mm_subs_epu16(a, b), _mm_subs_epu16(b, a)) }
+            _mm_or_si128(_mm_subs_epu16(a, b), _mm_subs_epu16(b, a))
         }
 
         /// Adjacent u16 lanes summed into four i32, each sum less 65536:
@@ -83,7 +83,7 @@ macro_rules! kernels {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn fold(v: __m128i) -> __m128i {
-            unsafe { _mm_madd_epi16(_mm_xor_si128(v, _mm_set1_epi16(i16::MIN)), _mm_set1_epi16(1)) }
+            _mm_madd_epi16(_mm_xor_si128(v, _mm_set1_epi16(i16::MIN)), _mm_set1_epi16(1))
         }
 
         /// The four i32 lanes of `v`, summed in i64.
@@ -189,26 +189,22 @@ macro_rules! kernels {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn butterfly16(r0: __m128i, r1: __m128i, r2: __m128i, r3: __m128i) -> [__m128i; 4] {
-            unsafe {
-                let s0 = _mm_add_epi16(r0, r3);
-                let s1 = _mm_add_epi16(r1, r2);
-                let s2 = _mm_sub_epi16(r1, r2);
-                let s3 = _mm_sub_epi16(r0, r3);
-                [_mm_add_epi16(s0, s1), _mm_add_epi16(s3, s2), _mm_sub_epi16(s0, s1), _mm_sub_epi16(s3, s2)]
-            }
+            let s0 = _mm_add_epi16(r0, r3);
+            let s1 = _mm_add_epi16(r1, r2);
+            let s2 = _mm_sub_epi16(r1, r2);
+            let s3 = _mm_sub_epi16(r0, r3);
+            [_mm_add_epi16(s0, s1), _mm_add_epi16(s3, s2), _mm_sub_epi16(s0, s1), _mm_sub_epi16(s3, s2)]
         }
 
         /// The same across four i32 vectors.
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn butterfly32(r0: __m128i, r1: __m128i, r2: __m128i, r3: __m128i) -> [__m128i; 4] {
-            unsafe {
-                let s0 = _mm_add_epi32(r0, r3);
-                let s1 = _mm_add_epi32(r1, r2);
-                let s2 = _mm_sub_epi32(r1, r2);
-                let s3 = _mm_sub_epi32(r0, r3);
-                [_mm_add_epi32(s0, s1), _mm_add_epi32(s3, s2), _mm_sub_epi32(s0, s1), _mm_sub_epi32(s3, s2)]
-            }
+            let s0 = _mm_add_epi32(r0, r3);
+            let s1 = _mm_add_epi32(r1, r2);
+            let s2 = _mm_sub_epi32(r1, r2);
+            let s3 = _mm_sub_epi32(r0, r3);
+            [_mm_add_epi32(s0, s1), _mm_add_epi32(s3, s2), _mm_sub_epi32(s0, s1), _mm_sub_epi32(s3, s2)]
         }
 
         /// SATD of the two tiles of differences in `r0..r3` (one row each,
@@ -385,14 +381,14 @@ pub(crate) mod avx2 {
     #[target_feature(enable = "avx2")]
     #[inline]
     unsafe fn absdiff(a: __m256i, b: __m256i) -> __m256i {
-        unsafe { _mm256_or_si256(_mm256_subs_epu16(a, b), _mm256_subs_epu16(b, a)) }
+        _mm256_or_si256(_mm256_subs_epu16(a, b), _mm256_subs_epu16(b, a))
     }
 
     /// Adjacent u16 lanes summed into i32, each sum less 65536.
     #[target_feature(enable = "avx2")]
     #[inline]
     unsafe fn fold(v: __m256i) -> __m256i {
-        unsafe { _mm256_madd_epi16(_mm256_xor_si256(v, _mm256_set1_epi16(i16::MIN)), _mm256_set1_epi16(1)) }
+        _mm256_madd_epi16(_mm256_xor_si256(v, _mm256_set1_epi16(i16::MIN)), _mm256_set1_epi16(1))
     }
 
     /// The eight i32 lanes of `v`, summed in i64.
@@ -469,25 +465,21 @@ pub(crate) mod avx2 {
     #[target_feature(enable = "avx2")]
     #[inline]
     unsafe fn butterfly16(r0: __m256i, r1: __m256i, r2: __m256i, r3: __m256i) -> [__m256i; 4] {
-        unsafe {
-            let s0 = _mm256_add_epi16(r0, r3);
-            let s1 = _mm256_add_epi16(r1, r2);
-            let s2 = _mm256_sub_epi16(r1, r2);
-            let s3 = _mm256_sub_epi16(r0, r3);
-            [_mm256_add_epi16(s0, s1), _mm256_add_epi16(s3, s2), _mm256_sub_epi16(s0, s1), _mm256_sub_epi16(s3, s2)]
-        }
+        let s0 = _mm256_add_epi16(r0, r3);
+        let s1 = _mm256_add_epi16(r1, r2);
+        let s2 = _mm256_sub_epi16(r1, r2);
+        let s3 = _mm256_sub_epi16(r0, r3);
+        [_mm256_add_epi16(s0, s1), _mm256_add_epi16(s3, s2), _mm256_sub_epi16(s0, s1), _mm256_sub_epi16(s3, s2)]
     }
 
     #[target_feature(enable = "avx2")]
     #[inline]
     unsafe fn butterfly32(r0: __m256i, r1: __m256i, r2: __m256i, r3: __m256i) -> [__m256i; 4] {
-        unsafe {
-            let s0 = _mm256_add_epi32(r0, r3);
-            let s1 = _mm256_add_epi32(r1, r2);
-            let s2 = _mm256_sub_epi32(r1, r2);
-            let s3 = _mm256_sub_epi32(r0, r3);
-            [_mm256_add_epi32(s0, s1), _mm256_add_epi32(s3, s2), _mm256_sub_epi32(s0, s1), _mm256_sub_epi32(s3, s2)]
-        }
+        let s0 = _mm256_add_epi32(r0, r3);
+        let s1 = _mm256_add_epi32(r1, r2);
+        let s2 = _mm256_sub_epi32(r1, r2);
+        let s3 = _mm256_sub_epi32(r0, r3);
+        [_mm256_add_epi32(s0, s1), _mm256_add_epi32(s3, s2), _mm256_sub_epi32(s0, s1), _mm256_sub_epi32(s3, s2)]
     }
 
     /// Four tiles across in i16, two per 128-bit lane: the 128-bit `pair16`
