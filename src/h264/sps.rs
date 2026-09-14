@@ -44,6 +44,12 @@ pub struct Vui {
     pub max_num_reorder_frames: Option<u32>,
     /// `max_dec_frame_buffering`, when signalled.
     pub max_dec_frame_buffering: Option<u32>,
+    /// `video_signal_type_present_flag`: the stream states its video format
+    /// and range, with or without a colour description. Without it
+    /// `full_range` is the value E.2.1 infers (0), not something the stream
+    /// said — which a consumer choosing between the stream and a container
+    /// needs to tell apart.
+    pub video_signal_type: bool,
     /// `video_full_range_flag`.
     pub full_range: bool,
     /// `colour_primaries`, `transfer_characteristics`, `matrix_coefficients`
@@ -337,6 +343,7 @@ fn parse_vui(r: &mut BitReader) -> Vui {
     }
     if r.flag() {
         // video_signal_type_present_flag
+        vui.video_signal_type = true;
         r.bits(3); // video_format
         vui.full_range = r.flag();
         if r.flag() {
@@ -523,5 +530,46 @@ impl Sps {
             return Err(Error::bitstream("SPS: cropping window larger than the picture"));
         }
         Ok(sps)
+    }
+}
+
+#[cfg(test)]
+mod vui_signal_type_tests {
+    use super::*;
+
+    /// An SPS NAL unit (its header byte included, no start code) → its VUI.
+    fn vui(nal: &[u8]) -> Vui {
+        let rbsp = crate::nal::unescape_rbsp(&nal[1..]);
+        Sps::parse(&rbsp).expect("SPS parses").vui.expect("VUI present")
+    }
+
+    /// ffmpeg 8.1.1 libx264, 64x64 testsrc2, `-color_range pc` and no other
+    /// colour option. trace_headers: video_signal_type_present_flag=1
+    /// video_full_range_flag=1 colour_description_present_flag=0.
+    const FULL_RANGE_ONLY: &[u8] = &[
+        0x67, 0x64, 0x00, 0x0a, 0xac, 0xd9, 0x44, 0x26, 0xc0, 0x5b, 0x20, 0x00, 0x00, 0x03, 0x00,
+        0x20, 0x00, 0x00, 0x07, 0x81, 0xe2, 0x44, 0xb2, 0xc0,
+    ];
+    /// The same encode without `-color_range`. trace_headers:
+    /// video_signal_type_present_flag=0.
+    const NO_SIGNAL_TYPE: &[u8] = &[
+        0x67, 0x64, 0x00, 0x0a, 0xac, 0xd9, 0x44, 0x26, 0xc0, 0x44, 0x00, 0x00, 0x03, 0x00, 0x04,
+        0x00, 0x00, 0x03, 0x00, 0xf0, 0x3c, 0x48, 0x96, 0x58,
+    ];
+
+    #[test]
+    fn a_range_without_a_colour_description_is_a_signalled_range() {
+        let v = vui(FULL_RANGE_ONLY);
+        assert!(v.video_signal_type);
+        assert!(v.full_range);
+        assert_eq!(v.colour_description, None);
+    }
+
+    #[test]
+    fn no_signal_type_is_told_apart_from_a_signalled_limited_range() {
+        let v = vui(NO_SIGNAL_TYPE);
+        assert!(!v.video_signal_type, "the flag is absent from this SPS");
+        assert!(!v.full_range, "the inferred value");
+        assert_eq!(v.colour_description, None);
     }
 }
