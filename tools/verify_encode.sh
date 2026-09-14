@@ -469,6 +469,18 @@ one() {
   frames=$(( $(stat -c %s "$src") / $(frame_bytes "$geom" "$chroma" "$depth") ))
   speed=$(awk -v ns="$((t1 - t0))" -v f="$frames" 'BEGIN { s = ns / 1e9; printf "%.3f s, %.0f f/s", s, (s > 0 ? f / s : 0) }')
 
+  # Every source picture has to come out. SELF and CROSS compare the stream
+  # with itself, so an encoder that drops pictures — a flush that forgets the
+  # ones a lookahead is holding — writes a shorter stream whose every picture
+  # still decodes to its reconstruction on both decoders, at a PSNR over the
+  # pictures that exist and a rate divided by them. Counting the
+  # reconstruction is the check nothing else here makes.
+  fb=$(frame_bytes "$geom" "$chroma" "$depth")
+  if [ "$(stat -c %s "$rec")" != "$((frames * fb))" ]; then
+    echo "ENCODE-FAIL $tag: the reconstruction holds $(( $(stat -c %s "$rec") / fb )) pictures, the source $frames"
+    return 1
+  fi
+
   # 1. SELF.
   ours="$OUT/$base.$name.ours.yuv"
   # H.264 4:0:0: ask the decoder for the samples the codec produced rather
