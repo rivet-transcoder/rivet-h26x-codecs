@@ -19,8 +19,8 @@
 //!
 //! # The coding quadtree
 //!
-//! `Config::max_cu_depth` (0 by default) lets a CTB split into smaller
-//! coding units, down to the 8x8 minimum coding block. Every node is a
+//! `Config::max_cu_depth` ([`DEFAULT_CU_DEPTH`], 2, when unset) lets a CTB
+//! split into smaller coding units, down to the 8x8 minimum coding block. Every node is a
 //! rate-distortion decision — the node coded whole against the node coded
 //! as four children, each side's cost its reconstruction's SSD plus the
 //! Lagrangian times the bits the production writer counts for its syntax
@@ -29,10 +29,10 @@
 //! decode order (`TreeCu`); the quadtree is read back from the placements
 //! to be written (`write_tree`) and walked by the quantiser chain
 //! (`QgChain`), which follows the reader's quantisation groups at any group
-//! and unit size. At 0 every CTB is one unit, and the stream is the one this
-//! encoder wrote before the quadtree existed.
+//! and unit size. At `Some(0)` every CTB is one unit, and the stream is the
+//! one this encoder wrote before the quadtree existed.
 //!
-//! ## Measured (2026-09-14), and the proposal on the default
+//! ## Measured (2026-09-14), and the default it decided
 //!
 //! One binary, `--cu-depth` the only difference, BD-rate by
 //! `tools/bd_rate.py`'s method (QP 22/27/32/37, luma PSNR of the encoder's
@@ -82,15 +82,13 @@
 //! is cheap — one motion search, mostly skips — while every node below it
 //! runs a search of its own.
 //!
-//! **Proposal, for the lead to decide: make `max_cu_depth` default to 2.**
-//! It buys a third of the bits at equal quality (-29% all-intra, -36% IP)
-//! for three to six times the CPU — a larger saving than every other tool
-//! this encoder has put together, on every clip but the flat gradient,
-//! where it costs nothing but time. If encode throughput is what binds —
-//! rivet's software tier runs this encoder inline — depth 1 is the middle
-//! of the road: half the saving (-19% / -16%) for about twice the CPU. The
-//! default stays 0 in this commit, because flipping it moves every H.265
-//! stream the gate knows.
+//! **Decided: the default is 2** ([`DEFAULT_CU_DEPTH`]). It buys a third of
+//! the bits at equal quality (-29% all-intra, -36% IP) for three to six
+//! times the CPU — what a full CU quadtree buys in any H.265 encoder, and a
+//! larger saving than every other tool this encoder has put together, on
+//! every clip but the flat gradient, where it costs nothing but time. A
+//! caller whose encode throughput binds asks for `Some(1)` — half the
+//! saving (-19% / -16%) for about twice the CPU — or `Some(0)`.
 
 use super::gop::{Coded, Kind, Scheduler};
 use super::h265_deblock::{deblock_inter_picture, deblock_picture};
@@ -1449,11 +1447,18 @@ impl PicCost {
     }
 }
 
+/// The coding-quadtree depth this encoder codes when the configuration
+/// leaves `max_cu_depth` unset: two splits below the CTB, down to 8x8 at a
+/// 32x32 CTB. Decided on the measurement recorded in this module's docs;
+/// `Some(0)` still codes one unit per CTB.
+pub const DEFAULT_CU_DEPTH: u32 = 2;
+
 /// How many quadtree levels below the CTB a stream coded under `cfg` at
-/// geometry `g` may split: what `max_cu_depth` asks, held above the 8x8
-/// minimum coding block — so a 16x16 CTB splits at most once.
+/// geometry `g` may split: what `max_cu_depth` asks, or
+/// [`DEFAULT_CU_DEPTH`] when it asks nothing, held above the 8x8 minimum
+/// coding block — so a 16x16 CTB splits at most once.
 fn tree_depth(cfg: &Config, g: &syn::Geometry) -> u32 {
-    cfg.max_cu_depth.min(g.log2_ctb - MIN_CB_LOG2)
+    cfg.max_cu_depth.unwrap_or(DEFAULT_CU_DEPTH).min(g.log2_ctb - MIN_CB_LOG2)
 }
 
 /// The quantiser the unit of `1 << log2` at `(x0, y0)` codes at: the
@@ -4313,7 +4318,7 @@ mod tests {
         ] {
             let tag = format!("{w}x{h} {chroma:?} {bit_depth}-bit gop={gop} bframes={bframes} {rate:?} aq={aq_strength} depth={max_cu_depth}");
             let frames = tree_frames(w, h, chroma, bit_depth, 6);
-            let config = Config { gop, bframes, bit_depth, rate, aq_strength, max_cu_depth, ..cfg(w as u32, h as u32, chroma) };
+            let config = Config { gop, bframes, bit_depth, rate, aq_strength, max_cu_depth: Some(max_cu_depth), ..cfg(w as u32, h as u32, chroma) };
             let mut e = H265Encoder::new(config.clone()).unwrap_or_else(|err| panic!("{tag}: {err}"));
             let mut units = Vec::new();
             for f in &frames {
@@ -4374,9 +4379,9 @@ mod tests {
             assert!(m > 0.5 * c && m < 2.0 * c, "{name} pictures: the split decisions priced {m} bits for {c} coded");
         }
 
-        // A tree changes the stream; no tree is the stream before it.
+        // A tree changes the stream, and the default is the depth-2 tree.
         let frames = tree_frames(64, 64, ChromaFormat::Yuv420, 8, 3);
-        let encode = |max_cu_depth: u32| -> Vec<u8> {
+        let encode = |max_cu_depth: Option<u32>| -> Vec<u8> {
             let mut e = H265Encoder::new(Config { gop: 8, max_cu_depth, ..cfg(64, 64, ChromaFormat::Yuv420) }).unwrap();
             let mut out = Vec::new();
             for f in &frames {
@@ -4389,12 +4394,14 @@ mod tests {
             }
             out
         };
-        assert_eq!(encode(0), encode(Config::default().max_cu_depth), "the default must be no tree");
-        assert_ne!(encode(0), encode(2), "a depth-2 tree changed nothing on content built to split");
+        assert_eq!(Config::default().max_cu_depth, None, "the default asks nothing, and the encoder's default answers");
+        assert_eq!(encode(None), encode(Some(DEFAULT_CU_DEPTH)), "an unset depth must code the default depth");
+        assert_eq!(DEFAULT_CU_DEPTH, 2);
+        assert_ne!(encode(Some(0)), encode(Some(2)), "a depth-2 tree changed nothing on content built to split");
 
         // Deeper than the minimum coding block allows at any CTB is refused
         // by name rather than clamped.
-        let err = H265Encoder::new(Config { max_cu_depth: 3, ..cfg(64, 64, ChromaFormat::Yuv420) }).err().expect("depth 3 must refuse");
+        let err = H265Encoder::new(Config { max_cu_depth: Some(3), ..cfg(64, 64, ChromaFormat::Yuv420) }).err().expect("depth 3 must refuse");
         assert!(format!("{err}").contains("max_cu_depth"), "{err}");
     }
 

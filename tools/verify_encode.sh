@@ -263,9 +263,12 @@ fi
 # format axis lives in the sources; a QP table reached under one format
 # alone needs both, and a row above 29 is necessary rather than
 # sufficient.
-# The `hevc*-cu*` rows turn on the H.265 coding quadtree (`--cu-depth`), and
-# which clip carries what is worth knowing. Depth 2 (8x8 units, PART_NxN)
-# is reachable only on 32x32 CTBs: the odd clip's 16x16 CTBs stop at depth
+# The H.265 encoder codes its coding quadtree by default (depth 2), so every
+# untagged hevc row exercises it; the `hevc*-cu0-*` rows (`--cu-depth 0`)
+# keep the whole-CTB path — the geometry of every stream before the
+# quadtree — under the same properties, and `hevc-cu1-ipb` the one-split
+# depth. Which clip carries what is worth knowing. Depth 2 (8x8 units,
+# PART_NxN) is reachable only on 32x32 CTBs: the odd clip's 16x16 CTBs stop at depth
 # 1 whatever the row asks, and grad's smooth gradients split almost nowhere
 # (its cells prove the syntax). detail, motion, cut and fade split at every
 # depth in every picture kind; NxN is taken on every clip in I pictures and
@@ -463,26 +466,26 @@ hevc10-hlg-ipb@p10|--codec h265 --qp 26 --gop 8 --bframes 2 --color 9:18:9
 hevc10-hlg-topleft-ip@420p10|--codec h265 --qp 26 --gop 8 --color 9:18:9 --chroma-loc 2
 abr-64k-cpb250-hdr10-sei@src_cut|--codec h264 --bitrate 64000 --cpb-ms 250 --gop 8 --color 9:16:9 --mastering-display G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1) --content-light 1000,400
 hevc10-hdr10-sei-ip@p10|--codec h265 --qp 26 --gop 8 --color 9:16:9 --mastering-display G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1) --content-light 1000,400
-hevc-cu2-intra|--codec h265 --qp 26 --gop 0 --cu-depth 2
-hevc-cu2-ip|--codec h265 --qp 26 --gop 8 --cu-depth 2
-hevc-cu2-ipb|--codec h265 --qp 26 --gop 8 --bframes 2 --cu-depth 2
+hevc-cu0-intra|--codec h265 --qp 26 --gop 0 --cu-depth 0
+hevc-cu0-ip|--codec h265 --qp 26 --gop 8 --cu-depth 0
+hevc-cu0-ipb|--codec h265 --qp 26 --gop 8 --bframes 2 --cu-depth 0
 hevc-cu1-ipb|--codec h265 --qp 26 --gop 8 --bframes 2 --cu-depth 1
-hevc-cu2-40-intra|--codec h265 --qp 40 --gop 0 --cu-depth 2
-hevc-cu2-40-ip|--codec h265 --qp 40 --gop 8 --cu-depth 2
-hevc-cu2-lossless-ipb|--codec h265 --lossless --gop 8 --bframes 2 --cu-depth 2
-hevc-cu2-40-sao-ip|--codec h265 --qp 40 --gop 8 --sao --cu-depth 2
-hevc-cu2-aq-ipb|--codec h265 --qp 26 --gop 8 --bframes 2 --aq 1.0 --cu-depth 2
-hevc-cu2-aq40-ip|--codec h265 --qp 40 --gop 8 --aq 1.0 --cu-depth 2
-hevc-cu2-abr-64k|--codec h265 --bitrate 64000 --gop 8 --cu-depth 2
-hevc-cu2-refs2-ip|--codec h265 --qp 26 --gop 8 --refs 2 --cu-depth 2
-hevc-cu2-vbv-125@src_cut|--codec h265 --bitrate 64000 --cpb-ms 125 --gop 8 --cu-depth 2
-hevc-cu2-wp-ipb@fade|--codec h265 --qp 26 --gop 8 --bframes 2 --wpred --cu-depth 2
-hevc10-cu2-ipb@p10|--codec h265 --qp 26 --gop 8 --bframes 2 --cu-depth 2
-hevc10-cu2-aq-ip@p10|--codec h265 --qp 26 --gop 8 --aq 1.0 --cu-depth 2
-hevc10-cu2-lossless-ip@p10|--codec h265 --lossless --gop 8 --cu-depth 2
-hevc12-cu2-40-sao-ip@p12|--codec h265 --qp 40 --gop 8 --sao --cu-depth 2
-hevc-cu0-intra@big|--codec h265 --qp 26 --gop 0
-hevc-cu0-ipb@big|--codec h265 --qp 26 --gop 8 --bframes 2
+hevc-cu0-40-intra|--codec h265 --qp 40 --gop 0 --cu-depth 0
+hevc-cu0-40-ip|--codec h265 --qp 40 --gop 8 --cu-depth 0
+hevc-cu0-lossless-ipb|--codec h265 --lossless --gop 8 --bframes 2 --cu-depth 0
+hevc-cu0-40-sao-ip|--codec h265 --qp 40 --gop 8 --sao --cu-depth 0
+hevc-cu0-aq-ipb|--codec h265 --qp 26 --gop 8 --bframes 2 --aq 1.0 --cu-depth 0
+hevc-cu0-aq40-ip|--codec h265 --qp 40 --gop 8 --aq 1.0 --cu-depth 0
+hevc-cu0-abr-64k|--codec h265 --bitrate 64000 --gop 8 --cu-depth 0
+hevc-cu0-refs2-ip|--codec h265 --qp 26 --gop 8 --refs 2 --cu-depth 0
+hevc-cu0-vbv-125@src_cut|--codec h265 --bitrate 64000 --cpb-ms 125 --gop 8 --cu-depth 0
+hevc-cu0-wp-ipb@fade|--codec h265 --qp 26 --gop 8 --bframes 2 --wpred --cu-depth 0
+hevc10-cu0-ipb@p10|--codec h265 --qp 26 --gop 8 --bframes 2 --cu-depth 0
+hevc10-cu0-aq-ip@p10|--codec h265 --qp 26 --gop 8 --aq 1.0 --cu-depth 0
+hevc10-cu0-lossless-ip@p10|--codec h265 --lossless --gop 8 --cu-depth 0
+hevc12-cu0-40-sao-ip@p12|--codec h265 --qp 40 --gop 8 --sao --cu-depth 0
+hevc-cu0-intra@big|--codec h265 --qp 26 --gop 0 --cu-depth 0
+hevc-cu0-ipb@big|--codec h265 --qp 26 --gop 8 --bframes 2 --cu-depth 0
 hevc-cu2-intra@big|--codec h265 --qp 26 --gop 0 --cu-depth 2
 hevc-cu2-ipb@big|--codec h265 --qp 26 --gop 8 --bframes 2 --cu-depth 2
 hevc-cu2-aq40-ipb@big|--codec h265 --qp 40 --gop 8 --bframes 2 --aq 1.0 --cu-depth 2

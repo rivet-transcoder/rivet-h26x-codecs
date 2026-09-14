@@ -135,9 +135,9 @@ fn main() {
             // byte-identical to before multiple references existed.
             "--refs" => cfg.max_refs = val(&mut i, &args, "--refs").parse().unwrap_or_else(|_| die("--refs")),
             // H.265 only: how many levels the coding quadtree may split a
-            // CTB (0, the default, codes one unit per CTB as every stream
-            // before the quadtree did).
-            "--cu-depth" => cfg.max_cu_depth = val(&mut i, &args, "--cu-depth").parse().unwrap_or_else(|_| die("--cu-depth")),
+            // CTB. Absent, the encoder's default (2); 0 codes one unit per
+            // CTB as every stream before the quadtree did.
+            "--cu-depth" => cfg.max_cu_depth = Some(val(&mut i, &args, "--cu-depth").parse().unwrap_or_else(|_| die("--cu-depth"))),
             // The VUI colour description, as the three H.273 code points
             // (colour_primaries:transfer_characteristics:matrix_coefficients).
             // Absent, the stream says nothing about colour.
@@ -275,7 +275,7 @@ fn main() {
         return;
     }
 
-    if cfg.max_cu_depth > 0 {
+    if cfg.max_cu_depth.is_some_and(|d| d > 0) {
         // Refused by name rather than ignored: H.264 codes macroblocks,
         // and a caller asking for a coding quadtree asked for a codec.
         die("--cu-depth is the H.265 coding quadtree; H.264 has none");
