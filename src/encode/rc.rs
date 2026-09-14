@@ -1371,10 +1371,11 @@ mod tests {
                 below = below.min(qp);
             }
             rc.account(bytes);
-            if floor.is_none() && i >= 40 {
-                if let Response::Insensitive { floor: fl, .. } = rc.complexity[PicKind::Inter as usize].response {
-                    floor = Some(fl);
-                }
+            if floor.is_none()
+                && i >= 40
+                && let Response::Insensitive { floor: fl, .. } = rc.complexity[PicKind::Inter as usize].response
+            {
+                floor = Some(fl);
             }
         }
         let fl = floor.expect("a verdict on the constant phase");
