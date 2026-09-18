@@ -76,6 +76,7 @@
 //! from both loop filters, and SAO would therefore be a no-op declared in
 //! every slice header. Shipping that is worse than refusing it.
 
+use crate::dsp::distortion::DistortionDsp;
 use crate::encode::h265_intra::{IntraCtx, ssd_lambda_scale};
 use crate::hevc::ctu::SaoMerge;
 use crate::hevc::frame::{Frame, Plane16};
@@ -160,6 +161,13 @@ impl Cat {
     fn add(&mut self, r: i32, e: i64, max: i32) {
         self.all.count += 1;
         self.all.sum += e;
+        self.add_rail(r, e, max);
+    }
+
+    /// The rail buckets' share of [`Cat::add`], for a sample whose count and
+    /// sum a kernel has already taken into `all`.
+    #[inline]
+    fn add_rail(&mut self, r: i32, e: i64, max: i32) {
         let up = (max - r) as usize;
         if up < CLIP_REACH {
             self.up[up].count += 1;
@@ -256,6 +264,8 @@ impl Cat {
 struct Stats {
     bands: [Cat; 32],
     edge: [Cat; 5],
+    /// The edge kernel's near-the-rail samples, `(category, rec, error)`.
+    near: Vec<(u8, u16, i32)>,
 }
 
 /// The Lagrangian the SAO decision prices bins with — the intra module's
@@ -318,6 +328,8 @@ fn bins_of(p: &SaoParams, cmax: u32, first_two: bool) -> u32 {
 
 /// One component of one CTB, as the decision needs to see it.
 struct Comp<'a, S: Sample> {
+    /// The encoder's distortion kernels: the SSD, and the edge statistics.
+    dist: &'a DistortionDsp<S>,
     rec: &'a Plane16<S>,
     src: &'a [S],
     src_stride: usize,
@@ -348,14 +360,9 @@ impl<S: Sample> Comp<'_, S> {
     /// SSD of leaving this CTB alone — the baseline every candidate must
     /// beat.
     fn ssd_off(&self) -> i64 {
-        let mut d = 0i64;
-        for y in self.y0..self.y0 + self.h {
-            for x in self.x0..self.x0 + self.w {
-                let e = self.err_at(x, y);
-                d += e * e;
-            }
-        }
-        d
+        let src = &self.src[self.y0 * self.src_stride + self.x0..];
+        let rec = &self.rec.data[self.rec.offset(self.x0 as isize, self.y0 as isize)..];
+        (self.dist.ssd)(src, self.src_stride, rec, self.rec.stride, self.w, self.h) as i64
     }
 
     /// Band statistics into `cats`: one bucket per band, `v >> shift`
@@ -374,7 +381,15 @@ impl<S: Sample> Comp<'_, S> {
     /// `edgeIdx`, skipping samples the filter will not touch because a
     /// classifying neighbour is unusable. `usable` is the caller's mirror
     /// of the filter's own.
-    fn edge_stats(&self, class: u8, usable: &dyn Fn(usize, usize, i32, i32) -> bool, cats: &mut [Cat; 5]) {
+    ///
+    /// For this encoder's pictures (one slice, one tile) a neighbour is
+    /// usable exactly when it is inside the picture, so every sample whose
+    /// neighbours both are — all of the CTB but, at most, a row or column
+    /// at a picture edge — goes through the distortion table's edge kernel,
+    /// and the rest through the loop below with the `usable` test. The
+    /// kernel counts and sums; the few samples near a rail come back in
+    /// `near` for their buckets.
+    fn edge_stats(&self, class: u8, usable: &dyn Fn(usize, usize, i32, i32) -> bool, cats: &mut [Cat; 5], near: &mut Vec<(u8, u16, i32)>) {
         let (hp, vp): ([i32; 2], [i32; 2]) = match class {
             0 => ([-1, 1], [0, 0]),
             1 => ([0, 0], [-1, 1]),
@@ -382,8 +397,46 @@ impl<S: Sample> Comp<'_, S> {
             _ => ([1, -1], [-1, 1]),
         };
         cats.iter_mut().for_each(Cat::clear);
+        // The interior: x in ix0..ix1, y in iy0..iy1, both neighbours
+        // inside the picture.
+        let ix0 = self.x0.max((-hp[0].min(hp[1])).max(0) as usize);
+        let ix1 = (self.x0 + self.w).min(self.pw - hp[0].max(hp[1]).max(0) as usize);
+        let iy0 = self.y0.max((-vp[0].min(vp[1])).max(0) as usize);
+        let iy1 = (self.y0 + self.h).min(self.ph - vp[0].max(vp[1]).max(0) as usize);
+        let interior = ix0 < ix1 && iy0 < iy1;
+        if interior {
+            let stride = self.rec.stride as isize;
+            let (na, nb) = (vp[0] as isize * stride + hp[0] as isize, vp[1] as isize * stride + hp[1] as isize);
+            let mut tally = [[0i64; 2]; 5];
+            near.clear();
+            (self.dist.sao_edge_stats)(
+                &self.rec.data,
+                self.rec.offset(ix0 as isize, iy0 as isize),
+                self.rec.stride,
+                &self.src[iy0 * self.src_stride + ix0..],
+                self.src_stride,
+                ix1 - ix0,
+                iy1 - iy0,
+                na,
+                nb,
+                self.max,
+                CLIP_REACH as i32,
+                &mut tally,
+                near,
+            );
+            for (c, t) in cats.iter_mut().zip(&tally) {
+                c.all.count += t[0];
+                c.all.sum += t[1];
+            }
+            for &(e, r, err) in near.iter() {
+                cats[e as usize].add_rail(r as i32, err as i64, self.max);
+            }
+        }
         for y in self.y0..self.y0 + self.h {
             for x in self.x0..self.x0 + self.w {
+                if interior && (ix0..ix1).contains(&x) && (iy0..iy1).contains(&y) {
+                    continue;
+                }
                 let (xa, ya) = (x as i32 + hp[0], y as i32 + vp[0]);
                 let (xb, yb) = (x as i32 + hp[1], y as i32 + vp[1]);
                 if !usable(x, y, xa, ya) || !usable(x, y, xb, yb) {
@@ -439,7 +492,7 @@ impl<S: Sample> Comp<'_, S> {
         // so the clamp is one-sided and a category that wants the other
         // direction simply takes zero.
         for class in 0..4u8 {
-            self.edge_stats(class, usable, &mut stats.edge);
+            self.edge_stats(class, usable, &mut stats.edge, &mut stats.near);
             let mut p = SaoParams { type_idx: 2, band_or_class: class, offsets: [0; 4] };
             let mut delta = 0i64;
             // off_tab order: categories 0, 1 take offsets 0, 1 (positive);
@@ -486,7 +539,7 @@ impl<S: Sample> Comp<'_, S> {
                 base + d
             }
             _ => {
-                self.edge_stats(p.band_or_class, usable, &mut stats.edge);
+                self.edge_stats(p.band_or_class, usable, &mut stats.edge, &mut stats.near);
                 let tab = [p.offsets[0] as i64, p.offsets[1] as i64, 0, p.offsets[2] as i64, p.offsets[3] as i64];
                 let mut d = 0i64;
                 for (i, c) in stats.edge.iter().enumerate() {
@@ -576,6 +629,7 @@ pub fn sao_picture<S: Sample>(
                 let x0 = rx * ctb / csw;
                 let y0 = ry * ctb / csh;
                 comps.push(Comp {
+                    dist: ctx.dist,
                     rec: plane,
                     src,
                     src_stride: stride,
@@ -715,7 +769,7 @@ impl<S: Sample> Comp<'_, S> {
                 }
             }
         } else {
-            self.edge_stats(class, usable, &mut stats.edge);
+            self.edge_stats(class, usable, &mut stats.edge, &mut stats.near);
             for (slot, cat) in [(0usize, 0usize), (1, 1), (2, 3), (3, 4)] {
                 let c = &stats.edge[cat];
                 let (o, d) = if slot < 2 { c.choose(0, cmax) } else { c.choose(-cmax, 0) };
@@ -736,7 +790,7 @@ impl<S: Sample> Comp<'_, S> {
 mod tests {
     use super::*;
     use crate::dsp::Cpu;
-    use crate::dsp::distortion::DistortionDsp;
+
     use crate::dsp::hevc::HevcDsp;
     use crate::dsp::hevc_enc::HevcEncDsp;
     use crate::encode::Config;
