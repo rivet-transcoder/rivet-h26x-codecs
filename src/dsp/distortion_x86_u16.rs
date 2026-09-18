@@ -590,7 +590,7 @@ pub(crate) mod avx2 {
 
     fn satd(a: &[u16], a_stride: usize, b: &[u16], b_stride: usize, w: usize, h: usize) -> u32 {
         // Sixteen or more wide, or eight wide in whole 8x8 blocks.
-        let ours = if w == 8 { h % 8 == 0 } else { w % 16 == 0 && h % 4 == 0 };
+        let ours = if w == 8 { h.is_multiple_of(8) } else { w.is_multiple_of(16) && h.is_multiple_of(4) };
         if !ours || h == 0 {
             return super::avx::satd(a, a_stride, b, b_stride, w, h);
         }

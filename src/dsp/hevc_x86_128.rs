@@ -2450,7 +2450,7 @@ mod tests {
                         };
                     }
                 }
-                let bd_shift = 12 - (trial % 3) as i32 * 2;
+                let bd_shift = 12 - (trial % 3) * 2;
                 let mut want = c;
                 (s.idct[0])(&mut want, bd_shift, mx, my);
                 let mut want_dst = c;
