@@ -115,7 +115,7 @@ pub(super) unsafe fn load_n(src: *const i16, avail: usize) -> __m256i {
 /// rows, plus `extra` samples along, stays inside `len` when the load reaches
 /// 16 lanes.
 #[inline(always)]
-fn fits(len: usize, stride: usize, rows: usize, w: usize, extra: usize) -> bool {
+pub(super) fn fits(len: usize, stride: usize, rows: usize, w: usize, extra: usize) -> bool {
     // Last row start + last vector start (rounded up to 16) + extra + 16.
     let last_x = if w == 0 { 0 } else { (w - 1) / 16 * 16 };
     (rows - 1) * stride + last_x + extra + 16 <= len
@@ -309,14 +309,14 @@ pub(super) unsafe fn fir_v<const TAPS: usize, T, const MODE: u8>(out: &Out16, sr
     }
 }
 
-fn qpel_h_avx2(dst: &mut [i16], src: &[u16], src_stride: usize, w: usize, h: usize, frac: usize, shift: i32) {
+pub(super) fn qpel_h_avx2(dst: &mut [i16], src: &[u16], src_stride: usize, w: usize, h: usize, frac: usize, shift: i32) {
     if !fits(src.len(), src_stride, h, w, 8) {
         return (HevcDsp::<u16>::SCALAR.qpel_h)(dst, src, src_stride, w, h, frac, shift);
     }
     unsafe { fir_h::<8, MODE_I16>(&Out16::i16(dst.as_mut_ptr(), w), src.as_ptr(), src_stride, w, h, &QPEL_FILTERS[frac][..8], shift) }
 }
 
-fn qpel_v_avx2(dst: &mut [i16], src: &[u16], src_stride: usize, w: usize, h: usize, frac: usize, shift: i32) {
+pub(super) fn qpel_v_avx2(dst: &mut [i16], src: &[u16], src_stride: usize, w: usize, h: usize, frac: usize, shift: i32) {
     if !fits(src.len(), src_stride, h + 7, w, 0) {
         return (HevcDsp::<u16>::SCALAR.qpel_v)(dst, src, src_stride, w, h, frac, shift);
     }
@@ -430,7 +430,7 @@ fn fused16<const TAPS: usize, const MODE: u8>(dst: &mut [u16], dst_stride: usize
 }
 
 #[allow(clippy::too_many_arguments)]
-fn qpel_uni_avx2(dst: &mut [u16], dst_stride: usize, src: &[u16], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], bit_depth: u32) {
+pub(super) fn qpel_uni_avx2(dst: &mut [u16], dst_stride: usize, src: &[u16], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], bit_depth: u32) {
     fused16::<8, MODE_UNI>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, &[], bit_depth)
 }
 
@@ -440,7 +440,7 @@ fn epel_uni_avx2(dst: &mut [u16], dst_stride: usize, src: &[u16], src_stride: us
 }
 
 #[allow(clippy::too_many_arguments)]
-fn qpel_bi_avx2(dst: &mut [u16], dst_stride: usize, src: &[u16], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], other: &[i16], bit_depth: u32) {
+pub(super) fn qpel_bi_avx2(dst: &mut [u16], dst_stride: usize, src: &[u16], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], other: &[i16], bit_depth: u32) {
     fused16::<8, MODE_BI>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, other, bit_depth)
 }
 
