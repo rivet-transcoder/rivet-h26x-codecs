@@ -185,7 +185,7 @@ macro_rules! kernels {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn clip(v: __m128i, maxv: __m128i) -> __m128i {
-            unsafe { _mm_min_epi16(_mm_max_epi16(v, _mm_setzero_si128()), maxv) }
+            _mm_min_epi16(_mm_max_epi16(v, _mm_setzero_si128()), maxv)
         }
 
         /// A tap pair as one i32 lane, for `pmaddwd`.
@@ -292,14 +292,12 @@ macro_rules! kernels {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn tap6_i32(r0: __m128i, r1: __m128i, r2: __m128i, r3: __m128i, r4: __m128i, r5: __m128i) -> __m128i {
-            unsafe {
-                let t = _mm_add_epi32(r2, r3);
-                let u = _mm_add_epi32(r1, r4);
-                let v = _mm_add_epi32(r0, r5);
-                let t20 = _mm_add_epi32(_mm_slli_epi32(t, 4), _mm_slli_epi32(t, 2));
-                let u5 = _mm_add_epi32(_mm_slli_epi32(u, 2), u);
-                _mm_sub_epi32(_mm_add_epi32(v, t20), u5)
-            }
+            let t = _mm_add_epi32(r2, r3);
+            let u = _mm_add_epi32(r1, r4);
+            let v = _mm_add_epi32(r0, r5);
+            let t20 = _mm_add_epi32(_mm_slli_epi32(t, 4), _mm_slli_epi32(t, 2));
+            let u5 = _mm_add_epi32(_mm_slli_epi32(u, 2), u);
+            _mm_sub_epi32(_mm_add_epi32(v, t20), u5)
         }
 
         /// The centre value from the wide intermediates of window rows
@@ -749,10 +747,8 @@ macro_rules! kernels {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn tc0_luma(tc0: &[i16; 4], half: usize) -> __m128i {
-            unsafe {
-                let (a, b) = (tc0[2 * half], tc0[2 * half + 1]);
-                _mm_setr_epi16(a, a, a, a, b, b, b, b)
-            }
+            let (a, b) = (tc0[2 * half], tc0[2 * half + 1]);
+            _mm_setr_epi16(a, a, a, a, b, b, b, b)
         }
 
         /// tC0 per lane for eight lines two to a segment: an MBAFF mixed
@@ -760,42 +756,38 @@ macro_rules! kernels {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn tc0_pairs(tc0: &[i16; 4]) -> __m128i {
-            unsafe {
-                let t = |k: usize| tc0[k];
-                _mm_setr_epi16(t(0), t(0), t(1), t(1), t(2), t(2), t(3), t(3))
-            }
+            let t = |k: usize| tc0[k];
+            _mm_setr_epi16(t(0), t(0), t(1), t(1), t(2), t(2), t(3), t(3))
         }
 
         /// Transpose eight 8-lane rows.
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn transpose8(r: &mut [__m128i; 8]) {
-            unsafe {
-                let a0 = _mm_unpacklo_epi16(r[0], r[1]);
-                let a1 = _mm_unpackhi_epi16(r[0], r[1]);
-                let a2 = _mm_unpacklo_epi16(r[2], r[3]);
-                let a3 = _mm_unpackhi_epi16(r[2], r[3]);
-                let a4 = _mm_unpacklo_epi16(r[4], r[5]);
-                let a5 = _mm_unpackhi_epi16(r[4], r[5]);
-                let a6 = _mm_unpacklo_epi16(r[6], r[7]);
-                let a7 = _mm_unpackhi_epi16(r[6], r[7]);
-                let b0 = _mm_unpacklo_epi32(a0, a2);
-                let b1 = _mm_unpackhi_epi32(a0, a2);
-                let b2 = _mm_unpacklo_epi32(a1, a3);
-                let b3 = _mm_unpackhi_epi32(a1, a3);
-                let b4 = _mm_unpacklo_epi32(a4, a6);
-                let b5 = _mm_unpackhi_epi32(a4, a6);
-                let b6 = _mm_unpacklo_epi32(a5, a7);
-                let b7 = _mm_unpackhi_epi32(a5, a7);
-                r[0] = _mm_unpacklo_epi64(b0, b4);
-                r[1] = _mm_unpackhi_epi64(b0, b4);
-                r[2] = _mm_unpacklo_epi64(b1, b5);
-                r[3] = _mm_unpackhi_epi64(b1, b5);
-                r[4] = _mm_unpacklo_epi64(b2, b6);
-                r[5] = _mm_unpackhi_epi64(b2, b6);
-                r[6] = _mm_unpacklo_epi64(b3, b7);
-                r[7] = _mm_unpackhi_epi64(b3, b7);
-            }
+            let a0 = _mm_unpacklo_epi16(r[0], r[1]);
+            let a1 = _mm_unpackhi_epi16(r[0], r[1]);
+            let a2 = _mm_unpacklo_epi16(r[2], r[3]);
+            let a3 = _mm_unpackhi_epi16(r[2], r[3]);
+            let a4 = _mm_unpacklo_epi16(r[4], r[5]);
+            let a5 = _mm_unpackhi_epi16(r[4], r[5]);
+            let a6 = _mm_unpacklo_epi16(r[6], r[7]);
+            let a7 = _mm_unpackhi_epi16(r[6], r[7]);
+            let b0 = _mm_unpacklo_epi32(a0, a2);
+            let b1 = _mm_unpackhi_epi32(a0, a2);
+            let b2 = _mm_unpacklo_epi32(a1, a3);
+            let b3 = _mm_unpackhi_epi32(a1, a3);
+            let b4 = _mm_unpacklo_epi32(a4, a6);
+            let b5 = _mm_unpackhi_epi32(a4, a6);
+            let b6 = _mm_unpacklo_epi32(a5, a7);
+            let b7 = _mm_unpackhi_epi32(a5, a7);
+            r[0] = _mm_unpacklo_epi64(b0, b4);
+            r[1] = _mm_unpackhi_epi64(b0, b4);
+            r[2] = _mm_unpacklo_epi64(b1, b5);
+            r[3] = _mm_unpackhi_epi64(b1, b5);
+            r[4] = _mm_unpacklo_epi64(b2, b6);
+            r[5] = _mm_unpackhi_epi64(b2, b6);
+            r[6] = _mm_unpacklo_epi64(b3, b7);
+            r[7] = _mm_unpackhi_epi64(b3, b7);
         }
 
         /// The eight rows × eight samples around a vertical edge (`q0` at
@@ -1143,13 +1135,11 @@ macro_rules! kernels {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn transpose4(r: [__m128i; 4]) -> [__m128i; 4] {
-            unsafe {
-                let t0 = _mm_unpacklo_epi32(r[0], r[1]); // r0c0 r1c0 r0c1 r1c1
-                let t1 = _mm_unpacklo_epi32(r[2], r[3]); // r2c0 r3c0 r2c1 r3c1
-                let t2 = _mm_unpackhi_epi32(r[0], r[1]); // r0c2 r1c2 r0c3 r1c3
-                let t3 = _mm_unpackhi_epi32(r[2], r[3]);
-                [_mm_unpacklo_epi64(t0, t1), _mm_unpackhi_epi64(t0, t1), _mm_unpacklo_epi64(t2, t3), _mm_unpackhi_epi64(t2, t3)]
-            }
+            let t0 = _mm_unpacklo_epi32(r[0], r[1]); // r0c0 r1c0 r0c1 r1c1
+            let t1 = _mm_unpacklo_epi32(r[2], r[3]); // r2c0 r3c0 r2c1 r3c1
+            let t2 = _mm_unpackhi_epi32(r[0], r[1]); // r0c2 r1c2 r0c3 r1c3
+            let t3 = _mm_unpackhi_epi32(r[2], r[3]);
+            [_mm_unpacklo_epi64(t0, t1), _mm_unpackhi_epi64(t0, t1), _mm_unpacklo_epi64(t2, t3), _mm_unpackhi_epi64(t2, t3)]
         }
 
         /// The 4x4 inverse transform (8.5.12.2) of four rows of i32
@@ -1182,29 +1172,27 @@ macro_rules! kernels {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn idct8_pass(d: &[__m128i; 8]) -> [__m128i; 8] {
-            unsafe {
-                let add = |a, b| _mm_add_epi32(a, b);
-                let sub = |a, b| _mm_sub_epi32(a, b);
-                let sh1 = |a| _mm_srai_epi32(a, 1);
-                let sh2 = |a| _mm_srai_epi32(a, 2);
-                let a0 = add(d[0], d[4]);
-                let a4 = sub(d[0], d[4]);
-                let a2 = sub(sh1(d[2]), d[6]);
-                let a6 = add(d[2], sh1(d[6]));
-                let b0 = add(a0, a6);
-                let b2 = add(a4, a2);
-                let b4 = sub(a4, a2);
-                let b6 = sub(a0, a6);
-                let a1 = sub(sub(sub(d[5], d[3]), d[7]), sh1(d[7]));
-                let a3 = sub(sub(add(d[1], d[7]), d[3]), sh1(d[3]));
-                let a5 = add(add(sub(d[7], d[1]), d[5]), sh1(d[5]));
-                let a7 = add(add(add(d[3], d[5]), d[1]), sh1(d[1]));
-                let b1 = add(a1, sh2(a7));
-                let b7 = sub(a7, sh2(a1));
-                let b3 = add(a3, sh2(a5));
-                let b5 = sub(sh2(a3), a5);
-                [add(b0, b7), add(b2, b5), add(b4, b3), add(b6, b1), sub(b6, b1), sub(b4, b3), sub(b2, b5), sub(b0, b7)]
-            }
+            let add = |a, b| _mm_add_epi32(a, b);
+            let sub = |a, b| _mm_sub_epi32(a, b);
+            let sh1 = |a| _mm_srai_epi32(a, 1);
+            let sh2 = |a| _mm_srai_epi32(a, 2);
+            let a0 = add(d[0], d[4]);
+            let a4 = sub(d[0], d[4]);
+            let a2 = sub(sh1(d[2]), d[6]);
+            let a6 = add(d[2], sh1(d[6]));
+            let b0 = add(a0, a6);
+            let b2 = add(a4, a2);
+            let b4 = sub(a4, a2);
+            let b6 = sub(a0, a6);
+            let a1 = sub(sub(sub(d[5], d[3]), d[7]), sh1(d[7]));
+            let a3 = sub(sub(add(d[1], d[7]), d[3]), sh1(d[3]));
+            let a5 = add(add(sub(d[7], d[1]), d[5]), sh1(d[5]));
+            let a7 = add(add(add(d[3], d[5]), d[1]), sh1(d[1]));
+            let b1 = add(a1, sh2(a7));
+            let b7 = sub(a7, sh2(a1));
+            let b3 = add(a3, sh2(a5));
+            let b5 = sub(sh2(a3), a5);
+            [add(b0, b7), add(b2, b5), add(b4, b3), add(b6, b1), sub(b6, b1), sub(b4, b3), sub(b2, b5), sub(b0, b7)]
         }
 
         /// The 8x8 inverse transform (8.5.13.2) of eight rows of i32

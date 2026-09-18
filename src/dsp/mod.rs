@@ -18,79 +18,70 @@ pub mod hevc;
 pub mod hevc_enc;
 #[doc(hidden)]
 pub mod u16_sweep;
-// The SIMD modules wrap their intrinsics in `unsafe {}` blocks: required on
-// the crate's MSRV, redundant (and warned about) on toolchains where
-// target-feature intrinsics became safe to call inside `#[target_feature]`
-// functions.
+// The SIMD modules call `core::arch` intrinsics directly. From Rust 1.87
+// (below the MSRV) an intrinsic that takes no raw pointer is safe to call
+// inside a function whose own `#[target_feature]` enables what it needs, so
+// those calls sit outside `unsafe` blocks and no module here allows
+// `unused_unsafe`: a redundant block is a warning. The blocks that remain
+// hold something unsafe on any toolchain — a load or store through a raw
+// pointer, pointer arithmetic, `ptr::read_unaligned` / `write_unaligned` /
+// `copy_nonoverlapping`, or a call to one of the `unsafe fn` kernels.
+//
+// Two edges of that rule decide what stays. A feature the *target* enables
+// does not count, only the caller's attribute does: NEON is baseline on
+// AArch64, yet a NEON helper with no `#[target_feature]` of its own (such as
+// `h264_neon`'s `round5`) still needs its block. And on wasm32 rustc treats
+// every call to a `#[target_feature]` function as safe, so the `simd128`
+// modules never had redundant blocks to allow.
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod x86_compat;
 #[cfg(target_arch = "x86_64")]
-#[allow(unused_unsafe)]
 pub(crate) mod h264_x86_128;
 #[cfg(target_arch = "x86_64")]
-#[allow(unused_unsafe)]
 pub(crate) mod h264_x86_128_u16;
 #[cfg(target_arch = "x86_64")]
-#[allow(unused_unsafe)]
 pub(crate) mod h264_avx2;
 #[cfg(target_arch = "x86_64")]
-#[allow(unused_unsafe)]
 pub(crate) mod h264_avx2_u16;
 #[cfg(target_arch = "x86_64")]
-#[allow(unused_unsafe)]
 pub(crate) mod distortion_x86;
 #[cfg(target_arch = "x86_64")]
-#[allow(unused_unsafe)]
 pub(crate) mod distortion_x86_u16;
 #[cfg(target_arch = "x86_64")]
-#[allow(unused_unsafe)]
 pub(crate) mod hevc_enc_x86;
 #[cfg(target_arch = "aarch64")]
-#[allow(unused_unsafe)]
 pub(crate) mod distortion_neon;
 #[cfg(target_arch = "aarch64")]
-#[allow(unused_unsafe)]
 pub(crate) mod distortion_neon_u16;
 #[cfg(target_arch = "aarch64")]
-#[allow(unused_unsafe)]
 pub(crate) mod h264_neon;
 #[cfg(target_arch = "aarch64")]
-#[allow(unused_unsafe)]
 pub(crate) mod h264_neon_u16;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod h264_wasm128;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod h264_wasm128_u16;
 #[cfg(target_arch = "x86_64")]
-#[allow(unused_unsafe)]
 pub(crate) mod hevc_x86_128;
 #[cfg(target_arch = "x86_64")]
-#[allow(unused_unsafe)]
 pub(crate) mod hevc_avx2;
 #[cfg(target_arch = "x86_64")]
-#[allow(unused_unsafe)]
 pub(crate) mod hevc_avx512;
 #[cfg(target_arch = "aarch64")]
-#[allow(unused_unsafe)]
 pub(crate) mod hevc_neon;
 #[cfg(target_arch = "x86_64")]
-#[allow(unused_unsafe)]
 pub(crate) mod hevc_avx2_u8;
 #[cfg(target_arch = "x86_64")]
-#[allow(unused_unsafe)]
 pub(crate) mod hevc_avx512_u8;
 #[cfg(target_arch = "aarch64")]
-#[allow(unused_unsafe)]
 pub(crate) mod hevc_neon_u8;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod hevc_wasm128;
 #[cfg(target_arch = "aarch64")]
-#[allow(unused_unsafe)]
 pub(crate) mod neon_dotprod;
 // The encode-only tiers beyond x86: the same kernels as `distortion_x86`
 // and `hevc_enc_x86`, on NEON and on wasm `simd128`.
 #[cfg(target_arch = "aarch64")]
-#[allow(unused_unsafe)]
 pub(crate) mod hevc_enc_neon;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod distortion_wasm128;

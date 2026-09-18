@@ -68,14 +68,12 @@ macro_rules! codec_compat {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn chroma_w(xf: i32, yf: i32) -> ChromaW {
-            unsafe {
-                ChromaW([
-                    _mm_set1_epi16(((8 - xf) * (8 - yf)) as i16),
-                    _mm_set1_epi16((xf * (8 - yf)) as i16),
-                    _mm_set1_epi16(((8 - xf) * yf) as i16),
-                    _mm_set1_epi16((xf * yf) as i16),
-                ])
-            }
+            ChromaW([
+                _mm_set1_epi16(((8 - xf) * (8 - yf)) as i16),
+                _mm_set1_epi16((xf * (8 - yf)) as i16),
+                _mm_set1_epi16(((8 - xf) * yf) as i16),
+                _mm_set1_epi16((xf * yf) as i16),
+            ])
         }
 
         /// `A·w0 + B·w1 + C·w2 + D·w3` over eight samples, where A/B are the
@@ -130,13 +128,11 @@ macro_rules! codec_compat {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn chroma_w(xf: i32, yf: i32) -> ChromaW {
-            unsafe {
-                // Each weight is at most 64, so all four fit i8.
-                ChromaW([
-                    _mm_set1_epi16(pair8(((8 - xf) * (8 - yf)) as i8, (xf * (8 - yf)) as i8)),
-                    _mm_set1_epi16(pair8(((8 - xf) * yf) as i8, (xf * yf) as i8)),
-                ])
-            }
+            // Each weight is at most 64, so all four fit i8.
+            ChromaW([
+                _mm_set1_epi16(pair8(((8 - xf) * (8 - yf)) as i8, (xf * (8 - yf)) as i8)),
+                _mm_set1_epi16(pair8(((8 - xf) * yf) as i8, (xf * yf) as i8)),
+            ])
         }
 
         /// `A·w0 + B·w1 + C·w2 + D·w3` over eight samples. The weights sum to
@@ -279,10 +275,8 @@ macro_rules! kernels {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn round5_pack(v: __m128i) -> __m128i {
-            unsafe {
-                let r = _mm_srai_epi16(_mm_add_epi16(v, _mm_set1_epi16(16)), 5);
-                _mm_packus_epi16(r, r)
-            }
+            let r = _mm_srai_epi16(_mm_add_epi16(v, _mm_set1_epi16(16)), 5);
+            _mm_packus_epi16(r, r)
         }
 
         /// A tap pair as one i32 lane, for `pmaddwd`.
@@ -319,25 +313,23 @@ macro_rules! kernels {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn j_combine(w: &[__m128i; 6]) -> __m128i {
-            unsafe {
-                let (r0, r1, r2, r3, r4, r5) = (w[0], w[1], w[2], w[3], w[4], w[5]);
-                let c01 = _mm_set1_epi32(pair(1, -5));
-                let c23 = _mm_set1_epi32(pair(20, 20));
-                let c45 = _mm_set1_epi32(pair(-5, 1));
-                let round = _mm_set1_epi32(512);
-                let lo = _mm_add_epi32(
-                    _mm_add_epi32(_mm_madd_epi16(_mm_unpacklo_epi16(r0, r1), c01), _mm_madd_epi16(_mm_unpacklo_epi16(r2, r3), c23)),
-                    _mm_add_epi32(_mm_madd_epi16(_mm_unpacklo_epi16(r4, r5), c45), round),
-                );
-                let hi = _mm_add_epi32(
-                    _mm_add_epi32(_mm_madd_epi16(_mm_unpackhi_epi16(r0, r1), c01), _mm_madd_epi16(_mm_unpackhi_epi16(r2, r3), c23)),
-                    _mm_add_epi32(_mm_madd_epi16(_mm_unpackhi_epi16(r4, r5), c45), round),
-                );
-                // At 128 bits `packs` already lands lanes 0..7 in order — the
-                // cross-lane fixup the 256-bit kernel needs has no counterpart.
-                let v = _mm_packs_epi32(_mm_srai_epi32(lo, 10), _mm_srai_epi32(hi, 10));
-                _mm_packus_epi16(v, v)
-            }
+            let (r0, r1, r2, r3, r4, r5) = (w[0], w[1], w[2], w[3], w[4], w[5]);
+            let c01 = _mm_set1_epi32(pair(1, -5));
+            let c23 = _mm_set1_epi32(pair(20, 20));
+            let c45 = _mm_set1_epi32(pair(-5, 1));
+            let round = _mm_set1_epi32(512);
+            let lo = _mm_add_epi32(
+                _mm_add_epi32(_mm_madd_epi16(_mm_unpacklo_epi16(r0, r1), c01), _mm_madd_epi16(_mm_unpacklo_epi16(r2, r3), c23)),
+                _mm_add_epi32(_mm_madd_epi16(_mm_unpacklo_epi16(r4, r5), c45), round),
+            );
+            let hi = _mm_add_epi32(
+                _mm_add_epi32(_mm_madd_epi16(_mm_unpackhi_epi16(r0, r1), c01), _mm_madd_epi16(_mm_unpackhi_epi16(r2, r3), c23)),
+                _mm_add_epi32(_mm_madd_epi16(_mm_unpackhi_epi16(r4, r5), c45), round),
+            );
+            // At 128 bits `packs` already lands lanes 0..7 in order — the
+            // cross-lane fixup the 256-bit kernel needs has no counterpart.
+            let v = _mm_packs_epi32(_mm_srai_epi32(lo, 10), _mm_srai_epi32(hi, 10));
+            _mm_packus_epi16(v, v)
         }
 
         /// Full samples of block row `y` from column `x` (window offset 2, 2).
@@ -677,10 +669,8 @@ macro_rules! kernels {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn tc0_luma(tc0: &[i16; 4], half: usize) -> __m128i {
-            unsafe {
-                let (a, b) = (tc0[2 * half], tc0[2 * half + 1]);
-                _mm_setr_epi16(a, a, a, a, b, b, b, b)
-            }
+            let (a, b) = (tc0[2 * half], tc0[2 * half + 1]);
+            _mm_setr_epi16(a, a, a, a, b, b, b, b)
         }
 
         /// Load the eight rows x 8 bytes around a vertical edge (`q0` at
@@ -770,10 +760,8 @@ macro_rules! kernels {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn tc0_luma8(tc0: &[i16; 4]) -> __m128i {
-            unsafe {
-                let t = |k: usize| tc0[k];
-                _mm_setr_epi16(t(0), t(0), t(1), t(1), t(2), t(2), t(3), t(3))
-            }
+            let t = |k: usize| tc0[k];
+            _mm_setr_epi16(t(0), t(0), t(1), t(1), t(2), t(2), t(3), t(3))
         }
 
         fn deblock_luma8_v(data: &mut [u8], off: usize, stride: usize, alpha: i32, beta: i32, tc0: &[i16; 4], _max: i32) {
@@ -913,10 +901,8 @@ macro_rules! kernels {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn tc0_chroma(tc0: &[i16; 4]) -> __m128i {
-            unsafe {
-                let t = |k: usize| tc0[k];
-                _mm_setr_epi16(t(0), t(0), t(1), t(1), t(2), t(2), t(3), t(3))
-            }
+            let t = |k: usize| tc0[k];
+            _mm_setr_epi16(t(0), t(0), t(1), t(1), t(2), t(2), t(3), t(3))
         }
 
         /// Load 8 rows x 4 bytes (p1 p0 q0 q1) around a vertical chroma edge
@@ -1099,65 +1085,61 @@ macro_rules! kernels {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn transpose8(r: &mut [__m128i; 8]) {
-            unsafe {
-                let a0 = _mm_unpacklo_epi16(r[0], r[1]);
-                let a1 = _mm_unpackhi_epi16(r[0], r[1]);
-                let a2 = _mm_unpacklo_epi16(r[2], r[3]);
-                let a3 = _mm_unpackhi_epi16(r[2], r[3]);
-                let a4 = _mm_unpacklo_epi16(r[4], r[5]);
-                let a5 = _mm_unpackhi_epi16(r[4], r[5]);
-                let a6 = _mm_unpacklo_epi16(r[6], r[7]);
-                let a7 = _mm_unpackhi_epi16(r[6], r[7]);
-                let b0 = _mm_unpacklo_epi32(a0, a2);
-                let b1 = _mm_unpackhi_epi32(a0, a2);
-                let b2 = _mm_unpacklo_epi32(a1, a3);
-                let b3 = _mm_unpackhi_epi32(a1, a3);
-                let b4 = _mm_unpacklo_epi32(a4, a6);
-                let b5 = _mm_unpackhi_epi32(a4, a6);
-                let b6 = _mm_unpacklo_epi32(a5, a7);
-                let b7 = _mm_unpackhi_epi32(a5, a7);
-                r[0] = _mm_unpacklo_epi64(b0, b4);
-                r[1] = _mm_unpackhi_epi64(b0, b4);
-                r[2] = _mm_unpacklo_epi64(b1, b5);
-                r[3] = _mm_unpackhi_epi64(b1, b5);
-                r[4] = _mm_unpacklo_epi64(b2, b6);
-                r[5] = _mm_unpackhi_epi64(b2, b6);
-                r[6] = _mm_unpacklo_epi64(b3, b7);
-                r[7] = _mm_unpackhi_epi64(b3, b7);
-            }
+            let a0 = _mm_unpacklo_epi16(r[0], r[1]);
+            let a1 = _mm_unpackhi_epi16(r[0], r[1]);
+            let a2 = _mm_unpacklo_epi16(r[2], r[3]);
+            let a3 = _mm_unpackhi_epi16(r[2], r[3]);
+            let a4 = _mm_unpacklo_epi16(r[4], r[5]);
+            let a5 = _mm_unpackhi_epi16(r[4], r[5]);
+            let a6 = _mm_unpacklo_epi16(r[6], r[7]);
+            let a7 = _mm_unpackhi_epi16(r[6], r[7]);
+            let b0 = _mm_unpacklo_epi32(a0, a2);
+            let b1 = _mm_unpackhi_epi32(a0, a2);
+            let b2 = _mm_unpacklo_epi32(a1, a3);
+            let b3 = _mm_unpackhi_epi32(a1, a3);
+            let b4 = _mm_unpacklo_epi32(a4, a6);
+            let b5 = _mm_unpackhi_epi32(a4, a6);
+            let b6 = _mm_unpacklo_epi32(a5, a7);
+            let b7 = _mm_unpackhi_epi32(a5, a7);
+            r[0] = _mm_unpacklo_epi64(b0, b4);
+            r[1] = _mm_unpackhi_epi64(b0, b4);
+            r[2] = _mm_unpacklo_epi64(b1, b5);
+            r[3] = _mm_unpackhi_epi64(b1, b5);
+            r[4] = _mm_unpacklo_epi64(b2, b6);
+            r[5] = _mm_unpackhi_epi64(b2, b6);
+            r[6] = _mm_unpacklo_epi64(b3, b7);
+            r[7] = _mm_unpackhi_epi64(b3, b7);
         }
 
         /// One 8-point pass (8.5.13.2) across eight registers.
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn idct8_pass(d: &[__m128i; 8]) -> [__m128i; 8] {
-            unsafe {
-                let add = |a, b| _mm_add_epi16(a, b);
-                let sub = |a, b| _mm_sub_epi16(a, b);
-                let sh1 = |a| _mm_srai_epi16(a, 1);
-                let sh2 = |a| _mm_srai_epi16(a, 2);
-                let a0 = add(d[0], d[4]);
-                let a4 = sub(d[0], d[4]);
-                let a2 = sub(sh1(d[2]), d[6]);
-                let a6 = add(d[2], sh1(d[6]));
-                let b0 = add(a0, a6);
-                let b2 = add(a4, a2);
-                let b4 = sub(a4, a2);
-                let b6 = sub(a0, a6);
-                // a1 = -d3 + d5 - d7 - (d7 >> 1)
-                let a1 = sub(sub(sub(d[5], d[3]), d[7]), sh1(d[7]));
-                // a3 = d1 + d7 - d3 - (d3 >> 1)
-                let a3 = sub(sub(add(d[1], d[7]), d[3]), sh1(d[3]));
-                // a5 = -d1 + d7 + d5 + (d5 >> 1)
-                let a5 = add(add(sub(d[7], d[1]), d[5]), sh1(d[5]));
-                // a7 = d3 + d5 + d1 + (d1 >> 1)
-                let a7 = add(add(add(d[3], d[5]), d[1]), sh1(d[1]));
-                let b1 = add(a1, sh2(a7));
-                let b7 = sub(a7, sh2(a1));
-                let b3 = add(a3, sh2(a5));
-                let b5 = sub(sh2(a3), a5);
-                [add(b0, b7), add(b2, b5), add(b4, b3), add(b6, b1), sub(b6, b1), sub(b4, b3), sub(b2, b5), sub(b0, b7)]
-            }
+            let add = |a, b| _mm_add_epi16(a, b);
+            let sub = |a, b| _mm_sub_epi16(a, b);
+            let sh1 = |a| _mm_srai_epi16(a, 1);
+            let sh2 = |a| _mm_srai_epi16(a, 2);
+            let a0 = add(d[0], d[4]);
+            let a4 = sub(d[0], d[4]);
+            let a2 = sub(sh1(d[2]), d[6]);
+            let a6 = add(d[2], sh1(d[6]));
+            let b0 = add(a0, a6);
+            let b2 = add(a4, a2);
+            let b4 = sub(a4, a2);
+            let b6 = sub(a0, a6);
+            // a1 = -d3 + d5 - d7 - (d7 >> 1)
+            let a1 = sub(sub(sub(d[5], d[3]), d[7]), sh1(d[7]));
+            // a3 = d1 + d7 - d3 - (d3 >> 1)
+            let a3 = sub(sub(add(d[1], d[7]), d[3]), sh1(d[3]));
+            // a5 = -d1 + d7 + d5 + (d5 >> 1)
+            let a5 = add(add(sub(d[7], d[1]), d[5]), sh1(d[5]));
+            // a7 = d3 + d5 + d1 + (d1 >> 1)
+            let a7 = add(add(add(d[3], d[5]), d[1]), sh1(d[1]));
+            let b1 = add(a1, sh2(a7));
+            let b7 = sub(a7, sh2(a1));
+            let b3 = add(a3, sh2(a5));
+            let b5 = sub(sh2(a3), a5);
+            [add(b0, b7), add(b2, b5), add(b4, b3), add(b6, b1), sub(b6, b1), sub(b4, b3), sub(b2, b5), sub(b0, b7)]
         }
 
         fn idct8_add(dst: &mut [u8], stride: usize, coeffs: &[i16; 64], _max: i32) {

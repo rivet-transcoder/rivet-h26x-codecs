@@ -76,10 +76,8 @@ macro_rules! kernels {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn sad_lanes(acc: __m128i) -> u32 {
-            unsafe {
-                (_mm_cvtsi128_si32(acc) as u32)
-                    .wrapping_add(_mm_cvtsi128_si32(_mm_srli_si128(acc, 8)) as u32)
-            }
+            (_mm_cvtsi128_si32(acc) as u32)
+                .wrapping_add(_mm_cvtsi128_si32(_mm_srli_si128(acc, 8)) as u32)
         }
 
         // ------------------------------------------------------------------
@@ -225,18 +223,16 @@ macro_rules! kernels {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn butterfly(r0: __m128i, r1: __m128i, r2: __m128i, r3: __m128i) -> [__m128i; 4] {
-            unsafe {
-                let s0 = _mm_add_epi16(r0, r3);
-                let s1 = _mm_add_epi16(r1, r2);
-                let s2 = _mm_sub_epi16(r1, r2);
-                let s3 = _mm_sub_epi16(r0, r3);
-                [
-                    _mm_add_epi16(s0, s1),
-                    _mm_add_epi16(s3, s2),
-                    _mm_sub_epi16(s0, s1),
-                    _mm_sub_epi16(s3, s2),
-                ]
-            }
+            let s0 = _mm_add_epi16(r0, r3);
+            let s1 = _mm_add_epi16(r1, r2);
+            let s2 = _mm_sub_epi16(r1, r2);
+            let s3 = _mm_sub_epi16(r0, r3);
+            [
+                _mm_add_epi16(s0, s1),
+                _mm_add_epi16(s3, s2),
+                _mm_sub_epi16(s0, s1),
+                _mm_sub_epi16(s3, s2),
+            ]
         }
 
         /// SATD of the two 4x4 tiles held in `r0..r3` (one row each, tile
@@ -537,18 +533,16 @@ pub(crate) mod avx2 {
     #[target_feature(enable = "avx2")]
     #[inline]
     unsafe fn butterfly(r0: __m256i, r1: __m256i, r2: __m256i, r3: __m256i) -> [__m256i; 4] {
-        unsafe {
-            let s0 = _mm256_add_epi16(r0, r3);
-            let s1 = _mm256_add_epi16(r1, r2);
-            let s2 = _mm256_sub_epi16(r1, r2);
-            let s3 = _mm256_sub_epi16(r0, r3);
-            [
-                _mm256_add_epi16(s0, s1),
-                _mm256_add_epi16(s3, s2),
-                _mm256_sub_epi16(s0, s1),
-                _mm256_sub_epi16(s3, s2),
-            ]
-        }
+        let s0 = _mm256_add_epi16(r0, r3);
+        let s1 = _mm256_add_epi16(r1, r2);
+        let s2 = _mm256_sub_epi16(r1, r2);
+        let s3 = _mm256_sub_epi16(r0, r3);
+        [
+            _mm256_add_epi16(s0, s1),
+            _mm256_add_epi16(s3, s2),
+            _mm256_sub_epi16(s0, s1),
+            _mm256_sub_epi16(s3, s2),
+        ]
     }
 
     /// Four tiles across, two per 128-bit lane: the 128-bit `satd_pair`

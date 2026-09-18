@@ -89,27 +89,23 @@ unsafe fn load16(p: *const u8) -> __m256i {
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn tap6_16(a: __m256i, b: __m256i, c: __m256i, d: __m256i, e: __m256i, f: __m256i) -> __m256i {
-    unsafe {
-        let t = _mm256_add_epi16(c, d);
-        let u = _mm256_add_epi16(b, e);
-        let v = _mm256_add_epi16(a, f);
-        // v + 20t - 5u = v + (t << 4) + (t << 2) - (u << 2) - u
-        let t20 = _mm256_add_epi16(_mm256_slli_epi16(t, 4), _mm256_slli_epi16(t, 2));
-        let u5 = _mm256_add_epi16(_mm256_slli_epi16(u, 2), u);
-        _mm256_sub_epi16(_mm256_add_epi16(v, t20), u5)
-    }
+    let t = _mm256_add_epi16(c, d);
+    let u = _mm256_add_epi16(b, e);
+    let v = _mm256_add_epi16(a, f);
+    // v + 20t - 5u = v + (t << 4) + (t << 2) - (u << 2) - u
+    let t20 = _mm256_add_epi16(_mm256_slli_epi16(t, 4), _mm256_slli_epi16(t, 2));
+    let u5 = _mm256_add_epi16(_mm256_slli_epi16(u, 2), u);
+    _mm256_sub_epi16(_mm256_add_epi16(v, t20), u5)
 }
 
 /// `clip((v + 16) >> 5)` of 16 i16 lanes packed to 16 u8 (low 128 bits).
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn round5_pack(v: __m256i) -> __m128i {
-    unsafe {
-        let r = _mm256_srai_epi16(_mm256_add_epi16(v, _mm256_set1_epi16(16)), 5);
-        let p = _mm256_packus_epi16(r, r); // per lane: [lo8 lo8 | hi8 hi8]
-        let p = _mm256_permute4x64_epi64(p, 0b11_01_10_00);
-        _mm256_castsi256_si128(p)
-    }
+    let r = _mm256_srai_epi16(_mm256_add_epi16(v, _mm256_set1_epi16(16)), 5);
+    let p = _mm256_packus_epi16(r, r); // per lane: [lo8 lo8 | hi8 hi8]
+    let p = _mm256_permute4x64_epi64(p, 0b11_01_10_00);
+    _mm256_castsi256_si128(p)
 }
 
 /// Horizontal half-sample intermediate (i16) for window row `row`.
@@ -140,26 +136,24 @@ unsafe fn h1_row(src: *const u8, stride: usize, col: usize, y: usize) -> __m256i
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn j_combine(w: &[__m256i; 6]) -> __m128i {
-    unsafe {
-        let (r0, r1, r2, r3, r4, r5) = (w[0], w[1], w[2], w[3], w[4], w[5]);
-        let c01 = _mm256_set1_epi32(pair(1, -5));
-        let c23 = _mm256_set1_epi32(pair(20, 20));
-        let c45 = _mm256_set1_epi32(pair(-5, 1));
-        let round = _mm256_set1_epi32(512);
-        let lo = _mm256_add_epi32(
-            _mm256_add_epi32(_mm256_madd_epi16(_mm256_unpacklo_epi16(r0, r1), c01), _mm256_madd_epi16(_mm256_unpacklo_epi16(r2, r3), c23)),
-            _mm256_add_epi32(_mm256_madd_epi16(_mm256_unpacklo_epi16(r4, r5), c45), round),
-        );
-        let hi = _mm256_add_epi32(
-            _mm256_add_epi32(_mm256_madd_epi16(_mm256_unpackhi_epi16(r0, r1), c01), _mm256_madd_epi16(_mm256_unpackhi_epi16(r2, r3), c23)),
-            _mm256_add_epi32(_mm256_madd_epi16(_mm256_unpackhi_epi16(r4, r5), c45), round),
-        );
-        // packs per lane keeps order (lo = lanes 0..3 | 8..11, hi = 4..7 | 12..15).
-        let v = _mm256_packs_epi32(_mm256_srai_epi32(lo, 10), _mm256_srai_epi32(hi, 10));
-        let p = _mm256_packus_epi16(v, v);
-        let p = _mm256_permute4x64_epi64(p, 0b11_01_10_00);
-        _mm256_castsi256_si128(p)
-    }
+    let (r0, r1, r2, r3, r4, r5) = (w[0], w[1], w[2], w[3], w[4], w[5]);
+    let c01 = _mm256_set1_epi32(pair(1, -5));
+    let c23 = _mm256_set1_epi32(pair(20, 20));
+    let c45 = _mm256_set1_epi32(pair(-5, 1));
+    let round = _mm256_set1_epi32(512);
+    let lo = _mm256_add_epi32(
+        _mm256_add_epi32(_mm256_madd_epi16(_mm256_unpacklo_epi16(r0, r1), c01), _mm256_madd_epi16(_mm256_unpacklo_epi16(r2, r3), c23)),
+        _mm256_add_epi32(_mm256_madd_epi16(_mm256_unpacklo_epi16(r4, r5), c45), round),
+    );
+    let hi = _mm256_add_epi32(
+        _mm256_add_epi32(_mm256_madd_epi16(_mm256_unpackhi_epi16(r0, r1), c01), _mm256_madd_epi16(_mm256_unpackhi_epi16(r2, r3), c23)),
+        _mm256_add_epi32(_mm256_madd_epi16(_mm256_unpackhi_epi16(r4, r5), c45), round),
+    );
+    // packs per lane keeps order (lo = lanes 0..3 | 8..11, hi = 4..7 | 12..15).
+    let v = _mm256_packs_epi32(_mm256_srai_epi32(lo, 10), _mm256_srai_epi32(hi, 10));
+    let p = _mm256_packus_epi16(v, v);
+    let p = _mm256_permute4x64_epi64(p, 0b11_01_10_00);
+    _mm256_castsi256_si128(p)
 }
 
 #[inline(always)]
@@ -408,13 +402,13 @@ unsafe fn weighted_bi_impl(dst: &mut [u8], stride: usize, a: &[u8], b: &[u8], w:
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn diff_lt(a: __m256i, b: __m256i, t: __m256i) -> __m256i {
-    unsafe { _mm256_cmpgt_epi16(t, _mm256_abs_epi16(_mm256_sub_epi16(a, b))) }
+    _mm256_cmpgt_epi16(t, _mm256_abs_epi16(_mm256_sub_epi16(a, b)))
 }
 
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn diff_lt128(a: __m128i, b: __m128i, t: __m128i) -> __m128i {
-    unsafe { _mm_cmpgt_epi16(t, _mm_abs_epi16(_mm_sub_epi16(a, b))) }
+    _mm_cmpgt_epi16(t, _mm_abs_epi16(_mm_sub_epi16(a, b)))
 }
 
 /// The eight positions of sixteen luma lines: `[p3, p2, p1, p0, q0, q1, q2, q3]`
@@ -516,20 +510,16 @@ unsafe fn luma_filter_intra(v: &mut LumaLines, alpha: i32, beta: i32) {
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn tc0_luma(tc0: &[i16; 4]) -> __m256i {
-    unsafe {
-        let t = |k: usize| tc0[k] as i16;
-        _mm256_setr_epi16(t(0), t(0), t(0), t(0), t(1), t(1), t(1), t(1), t(2), t(2), t(2), t(2), t(3), t(3), t(3), t(3))
-    }
+    let t = |k: usize| tc0[k] as i16;
+    _mm256_setr_epi16(t(0), t(0), t(0), t(0), t(1), t(1), t(1), t(1), t(2), t(2), t(2), t(2), t(3), t(3), t(3), t(3))
 }
 
 /// Pack sixteen i16 lanes to sixteen bytes.
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn pack16(v: __m256i) -> __m128i {
-    unsafe {
-        let p = _mm256_packus_epi16(v, v);
-        _mm256_castsi256_si128(_mm256_permute4x64_epi64(p, 0b11_01_10_00))
-    }
+    let p = _mm256_packus_epi16(v, v);
+    _mm256_castsi256_si128(_mm256_permute4x64_epi64(p, 0b11_01_10_00))
 }
 
 /// Load the sixteen rows x 8 bytes around a vertical edge (`q0` at `data`)
@@ -736,10 +726,8 @@ unsafe fn chroma_filter_intra(v: &mut ChromaLines, alpha: i32, beta: i32) {
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn tc0_chroma(tc0: &[i16; 4]) -> __m128i {
-    unsafe {
-        let t = |k: usize| tc0[k] as i16;
-        _mm_setr_epi16(t(0), t(0), t(1), t(1), t(2), t(2), t(3), t(3))
-    }
+    let t = |k: usize| tc0[k] as i16;
+    _mm_setr_epi16(t(0), t(0), t(1), t(1), t(2), t(2), t(3), t(3))
 }
 
 /// Eight bytes -> eight i16 lanes.
@@ -942,65 +930,61 @@ unsafe fn idct4_add_impl(dst: *mut u8, stride: usize, c: &[i16; 16]) {
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn transpose8(r: &mut [__m128i; 8]) {
-    unsafe {
-        let a0 = _mm_unpacklo_epi16(r[0], r[1]);
-        let a1 = _mm_unpackhi_epi16(r[0], r[1]);
-        let a2 = _mm_unpacklo_epi16(r[2], r[3]);
-        let a3 = _mm_unpackhi_epi16(r[2], r[3]);
-        let a4 = _mm_unpacklo_epi16(r[4], r[5]);
-        let a5 = _mm_unpackhi_epi16(r[4], r[5]);
-        let a6 = _mm_unpacklo_epi16(r[6], r[7]);
-        let a7 = _mm_unpackhi_epi16(r[6], r[7]);
-        let b0 = _mm_unpacklo_epi32(a0, a2);
-        let b1 = _mm_unpackhi_epi32(a0, a2);
-        let b2 = _mm_unpacklo_epi32(a1, a3);
-        let b3 = _mm_unpackhi_epi32(a1, a3);
-        let b4 = _mm_unpacklo_epi32(a4, a6);
-        let b5 = _mm_unpackhi_epi32(a4, a6);
-        let b6 = _mm_unpacklo_epi32(a5, a7);
-        let b7 = _mm_unpackhi_epi32(a5, a7);
-        r[0] = _mm_unpacklo_epi64(b0, b4);
-        r[1] = _mm_unpackhi_epi64(b0, b4);
-        r[2] = _mm_unpacklo_epi64(b1, b5);
-        r[3] = _mm_unpackhi_epi64(b1, b5);
-        r[4] = _mm_unpacklo_epi64(b2, b6);
-        r[5] = _mm_unpackhi_epi64(b2, b6);
-        r[6] = _mm_unpacklo_epi64(b3, b7);
-        r[7] = _mm_unpackhi_epi64(b3, b7);
-    }
+    let a0 = _mm_unpacklo_epi16(r[0], r[1]);
+    let a1 = _mm_unpackhi_epi16(r[0], r[1]);
+    let a2 = _mm_unpacklo_epi16(r[2], r[3]);
+    let a3 = _mm_unpackhi_epi16(r[2], r[3]);
+    let a4 = _mm_unpacklo_epi16(r[4], r[5]);
+    let a5 = _mm_unpackhi_epi16(r[4], r[5]);
+    let a6 = _mm_unpacklo_epi16(r[6], r[7]);
+    let a7 = _mm_unpackhi_epi16(r[6], r[7]);
+    let b0 = _mm_unpacklo_epi32(a0, a2);
+    let b1 = _mm_unpackhi_epi32(a0, a2);
+    let b2 = _mm_unpacklo_epi32(a1, a3);
+    let b3 = _mm_unpackhi_epi32(a1, a3);
+    let b4 = _mm_unpacklo_epi32(a4, a6);
+    let b5 = _mm_unpackhi_epi32(a4, a6);
+    let b6 = _mm_unpacklo_epi32(a5, a7);
+    let b7 = _mm_unpackhi_epi32(a5, a7);
+    r[0] = _mm_unpacklo_epi64(b0, b4);
+    r[1] = _mm_unpackhi_epi64(b0, b4);
+    r[2] = _mm_unpacklo_epi64(b1, b5);
+    r[3] = _mm_unpackhi_epi64(b1, b5);
+    r[4] = _mm_unpacklo_epi64(b2, b6);
+    r[5] = _mm_unpackhi_epi64(b2, b6);
+    r[6] = _mm_unpacklo_epi64(b3, b7);
+    r[7] = _mm_unpackhi_epi64(b3, b7);
 }
 
 /// One 8-point pass (8.5.13.2) across eight registers.
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn idct8_pass(d: &[__m128i; 8]) -> [__m128i; 8] {
-    unsafe {
-        let add = |a, b| _mm_add_epi16(a, b);
-        let sub = |a, b| _mm_sub_epi16(a, b);
-        let sh1 = |a| _mm_srai_epi16(a, 1);
-        let sh2 = |a| _mm_srai_epi16(a, 2);
-        let a0 = add(d[0], d[4]);
-        let a4 = sub(d[0], d[4]);
-        let a2 = sub(sh1(d[2]), d[6]);
-        let a6 = add(d[2], sh1(d[6]));
-        let b0 = add(a0, a6);
-        let b2 = add(a4, a2);
-        let b4 = sub(a4, a2);
-        let b6 = sub(a0, a6);
-        // a1 = -d3 + d5 - d7 - (d7 >> 1)
-        let a1 = sub(sub(sub(d[5], d[3]), d[7]), sh1(d[7]));
-        // a3 = d1 + d7 - d3 - (d3 >> 1)
-        let a3 = sub(sub(add(d[1], d[7]), d[3]), sh1(d[3]));
-        // a5 = -d1 + d7 + d5 + (d5 >> 1)
-        let a5 = add(add(sub(d[7], d[1]), d[5]), sh1(d[5]));
-        // a7 = d3 + d5 + d1 + (d1 >> 1)
-        let a7 = add(add(add(d[3], d[5]), d[1]), sh1(d[1]));
-        let b1 = add(a1, sh2(a7));
-        let b7 = sub(a7, sh2(a1));
-        let b3 = add(a3, sh2(a5));
-        let b5 = sub(sh2(a3), a5);
-        [add(b0, b7), add(b2, b5), add(b4, b3), add(b6, b1), sub(b6, b1), sub(b4, b3), sub(b2, b5), sub(b0, b7)]
-    }
+    let add = |a, b| _mm_add_epi16(a, b);
+    let sub = |a, b| _mm_sub_epi16(a, b);
+    let sh1 = |a| _mm_srai_epi16(a, 1);
+    let sh2 = |a| _mm_srai_epi16(a, 2);
+    let a0 = add(d[0], d[4]);
+    let a4 = sub(d[0], d[4]);
+    let a2 = sub(sh1(d[2]), d[6]);
+    let a6 = add(d[2], sh1(d[6]));
+    let b0 = add(a0, a6);
+    let b2 = add(a4, a2);
+    let b4 = sub(a4, a2);
+    let b6 = sub(a0, a6);
+    // a1 = -d3 + d5 - d7 - (d7 >> 1)
+    let a1 = sub(sub(sub(d[5], d[3]), d[7]), sh1(d[7]));
+    // a3 = d1 + d7 - d3 - (d3 >> 1)
+    let a3 = sub(sub(add(d[1], d[7]), d[3]), sh1(d[3]));
+    // a5 = -d1 + d7 + d5 + (d5 >> 1)
+    let a5 = add(add(sub(d[7], d[1]), d[5]), sh1(d[5]));
+    // a7 = d3 + d5 + d1 + (d1 >> 1)
+    let a7 = add(add(add(d[3], d[5]), d[1]), sh1(d[1]));
+    let b1 = add(a1, sh2(a7));
+    let b7 = sub(a7, sh2(a1));
+    let b3 = add(a3, sh2(a5));
+    let b5 = sub(sh2(a3), a5);
+    [add(b0, b7), add(b2, b5), add(b4, b3), add(b6, b1), sub(b6, b1), sub(b4, b3), sub(b2, b5), sub(b0, b7)]
 }
 
 fn idct8_add_avx2(dst: &mut [u8], stride: usize, coeffs: &[i16; 64], _max: i32) {

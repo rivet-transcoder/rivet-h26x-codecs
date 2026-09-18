@@ -19,6 +19,16 @@
 //! feature string by a literal, because they are not the same thing: the AVX
 //! instantiation compiles the SSE4.1 primitive set with `enable = "avx"` to
 //! get VEX encoding, so it passes `("avx", sse41)`.
+//!
+//! What this is *not* is an MSRV or `unsafe` shim, and no toolchain version
+//! retires it: `pblendvb`, `pmovzxbw` and `pminsd` are SSE4.1 *hardware*, and
+//! a CPU without them has to be handed the two- or three-instruction sequence
+//! instead. The toolchain-dependent part was the `unsafe {}` block each
+//! primitive used to wrap its intrinsics in, and Rust 1.87 retired those: the
+//! `#[target_feature]` a primitive is compiled with makes its intrinsics safe
+//! to call (see the note above the module declarations in `dsp`). The
+//! primitives stay `unsafe fn`, because calling one from code that has not
+//! established `$feat` is exactly what the caller has to vouch for.
 
 /// Expand the level-dependent primitives for `$feat` / `$lvl`.
 ///
@@ -29,42 +39,42 @@ macro_rules! compat_core {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn zx8(v: __m128i) -> __m128i {
-            unsafe { _mm_unpacklo_epi8(v, _mm_setzero_si128()) }
+            _mm_unpacklo_epi8(v, _mm_setzero_si128())
         }
 
         /// Zero-extend the high eight bytes of `v` to eight i16.
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn zx8h(v: __m128i) -> __m128i {
-            unsafe { _mm_unpackhi_epi8(v, _mm_setzero_si128()) }
+            _mm_unpackhi_epi8(v, _mm_setzero_si128())
         }
 
         /// Zero-extend the low four u16 lanes of `v` to four i32.
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn zx16(v: __m128i) -> __m128i {
-            unsafe { _mm_unpacklo_epi16(v, _mm_setzero_si128()) }
+            _mm_unpacklo_epi16(v, _mm_setzero_si128())
         }
 
         /// Zero-extend u16 lanes 4..8 of `v` to four i32.
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn zx16h(v: __m128i) -> __m128i {
-            unsafe { _mm_unpackhi_epi16(v, _mm_setzero_si128()) }
+            _mm_unpackhi_epi16(v, _mm_setzero_si128())
         }
 
         /// Sign-extend the low four i16 lanes of `v` to four i32.
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn sx16(v: __m128i) -> __m128i {
-            unsafe { _mm_srai_epi32(_mm_unpacklo_epi16(v, v), 16) }
+            _mm_srai_epi32(_mm_unpacklo_epi16(v, v), 16)
         }
 
         /// Sign-extend i16 lanes 4..8 of `v` to four i32.
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn sx16h(v: __m128i) -> __m128i {
-            unsafe { _mm_srai_epi32(_mm_unpackhi_epi16(v, v), 16) }
+            _mm_srai_epi32(_mm_unpackhi_epi16(v, v), 16)
         }
 
 
@@ -85,24 +95,22 @@ macro_rules! compat_core {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn sel(a: __m128i, b: __m128i, m: __m128i) -> __m128i {
-            unsafe { _mm_or_si128(_mm_andnot_si128(m, a), _mm_and_si128(m, b)) }
+            _mm_or_si128(_mm_andnot_si128(m, a), _mm_and_si128(m, b))
         }
 
         /// `|v|` per i16 lane (never given `i16::MIN`).
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn abs16(v: __m128i) -> __m128i {
-            unsafe { _mm_max_epi16(v, _mm_sub_epi16(_mm_setzero_si128(), v)) }
+            _mm_max_epi16(v, _mm_sub_epi16(_mm_setzero_si128(), v))
         }
 
         /// `|v|` per i32 lane.
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn abs32(v: __m128i) -> __m128i {
-            unsafe {
-                let m = _mm_srai_epi32(v, 31);
-                _mm_sub_epi32(_mm_xor_si128(v, m), m)
-            }
+            let m = _mm_srai_epi32(v, 31);
+            _mm_sub_epi32(_mm_xor_si128(v, m), m)
         }
 
         /// Signed 32-bit minimum.
@@ -123,14 +131,14 @@ macro_rules! compat_core {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn maxb0(v: __m128i) -> __m128i {
-            unsafe { _mm_and_si128(v, _mm_cmpgt_epi8(v, _mm_setzero_si128())) }
+            _mm_and_si128(v, _mm_cmpgt_epi8(v, _mm_setzero_si128()))
         }
 
         /// Whether every bit of `v` is zero.
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn is_zero(v: __m128i) -> bool {
-            unsafe { _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_setzero_si128())) == 0xFFFF }
+            _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_setzero_si128())) == 0xFFFF
         }
     };
 
@@ -143,14 +151,14 @@ macro_rules! compat_core {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn abs16(v: __m128i) -> __m128i {
-            unsafe { _mm_abs_epi16(v) }
+            _mm_abs_epi16(v)
         }
 
         /// `|v|` per i32 lane.
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn abs32(v: __m128i) -> __m128i {
-            unsafe { _mm_abs_epi32(v) }
+            _mm_abs_epi32(v)
         }
     };
 
@@ -160,37 +168,37 @@ macro_rules! compat_core {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn zx8(v: __m128i) -> __m128i {
-            unsafe { _mm_unpacklo_epi8(v, _mm_setzero_si128()) }
+            _mm_unpacklo_epi8(v, _mm_setzero_si128())
         }
 
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn zx8h(v: __m128i) -> __m128i {
-            unsafe { _mm_unpackhi_epi8(v, _mm_setzero_si128()) }
+            _mm_unpackhi_epi8(v, _mm_setzero_si128())
         }
 
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn zx16(v: __m128i) -> __m128i {
-            unsafe { _mm_unpacklo_epi16(v, _mm_setzero_si128()) }
+            _mm_unpacklo_epi16(v, _mm_setzero_si128())
         }
 
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn zx16h(v: __m128i) -> __m128i {
-            unsafe { _mm_unpackhi_epi16(v, _mm_setzero_si128()) }
+            _mm_unpackhi_epi16(v, _mm_setzero_si128())
         }
 
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn sx16(v: __m128i) -> __m128i {
-            unsafe { _mm_srai_epi32(_mm_unpacklo_epi16(v, v), 16) }
+            _mm_srai_epi32(_mm_unpacklo_epi16(v, v), 16)
         }
 
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn sx16h(v: __m128i) -> __m128i {
-            unsafe { _mm_srai_epi32(_mm_unpackhi_epi16(v, v), 16) }
+            _mm_srai_epi32(_mm_unpackhi_epi16(v, v), 16)
         }
 
 
@@ -208,7 +216,7 @@ macro_rules! compat_core {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn sel(a: __m128i, b: __m128i, m: __m128i) -> __m128i {
-            unsafe { _mm_or_si128(_mm_andnot_si128(m, a), _mm_and_si128(m, b)) }
+            _mm_or_si128(_mm_andnot_si128(m, a), _mm_and_si128(m, b))
         }
 
         #[target_feature(enable = $feat)]
@@ -226,13 +234,13 @@ macro_rules! compat_core {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn maxb0(v: __m128i) -> __m128i {
-            unsafe { _mm_and_si128(v, _mm_cmpgt_epi8(v, _mm_setzero_si128())) }
+            _mm_and_si128(v, _mm_cmpgt_epi8(v, _mm_setzero_si128()))
         }
 
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn is_zero(v: __m128i) -> bool {
-            unsafe { _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_setzero_si128())) == 0xFFFF }
+            _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_setzero_si128())) == 0xFFFF
         }
     };
 
@@ -241,42 +249,42 @@ macro_rules! compat_core {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn zx8(v: __m128i) -> __m128i {
-            unsafe { _mm_cvtepu8_epi16(v) }
+            _mm_cvtepu8_epi16(v)
         }
 
         /// Zero-extend the high eight bytes of `v` to eight i16.
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn zx8h(v: __m128i) -> __m128i {
-            unsafe { _mm_cvtepu8_epi16(_mm_srli_si128(v, 8)) }
+            _mm_cvtepu8_epi16(_mm_srli_si128(v, 8))
         }
 
         /// Zero-extend the low four u16 lanes of `v` to four i32.
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn zx16(v: __m128i) -> __m128i {
-            unsafe { _mm_cvtepu16_epi32(v) }
+            _mm_cvtepu16_epi32(v)
         }
 
         /// Zero-extend u16 lanes 4..8 of `v` to four i32.
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn zx16h(v: __m128i) -> __m128i {
-            unsafe { _mm_cvtepu16_epi32(_mm_srli_si128(v, 8)) }
+            _mm_cvtepu16_epi32(_mm_srli_si128(v, 8))
         }
 
         /// Sign-extend the low four i16 lanes of `v` to four i32.
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn sx16(v: __m128i) -> __m128i {
-            unsafe { _mm_cvtepi16_epi32(v) }
+            _mm_cvtepi16_epi32(v)
         }
 
         /// Sign-extend i16 lanes 4..8 of `v` to four i32.
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn sx16h(v: __m128i) -> __m128i {
-            unsafe { _mm_cvtepi16_epi32(_mm_srli_si128(v, 8)) }
+            _mm_cvtepi16_epi32(_mm_srli_si128(v, 8))
         }
 
 
@@ -284,62 +292,62 @@ macro_rules! compat_core {
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn zx8d(v: __m128i) -> __m128i {
-            unsafe { _mm_cvtepu8_epi32(v) }
+            _mm_cvtepu8_epi32(v)
         }
 
         /// Zero-extend bytes 4..8 of `v` to four i32.
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn zx8dh(v: __m128i) -> __m128i {
-            unsafe { _mm_cvtepu8_epi32(_mm_srli_si128(v, 4)) }
+            _mm_cvtepu8_epi32(_mm_srli_si128(v, 4))
         }
         /// `b` where `m`'s lanes are all-ones, `a` where they are all-zeros.
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn sel(a: __m128i, b: __m128i, m: __m128i) -> __m128i {
-            unsafe { _mm_blendv_epi8(a, b, m) }
+            _mm_blendv_epi8(a, b, m)
         }
 
         /// `|v|` per i16 lane.
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn abs16(v: __m128i) -> __m128i {
-            unsafe { _mm_abs_epi16(v) }
+            _mm_abs_epi16(v)
         }
 
         /// `|v|` per i32 lane.
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn abs32(v: __m128i) -> __m128i {
-            unsafe { _mm_abs_epi32(v) }
+            _mm_abs_epi32(v)
         }
 
         /// Signed 32-bit minimum.
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn min32(a: __m128i, b: __m128i) -> __m128i {
-            unsafe { _mm_min_epi32(a, b) }
+            _mm_min_epi32(a, b)
         }
 
         /// Signed 32-bit maximum.
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn max32(a: __m128i, b: __m128i) -> __m128i {
-            unsafe { _mm_max_epi32(a, b) }
+            _mm_max_epi32(a, b)
         }
 
         /// `max(v, 0)` per signed byte.
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn maxb0(v: __m128i) -> __m128i {
-            unsafe { _mm_max_epi8(v, _mm_setzero_si128()) }
+            _mm_max_epi8(v, _mm_setzero_si128())
         }
 
         /// Whether every bit of `v` is zero.
         #[target_feature(enable = $feat)]
         #[inline]
         unsafe fn is_zero(v: __m128i) -> bool {
-            unsafe { _mm_testz_si128(v, v) != 0 }
+            _mm_testz_si128(v, v) != 0
         }
     };
 }
