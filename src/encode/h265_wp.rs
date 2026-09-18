@@ -23,13 +23,17 @@
 //! table says so in one flag bit. A fit that helps nothing costs the
 //! table's bits and biases the motion search for no return.
 //!
-//! The fit is H.264's too (`encode::h264`'s explicit weighting for P
+//! The fit is H.264's too (`encode::h264`'s explicit weighting for P and B
 //! slices): H.264's table carries the weight itself where H.265's carries a
 //! delta around the identity, so [`fit_samples`] takes the range the
 //! caller's syntax can hold, and the reference as a plain sample layout
 //! ([`RefSamples`]) rather than either decoder's plane type. The weighted
 //! arithmetic the check applies is the same in both standards: H.264's
-//! 8.4.2.3.2 uni-directional formula at `logWD >= 1` is H.265's.
+//! 8.4.2.3.2 uni-directional formula at `logWD >= 1` is H.265's, and at
+//! `logWD` 0 it drops the rounding shift, as `weighted_sad` does. H.264
+//! also bounds the sum of a bi-predicted pair's two weights, which a B
+//! slice's fits can break at [`LOG2_DENOM`]; [`fit_samples_at`] quantises
+//! the same sums ([`plane_sums`]) at a coarser denominator for it.
 //!
 //! What this is not: a per-block decision. The table is per slice and
 //! per reference, so a picture whose left half fades and whose right
