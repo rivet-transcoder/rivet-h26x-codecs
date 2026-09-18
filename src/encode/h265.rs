@@ -737,12 +737,10 @@ impl<S: Sample> Core<S> {
             let bits = a.access.data.len() as u64 * 8;
             // A picture planned from a seed and nothing else: its own bits
             // are the measurement the seed stood in for.
-            if attempt == 0 {
-                if let Some(again) = self.rc.as_mut().and_then(|rc| rc.seed_recode(bits)) {
-                    self.seed_recoded += 1;
-                    qp = again;
-                    continue;
-                }
+            if attempt == 0 && let Some(again) = self.rc.as_mut().and_then(|rc| rc.seed_recode(bits)) {
+                self.seed_recoded += 1;
+                qp = again;
+                continue;
             }
             // What the buffer can hand over at this picture's removal time.
             // `None` means no buffer was declared and nothing can fail.
