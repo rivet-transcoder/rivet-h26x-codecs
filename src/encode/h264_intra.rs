@@ -256,6 +256,11 @@ pub struct IntraCtx<'a, S: Sample> {
     /// ([`Geometry::chroma_mv_dy`](crate::encode::h264_syntax::Geometry::chroma_mv_dy)):
     /// zero outside a 4:2:0 field predicting from the opposite parity.
     pub chroma_mv_dy: [i32; 2],
+    /// What the level the SPS claims asks of the motion search
+    /// ([`MotionLimits`](crate::encode::level::MotionLimits)): the vertical
+    /// vector range. [`MotionLimits::NONE`](crate::encode::level::MotionLimits::NONE)
+    /// where nothing searches H.264 motion.
+    pub motion: crate::encode::level::MotionLimits,
 }
 
 /// Whether a 4x4 block's top-right neighbour has been reconstructed by the
@@ -1546,6 +1551,7 @@ mod tests {
                 subparts: false,
                 field: false,
                 chroma_mv_dy: [0; 2],
+                motion: crate::encode::level::MotionLimits::NONE,
             };
             // (the encoder's 8x8 list index, the plane it codes, whether
             // the macroblock is inter, and the QP that plane is coded at)
@@ -1637,6 +1643,7 @@ mod tests {
             subparts: false,
             field: false,
             chroma_mv_dy: [0; 2],
+            motion: crate::encode::level::MotionLimits::NONE,
         };
         let mut rec = crate::encode::h264_syntax::recon_plane(32, 32, 16);
         for v in rec.data.iter_mut() {

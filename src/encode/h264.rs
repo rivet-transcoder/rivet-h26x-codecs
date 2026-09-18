@@ -773,8 +773,10 @@ impl<S: Sample> Core<S> {
             }
         };
         // The level the SPS will claim: refused here, before any header
-        // exists, when no level admits the stream (`encode::level`).
-        super::level::h264(&cfg, &geom)?;
+        // exists, when no level admits the stream (`encode::level`). The
+        // motion search is then held to what that level allows.
+        let level = super::level::h264(&cfg, &geom)?;
+        let tools = tools.with_motion(super::level::MotionLimits::h264(level.idc));
         let rc = match cfg.rate {
             // The controller aims at the *declared* rate where a buffer
             // was declared, so the two cannot disagree by the rounding.

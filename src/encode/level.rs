@@ -97,6 +97,18 @@
 //!   level (A.4.1: "a suitable label for bitstreams that can exceed the
 //!   limits of all other specified levels"). It is not refused.
 //!
+//! # What the encoder keeps for its level
+//!
+//! Some limits constrain the encoder's *decisions*, not its parameters,
+//! and no choice of level can meet them on its behalf. The encoder derives
+//! the level first and then holds its decisions to it
+//! ([`MotionLimits`]):
+//!
+//! - H.264 `MaxVmvR` (A.3.2(g)): every luma vector's vertical component
+//!   within `[-MaxVmvR, MaxVmvR - 1/4]` frame samples — 64 at level 1, 512
+//!   from 3.1 — halved in a field macroblock's own rows. The motion search
+//!   clamps its window to it, as x264 does (`h264_me::search_rect`).
+//!
 //! # What is not checked here
 //!
 //! - **The rate of a constant-quantiser stream.** See above: no bound
@@ -161,36 +173,38 @@ struct H264Row {
     max_cpb: u64,
     /// `MinCR`.
     min_cr: u64,
+    /// `MaxVmvR`, luma frame samples.
+    max_vmv_r: i32,
 }
 
 #[allow(clippy::too_many_arguments)]
-const fn h264_row(idc: u8, name: &'static str, max_mbps: u64, max_fs: u64, max_dpb_mbs: u64, max_br: u64, max_cpb: u64, min_cr: u64) -> H264Row {
-    H264Row { idc, name, max_mbps, max_fs, max_dpb_mbs, max_br, max_cpb, min_cr }
+const fn h264_row(idc: u8, name: &'static str, max_mbps: u64, max_fs: u64, max_dpb_mbs: u64, max_br: u64, max_cpb: u64, min_cr: u64, max_vmv_r: i32) -> H264Row {
+    H264Row { idc, name, max_mbps, max_fs, max_dpb_mbs, max_br, max_cpb, min_cr, max_vmv_r }
 }
 
 /// Table A-1 in the order the standard ranks it (A.3.1: a row nearer the
 /// top is a lower level), 1b between 1 and 1.1.
 const H264_LEVELS: [H264Row; 20] = [
-    h264_row(10, "1", 1_485, 99, 396, 64, 175, 2),
-    h264_row(9, "1b", 1_485, 99, 396, 128, 350, 2),
-    h264_row(11, "1.1", 3_000, 396, 900, 192, 500, 2),
-    h264_row(12, "1.2", 6_000, 396, 2_376, 384, 1_000, 2),
-    h264_row(13, "1.3", 11_880, 396, 2_376, 768, 2_000, 2),
-    h264_row(20, "2", 11_880, 396, 2_376, 2_000, 2_000, 2),
-    h264_row(21, "2.1", 19_800, 792, 4_752, 4_000, 4_000, 2),
-    h264_row(22, "2.2", 20_250, 1_620, 8_100, 4_000, 4_000, 2),
-    h264_row(30, "3", 40_500, 1_620, 8_100, 10_000, 10_000, 2),
-    h264_row(31, "3.1", 108_000, 3_600, 18_000, 14_000, 14_000, 4),
-    h264_row(32, "3.2", 216_000, 5_120, 20_480, 20_000, 20_000, 4),
-    h264_row(40, "4", 245_760, 8_192, 32_768, 20_000, 25_000, 4),
-    h264_row(41, "4.1", 245_760, 8_192, 32_768, 50_000, 62_500, 2),
-    h264_row(42, "4.2", 522_240, 8_704, 34_816, 50_000, 62_500, 2),
-    h264_row(50, "5", 589_824, 22_080, 110_400, 135_000, 135_000, 2),
-    h264_row(51, "5.1", 983_040, 36_864, 184_320, 240_000, 240_000, 2),
-    h264_row(52, "5.2", 2_073_600, 36_864, 184_320, 240_000, 240_000, 2),
-    h264_row(60, "6", 4_177_920, 139_264, 696_320, 240_000, 240_000, 2),
-    h264_row(61, "6.1", 8_355_840, 139_264, 696_320, 480_000, 480_000, 2),
-    h264_row(62, "6.2", 16_711_680, 139_264, 696_320, 800_000, 800_000, 2),
+    h264_row(10, "1", 1_485, 99, 396, 64, 175, 2, 64),
+    h264_row(9, "1b", 1_485, 99, 396, 128, 350, 2, 64),
+    h264_row(11, "1.1", 3_000, 396, 900, 192, 500, 2, 128),
+    h264_row(12, "1.2", 6_000, 396, 2_376, 384, 1_000, 2, 128),
+    h264_row(13, "1.3", 11_880, 396, 2_376, 768, 2_000, 2, 128),
+    h264_row(20, "2", 11_880, 396, 2_376, 2_000, 2_000, 2, 128),
+    h264_row(21, "2.1", 19_800, 792, 4_752, 4_000, 4_000, 2, 256),
+    h264_row(22, "2.2", 20_250, 1_620, 8_100, 4_000, 4_000, 2, 256),
+    h264_row(30, "3", 40_500, 1_620, 8_100, 10_000, 10_000, 2, 256),
+    h264_row(31, "3.1", 108_000, 3_600, 18_000, 14_000, 14_000, 4, 512),
+    h264_row(32, "3.2", 216_000, 5_120, 20_480, 20_000, 20_000, 4, 512),
+    h264_row(40, "4", 245_760, 8_192, 32_768, 20_000, 25_000, 4, 512),
+    h264_row(41, "4.1", 245_760, 8_192, 32_768, 50_000, 62_500, 2, 512),
+    h264_row(42, "4.2", 522_240, 8_704, 34_816, 50_000, 62_500, 2, 512),
+    h264_row(50, "5", 589_824, 22_080, 110_400, 135_000, 135_000, 2, 512),
+    h264_row(51, "5.1", 983_040, 36_864, 184_320, 240_000, 240_000, 2, 512),
+    h264_row(52, "5.2", 2_073_600, 36_864, 184_320, 240_000, 240_000, 2, 512),
+    h264_row(60, "6", 4_177_920, 139_264, 696_320, 240_000, 240_000, 2, 8192),
+    h264_row(61, "6.1", 8_355_840, 139_264, 696_320, 480_000, 480_000, 2, 8192),
+    h264_row(62, "6.2", 16_711_680, 139_264, 696_320, 800_000, 800_000, 2, 8192),
 ];
 
 /// `cpbBrVclFactor` (Table A-2) for the profiles this encoder writes.
@@ -331,6 +345,46 @@ pub fn h264(cfg: &Config, g: &h264_syntax::Geometry) -> Result<Level> {
         top.name,
         s.exceeds(top).join("; ")
     )))
+}
+
+/// What an H.264 level asks of the encoder's motion *decisions* rather
+/// than of its parameters: limits no choice of level can meet on the
+/// encoder's behalf, which the motion search therefore keeps for the
+/// level the stream claims. Derived from that level — the level first,
+/// then the search held to it — so the claim and the vectors cannot
+/// disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MotionLimits {
+    /// `MaxVmvR` (A.3.2(g)): every luma vector's vertical component lies
+    /// in `[-max_vmv_r, max_vmv_r - 1/4]`, in luma *frame* samples — so a
+    /// field macroblock, whose rows are every other frame row, has half
+    /// the range in its own rows.
+    pub max_vmv_r: i32,
+}
+
+impl MotionLimits {
+    /// No limit at all: what a context that searches no H.264 motion (the
+    /// H.265 encoder's, which shares the context type) carries.
+    pub const NONE: MotionLimits = MotionLimits { max_vmv_r: i32::MAX };
+
+    /// The limits of the H.264 level whose `level_idc` is `idc` (Table
+    /// A-1). A `level_idc` outside the table — which the encoder never
+    /// writes — gets none.
+    pub fn h264(idc: u8) -> MotionLimits {
+        match H264_LEVELS.iter().find(|row| row.idc == idc) {
+            Some(row) => MotionLimits { max_vmv_r: row.max_vmv_r },
+            None => MotionLimits::NONE,
+        }
+    }
+
+    /// The vertical range a search in rows of this kind may use, in full
+    /// samples of those rows: `±(range - 1)`, so that a quarter-sample
+    /// refinement of at most three quarters either way stays inside
+    /// `[-range, range - 1/4]`.
+    pub fn vertical_search(&self, field: bool) -> i32 {
+        let range = if field { self.max_vmv_r / 2 } else { self.max_vmv_r };
+        range.saturating_sub(1)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -616,6 +670,21 @@ mod tests {
         let l = h265_with(c, None);
         assert!(!l.high_tier, "{}x{}@{}: High tier at level {}", c.width, c.height, c.fps, l.name);
         l.name
+    }
+
+    /// `MaxVmvR` by level (Table A-1), and the search window it leaves: a
+    /// full-sample search within `±(range - 1)` whose quarter refinement
+    /// cannot leave `[-range, range - 1/4]`, half the rows for a field
+    /// macroblock.
+    #[test]
+    fn motion_limits_follow_table_a1() {
+        for (idc, vmv) in [(10, 64), (9, 64), (11, 128), (20, 128), (21, 256), (30, 256), (31, 512), (52, 512), (60, 8192), (62, 8192)] {
+            assert_eq!(MotionLimits::h264(idc).max_vmv_r, vmv, "level_idc {idc}");
+        }
+        assert_eq!(MotionLimits::h264(99), MotionLimits::NONE);
+        let l = MotionLimits::h264(31);
+        assert_eq!((l.vertical_search(false), l.vertical_search(true)), (511, 255));
+        assert_eq!(MotionLimits::NONE.vertical_search(true), i32::MAX / 2 - 1);
     }
 
     /// Frame sizes and rates against Table A-1, each at or just past a row's

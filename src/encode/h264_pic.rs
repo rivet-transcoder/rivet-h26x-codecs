@@ -74,6 +74,10 @@ pub struct IntraTools<S: Sample> {
     /// decoder will hold for it. One constant per encoder, riding here for
     /// the reason the two switches above do.
     pub(crate) aq_strength: f32,
+    /// What the stream's level asks of the motion search
+    /// (`encode::level::MotionLimits`). One constant per encoder, like the
+    /// switches above; none until the encoder has chosen its level.
+    pub(crate) motion: crate::encode::level::MotionLimits,
 }
 
 impl<S: Sample> IntraTools<S> {
@@ -96,12 +100,19 @@ impl<S: Sample> IntraTools<S> {
             transform_8x8,
             subparts,
             aq_strength: 0.0,
+            motion: crate::encode::level::MotionLimits::NONE,
         }
     }
 
     /// The same tools with adaptive quantisation at `strength` (0 off).
     pub(crate) fn with_aq(mut self, strength: f32) -> Self {
         self.aq_strength = strength;
+        self
+    }
+
+    /// The same tools searching motion within `limits`.
+    pub(crate) fn with_motion(mut self, limits: crate::encode::level::MotionLimits) -> Self {
+        self.motion = limits;
         self
     }
 }
@@ -481,6 +492,7 @@ impl<'a, S: Sample> PicCoding<'a, S> {
             subparts: tools.subparts,
             field: g.field_pic,
             chroma_mv_dy: g.chroma_mv_dy,
+            motion: tools.motion,
         };
         let (mbs_wide, mbs_high) = (g.mbs_wide as usize, g.mbs_high as usize);
         let luma_stride = g.coded_width as usize;

@@ -1375,6 +1375,7 @@ mod tests {
                 subparts: false,
                 field: false,
                 chroma_mv_dy: [0; 2],
+                motion: crate::encode::level::MotionLimits::NONE,
             };
             let mut rec = vec![
                 recon_plane(16, 16, LUMA_PAD),
@@ -1671,6 +1672,7 @@ mod tests {
                     subparts: false,
                     field: false,
                     chroma_mv_dy: [0; 2],
+                    motion: crate::encode::level::MotionLimits::NONE,
                 };
                 let mut rec = vec![
                     recon_plane(16, 16, LUMA_PAD),
@@ -1742,6 +1744,7 @@ mod tests {
                     subparts: false,
                     field: false,
                     chroma_mv_dy: [0; 2],
+                    motion: crate::encode::level::MotionLimits::NONE,
                 };
                 let cpad = if c444 { LUMA_PAD } else { CHROMA_PAD };
                 let cw = if c444 { 16 } else { 8 };
