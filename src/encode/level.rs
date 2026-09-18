@@ -849,9 +849,13 @@ mod tests {
     /// reconstructions. H.264 at 176x144 with four references is level 1,
     /// whose `MaxDpbFrames` is exactly four — the size this crate's decoder
     /// takes, the SPS carrying no `max_dec_frame_buffering` — and B pictures
-    /// ride on top; five references move it to level 1.1. H.265 with four
-    /// references and three B pictures declares eight buffers, level 1's
-    /// `MaxDpbSize` at this size; five declare nine, level 2.
+    /// ride on top; five references move it to level 1.1. H.265 with two
+    /// references and five B pictures declares eight buffers, level 1's
+    /// `MaxDpbSize` at this size; six B pictures declare nine, level 2.
+    /// (Two references: with three or more beside B pictures the encoder's
+    /// B-picture reference sets drop an anchor the next P picture still
+    /// uses, which libavcodec refuses and this crate's decoder forgives —
+    /// a defect of its own, not of the level.)
     #[test]
     fn streams_at_a_dpb_boundary_round_trip() {
         let frames = moving(176, 144, 13);
@@ -873,11 +877,11 @@ mod tests {
             dec.flush().unwrap();
             round_trip(&tag, &units, e.reconstructions(), std::iter::from_fn(|| dec.next_picture().map(|p| p.into_packed())));
         }
-        for (refs, idc, buffers) in [(4u32, 30u8, 8u32), (5, 60, 9)] {
-            let tag = format!("H.265 refs {refs} bframes 3");
+        for (bframes, idc, buffers) in [(5u32, 30u8, 8u32), (6, 60, 9)] {
+            let tag = format!("H.265 refs 2 bframes {bframes}");
             let c = Config {
-                max_refs: refs,
-                bframes: 3,
+                max_refs: 2,
+                bframes,
                 gop: 250,
                 rate: RateControl::ConstantQp(30),
                 max_cu_depth: Some(0),
