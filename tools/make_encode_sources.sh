@@ -173,9 +173,10 @@ gen big    "testsrc2=size=128x80:rate=25,format=yuv420p[a];mandelbrot=size=128x8
 # 88x48: a right column of CTBs 24 wide (a 32 node crossing the edge, its
 # right 16 children crossing again) and a bottom row 16 high (a crossing 32
 # whose lower children lie outside) behind a conformance window of 4 rows —
-# the remainder 1280x720 and 3840x2160 leave at the bottom, which the odd
-# clip (50x34, coded 56x40: remainders 24 and 8) does not have. testsrc2
-# moves, so inter pictures split at the edges too.
+# the remainder 1280x720 and 3840x2160 leave at the bottom. It is the one
+# partial-CTB clip: the odd clip (50x34) is below 64 both ways, where the
+# encoder keeps whole CTBs (`Geometry::new`). 88x44 is 64 or more one way,
+# which is enough. testsrc2 moves, so inter pictures split at the edges too.
 #
 # VISITED ONLY BY ROWS THAT NAME IT (`@edge`): the `420p8` depth token keeps
 # every untagged row off it, as on the big clip.

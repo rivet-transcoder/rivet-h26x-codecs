@@ -94,19 +94,37 @@ impl Geometry {
     /// 32x32 and the coded picture is the smallest legal one, a whole number
     /// of 8x8 minimum coding blocks: the CTBs along the right and bottom
     /// edges are partial, and the tree decisions and the writer produce the
-    /// splits the reader infers there (`tree_steps` in `encode::h265`). A
-    /// whole-CTB unit at `max_cu_depth` 0 cannot be partial, so there the
-    /// coded picture is a whole number of CTBs, 16 or 32, whichever pads
-    /// less, the larger on a tie — the geometry every stream had before
-    /// partial CTBs. The conformance window crops whatever is coded beyond
-    /// the requested size. The standard's CTB floor is 16 (an 8x8 CTB is
-    /// illegal — this crate's own SPS parser rejects it, which is how that
-    /// constraint was rediscovered), and the decision machinery's ceiling
-    /// is 32; 64x64 CTBs are not produced.
+    /// splits the reader infers there (`tree_steps` in `encode::h265`).
+    /// Otherwise the coded picture is a whole number of CTBs, 16 or 32,
+    /// whichever pads less, the larger on a tie — the geometry every stream
+    /// had before partial CTBs. That is the rule at `max_cu_depth` 0, where
+    /// a whole-CTB unit cannot be partial, and, under the quadtree, for a
+    /// picture narrower *and* shorter than 64.
+    ///
+    /// That size exception is fitted to one measured clip, not derived.
+    /// The 50x34 gate clip coded as partial 32x32 CTBs (56x40) against the
+    /// whole 16x16 ones (64x48), per-plane YUV BD-rate at QP 22-40 (34-43
+    /// in brackets): IP +1.08% (+1.66%), IPB +1.33% (+3.74%), AQ IP +8.58%
+    /// (+11.75%), AQ IPB +7.51% (+11.40%), all-intra -0.56% (-0.62%). 32x32
+    /// CTBs padded to whole ones (64x64) lost as much in AQ (IP +11.1%, IPB
+    /// +10.6% at QP 22-40), so the AQ loss is CTB 32 with adaptive
+    /// quantisation on a picture that small, not the partial geometry. The
+    /// 88x44 gate clip, partial 32x32 CTBs against whole 16x16 ones, gains
+    /// in every family measured (IP -7.6%, AQ IP -6.0% YUV at QP 22-40), as
+    /// do 1280x720 and 3840x2160 (the module doc of `encode::h265`). No
+    /// picture between 50x34 and 88x44 was measured: 64 is where the rule
+    /// was drawn, not where the loss was found to end.
+    ///
+    /// The conformance window crops whatever is coded beyond the requested
+    /// size. The standard's CTB floor is 16 (an 8x8 CTB is illegal — this
+    /// crate's own SPS parser rejects it, which is how that constraint was
+    /// rediscovered), and the decision machinery's ceiling is 32; 64x64
+    /// CTBs are not produced.
     pub fn new(cfg: &Config) -> Self {
         let log2_min_cb = 3;
         let tree = cfg.max_cu_depth.unwrap_or(crate::encode::h265::DEFAULT_CU_DEPTH) > 0;
-        let (log2_ctb, coded_width, coded_height) = if tree {
+        let small = cfg.width < 64 && cfg.height < 64;
+        let (log2_ctb, coded_width, coded_height) = if tree && !small {
             let m = 1u32 << log2_min_cb;
             (5, cfg.width.div_ceil(m) * m, cfg.height.div_ceil(m) * m)
         } else {
@@ -1129,42 +1147,59 @@ mod tests {
         }
     }
 
+    /// Whole CTBs (50x34, below 64 both ways) and partial ones (90x34)
+    /// both crop back to the requested size.
     #[test]
     fn the_conformance_window_recovers_the_requested_size() {
-        let (cfg, g) = geom(50, 34, ChromaFormat::Yuv420);
-        assert_eq!((g.coded_width, g.coded_height), (56, 40));
-        let sps = write_sps(&cfg, &g, 8, None);
-        let parsed = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&sps)).unwrap();
-        let (l, r, t, b) = parsed.conf_win;
-        assert_eq!(g.coded_width - l - r, 50);
-        assert_eq!(g.coded_height - t - b, 34);
+        for (w, h, coded) in [(50, 34, (64, 48)), (90, 34, (96, 40))] {
+            let (cfg, g) = geom(w, h, ChromaFormat::Yuv420);
+            assert_eq!((g.coded_width, g.coded_height), coded, "{w}x{h}");
+            let sps = write_sps(&cfg, &g, 8, None);
+            let parsed = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&sps)).unwrap();
+            let (l, r, t, b) = parsed.conf_win;
+            assert_eq!((g.coded_width - l - r, g.coded_height - t - b), (w, h), "{w}x{h}");
+        }
     }
 
     /// Under the coding quadtree the CTB is 32 and the coded picture the
     /// smallest legal one, whole 8x8 minimum coding blocks, whatever the
-    /// edge CTBs are left holding; at depth 0 it is whole CTBs, 16 or 32 by
+    /// edge CTBs are left holding — unless the picture is narrower and
+    /// shorter than 64. There, and at depth 0, it is whole CTBs, 16 or 32 by
     /// least padding. See `Geometry::new`.
     #[test]
-    fn the_coded_picture_is_minimal_under_the_quadtree_and_whole_ctus_at_depth_0() {
+    fn the_coded_picture_is_minimal_under_the_quadtree_and_whole_ctus_at_depth_0_or_below_64() {
         let at = |w: u32, h: u32, depth: Option<u32>| {
             let g = Geometry::new(&Config { max_cu_depth: depth, ..geom(w, h, ChromaFormat::Yuv420).0 });
             (g.log2_ctb, g.coded_width, g.coded_height, g.ctbs_wide, g.ctbs_high)
         };
         for depth in [None, Some(1), Some(2)] {
             assert_eq!(at(64, 64, depth), (5, 64, 64, 2, 2));
-            assert_eq!(at(48, 48, depth), (5, 48, 48, 2, 2));
-            assert_eq!(at(24, 24, depth), (5, 24, 24, 1, 1));
-            assert_eq!(at(50, 34, depth), (5, 56, 40, 2, 2));
+            // One side of 64 is enough to leave the exception: 16x16 CTBs
+            // would code 64x48 whole, and the quadtree codes 32x32 ones.
+            assert_eq!(at(64, 48, depth), (5, 64, 48, 2, 2));
+            assert_eq!(at(48, 64, depth), (5, 48, 64, 2, 2));
+            assert_eq!(at(88, 44, depth), (5, 88, 48, 3, 2));
             assert_eq!(at(1280, 720, depth), (5, 1280, 720, 40, 23));
             assert_eq!(at(1366, 768, depth), (5, 1368, 768, 43, 24));
             assert_eq!(at(3840, 2160, depth), (5, 3840, 2160, 120, 68));
+            // Narrower and shorter than 64: the depth-0 geometry. 50x34 is
+            // the clip the exception was fitted to; 63x40 and 40x63 sit on
+            // its edge. 63x63 codes 64x64 either way, 32x32 CTBs on a tie.
+            for (w, h) in [(50, 34), (48, 48), (24, 24), (63, 63), (63, 40), (40, 63)] {
+                assert_eq!(at(w, h, depth), at(w, h, Some(0)), "{w}x{h} depth {depth:?}");
+            }
+            assert_eq!(at(50, 34, depth), (4, 64, 48, 4, 3));
+            assert_eq!(at(63, 40, depth), (4, 64, 48, 4, 3));
+            assert_eq!(at(63, 63, depth), (5, 64, 64, 2, 2));
         }
         assert_eq!(at(64, 64, Some(0)), (5, 64, 64, 2, 2));
+        assert_eq!(at(64, 48, Some(0)), (4, 64, 48, 4, 3));
         assert_eq!(at(48, 48, Some(0)), (4, 48, 48, 3, 3));
         // 24x24 pads to 32x32 under either CTB size; the tie goes to 32.
         assert_eq!(at(24, 24, Some(0)), (5, 32, 32, 1, 1));
         // 50x34: CTB 16 pads to 64x48, CTB 32 to 64x64 — 16 pads less.
         assert_eq!(at(50, 34, Some(0)), (4, 64, 48, 4, 3));
+        assert_eq!(at(88, 44, Some(0)), (4, 96, 48, 6, 3));
         assert_eq!(at(1280, 720, Some(0)), (4, 1280, 720, 80, 45));
     }
 

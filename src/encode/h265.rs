@@ -120,14 +120,15 @@
 //!
 //! ## CTB size (2026-09-14)
 //!
-//! Under the coding quadtree every picture codes 32x32 CTBs, partial along
-//! the right and bottom edges, and the coded size is the smallest legal
-//! one — whole 8x8 minimum coding blocks (`h265_syntax::Geometry::new`,
-//! `tree_steps`). The rule before picked 16 or 32, whichever padded less,
-//! so 1280x720, 3840x2160 and 640x360 coded 16x16 CTBs, where the quadtree
-//! can split once and depth 2 buys nothing. One binary, 16 frames, QP
-//! 22/27/32/37, against that rule (bytes summed over the QPs; BD-rate of
-//! luma and of YUV 6:1:1; per-process CPU seconds):
+//! Under the coding quadtree every picture 64 or more in either direction
+//! codes 32x32 CTBs, partial along the right and bottom edges, and the
+//! coded size is the smallest legal one — whole 8x8 minimum coding blocks
+//! (`h265_syntax::Geometry::new`, `tree_steps`). The rule before picked 16
+//! or 32, whichever padded less, so 1280x720, 3840x2160 and 640x360 coded
+//! 16x16 CTBs, where the quadtree can split once and depth 2 buys nothing.
+//! One binary, 16 frames, QP 22/27/32/37, against that rule (bytes summed
+//! over the QPs; BD-rate of luma and of YUV 6:1:1; per-process CPU
+//! seconds):
 //!
 //! ```text
 //!                          CTB 32 padded to whole CTBs     CTB 32 partial at the edges
@@ -149,10 +150,35 @@
 //! 3840x2160 ones do not. At `max_cu_depth` 0 a whole-CTB unit cannot be
 //! partial, so that geometry keeps the old rule.
 //!
+//! So do pictures below 64 both ways, and that exception is fitted to one
+//! clip. Partial CTB 32 against the old rule's whole CTBs (16x16 on both
+//! clips; per-plane YUV BD-rate, QP 22-40 and in brackets 34-43, AQ at
+//! `--aq 1.0`):
+//!
+//! ```text
+//!              50x34 (coded 56x40, was 64x48)   88x44 (coded 88x48, was 96x48)
+//!   I          -0.56%  (-0.62%)                  -0.80%  (-1.61%)
+//!   IP         +1.08%  (+1.66%)                  -7.64%  (-9.67%)
+//!   IPB        +1.33%  (+3.74%)                  -7.24%  (-9.80%)
+//!   AQ IP      +8.58% (+11.75%)                  -5.98%  (-6.60%)
+//!   AQ IPB     +7.51% (+11.40%)                  -4.94%  (-6.98%)
+//! ```
+//!
+//! CTB 32 padded to whole CTBs (64x64) lost as much on 50x34 with AQ (IP
+//! +11.1%, IPB +10.6%), and 8x8 groups on the partial CTBs still lost 8.2%
+//! and 8.0%, so it is CTB 32 on a picture that small, not the partial
+//! geometry or the group size. 50x34 keeps the old rule and codes as it
+//! did; 88x44, 64 or more one way, takes partial CTBs. No size between the
+//! two was measured, so 64 marks where the rule was drawn, not where the
+//! loss ends.
+//!
 //! The quantisation group adaptive quantisation uses follows the stream:
 //! the CTB in an all-intra stream, half the CTB where pictures are
 //! predicted from others (`Core::new` records the measurement; CTB groups
-//! in every stream regressed the fading clip in IP and IPB).
+//! in every stream regressed the fading clip in IP and IPB). It does so at
+//! either CTB size: on 50x34's 16x16 CTBs the all-intra group of 16
+//! against the 8 before gains 1.9% YUV at QP 22-40 (3.3% at 34-43), every
+//! plane better.
 
 use super::gop::{Coded, Kind, Scheduler};
 use super::h265_deblock::{deblock_inter_picture, deblock_picture};
@@ -4422,12 +4448,13 @@ mod tests {
     }
 
     /// Partial edge CTBs round-trip. Where the picture is not whole 32x32
-    /// CTBs the coded picture is the smallest legal one and the CTBs along
-    /// the right and bottom edges are partial, their splits inferred rather
-    /// than coded: 1280x720 leaves a bottom row of 16, 1366x768 a right
-    /// column of 24 behind a conformance window of 2, and the small sizes
-    /// take the other remainders (8, 16, 24) in each direction, intra, P
-    /// and B, through the production decoder.
+    /// CTBs (and not below 64 both ways, see `Geometry::new`) the coded
+    /// picture is the smallest legal one and the CTBs along the right and
+    /// bottom edges are partial, their splits inferred rather than coded:
+    /// 1280x720 leaves a bottom row of 16, 1366x768 a right column of 24
+    /// behind a conformance window of 2, and the small sizes take the other
+    /// remainders (8, 16, 24) in each direction, intra, P and B, through the
+    /// production decoder.
     #[test]
     fn partial_edge_ctbs_round_trip() {
         for (w, h, gop, bframes, frames) in [
@@ -4435,7 +4462,7 @@ mod tests {
             (1366, 768, 8, 0, 2),
             (88, 44, 8, 2, 4),
             (72, 56, 8, 2, 4),
-            (50, 34, 0, 0, 2),
+            (80, 34, 0, 0, 2),
         ] {
             let tag = format!("{w}x{h} gop={gop} bframes={bframes}");
             let config = Config { gop, bframes, ..cfg(w as u32, h as u32, ChromaFormat::Yuv420) };

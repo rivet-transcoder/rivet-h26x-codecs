@@ -477,9 +477,10 @@ at the CTB size (`log2_cu = log2_ctb_size`; the writer took 32 for a
 64x64 clip and 16 only where that padded less, as for `odd`), so on these
 clips its SAD calls never took the 16-wide path; that combination did not
 exist in that encoder. (Since the coding quadtree it searches every unit
-size down to 8x8, and the CTB is 32x32 at every picture size, partial
-along the right and bottom edges; whole 16x16 CTBs remain only at
-`max_cu_depth` 0, where they pad less.) The H.265 rows are reached through the quantiser: the same two
+size down to 8x8, and the CTB is 32x32, partial along the right and bottom
+edges, at every picture size 64 or more in either direction; whole 16x16
+CTBs remain, where they pad less, at `max_cu_depth` 0 and below 64 both
+ways, as for `odd`.) The H.265 rows are reached through the quantiser: the same two
 clips with the AVX2 quantiser's rounding offset doubled give `avx` 68
 identical again and `avx2` 18 of 68 MOVED — every H.265 row that
 quantises, on both clips, while the six lossless cells and all 44 H.264

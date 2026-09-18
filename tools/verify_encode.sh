@@ -339,21 +339,23 @@ EXCLUSIVE_TOKENS="ilace"
 # keep the whole-CTB path — the geometry of every stream before the
 # quadtree — under the same properties, and `hevc-cu1-ipb` the one-split
 # depth. Which clip carries what is worth knowing. Under the quadtree the CTB
-# is 32x32 and the coded picture the smallest legal size, so the odd clip
-# (50x34, coded 56x40) ends in partial CTBs, 24 wide and 8 high, whose
-# splits the reader infers; its `--cu-depth 0` rows keep whole 16x16 CTBs
-# (64x48), which a whole-CTB unit needs. grad's smooth gradients split almost
-# nowhere (its cells prove the syntax). detail, motion, cut and fade split at
+# is 32x32 and the coded picture the smallest legal size, partial CTBs
+# along the right and bottom edges — except below 64 both ways, where every
+# row keeps whole CTBs, 16 or 32 by least padding (`Geometry::new` has the
+# measurement that exception is fitted to). So the odd clip (50x34) codes
+# whole 16x16 CTBs (64x48) in every row, where the quadtree stops at depth
+# 1 whatever the row asks. grad's smooth gradients split almost nowhere
+# (its cells prove the syntax). detail, motion, cut and fade split at
 # every depth in every picture kind; NxN is taken on every clip in I pictures
 # and on seven of them inside P/B. The @big clip, src_big_256x160_420p8 — the
 # one clip larger than 64x64, forty CTBs of four unrelated contents — is
 # spelled with a depth token so every row without an `@` skips it (the deep
 # clips' rule); its `hevc-cu0-*@big` rows are the depth-0 twins of the
 # `hevc-cu2-*@big` ones. The @edge clip, src_edge_88x44_420p8 (coded 88x48),
-# takes the partial-CTB remainder the odd clip lacks: a bottom row 16 high,
-# the one 1280x720 and 3840x2160 leave, beside a right column 24 wide. Its
-# `hevc-cu1-edge-ipb` row splits past its depth where the edge forces it,
-# and `hevc-cu0-edge-ipb` is the whole-CTB geometry (16x16 CTBs, 96x48).
+# is the one partial-CTB clip: a bottom row 16 high, the remainder 1280x720
+# and 3840x2160 leave, beside a right column 24 wide. Its `hevc-cu1-edge-ipb`
+# row splits past its depth where the edge forces it, and
+# `hevc-cu0-edge-ipb` is the whole-CTB geometry (16x16 CTBs, 96x48).
 #
 # The quadtree's mutations, each run once against these rows: the split
 # decision ignored by the writer, the split_cu_flag neighbour context
