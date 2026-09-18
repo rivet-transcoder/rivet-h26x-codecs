@@ -32,7 +32,7 @@
 # Usage: source this, define `mutate_check`, then call `mutate_try` per fault.
 #
 #   . tools/mutate.sh
-#   mutate_check() { cargo test --quiet 2>&1 | grep -E 'test result'; }
+#   mutate_check() { cargo test --quiet 2>&1 | grep -E 'test result'; return "${PIPESTATUS[0]}"; }
 #   mutate_try "cbf inverted" src/encode/h265.rs 'cbf as u32' '!cbf as u32'
 #   mutate_report
 #
@@ -52,6 +52,25 @@ _MUTATE_CAUGHT=0
 _MUTATE_MISSED=0
 _MUTATE_SKIPPED=0
 _MUTATE_MISSED_NAMES=()
+
+# mutate_failed RC OUTPUT — the verdict: did the checks fail?
+#
+# A non-zero status, or a line that marks a failure the way the tools here
+# print one: an upper-case FAIL (cargo's "FAILED", verify_encode's
+# "SELF-FAIL"/"QUALITY-FAIL", "SOMETHING FAILED"), a non-zero "N failed"
+# count, a compiler or runtime "error" at the start of a line, or a panic.
+# It must NOT match a success line: cargo's "test result: ok. 330 passed;
+# 0 failed" and verify_encode's "encode: 959 passed, 0 failed" both contain
+# the word "failed". An earlier verdict grepped `fail|error` case-blind, so
+# every mutation checked through the usage example above read CAUGHT even
+# when the tests passed. tools/mutate_selftest.sh pins these cases.
+mutate_failed() {
+  local rc="$1" out="$2"
+  [ "$rc" -ne 0 ] && return 0
+  # A zero counter such as "ENCODE-FAIL(A)=0" names a failure kind, not one.
+  printf '%s\n' "$out" | sed -E 's/[A-Z-]*FAIL[A-Z()]*=0([^0-9]|$)/\1/g' \
+    | grep -qE 'FAIL|(^|[^0-9])[1-9][0-9]* failed|^[[:space:]]*error(\[|:)|panicked'
+}
 
 # mutate_try NAME FILE FROM TO
 mutate_try() {
@@ -86,9 +105,9 @@ PY
   out="$(mutate_check 2>&1)"
   local rc=$?
   echo "$out" | sed 's/^/     /'
-  # Caught when the checks failed: a non-zero status, or any line the caller's
-  # own output marks as a failure.
-  if [ $rc -ne 0 ] || echo "$out" | grep -qiE 'fail|error'; then
+  # Caught when the checks failed: a non-zero status, or a line the caller's
+  # own output marks as a failure (see mutate_failed).
+  if mutate_failed "$rc" "$out"; then
     echo "     -> CAUGHT"
     _MUTATE_CAUGHT=$((_MUTATE_CAUGHT + 1))
   else
