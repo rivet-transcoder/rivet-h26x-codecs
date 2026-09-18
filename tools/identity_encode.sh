@@ -21,9 +21,19 @@
 #   ENV_A / ENV_B   the two environments (default H26X_ENC_NO_SIMD=1 vs none)
 #   ENC_B=exe       a second binary for side B, for a change that has no
 #                   switch (default: the same binary)
+#   MASK=level      a cell whose bitstreams differ only in the level they
+#                   claim (tools/level_mask.py: H.264 SPS level_idc, H.265
+#                   VPS/SPS general_tier_flag and general_level_idc), with
+#                   identical reconstructions, is LEVEL-ONLY rather than
+#                   MOVED — for a change to how the level is chosen, which
+#                   moves that one field in nearly every stream and nothing
+#                   else. Every other difference is still MOVED.
 # Resolved before the cd below, which would otherwise turn a relative
 # script path into nothing.
 VERIFY=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/verify_encode.sh
+LEVEL_MASK=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/level_mask.py
+MASK=${MASK:-}
+case "$MASK" in ""|level) ;; *) echo "MASK=$MASK: only MASK=level is known" >&2; exit 2 ;; esac
 cd "${H26X_WORK:-$(dirname "$0")}"
 ENC=${1:-../release/examples/h26xenc.exe}
 [ -f "$ENC" ] || ENC=${ENC%.exe}
@@ -77,6 +87,16 @@ one() {
     echo "ENCODE-FAIL $tag (B): $(tail -1 "$b.log" | head -c 100)"; return 1
   fi
   if ! cmp -s "$a" "$b"; then
+    if [ "$MASK" = level ]; then
+      codec=h264; case "$flags" in *"--codec h265"*) codec=h265 ;; esac
+      if m=$(python "$LEVEL_MASK" "$codec" "$a" "$b"); then
+        if cmp -s "$a.yuv" "$b.yuv"; then
+          echo "LEVEL-ONLY  $tag ($m)"; return 0
+        fi
+        echo "MOVED       $tag: reconstructions differ (bitstreams differ only in the level: $m)"; return 1
+      fi
+      echo "MOVED       $tag: bitstreams differ beyond the level ($m)"; return 1
+    fi
     echo "MOVED       $tag: bitstreams differ ($(stat -c %s "$a") vs $(stat -c %s "$b") bytes)"; return 1
   fi
   if ! cmp -s "$a.yuv" "$b.yuv"; then
@@ -85,9 +105,9 @@ one() {
   echo "SAME        $tag ($(stat -c %s "$a") bytes)"
 }
 export -f one
-export ENC ENC_B OUT ENV_A ENV_B
+export ENC ENC_B OUT ENV_A ENV_B MASK LEVEL_MASK
 
-echo "== encode identity: [$ENV_A] $(basename "$ENC") vs [${ENV_B:-as shipped}] $(basename "$ENC_B") =="
+echo "== encode identity: [$ENV_A] $(basename "$ENC") vs [${ENV_B:-as shipped}] $(basename "$ENC_B")${MASK:+ (MASK=$MASK)} =="
 results="$OUT/results.txt"
 for src in $SOURCES; do
   echo "$CONFIGS" | while IFS='|' read -r name flags; do
@@ -111,12 +131,13 @@ for src in $SOURCES; do
 done | xargs -P "$JOBS" -I{} bash -c 'IFS="|" read -r s n f <<< "{}"; one "$s" "$n" "$f"' | sort | tee "$results"
 
 same=$(grep -c '^SAME' "$results")
+masked=$(grep -c '^LEVEL-ONLY' "$results")
 bad=$(grep -cE '^(MOVED|ENCODE-FAIL)' "$results")
 echo
-echo "identity: $same identical, $bad moved"
+echo "identity: $same identical, ${MASK:+$masked level-only, }$bad moved"
 # Zero cells is not a pass: it is the configuration list failing to parse
 # or the corpus missing, and a green line over nothing is the vacuity this
 # whole gate exists to refuse.
-if [ "$same" = 0 ]; then echo "NO CELLS RAN"; exit 2; fi
+if [ "$((same + masked))" = 0 ]; then echo "NO CELLS RAN"; exit 2; fi
 [ "$bad" = 0 ] && echo "ALL IDENTICAL" || echo "CELLS MOVED"
 [ "$bad" = 0 ]

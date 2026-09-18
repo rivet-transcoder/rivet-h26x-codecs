@@ -772,6 +772,9 @@ impl<S: Sample> Core<S> {
                 ));
             }
         };
+        // The level the SPS will claim: refused here, before any header
+        // exists, when no level admits the stream (`encode::level`).
+        super::level::h264(&cfg, &geom)?;
         let rc = match cfg.rate {
             // The controller aims at the *declared* rate where a buffer
             // was declared, so the two cannot disagree by the rounding.

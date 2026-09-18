@@ -194,7 +194,7 @@ fn chroma_idc(c: ChromaFormat) -> u32 {
 /// libavcodec refused the first stream that had them
 /// ("sps_max_num_reorder_pics out of range"). Our own decoder was more
 /// forgiving, which is exactly why CROSS exists.
-fn dpb(cfg: &Config) -> (u32, u32) {
+pub(crate) fn dpb(cfg: &Config) -> (u32, u32) {
     let reorder = cfg.bframes;
     (cfg.max_refs.max(1) + reorder, reorder)
 }
@@ -205,8 +205,10 @@ fn dpb(cfg: &Config) -> (u32, u32) {
 /// 43-bit reserved field that has to be written as two pieces because it does
 /// not fit a single call. Main for 8-bit 4:2:0, Main 10 for deeper, Rext for
 /// anything else — claiming a profile that does not admit the format is a
-/// stream a decoder may refuse.
-fn write_ptl(w: &mut BitWriter, g: &Geometry) {
+/// stream a decoder may refuse. The tier and level are the lowest that
+/// admit the stream (`encode::level`), derived from `cfg` alone so that the
+/// VPS and the SPS cannot claim different ones.
+fn write_ptl(w: &mut BitWriter, cfg: &Config, g: &Geometry) {
     let profile = if g.chroma != ChromaFormat::Yuv420 || g.bit_depth > 10 {
         4 // Range extensions
     } else if g.bit_depth > 8 {
@@ -214,8 +216,9 @@ fn write_ptl(w: &mut BitWriter, g: &Geometry) {
     } else {
         1 // Main
     };
+    let level = crate::encode::level::h265(cfg, g);
     w.bits(2, 0); // general_profile_space
-    w.flag(false); // general_tier_flag
+    w.flag(level.high_tier); // general_tier_flag
     w.bits(5, profile); // general_profile_idc
     // general_profile_compatibility_flag[32]
     for i in 0..32 {
@@ -228,7 +231,7 @@ fn write_ptl(w: &mut BitWriter, g: &Geometry) {
     // 43 reserved zero bits, in two writes because one call takes at most 32.
     w.zeros(43);
     w.flag(false); // general_inbld_flag / reserved
-    w.bits(8, 120); // general_level_idc: level 4.0, which admits 1080p
+    w.bits(8, u32::from(level.idc)); // general_level_idc
 }
 
 /// The coded picture buffer this stream declares, in the exact values the
@@ -432,7 +435,7 @@ pub fn write_vps(cfg: &Config, g: &Geometry) -> Vec<u8> {
     w.bits(3, 0); // vps_max_sub_layers_minus1
     w.flag(true); // vps_temporal_id_nesting_flag
     w.bits(16, 0xffff); // vps_reserved_0xffff_16bits
-    write_ptl(&mut w, g);
+    write_ptl(&mut w, cfg, g);
     w.flag(true); // vps_sub_layer_ordering_info_present_flag
     let (buffering, reorder) = dpb(cfg);
     w.ue(buffering); // vps_max_dec_pic_buffering_minus1[0]
@@ -452,7 +455,7 @@ pub fn write_sps(cfg: &Config, g: &Geometry, log2_max_poc_lsb: u32, cpb: Option<
     w.bits(4, 0); // sps_video_parameter_set_id
     w.bits(3, 0); // sps_max_sub_layers_minus1
     w.flag(true); // sps_temporal_id_nesting_flag
-    write_ptl(&mut w, g);
+    write_ptl(&mut w, cfg, g);
     w.ue(0); // sps_seq_parameter_set_id
     w.ue(chroma_idc(g.chroma));
     if g.chroma == ChromaFormat::Yuv444 {

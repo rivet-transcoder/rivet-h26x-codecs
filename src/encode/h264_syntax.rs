@@ -366,7 +366,7 @@ impl Geometry {
 /// needs High. Claiming a lower profile than the stream needs is the kind
 /// of error a decoder is entitled to reject the stream over, so this errs
 /// upwards.
-fn profile_idc(g: &Geometry) -> u8 {
+pub(crate) fn profile_idc(g: &Geometry) -> u8 {
     match g.chroma {
         _ if g.bit_depth > 10 => 244,
         ChromaFormat::Yuv444 => 244,
@@ -400,11 +400,11 @@ pub fn write_sps(
     w.bits(8, profile as u32);
     // constraint_set0..5 then two reserved zero bits.
     w.bits(8, 0);
-    // Level 5.1 unconditionally. Deriving the true level from size and rate
-    // is a table lookup this encoder will want later; until then, claiming a
-    // level that admits everything is honest, whereas claiming one too low
-    // would be a stream a conforming decoder may refuse.
-    w.bits(8, 51);
+    // The lowest level that admits the stream (`encode::level`). The
+    // encoder refuses a stream no level admits before writing anything; a
+    // test driving this writer with such a configuration gets 6.2, the
+    // highest.
+    w.bits(8, u32::from(crate::encode::level::h264(cfg, g).map_or(62, |l| l.idc)));
     w.ue(0); // seq_parameter_set_id
     if has_chroma_extension(profile) {
         w.ue(match g.chroma {
