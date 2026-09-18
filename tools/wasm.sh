@@ -106,6 +106,17 @@ for w in scalar simd128; do
   [ "$got" = "OK" ] || fail=1
 done
 
+# The HEVC kernels have a randomised sweep of their own in the probe
+# (`h26x_hevc_dsp_check`: interpolation, transforms, SAO, deblocking, intra
+# prediction, both sample tables), which `wasm_dsp_check.mjs` runs; the
+# scalar build would compare the reference with itself, so only simd128.
+echo
+echo "== HEVC kernel sweep inside wasm (randomised, against scalar) =="
+got=$(node tools/wasm_dsp_check.mjs "$TMP/simd128.wasm" 2>&1 | tail -1)
+printf "  %-8s %s
+" simd128 "$got"
+[ "$got" = "SIMD128: OK" ] || fail=1
+
 for w in scalar simd128; do
   echo
   echo "== vendored streams, decoded inside wasm ($w) =="

@@ -138,6 +138,40 @@ fn lcg(seed: &mut u64) -> u32 {
     (*seed >> 33) as u32
 }
 
+/// `h26x_hevc_dsp_check`'s intra sweep for one table (a macro, since the
+/// sample trait is the crate's own).
+macro_rules! intra_check {
+    ($s:expr, $d:expr, $max:expr, $t:ty) => {{
+        const ANGLES: [i32; 33] = [32, 26, 21, 17, 13, 9, 5, 2, 0, -2, -5, -9, -13, -17, -21, -26, -32, -26, -21, -17, -13, -9, -5, -2, 0, 2, 5, 9, 13, 17, 21, 26, 32];
+        let (s, d, max): (&h26x::dsp::hevc::HevcDsp<$t>, &h26x::dsp::hevc::HevcDsp<$t>, u32) = ($s, $d, $max);
+        let mut fails = 0u32;
+        let mut seed = 0x1a7a_u64 + max as u64;
+        let stride = 40;
+        for n in [4usize, 8, 16, 32] {
+            let refs: Vec<u16> = (0..3 * 64 + 1 + 32).map(|_| (lcg(&mut seed) % (max + 1)) as u16).collect();
+            let (left, top) = (&refs[..64], &refs[64..128]);
+            let mut a = vec![<$t>::default(); stride * 33];
+            let mut b = vec![<$t>::default(); stride * 33];
+            (s.intra_planar)(&mut a, stride, left, top, n);
+            (d.intra_planar)(&mut b, stride, left, top, n);
+            fails += (a != b) as u32;
+            for edge in [false, true] {
+                (s.intra_dc)(&mut a, stride, left, top, n, edge);
+                (d.intra_dc)(&mut b, stride, left, top, n, edge);
+                fails += (a != b) as u32;
+            }
+            for angle in ANGLES {
+                for transposed in [false, true] {
+                    (s.intra_angular)(&mut a, stride, &refs, n, angle, transposed);
+                    (d.intra_angular)(&mut b, stride, &refs, n, angle, transposed);
+                    fails += (a != b) as u32;
+                }
+            }
+        }
+        fails
+    }};
+}
+
 /// Compare every entry of the installed HEVC kernel tables — 8-bit, and
 /// 16-bit at bit depths 10 and 12 — against the scalar reference over
 /// randomized inputs — all the block shapes the
@@ -588,6 +622,14 @@ pub extern "C" fn h26x_hevc_dsp_check() -> u32 {
             }
             fails += (a != b) as u32;
         }
+    }
+
+    // The intra predictors, in both tables: every size, every angle both
+    // ways round, planar, and DC with and without its edge filter, over
+    // references uniform across each depth.
+    fails += intra_check!(&HevcDsp::<u8>::SCALAR, &HevcDsp::<u8>::new(h26x::dsp::Cpu::detect()), 255, u8);
+    for max in [1023, 4095] {
+        fails += intra_check!(&HevcDsp::<u16>::SCALAR, &HevcDsp::<u16>::new(h26x::dsp::Cpu::detect()), max, u16);
     }
 
     fails

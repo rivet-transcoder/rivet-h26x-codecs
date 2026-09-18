@@ -135,6 +135,9 @@ pub fn install(d: &mut HevcDsp<u8>) {
     d.deblock_chroma_v = deblock_chroma_v;
     d.deblock_chroma_h = deblock_chroma_h;
     d.idst4 = idst4;
+    d.intra_planar = intra_planar;
+    d.intra_dc = intra_dc;
+    d.intra_angular = intra_angular;
 }
 
 /// Replace the scalar entries of `d` with the simd128 kernels (16-bit
@@ -170,6 +173,9 @@ pub fn install_u16(d: &mut HevcDsp<u16>) {
     d.deblock_chroma_v = deblock_chroma_v16;
     d.deblock_chroma_h = deblock_chroma_h16;
     d.idst4 = idst4;
+    d.intra_planar = intra_planar;
+    d.intra_dc = intra_dc;
+    d.intra_angular = intra_angular;
 }
 
 
@@ -1007,6 +1013,157 @@ fn idct<const N: usize>(coeffs: &mut [i16], bd_shift: i32, max_x: usize, max_y: 
         return inv4(coeffs, bd_shift, &DCT4);
     }
     unsafe { idct_impl::<N>(coeffs, bd_shift, max_x, max_y) }
+}
+
+// ----------------------------------------------------------------------
+// Intra prediction
+// ----------------------------------------------------------------------
+//
+// `hevc_x86_128.rs`'s intra kernels on simd128, generic over the sample
+// type in the same way: u16 references for both tables, i16 / i32 lanes,
+// only the store differs. `i32x4_dot_i16x8` reads the references as i16,
+// so one above 32767 (a 16-bit stream) goes to the scalar kernel.
+
+/// Store the first `n` (≤ 8) lanes of `v` (values in sample range) as
+/// samples of `S`.
+#[inline]
+unsafe fn put<S: crate::hevc::frame::Sample>(dst: *mut S, v: v128, n: usize) {
+    unsafe {
+        if S::BYTES == 2 {
+            return store_i16_n(dst as *mut i16, v, n);
+        }
+        store_bytes(dst as *mut u8, u8x16_narrow_i16x8(v, v), n)
+    }
+}
+
+/// Whether any of `r` is above 32767. Never true of a u8 table's.
+#[inline]
+fn over_i16<S: crate::hevc::frame::Sample>(r: &[u16]) -> bool {
+    S::BYTES == 2 && r.iter().any(|&v| v > 32767)
+}
+
+fn intra_planar<S: crate::hevc::frame::Sample>(dst: &mut [S], stride: usize, left: &[u16], top: &[u16], n: usize) {
+    let fits = left.len() > n && top.len() >= n.max(8) && (n - 1) * stride + n <= dst.len();
+    if !fits || !(4..=32).contains(&n) || over_i16::<S>(&left[..=n]) || over_i16::<S>(&top[..=n]) {
+        return (HevcDsp::<S>::scalar().intra_planar)(dst, stride, left, top, n);
+    }
+    unsafe {
+        let d = dst.as_mut_ptr();
+        let sh = n.trailing_zeros() + 1;
+        let round = i32x4_splat(n as i32);
+        let ln = i16x8_splat(left[n] as i16);
+        let chunks = n.div_ceil(8);
+        let mut w = [(i32x4_splat(0), i32x4_splat(0)); 4];
+        let mut t = [(i32x4_splat(0), i32x4_splat(0)); 4];
+        for c in 0..chunks {
+            let wx = |x: usize| pair16((n as i32 - 1 - x as i32) as i16, (x + 1) as i16);
+            let x0 = 8 * c;
+            w[c] = (i32x4(wx(x0), wx(x0 + 1), wx(x0 + 2), wx(x0 + 3)), i32x4(wx(x0 + 4), wx(x0 + 5), wx(x0 + 6), wx(x0 + 7)));
+            let tx = v128_load(top.as_ptr().add(x0) as *const v128);
+            t[c] = (zip_lo16(tx, ln), zip_hi16(tx, ln));
+        }
+        for (y, &ly) in left[..n].iter().enumerate() {
+            let a = i32x4_splat(pair16(ly as i16, top[n] as i16));
+            let b = i32x4_splat(pair16((n - 1 - y) as i16, (y + 1) as i16));
+            for c in 0..chunks {
+                let lo = i32x4_add(i32x4_add(i32x4_dot_i16x8(w[c].0, a), i32x4_dot_i16x8(t[c].0, b)), round);
+                let hi = i32x4_add(i32x4_add(i32x4_dot_i16x8(w[c].1, a), i32x4_dot_i16x8(t[c].1, b)), round);
+                let v = i16x8_narrow_i32x4(i32x4_shr(lo, sh), i32x4_shr(hi, sh));
+                put(d.add(y * stride + 8 * c), v, (n - 8 * c).min(8));
+            }
+        }
+    }
+}
+
+fn intra_dc<S: crate::hevc::frame::Sample>(dst: &mut [S], stride: usize, left: &[u16], top: &[u16], n: usize, edge: bool) {
+    if left.len() < n || top.len() < n || !(4..=32).contains(&n) || (n - 1) * stride + n > dst.len() {
+        return (HevcDsp::<S>::scalar().intra_dc)(dst, stride, left, top, n, edge);
+    }
+    let log2n = n.trailing_zeros();
+    let sum = n as i32 + top[..n].iter().chain(&left[..n]).map(|&v| v as i32).sum::<i32>();
+    let dc = sum >> (log2n + 1);
+    unsafe {
+        let d = dst.as_mut_ptr();
+        let v = i16x8_splat(dc as i16);
+        for y in 0..n {
+            let mut x = 0;
+            while x < n {
+                put(d.add(y * stride + x), v, (n - x).min(8));
+                x += 8;
+            }
+        }
+    }
+    if edge {
+        dst[0] = S::from_i32((left[0] as i32 + 2 * dc + top[0] as i32 + 2) >> 2);
+        for x in 1..n {
+            dst[x] = S::from_i32((top[x] as i32 + 3 * dc + 2) >> 2);
+        }
+        for (y, &l) in left[..n].iter().enumerate().skip(1) {
+            dst[y * stride] = S::from_i32((l as i32 + 3 * dc + 2) >> 2);
+        }
+    }
+}
+
+fn intra_angular<S: crate::hevc::frame::Sample>(dst: &mut [S], stride: usize, refs: &[u16], n: usize, angle: i32, transposed: bool) {
+    // Every load of the last vector of a row, from `ref[-n]` up.
+    if refs.len() < 3 * n + 2 + 8 || !(4..=32).contains(&n) || (n - 1) * stride + n > dst.len() || over_i16::<S>(&refs[..3 * n + 2]) {
+        return (HevcDsp::<S>::scalar().intra_angular)(dst, stride, refs, n, angle, transposed);
+    }
+    unsafe {
+        let d = dst.as_mut_ptr();
+        // Written before it is read, tile by tile, so not cleared.
+        let mut tmp = [std::mem::MaybeUninit::<u16>::uninit(); 32 * 32];
+        let r16 = i32x4_splat(16);
+        for y in 0..n {
+            let pos = (y as i32 + 1) * angle;
+            let (i, f) = (pos >> 5, pos & 31);
+            let k = i32x4_splat(pair16((32 - f) as i16, f as i16));
+            let p = refs.as_ptr().offset(n as isize + i as isize + 1);
+            let mut x = 0;
+            while x < n {
+                let a = v128_load(p.add(x) as *const v128);
+                let v = if f == 0 {
+                    a
+                } else {
+                    let b = v128_load(p.add(x + 1) as *const v128);
+                    let lo = i32x4_shr(i32x4_add(i32x4_dot_i16x8(zip_lo16(a, b), k), r16), 5);
+                    let hi = i32x4_shr(i32x4_add(i32x4_dot_i16x8(zip_hi16(a, b), k), r16), 5);
+                    i16x8_narrow_i32x4(lo, hi)
+                };
+                if transposed {
+                    store_i16_n(tmp.as_mut_ptr().add(y * n + x) as *mut i16, v, (n - x).min(8));
+                } else {
+                    put(d.add(y * stride + x), v, (n - x).min(8));
+                }
+                x += 8;
+            }
+        }
+        if !transposed {
+            return;
+        }
+        let t = tmp.as_ptr() as *const u16;
+        if n == 4 {
+            let r = |j: usize| v128_load64_zero(t.add(4 * j) as *const u64);
+            let a = zip_lo16(r(0), r(1));
+            let b = zip_lo16(r(2), r(3));
+            let c01 = zip_lo32(a, b);
+            let c23 = zip_hi32(a, b);
+            put(d, c01, 4);
+            put(d.add(stride), zip_hi64(c01, c01), 4);
+            put(d.add(2 * stride), c23, 4);
+            put(d.add(3 * stride), zip_hi64(c23, c23), 4);
+            return;
+        }
+        for by in (0..n).step_by(8) {
+            for bx in (0..n).step_by(8) {
+                let mut r: [v128; 8] = std::array::from_fn(|j| v128_load(t.add((by + j) * n + bx) as *const v128));
+                transpose8_u16(&mut r);
+                for (j, v) in r.iter().enumerate() {
+                    put(d.add((bx + j) * stride + by), *v, 8);
+                }
+            }
+        }
+    }
 }
 
 /// The 4x4 DCT basis, `TRANSFORM32` at every eighth row.
