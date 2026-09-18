@@ -220,6 +220,20 @@ pub enum FieldCoding {
     Mbaff,
 }
 
+/// Which prediction-unit shapes an H.265 inter coding unit may take besides
+/// `PART_2Nx2N` (see [`Config::inter_parts`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InterParts {
+    /// One prediction unit per coding unit, `PART_2Nx2N`: every stream
+    /// written before partitions existed.
+    #[default]
+    None,
+    /// Also the symmetric halves, `PART_2NxN` (two units one above the
+    /// other) and `PART_Nx2N` (side by side), each unit with its own
+    /// motion, at every coding-unit size.
+    Symmetric,
+}
+
 /// Everything the encoder needs that is not a picture.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -436,6 +450,23 @@ pub struct Config {
     /// H.264, with [`Config::interlace`]: field pictures, picture-adaptive
     /// or macroblock-adaptive frame/field coding. Ignored without it.
     pub field_coding: FieldCoding,
+    /// H.265: the prediction-unit shapes an inter coding unit may take
+    /// besides `PART_2Nx2N`. [`InterParts::None`], the default, codes one
+    /// unit per coding unit and every stream is byte-identical to one from
+    /// an encoder without the switch. Each shape tried searches each of its
+    /// units, so it costs motion-estimation time at every coding unit, and
+    /// a close call is coded both ways (`encode::h265_me`). H.264 refuses
+    /// anything but `None` by name: its macroblock partitions are
+    /// [`Config::subparts`].
+    ///
+    /// Measured 2026-09-18, [`InterParts::Symmetric`] against `None` on one
+    /// binary, YUV BD-rate IP / IPB: the gate corpus -1.6% / -1.9% at QP
+    /// 22-40 (per clip up to -4.2% / -4.8%; the held and the smooth clips
+    /// 0) and -0.2% / -0.35% at 34-43, where a shape rarely pays for its
+    /// second unit; at QP 22-37, 1280x720 -2.7% / -2.4% synthetic and
+    /// -1.5% / -1.3% natural, 3840x2160 -0.8% / -0.3% synthetic and
+    /// -1.4% / -1.2% natural. CPU 1.6-2.2x against `None`.
+    pub inter_parts: InterParts,
 }
 
 impl Default for Config {
@@ -466,6 +497,7 @@ impl Default for Config {
             max_cu_depth: None,
             interlace: None,
             field_coding: FieldCoding::Paff,
+            inter_parts: InterParts::None,
         }
     }
 }

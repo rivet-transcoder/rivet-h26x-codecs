@@ -541,6 +541,19 @@ EXCLUSIVE_TOKENS="ilace fdeep wsine"
 # was red. They visit motion (and, through the tag, its 10-bit twin
 # motion10), fade and cut; --gop 250 because at --gop 8 the GOP ends before
 # --bframes 3 leaves a B picture below an anchor it does not use.
+# The hevc*-parts* rows are H.265 inter partitions (--parts sym): a CU may
+# be two prediction units, PART_2NxN or PART_Nx2N, each with its own
+# motion, merge or AMVP. What they hold: part_mode's spelling, each unit's
+# syntax in the reader's order, the second unit's candidate list (derived
+# with the first unit's motion already stored), 8x4 and 4x8 units never
+# BI, and the deblocking edge between the units — the last only CROSS can
+# arbitrate, since our decoder shares the encoder's edge marking. The
+# untagged rows cover every chroma format, odd and the smooth clips (where
+# no shape wins); @big and @edge the larger and partial-CTB pictures, @p10
+# the deep path, @cut the whole-CTB units of --cu-depth 0 and @fade the
+# weighted, three-reference combination. h26xenc's `shapes` census counts
+# 2nxn / nx2n per picture kind, so a green cell can be told from one whose
+# pictures took no shape.
 CONFIGS=${CONFIGS:-"
 lossless-intra|--codec h264 --lossless --gop 0
 cqp-intra|--codec h264 --qp 26 --gop 0
@@ -612,6 +625,14 @@ hevc-refs2-ipb|--codec h265 --qp 26 --gop 8 --bframes 2 --refs 2
 hevc-refs2-40-ip|--codec h265 --qp 40 --gop 8 --refs 2
 hevc-refs2-wp-ip@fade|--codec h265 --qp 26 --gop 8 --refs 2 --wpred
 hevc10-refs2-ip@p10|--codec h265 --qp 26 --gop 8 --refs 2
+hevc-parts-ip|--codec h265 --qp 26 --gop 8 --parts sym
+hevc-parts-ipb|--codec h265 --qp 26 --gop 8 --bframes 2 --parts sym
+hevc-parts-aq40-sao-ipb|--codec h265 --qp 40 --gop 8 --bframes 2 --aq 1.0 --sao --parts sym
+hevc-parts-ipb@big|--codec h265 --qp 26 --gop 8 --bframes 2 --parts sym
+hevc-parts-ipb@edge|--codec h265 --qp 26 --gop 8 --bframes 2 --parts sym
+hevc10-parts-ipb@p10|--codec h265 --qp 26 --gop 8 --bframes 2 --parts sym
+hevc-cu0-parts-ipb@cut|--codec h265 --qp 26 --gop 8 --bframes 2 --cu-depth 0 --parts sym
+hevc-parts-refs3-wp-ipb@fade|--codec h265 --qp 30 --gop 250 --bframes 2 --refs 3 --wpred --parts sym
 hevc-refs3-ipb@motion|--codec h265 --qp 26 --gop 250 --bframes 2 --refs 3
 hevc-refs3-ipb@fade|--codec h265 --qp 26 --gop 250 --bframes 2 --refs 3
 hevc-refs3-ipb@cut|--codec h265 --qp 26 --gop 250 --bframes 2 --refs 3

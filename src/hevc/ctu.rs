@@ -46,8 +46,10 @@ pub enum PartMode {
 
 impl PartMode {
     /// The prediction blocks `(x, y, w, h)` relative to the CB of size `n`
-    /// (the first `count` entries are valid).
-    fn pus(self, n: i32) -> Pus {
+    /// (the first `count` entries are valid). The encoder's partition
+    /// decisions and its deblocker take the rectangles from here too, so
+    /// the two sides cannot disagree about where a unit's edges are.
+    pub(crate) fn pus(self, n: i32) -> Pus {
         let z = (0, 0, 0, 0);
         match self {
             PartMode::P2Nx2N => Pus { list: [(0, 0, n, n), z, z, z], count: 1 },
@@ -63,14 +65,14 @@ impl PartMode {
 }
 
 /// The prediction blocks of a partitioning, without a heap allocation.
-struct Pus {
+pub(crate) struct Pus {
     list: [(i32, i32, i32, i32); 4],
     count: usize,
 }
 
 impl Pus {
     #[inline(always)]
-    fn iter(&self) -> impl Iterator<Item = &(i32, i32, i32, i32)> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &(i32, i32, i32, i32)> {
         self.list[..self.count].iter()
     }
 }
@@ -1691,17 +1693,60 @@ pub(crate) fn write_pred_mode_flag(e: &mut CabacEncoder, cx: &mut Contexts, intr
 
 /// Write `part_mode` for an inter CU: PART_2Nx2N only — the single
 /// context-coded 1 of `parse_part_mode`'s first bin. Unlike intra, an
-/// inter CU codes `part_mode` at every size. The rectangular shapes
-/// (2NxN, Nx2N, inter NxN) and the four AMP shapes are refused by name
-/// until a writer spells their bins — their trees depend on the CB size
-/// and `amp_enabled_flag`, and a half-spelled shape is a desync.
+/// inter CU codes `part_mode` at every size. The other shapes go through
+/// [`write_part_mode_inter_at`], whose bins depend on the CB size and on
+/// `amp_enabled_flag`; for 2Nx2N they do not, which is why this spelling
+/// needs neither.
 #[allow(dead_code)]
 pub(crate) fn write_part_mode_inter(e: &mut CabacEncoder, cx: &mut Contexts, mode: PartMode) {
-    debug_assert!(
-        mode == PartMode::P2Nx2N,
-        "only PART_2Nx2N has an inter writer (2NxN / Nx2N / NxN / AMP refused)"
-    );
+    debug_assert!(mode == PartMode::P2Nx2N, "a shape other than PART_2Nx2N needs the CB size: write_part_mode_inter_at");
     e.encode_decision(&mut cx.c[PART_MODE_OFFSET], 1);
+}
+
+/// Write an inter CU's `part_mode`, any shape, for a CB of `1 << log2_cb`
+/// under an SPS whose minimum CB is `1 << log2_min_cb` and whose
+/// `amp_enabled_flag` is `amp`: the inverse of `parse_part_mode`'s inter
+/// arms (9.3.3.7, Table 9-43), bin for bin and context for context.
+///
+/// - At the minimum CB: 2NxN is `01`; Nx2N is `00` at 8x8, where inter NxN
+///   does not exist and the reader stops after two bins, and `001` above
+///   it, where `000` is NxN.
+/// - Above it without AMP: 2NxN `01`, Nx2N `00`.
+/// - Above it with AMP the second bin picks the direction and a third,
+///   in context 3, says whether the halves are equal: 2NxN `011`, Nx2N
+///   `001`; the unequal shapes then spend one bypass bin on which end the
+///   quarter is at: 2NxnU `0100`, 2NxnD `0101`, nLx2N `0000`, nRx2N `0001`.
+///
+/// So turning `amp_enabled_flag` on lengthens 2NxN and Nx2N by a bin at
+/// every CB above the minimum, whether or not any AMP shape is chosen.
+/// The AMP shapes above the minimum only; the reader has no spelling for
+/// them at it, and none for inter NxN at 8x8.
+pub(crate) fn write_part_mode_inter_at(e: &mut CabacEncoder, cx: &mut Contexts, mode: PartMode, log2_cb: u32, log2_min_cb: u32, amp: bool) {
+    e.encode_decision(&mut cx.c[PART_MODE_OFFSET], u32::from(mode == PartMode::P2Nx2N));
+    if mode == PartMode::P2Nx2N {
+        return;
+    }
+    let horizontal = matches!(mode, PartMode::P2NxN | PartMode::P2NxnU | PartMode::P2NxnD);
+    if log2_cb == log2_min_cb {
+        debug_assert!(matches!(mode, PartMode::P2NxN | PartMode::PNx2N | PartMode::PNxN), "{mode:?} at the minimum coding block");
+        debug_assert!(mode != PartMode::PNxN || log2_cb > 3, "inter NxN at 8x8");
+        e.encode_decision(&mut cx.c[PART_MODE_OFFSET + 1], u32::from(mode == PartMode::P2NxN));
+        if mode != PartMode::P2NxN && log2_cb > 3 {
+            e.encode_decision(&mut cx.c[PART_MODE_OFFSET + 2], u32::from(mode == PartMode::PNx2N));
+        }
+        return;
+    }
+    debug_assert!(mode != PartMode::PNxN, "inter NxN above the minimum coding block");
+    e.encode_decision(&mut cx.c[PART_MODE_OFFSET + 1], u32::from(horizontal));
+    if !amp {
+        debug_assert!(matches!(mode, PartMode::P2NxN | PartMode::PNx2N), "{mode:?} without amp_enabled_flag");
+        return;
+    }
+    let equal = matches!(mode, PartMode::P2NxN | PartMode::PNx2N);
+    e.encode_decision(&mut cx.c[PART_MODE_OFFSET + 3], u32::from(equal));
+    if !equal {
+        e.encode_bypass(u32::from(matches!(mode, PartMode::P2NxnD | PartMode::PnRx2N)));
+    }
 }
 
 /// Write `merge_flag` for a non-skipped inter PU (a skipped CU implies

@@ -185,7 +185,7 @@
 use super::gop::{Coded, Kind, Scheduler};
 use super::h265_deblock::{deblock_inter_picture, deblock_picture};
 use super::h265_intra::{CuDecision, IntraCtx, IntraPicture, MIN_CB_LOG2, Srcs, TreeCu, ssd_lambda};
-use super::h265_me::{InterCuDecision, InterCuKind, InterPicture, PCuDecision, TreeRefs, MAX_MERGE_CAND};
+use super::h265_me::{write_prediction_unit, InterCuDecision, InterCuKind, InterPicture, PCuDecision, TreeRefs, MAX_MERGE_CAND};
 use super::rc::{Insensitivity, PicKind, RateController};
 use super::h265_sao::{SaoPlan, sao_picture};
 use super::aq;
@@ -206,7 +206,7 @@ use crate::hevc::ctu::{
     SaoCtx, SaoMergeNb, SplitCuNb, qp_y_from_pred, qp_y_pred_from, write_cbf_chroma, write_cbf_luma, write_cu_qp_delta,
     write_cu_skip_flag, write_sao,
     write_cu_transquant_bypass_flag, write_merge_flag, write_merge_idx, write_mvd,
-    write_inter_pred_idc, write_mvp_flag, write_part_mode_inter, write_pred_mode_flag,
+    write_inter_pred_idc, write_mvp_flag, write_part_mode_inter, write_part_mode_inter_at, write_pred_mode_flag,
     write_ref_idx, write_rqt_root_cbf,
     write_intra_chroma_pred_mode, write_mpm_idx, write_part_mode_intra, write_prev_intra_luma_pred_flag,
     write_rem_intra_luma_pred_mode, write_split_cu_flag, write_split_transform_flag,
@@ -1285,6 +1285,7 @@ impl<S: Sample> Core<S> {
         // The reconstruction takes its sample depth from the parsed SPS —
         // the same field a decoder of this stream sizes its frames by.
         let mut pic = InterPicture::<S>::new(&sps, &pps, c.poc as i32);
+        pic.parts = self.cfg.inter_parts;
 
         // Weighted prediction, for a P slice under `weighted_pred_flag` and
         // a B slice under `weighted_bipred_flag`: one entry per reference
@@ -1514,7 +1515,7 @@ impl<S: Sample> Core<S> {
                     write_sao_for(&mut e, &mut cx, plan.as_ref(), addr, cxu, cy, bit_depth, cat);
                     let ctu = &cus[ctu_start[addr]..ctu_start[addr + 1]];
                     census.qp_delta += write_tree(&mut e, &mut cx, ctu, (cxu << g.log2_ctb, cy << g.log2_ctb), g.log2_ctb, &mut tc, chain.as_mut(), &mut |e, cx, cu, left, above, delta| match &cu.d {
-                        PCuDecision::Inter(d) => write_cu_inter(e, cx, d, left, above, cat, bypass, delta, nref, cu.depth),
+                        PCuDecision::Inter(d) => write_cu_inter(e, cx, d, left, above, cat, bypass, delta, nref, cu.depth, c.kind == Kind::B),
                         PCuDecision::Intra(d) => write_cu_intra_in_p(e, cx, d, left, above, cat, bypass, delta),
                     });
                     e.encode_terminate(u32::from(cy == hc - 1 && cxu == wc - 1));
@@ -2183,7 +2184,7 @@ pub(crate) fn p_cu_bits(d: &PCuDecision, cat: u32, qp: i32, pps_bypass: bool, is
     let mut cx = Contexts::new(if is_b { 2 } else { 1 }, qp);
     let mut e = CabacEncoder::counting();
     match d {
-        PCuDecision::Inter(d) => write_cu_inter(&mut e, &mut cx, d, None, None, cat, pps_bypass, None, nref, depth),
+        PCuDecision::Inter(d) => write_cu_inter(&mut e, &mut cx, d, None, None, cat, pps_bypass, None, nref, depth, is_b),
         PCuDecision::Intra(d) => write_cu_intra_in_p(&mut e, &mut cx, d, None, None, cat, pps_bypass, None),
     }
     e.fractional_bits() as f32
@@ -2258,6 +2259,11 @@ pub struct KindCensus {
     pub ref_older: u64,
     /// Intra units coded `PART_NxN`: four 4x4 blocks at the 8x8 minimum.
     pub nxn: u64,
+    /// Inter units coded `PART_2NxN`: two prediction units, one above the
+    /// other.
+    pub part_2nxn: u64,
+    /// Inter units coded `PART_Nx2N`: two prediction units side by side.
+    pub part_nx2n: u64,
     /// Coding units at quadtree depth 1: one split below the CTB.
     pub depth1: u64,
     /// Coding units at quadtree depth 2: two splits below — 8x8 at a 32x32
@@ -2308,6 +2314,11 @@ impl KindCensus {
                         InterCuKind::Skip { .. } => c.skip += 1,
                         InterCuKind::Merge { .. } => c.merge += 1,
                         InterCuKind::Amvp { .. } | InterCuKind::BAmvp { .. } => c.amvp += 1,
+                        InterCuKind::Parts => match d.part {
+                            crate::hevc::ctu::PartMode::P2NxN => c.part_2nxn += 1,
+                            crate::hevc::ctu::PartMode::PNx2N => c.part_nx2n += 1,
+                            other => unreachable!("an inter shape this encoder does not decide: {other:?}"),
+                        },
                         InterCuKind::UseIntra => unreachable!("replaced by the intra decision"),
                     }
                     c.bi += u64::from(d.ref_idx >= 0 && d.ref_idx_l1 >= 0);
@@ -2341,6 +2352,8 @@ impl KindCensus {
         self.wp_rd_default += other.wp_rd_default;
         self.ref_older += other.ref_older;
         self.nxn += other.nxn;
+        self.part_2nxn += other.part_2nxn;
+        self.part_nx2n += other.part_nx2n;
         self.depth1 += other.depth1;
         self.depth2 += other.depth2;
         self.model_bits += other.model_bits;
@@ -2365,6 +2378,8 @@ impl KindCensus {
             ("wp_rd_default", self.wp_rd_default),
             ("ref_older", self.ref_older),
             ("nxn", self.nxn),
+            ("2nxn", self.part_2nxn),
+            ("nx2n", self.part_nx2n),
             ("depth1", self.depth1),
             ("depth2", self.depth2),
             ("model_bits", self.model_bits),
@@ -2477,6 +2492,7 @@ fn write_cu_inter(
     qp_delta: Option<i32>,
     nref: u32,
     depth: u32,
+    is_b: bool,
 ) {
     let log2 = d.log2_cu;
     debug_assert!(pps_bypass || !d.bypass, "a bypass CU is unspellable unless the PPS enables the flag");
@@ -2504,7 +2520,24 @@ fn write_cu_inter(
     }
 
     write_pred_mode_flag(e, cx, false);
-    write_part_mode_inter(e, cx, crate::hevc::ctu::PartMode::P2Nx2N);
+    if d.kind == InterCuKind::Parts {
+        // Two prediction units: part_mode, each unit's syntax in the
+        // reader's order, then rqt_root_cbf, which the reader infers only
+        // for a 2Nx2N merge unit and so reads here whatever the units are.
+        // Each unit's inter_pred_idc takes its own dimensions: an 8x4 or
+        // 4x8 unit codes one bin and never BI.
+        write_part_mode_inter_at(e, cx, d.part, log2, MIN_CB_LOG2, false);
+        let n = 1i32 << log2;
+        for (pu, &(_, _, pw, ph)) in d.pus.iter().zip(d.part.pus(n).iter()) {
+            write_prediction_unit(e, cx, pu, is_b, pw, ph, depth, nref);
+        }
+        write_rqt_root_cbf(e, cx, d.rqt_root_cbf);
+        if !d.rqt_root_cbf {
+            return;
+        }
+    } else {
+        write_part_mode_inter(e, cx, crate::hevc::ctu::PartMode::P2Nx2N);
+    }
     match d.kind {
         InterCuKind::Merge { merge_idx } => {
             write_merge_flag(e, cx, true);
@@ -2558,6 +2591,7 @@ fn write_cu_inter(
                 return;
             }
         }
+        InterCuKind::Parts => {}
         InterCuKind::Skip { .. } | InterCuKind::UseIntra => unreachable!("handled above"),
     }
 
@@ -3786,7 +3820,7 @@ mod tests {
             // ahead of every unit above the minimum coding block, at the
             // neutral neighbour context `Rate` prices it in.
             write_split_cu_flag(&mut e, &mut cx, &SplitCuNb { left_depth: None, above_depth: None }, 0, false);
-            write_cu_inter(&mut e, &mut cx, d, None, None, 1, false, None, 1, 0);
+            write_cu_inter(&mut e, &mut cx, d, None, None, 1, false, None, 1, 0, false);
             e.fractional_bits() as f32
         };
 
@@ -4888,6 +4922,133 @@ mod tests {
         }
     }
 
+    /// Pictures whose motion differs inside 16x16 blocks, for the inter
+    /// partitions to take: cell texture everywhere; in the left half of
+    /// the picture each block's top eight rows move right and its bottom
+    /// eight left (two units one above the other, 2NxN), in the right half
+    /// its left eight columns move down and its right eight up (side by
+    /// side, Nx2N). Chroma follows luma at the format's subsampling.
+    fn split_motion_frames(w: usize, h: usize, chroma: ChromaFormat, bit_depth: u32, count: usize) -> Vec<Vec<u8>> {
+        let (sw, sh) = match chroma {
+            ChromaFormat::Yuv420 => (2usize, 2usize),
+            ChromaFormat::Yuv422 => (2, 1),
+            _ => (1, 1),
+        };
+        let (cw, ch) = if chroma == ChromaFormat::Monochrome { (0, 0) } else { (w / sw, h / sh) };
+        let shift = bit_depth - 8;
+        let luma = |x: usize, y: usize, f: usize| -> u32 {
+            let (x, y, f) = (x as i32, y as i32, f as i32);
+            let (sx, sy) = if (x as usize) < w / 2 {
+                if y % 16 < 8 { (x - 2 * f, y) } else { (x + 2 * f, y) }
+            } else if x % 16 < 8 {
+                (x, y - 2 * f)
+            } else {
+                (x, y + 2 * f)
+            };
+            // Texture in 4x4 cells over a gentle ramp: enough for the
+            // search to lock on, smooth enough inside a cell that the
+            // deblocking filter's activity test lets it act on the edge
+            // between two units (a noise texture switches it off, and an
+            // unmarked unit edge would then go unseen).
+            let ramp = (sx + 2 * sy).rem_euclid(96) as u32;
+            60 + ramp + hash2(sx.div_euclid(4), sy.div_euclid(4)) % 40
+        };
+        (0..count)
+            .map(|f| {
+                let mut samples: Vec<u32> = Vec::with_capacity(w * h + 2 * cw * ch);
+                for y in 0..h {
+                    for x in 0..w {
+                        samples.push(luma(x, y, f) << shift);
+                    }
+                }
+                for c in 1..=2u32 {
+                    for y in 0..ch {
+                        for x in 0..cw {
+                            let base = 64 + (luma(x * sw, y * sh, f) >> 1) + 8 * c;
+                            samples.push(base.min(255) << shift);
+                        }
+                    }
+                }
+                if shift == 0 {
+                    samples.iter().map(|&v| v as u8).collect()
+                } else {
+                    samples.iter().flat_map(|&v| (v as u16).to_le_bytes()).collect()
+                }
+            })
+            .collect()
+    }
+
+    /// Inter prediction units round-trip: under `InterParts::Symmetric` P
+    /// and B pictures take 2NxN and Nx2N coding units — in every chroma
+    /// format, at 10 bits, with three references, on partial CTBs — and the
+    /// production decoder decodes each stream to the encoder's
+    /// reconstructions without generating a reference. What this holds:
+    /// the part_mode spelling, each unit's syntax in the reader's order
+    /// (the second unit's candidates derived with the first unit's motion
+    /// already stored), each unit's own prediction, and the deblocking
+    /// edge between the units. The census must show both shapes taken, in
+    /// P and in B pictures, so the round trip is not vacuous.
+    #[test]
+    fn inter_partitions_round_trip() {
+        let mut taken = [[0u64; 2]; 2]; // [P, B] x [2NxN, Nx2N]
+        for (w, h, chroma, bit_depth, bframes, refs) in [
+            (64usize, 64usize, ChromaFormat::Yuv420, 8u32, 0u32, 1u32),
+            (64, 64, ChromaFormat::Yuv420, 8, 2, 1),
+            (64, 64, ChromaFormat::Yuv444, 8, 2, 1),
+            (64, 64, ChromaFormat::Yuv422, 8, 0, 2),
+            (64, 64, ChromaFormat::Monochrome, 8, 2, 1),
+            (64, 64, ChromaFormat::Yuv420, 10, 2, 1),
+            (88, 44, ChromaFormat::Yuv420, 8, 1, 3),
+        ] {
+            let tag = format!("{w}x{h} {chroma:?} {bit_depth}-bit bframes={bframes} refs={refs}");
+            let config = Config { gop: 8, bframes, max_refs: refs, bit_depth, inter_parts: crate::encode::InterParts::Symmetric, ..cfg(w as u32, h as u32, chroma) };
+            let frames = split_motion_frames(w, h, chroma, bit_depth, 6);
+            let mut e = H265Encoder::new(config).unwrap_or_else(|err| panic!("{tag}: {err}"));
+            let mut units = Vec::new();
+            for f in &frames {
+                units.extend(e.push(f).unwrap_or_else(|err| panic!("{tag}: {err}")));
+            }
+            units.extend(e.flush().unwrap());
+            let mut dec = crate::hevc::HevcDecoder::new();
+            for u in &units {
+                dec.push_annexb(&u.data).unwrap_or_else(|err| panic!("{tag}: the decoder rejected the stream: {err}"));
+            }
+            dec.flush().unwrap();
+            assert_eq!(dec.warnings(), 0, "{tag}: the decoder generated a reference");
+            let mut by_display = vec![None; units.len()];
+            for u in &units {
+                by_display[u.display as usize] = Some(u.encode_index as usize);
+            }
+            for (i, coded) in by_display.iter().enumerate() {
+                let want = &e.reconstructions()[coded.unwrap_or_else(|| panic!("{tag}: display index {i} never coded"))];
+                let got = dec.next_picture().unwrap_or_else(|| panic!("{tag}: picture {i} missing"));
+                assert!(got.into_packed() == *want, "{tag}: picture {i} decoded differently than the encoder reconstructed it");
+            }
+            for (k, slot) in [(0usize, Census::slot(Kind::P)), (1, Census::slot(Kind::B))] {
+                let c = &e.census().by_kind[slot];
+                taken[k][0] += c.part_2nxn;
+                taken[k][1] += c.part_nx2n;
+            }
+        }
+        assert!(taken.iter().flatten().all(|&n| n > 0), "every shape in both picture kinds: [P, B] x [2NxN, Nx2N] = {taken:?}");
+    }
+
+    /// Without the switch no unit is partitioned: the census counts none
+    /// on the same pictures, and the default configuration asks for none.
+    #[test]
+    fn inter_partitions_are_off_by_default() {
+        assert_eq!(Config::default().inter_parts, crate::encode::InterParts::None);
+        let frames = split_motion_frames(64, 64, ChromaFormat::Yuv420, 8, 6);
+        let mut e = H265Encoder::new(Config { gop: 8, bframes: 2, ..cfg(64, 64, ChromaFormat::Yuv420) }).unwrap();
+        for f in &frames {
+            e.push(f).unwrap();
+        }
+        e.flush().unwrap();
+        for c in &e.census().by_kind {
+            assert_eq!((c.part_2nxn, c.part_nx2n), (0, 0), "a partition without the switch");
+        }
+    }
+
     /// Adaptive quantisation's group follows the stream: the CTB in an
     /// all-intra stream and wherever every CTB is one unit, half the CTB
     /// where the coding quadtree codes pictures that others predict from —
@@ -5055,6 +5216,17 @@ mod tests {
         for ok in [None, Some(0)] {
             assert!(crate::encode::h264::H264Encoder::new(Config { max_cu_depth: ok, ..cfg(64, 64, ChromaFormat::Yuv420) }).is_ok(), "H.264 refused {ok:?}");
         }
+    }
+
+    /// H.265's inter partitions are refused by H.264 by name, as the
+    /// quadtree depth is: H.264 partitions macroblocks through `subparts`.
+    #[test]
+    fn the_h264_encoder_refuses_inter_partitions_by_name() {
+        let err = crate::encode::h264::H264Encoder::new(Config { inter_parts: crate::encode::InterParts::Symmetric, ..cfg(64, 64, ChromaFormat::Yuv420) })
+            .err()
+            .expect("H.264 accepted inter_parts Symmetric");
+        let msg = format!("{err}");
+        assert!(msg.contains("inter_parts") && msg.contains("H.264"), "{msg}");
     }
 
     /// A source sample above the declared depth is refused by name, not

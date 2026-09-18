@@ -117,16 +117,23 @@ pub fn deblock_inter_picture<S: Sample>(ctx: &IntraCtx<'_, S>, pic: &mut InterPi
             // CTB — then the edge flags and the cbf, which is where the
             // two kinds part company.
             PicInfo::fill4(&mut pic.info.qp_y, w4, x0, y0, n, n, d.qp_y() as i8);
-            // The prediction-block edge bits — 2 down the PU's left
-            // column, 8 along its top row. One PU per CU of either kind,
-            // so its boundary is the CU's.
-            for yy in (y0..y0 + n).step_by(4) {
-                let i = (yy >> 2) * w4 + (x0 >> 2);
-                pic.info.edges[i] |= 2;
-            }
-            for xx in (x0..x0 + n).step_by(4) {
-                let i = (y0 >> 2) * w4 + (xx >> 2);
-                pic.info.edges[i] |= 8;
+            // The prediction-block edge bits — 2 down each PU's left
+            // column, 8 along its top row — through the reader's own
+            // `PartMode::pus`, as `coding_unit` marks them. One PU covering
+            // the CU for an intra CU and every 2Nx2N inter one; two for a
+            // partitioned CU, whose inner edge the filter must see.
+            let part = match d {
+                PCuDecision::Inter(d) => d.part,
+                PCuDecision::Intra(_) => crate::hevc::ctu::PartMode::P2Nx2N,
+            };
+            for &(px, py, pw, ph) in part.pus(n as i32).iter() {
+                let (ax, ay) = (x0 + px as usize, y0 + py as usize);
+                for yy in (ay..ay + ph as usize).step_by(4) {
+                    pic.info.edges[(yy >> 2) * w4 + (ax >> 2)] |= 2;
+                }
+                for xx in (ax..ax + pw as usize).step_by(4) {
+                    pic.info.edges[(ay >> 2) * w4 + (xx >> 2)] |= 8;
+                }
             }
             match d {
                 PCuDecision::Inter(d) => {

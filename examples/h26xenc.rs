@@ -17,7 +17,7 @@
 
 use h26x::ChromaFormat;
 use h26x::encode::{
-    ColourDescription, Config, ContentLightLevel, Entropy, FieldCoding, FieldOrder, MasteringDisplay, RateControl,
+    ColourDescription, Config, ContentLightLevel, Entropy, FieldCoding, FieldOrder, InterParts, MasteringDisplay, RateControl,
 };
 
 /// `G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)` — x265's `master-display`
@@ -58,6 +58,7 @@ fn die(msg: &str) -> ! {
          \x20      [--fps N] [--cpb-ms N]\n\
          \x20      [--gop N] [--bframes N] [--cavlc] [--t8x8] [--subparts] [--sao]\n\
          \x20      [--aq STRENGTH] [--lookahead N] [--wpred] [--refs N] [--cu-depth N] [--depth N] [--threads N]\n\
+         \x20      [--parts none|sym] (H.265)\n\
          \x20      [--interlace tff|bff [--field-coding field|paff|mbaff]] (H.264)\n\
          \x20      [--color PRIMARIES:TRANSFER:MATRIX (H.273 codes, e.g. 9:16:9 for HDR10)]\n\
          \x20      [--full-range] [--chroma-loc N (H.273 chroma_sample_loc_type 0..=5)]\n\
@@ -141,6 +142,16 @@ fn main() {
             // CTB. Absent, the encoder's default (2); 0 codes one unit per
             // CTB as every stream before the quadtree did.
             "--cu-depth" => cfg.max_cu_depth = Some(val(&mut i, &args, "--cu-depth").parse().unwrap_or_else(|_| die("--cu-depth"))),
+            // H.265 only: the inter prediction-unit shapes a coding unit
+            // may take besides 2Nx2N. Absent, none: every stream is
+            // byte-identical to one from an encoder without partitions.
+            "--parts" => {
+                cfg.inter_parts = match val(&mut i, &args, "--parts").as_str() {
+                    "none" => InterParts::None,
+                    "sym" => InterParts::Symmetric,
+                    _ => die("--parts wants none or sym"),
+                }
+            }
             // H.264 only: the input frames are interlaced, in this field
             // order, and are coded as interlaced video. H.265 refuses it.
             "--interlace" => {
