@@ -976,6 +976,8 @@ impl<S: Sample> Core<S> {
                 // An IDR references nothing, so its reference picture set
                 // is empty.
                 ref_deltas: Vec::new(),
+                // It keeps nothing either: an IDR empties the buffer.
+                kept_deltas: Vec::new(),
                 // Present exactly when the SPS enabled SAO, and the chroma
                 // flag only outside monochrome - the reader's two gates.
                 sao: sao_flags(self.cfg.sao, cat),
@@ -1133,18 +1135,38 @@ impl<S: Sample> Core<S> {
     /// the selection above searches by picture order count rather than
     /// taking the last.
     fn retain_reference(&mut self, c: &Coded, mut frame: crate::hevc::frame::Frame<S>) {
-        if !c.reference {
-            return;
+        let want = self.refs_after(c);
+        if c.reference {
+            frame.poc = c.poc as i32;
+            frame.extend_rows(0, frame.height);
+            self.refs.push(frame);
+            while self.refs.len() > self.refs_kept() {
+                self.refs.remove(0);
+            }
         }
-        frame.poc = c.poc as i32;
-        frame.extend_rows(0, frame.height);
-        self.refs.push(frame);
-        // Two for the B geometry above, or as many past pictures as
-        // `max_refs` lets a P picture choose between — whichever is more.
-        let keep = (self.cfg.max_refs as usize).max(2);
-        while self.refs.len() > keep {
-            self.refs.remove(0);
+        debug_assert_eq!(self.refs.iter().map(|f| f.poc).collect::<Vec<_>>(), want, "the slice's reference picture set promised these");
+    }
+
+    /// How many reference pictures the encoder holds: two for the B
+    /// geometry above, or as many past pictures as `max_refs` lets a P
+    /// picture choose between — whichever is more.
+    fn refs_kept(&self) -> usize {
+        (self.cfg.max_refs as usize).max(2)
+    }
+
+    /// The picture order counts `retain_reference` will hold once `c` is
+    /// coded, oldest first: `c` itself if it is a reference, and the most
+    /// recent of those before it. Every later picture predicts from these
+    /// alone, so they are what `c`'s reference picture set must keep —
+    /// and it is computed here, from the same count, so that the set
+    /// written and the pictures kept cannot disagree.
+    fn refs_after(&self, c: &Coded) -> Vec<i32> {
+        let mut pocs: Vec<i32> = self.refs.iter().map(|f| f.poc).collect();
+        if c.reference {
+            pocs.push(c.poc);
         }
+        let drop = pocs.len().saturating_sub(self.refs_kept());
+        pocs.split_off(drop)
     }
 
     /// Code one inter picture — P or B: every CTU one coding unit, or a
@@ -1324,6 +1346,12 @@ impl<S: Sample> Core<S> {
             _ => {}
         }
 
+        // The pictures this slice predicts from: every picture in
+        // RefPicList0, and for a B picture the future anchor.
+        let mut used: Vec<i32> = l0.iter().map(|f| f.poc).collect();
+        if let (Some(f), Kind::B) = (future_poc, c.kind) {
+            used.push(f);
+        }
         let mut w = BitWriter::with_capacity(cw * ch / 4);
         syn::write_slice_header(
             &syn::SliceHeader {
@@ -1331,19 +1359,21 @@ impl<S: Sample> Core<S> {
                 poc_lsb: (c.poc as u32) & ((1 << LOG2_MAX_POC_LSB) - 1),
                 qp: i32::from(qp),
                 log2_max_poc_lsb: LOG2_MAX_POC_LSB,
-                // The inline short term reference picture set: one entry
-                // per reference this slice will use — every picture in
-                // RefPicList0, and for a B picture the future anchor. The
-                // header writer counts these to decide
+                // The inline short term reference picture set: one used
+                // entry per reference this slice predicts from. The header
+                // writer counts these to decide
                 // `num_ref_idx_active_override_flag`, so the set and the
                 // declared counts cannot disagree.
-                ref_deltas: {
-                    let mut d: Vec<i32> = l0.iter().map(|f| f.poc - cur).collect();
-                    if let (Some(f), Kind::B) = (future_poc, c.kind) {
-                        d.push(f - cur);
-                    }
-                    d
-                },
+                ref_deltas: used.iter().map(|poc| poc - cur).collect(),
+                // Every other picture the encoder still holds once this
+                // one is coded, which a later picture may use. A picture
+                // left out of the set is marked unused for reference and a
+                // decoder may drop it. A B picture referencing one past
+                // anchor used to leave out the older anchors, and a
+                // following P picture with three or more references then
+                // named a picture libavcodec had already dropped ("Could
+                // not find ref with POC 0").
+                kept_deltas: self.refs_after(&c).into_iter().filter(|p| *p != cur && !used.contains(p)).map(|poc| poc - cur).collect(),
                 // As in `code_picture`, and from the same switch.
                 sao: sao_flags(self.cfg.sao, cat),
                 // The table a P slice must carry under `weighted_pred_flag`
@@ -4640,6 +4670,90 @@ mod tests {
             }
             for (i, coded) in by_display.iter().enumerate() {
                 let want = &e.reconstructions()[coded.unwrap_or_else(|| panic!("{tag}: display index {i} never coded"))];
+                let got = dec.next_picture().unwrap_or_else(|| panic!("{tag}: picture {i} missing"));
+                assert!(got.into_packed() == *want, "{tag}: picture {i} decoded differently than the encoder reconstructed it");
+            }
+        }
+    }
+
+    /// Every picture's reference picture set keeps what a later picture
+    /// uses. A picture the set leaves out is marked unused for reference
+    /// (8.3.2) and no later set can name it again. With three or more
+    /// references and B pictures, a B picture's set once listed only the
+    /// two anchors it predicts from: it dropped the older anchors, and the
+    /// next P picture named one libavcodec no longer held. This decoder
+    /// generated a stand-in (8.3.3) and counted a warning, so SELF still
+    /// passed. The walk below is the reader's marking: the buffer after
+    /// each picture is its set plus itself, and every entry of the next
+    /// set must be in it. The active counts must be the used entries, and
+    /// the production decoder must decode the stream without generating
+    /// a reference and match the reconstructions.
+    #[test]
+    fn every_reference_picture_set_keeps_what_a_later_picture_uses() {
+        use crate::hevc::pps::Pps;
+        use crate::hevc::slice::SliceHeader as ParsedHeader;
+        use crate::hevc::sps::Sps;
+        use crate::nal::HevcNalHeader;
+        for (refs, bframes) in [(3u32, 2u32), (4, 3), (3, 1), (2, 2), (1, 2), (3, 0)] {
+            let tag = format!("refs {refs} bframes {bframes}");
+            let config = Config { gop: 250, bframes, max_refs: refs, ..cfg(64, 64, ChromaFormat::Yuv420) };
+            let frames = tree_frames(64, 64, ChromaFormat::Yuv420, 8, 13);
+            let mut e = H265Encoder::new(config).unwrap_or_else(|err| panic!("{tag}: {err}"));
+            let mut units = Vec::new();
+            for f in &frames {
+                units.extend(e.push(f).unwrap_or_else(|err| panic!("{tag}: {err}")));
+            }
+            units.extend(e.flush().unwrap());
+            let (mut sps, mut pps) = (None, None);
+            let mut dpb: Vec<i32> = Vec::new();
+            let mut kept_any = false;
+            for u in &units {
+                for nal in crate::nal::annexb_nals(&u.data) {
+                    let kind = (nal[0] >> 1) & 0x3f;
+                    if kind == syn::NAL_SPS {
+                        sps = Some(Sps::parse(&crate::nal::unescape_rbsp(&nal[2..])).unwrap());
+                    } else if kind == syn::NAL_PPS {
+                        let mut p = Pps::parse(&crate::nal::unescape_rbsp(&nal[2..])).unwrap();
+                        p.resolve_tiles(sps.as_ref().unwrap()).unwrap();
+                        pps = Some(p);
+                    } else if kind < 32 {
+                        let rbsp = crate::nal::unescape_rbsp(nal);
+                        let hdr = HevcNalHeader::parse(&rbsp).unwrap();
+                        let (sps, pps) = (sps.clone().unwrap(), pps.clone().unwrap());
+                        let (h, _, _) = ParsedHeader::parse(&rbsp, hdr, &|_| Some(pps.clone()), &|_| Some(sps.clone()), None).unwrap();
+                        let cur = u.poc;
+                        if (16..=23).contains(&kind) {
+                            dpb = vec![cur];
+                            continue;
+                        }
+                        let set: Vec<(i32, bool)> = h.st_rps.neg.iter().chain(h.st_rps.pos.iter()).map(|&(d, used)| (cur + d, used)).collect();
+                        for &(poc, _) in &set {
+                            assert!(dpb.contains(&poc), "{tag}: POC {cur} names POC {poc}, which an earlier set dropped (buffer {dpb:?})");
+                        }
+                        kept_any |= set.iter().any(|&(_, used)| !used);
+                        let count = |list: &[(i32, bool)]| list.iter().filter(|e| e.1).count() as u32;
+                        assert_eq!(h.num_ref_idx[0], count(&h.st_rps.neg), "{tag}: POC {cur} list 0 is its used past entries");
+                        if !h.st_rps.pos.is_empty() {
+                            assert_eq!(h.num_ref_idx[1], count(&h.st_rps.pos), "{tag}: POC {cur} list 1 is its used future entries");
+                        }
+                        dpb = set.iter().map(|e| e.0).chain([cur]).collect();
+                    }
+                }
+            }
+            // Only a B picture below an older anchor it does not use keeps one.
+            assert_eq!(kept_any, refs >= 3 && bframes > 0, "{tag}: pictures kept unused");
+            let mut dec = crate::hevc::HevcDecoder::new();
+            for u in &units {
+                dec.push_annexb(&u.data).unwrap_or_else(|err| panic!("{tag}: the decoder rejected the stream: {err}"));
+            }
+            dec.flush().unwrap();
+            assert_eq!(dec.warnings(), 0, "{tag}: the decoder generated a missing reference");
+            let mut by_display = vec![None; units.len()];
+            for u in &units {
+                by_display[u.display as usize] = Some(u.encode_index as usize);
+            }
+            for (i, coded) in by_display.iter().enumerate() {
+                let want = &e.reconstructions()[coded.unwrap()];
                 let got = dec.next_picture().unwrap_or_else(|| panic!("{tag}: picture {i} missing"));
                 assert!(got.into_packed() == *want, "{tag}: picture {i} decoded differently than the encoder reconstructed it");
             }

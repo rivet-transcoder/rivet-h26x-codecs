@@ -530,6 +530,17 @@ EXCLUSIVE_TOKENS="ilace fdeep wsine"
 # the misread stream while both differ from the encoder's reconstruction.
 # CROSS checks the field reference lists and field-geometry filtering with a
 # decoder that shares none of our code.
+# The hevc-refs3-ipb / hevc-refs4-b3 rows are H.265 with more references than
+# a B picture predicts from, over one long GOP (--gop 250). A B picture uses
+# one past anchor and the future one, and its reference picture set must
+# still keep the older anchors a later P picture uses, flagged unused. When
+# it listed only the two it uses, the older anchors were marked unused, and
+# libavcodec refused the next P picture that named one ("Could not find ref
+# with POC 0"). Our decoder generates a stand-in for a missing reference and
+# counts a warning (h26xdec prints the count), so SELF passed and only CROSS
+# was red. They visit motion (and, through the tag, its 10-bit twin
+# motion10), fade and cut; --gop 250 because at --gop 8 the GOP ends before
+# --bframes 3 leaves a B picture below an anchor it does not use.
 CONFIGS=${CONFIGS:-"
 lossless-intra|--codec h264 --lossless --gop 0
 cqp-intra|--codec h264 --qp 26 --gop 0
@@ -601,6 +612,12 @@ hevc-refs2-ipb|--codec h265 --qp 26 --gop 8 --bframes 2 --refs 2
 hevc-refs2-40-ip|--codec h265 --qp 40 --gop 8 --refs 2
 hevc-refs2-wp-ip@fade|--codec h265 --qp 26 --gop 8 --refs 2 --wpred
 hevc10-refs2-ip@p10|--codec h265 --qp 26 --gop 8 --refs 2
+hevc-refs3-ipb@motion|--codec h265 --qp 26 --gop 250 --bframes 2 --refs 3
+hevc-refs3-ipb@fade|--codec h265 --qp 26 --gop 250 --bframes 2 --refs 3
+hevc-refs3-ipb@cut|--codec h265 --qp 26 --gop 250 --bframes 2 --refs 3
+hevc-refs4-b3@motion|--codec h265 --qp 26 --gop 250 --bframes 3 --refs 4
+hevc-refs4-b3@fade|--codec h265 --qp 26 --gop 250 --bframes 3 --refs 4
+hevc-refs4-b3@cut|--codec h265 --qp 26 --gop 250 --bframes 3 --refs 4
 abr-64k-cpb@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8
 abr-64k-cavlc-cpb@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8 --cavlc
 h264-10-lossless-intra@p10|--codec h264 --lossless --gop 0

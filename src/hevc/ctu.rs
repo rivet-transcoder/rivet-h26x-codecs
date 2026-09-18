@@ -2880,7 +2880,7 @@ mod write_round_trip {
         // Both switches on when SAO is under test, so the reader walks
         // all three components and every inheritance rule is exercised.
         let sao_flags = sao.then_some(crate::encode::h265_syntax::SaoFlags { luma: true, chroma: Some(true) });
-        let eh = EncSliceHeader { kind: Kind::Idr, poc_lsb: 0, qp, log2_max_poc_lsb: 8, ref_deltas: Vec::new(), sao: sao_flags, pred_weights: None };
+        let eh = EncSliceHeader { kind: Kind::Idr, poc_lsb: 0, qp, log2_max_poc_lsb: 8, ref_deltas: Vec::new(), kept_deltas: Vec::new(), sao: sao_flags, pred_weights: None };
         write_slice_header(&eh, 26, NAL_IDR_N_LP, false, &mut w);
         w.flag(true); // byte_alignment(): alignment_bit_equal_to_one
         w.align_zero();
