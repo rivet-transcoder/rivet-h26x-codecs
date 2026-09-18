@@ -464,6 +464,36 @@ pub struct BRefs<'a, S: Sample> {
     pub weighting: [Weighting; 3],
 }
 
+/// How a B slice weights its predictions: what its PPS's
+/// `weighted_bipred_idc` says, and for an explicit one the slice's table.
+#[derive(Clone, Copy, Debug)]
+pub enum BWeights<'a> {
+    /// idc 0: one list's prediction as it is, two lists' averaged.
+    Default,
+    /// idc 1: the slice's `pred_weight_table`.
+    Explicit(&'a PredWeightTable),
+    /// idc 2: a bi-predicted block weighted by `(w0, w1)` at `logWD` 5 —
+    /// the reader's `implicit_pair` from the picture's POC distances to its
+    /// two references — and a one-list block as it is.
+    Implicit(i32, i32),
+}
+
+impl BWeights<'_> {
+    /// [`BRefs::weighting`] under these weights at `bit_depth`: the
+    /// reader's derivation for each reference pair — `explicit_weighting`
+    /// of the table, or the arm of `SliceRefs::weighting` that implicit
+    /// weighting takes (`logWD` 5, no offsets, default for one list).
+    pub(crate) fn weightings(&self, bit_depth: u32) -> [Weighting; 3] {
+        match *self {
+            BWeights::Default => [Weighting::Default; 3],
+            BWeights::Explicit(t) => b_weightings(Some(t), bit_depth),
+            BWeights::Implicit(w0, w1) => {
+                [Weighting::Default, Weighting::Default, Weighting::Weighted { log_wd: [5; 3], w: [[w0, w1]; 3], o: [[0; 2]; 3] }]
+            }
+        }
+    }
+}
+
 /// [`BRefs::weighting`] for a B slice's `pred_weight_table` `t` at
 /// `bit_depth`: the reader's `explicit_weighting` for each reference pair
 /// a prediction can use, in [`BRefs::weighting`]'s order — or default

@@ -42,7 +42,9 @@ use super::rc::{Insensitivity, PicKind, RateController};
 use super::h264_syntax as syn;
 use super::h265_wp;
 use crate::h264::slice::{PredWeightTable, WeightEntry};
-use super::{Access, Config, Entropy, FieldCoding, FieldOrder, RateControl};
+use super::h264_me::BWeights;
+use super::{Access, BWeighting, Config, Entropy, FieldCoding, FieldOrder, RateControl};
+use crate::h264::recon::implicit_pair;
 use crate::bitwriter::BitWriter;
 use crate::h264::dpb::{DecodedPic, Dpb, PocState, RefMark};
 use crate::h264::frame::{BlockMotion, Frame, PARITY_FRAME, SharedFrame};
@@ -735,6 +737,31 @@ impl<S: Sample> Core<S> {
                 ));
             }
         }
+        match cfg.b_weighting {
+            Some(BWeighting::Explicit) if !cfg.weighted_pred => {
+                // The explicit table is the weighted-prediction fit; asked for
+                // alone it would have nothing to fit with.
+                return Err(Error::unsupported(
+                    "H.264 encode: explicit B weighting without weighted prediction (the B table is weighted_pred's fit; ask for weighted_pred)",
+                ));
+            }
+            Some(BWeighting::Implicit) if cfg.interlace.is_some() => {
+                // A field macroblock of an MBAFF frame weights by its own
+                // field's distances (8.4.2.3.1), which the interlaced walks
+                // do not derive.
+                return Err(Error::unsupported(
+                    "H.264 encode: implicit B weighting over interlaced coding (encoder in progress)",
+                ));
+            }
+            Some(BWeighting::Implicit) if cfg.rate == RateControl::Lossless => {
+                // A lossless stream's B pictures are all-skip copies at the
+                // plain average of their anchors, which a weighting would move.
+                return Err(Error::unsupported(
+                    "H.264 encode: implicit B weighting on a lossless stream (its B pictures are plain averages of their anchors)",
+                ));
+            }
+            _ => {}
+        }
         if cfg.weighted_pred && cfg.rate == RateControl::Lossless {
             // A lossless stream's inter pictures are all-skip copies of
             // their reference (PCM has no inter spelling), and a weighting
@@ -1226,7 +1253,7 @@ impl<S: Sample> Core<S> {
                 strong_fit = strong;
                 Some(table)
             }
-            Kind::B if self.cfg.weighted_pred && transform_b => Some(self.b_weights(
+            Kind::B if transform_b && syn::b_weighting(&self.cfg) == BWeighting::Explicit => Some(self.b_weights(
                 &planes,
                 [&self.refs[past.expect("checked above")].1, &self.refs[future.expect("checked above")].1],
                 fit,
@@ -1417,7 +1444,18 @@ impl<S: Sample> Core<S> {
             let p1 = future.expect("checked above");
             let refs2 = [&self.refs[p0].1[..], &self.refs[p1].1[..]];
             let col = super::h264_pic::Colocated::progressive(&self.refs[p1].2);
-            let weights = wp.as_ref().map(|p| &p.table);
+            // How the slice weights its predictions: its table, the pair of
+            // distance weights the reader derives from the three pictures'
+            // order counts (one reference per list, none long-term), or
+            // neither.
+            let weights = match (syn::b_weighting(&self.cfg), wp.as_ref()) {
+                (BWeighting::Explicit, Some(p)) => BWeights::Explicit(&p.table),
+                (BWeighting::Implicit, _) => {
+                    let (w0, w1) = implicit_pair(c.poc, self.refs[p0].0, self.refs[p1].0, false, false);
+                    BWeights::Implicit(w0, w1)
+                }
+                _ => BWeights::Default,
+            };
             if cabac {
                 motion = super::h264_cabac_mb::write_b_picture_cabac(
                     &mut w, &g, &self.tools, qp, &planes, &mut recon, refs2, &col, weights,
@@ -1688,9 +1726,9 @@ impl<S: Sample> Core<S> {
                         },
                     };
                     if cabac {
-                        super::h264_cabac_mb::write_b_picture_cabac(&mut w, &gf, &self.tools, qp, &planes, &mut recon, refs2, &col, None)
+                        super::h264_cabac_mb::write_b_picture_cabac(&mut w, &gf, &self.tools, qp, &planes, &mut recon, refs2, &col, super::h264_me::BWeights::Default)
                     } else {
-                        let m = super::h264_cavlc_mb::write_b_picture(&mut w, &gf, &self.tools, qp, &planes, &mut recon, refs2, &col, None);
+                        let m = super::h264_cavlc_mb::write_b_picture(&mut w, &gf, &self.tools, qp, &planes, &mut recon, refs2, &col, super::h264_me::BWeights::Default);
                         w.rbsp_trailing_bits();
                         m
                     }
@@ -1930,9 +1968,9 @@ impl<S: Sample> Core<S> {
                     },
                 };
                 if cabac {
-                    super::h264_cabac_mb::write_b_picture_cabac(&mut w, &g, &self.tools, qp, &planes, &mut recon, refs2, &col, None)
+                    super::h264_cabac_mb::write_b_picture_cabac(&mut w, &g, &self.tools, qp, &planes, &mut recon, refs2, &col, super::h264_me::BWeights::Default)
                 } else {
-                    let m = super::h264_cavlc_mb::write_b_picture(&mut w, &g, &self.tools, qp, &planes, &mut recon, refs2, &col, None);
+                    let m = super::h264_cavlc_mb::write_b_picture(&mut w, &g, &self.tools, qp, &planes, &mut recon, refs2, &col, super::h264_me::BWeights::Default);
                     w.rbsp_trailing_bits();
                     m
                 }
@@ -2943,6 +2981,95 @@ mod tests {
         let moving = census(&woven_frames(64, 64, ChromaFormat::Yuv420, 8, 12, 0), 26);
         assert!(moving.wp_priced[1] > 0, "moving texture: no weak fit was priced: {moving:?}");
         assert!(moving.wp_rd_default[1] > 0, "moving texture: every weak fit beat the defaults: {moving:?}");
+    }
+
+    /// Implicit B weighting (`weighted_bipred_idc` 2) round-trips through
+    /// the production decoder, whose own derivation (`implicit_pair`, from
+    /// the order counts it reads) weights the same pairs the encoder did:
+    /// both entropy coders, every chroma format, 8 and 10 bits, one to
+    /// three B pictures, beside weighted P pictures, and with the 8x8
+    /// transform and sub-partitions. The weights are by distance — two
+    /// thirds and one third a third of the way between the anchors, a half
+    /// each halfway — and the stream is not the default-weighted one.
+    #[test]
+    fn implicit_b_weighting_round_trips_and_weighs_by_distance() {
+        use crate::encode::BWeighting;
+        assert_eq!(implicit_pair(2, 0, 6, false, false), (43, 21), "a third of the way along");
+        assert_eq!(implicit_pair(4, 0, 6, false, false), (22, 42), "two thirds (the spec rounds DistScaleFactor, not the weights)");
+        assert_eq!(implicit_pair(2, 0, 4, false, false), (32, 32), "halfway");
+        for (chroma, bit_depth, bframes, entropy, tools, wpred) in [
+            (ChromaFormat::Yuv420, 8u32, 2u32, Entropy::Cabac, false, false),
+            (ChromaFormat::Yuv420, 8, 3, Entropy::Cavlc, true, false),
+            (ChromaFormat::Yuv422, 8, 1, Entropy::Cabac, true, false),
+            (ChromaFormat::Yuv444, 8, 2, Entropy::Cavlc, false, true),
+            (ChromaFormat::Monochrome, 8, 2, Entropy::Cabac, false, false),
+            (ChromaFormat::Yuv420, 10, 2, Entropy::Cabac, true, true),
+            (ChromaFormat::Yuv444, 10, 3, Entropy::Cabac, false, false),
+        ] {
+            let tag = format!("{chroma:?} {bit_depth}-bit bframes={bframes} {entropy:?} t8x8+subparts={tools} wpred={wpred}");
+            let frames: Vec<Vec<u8>> = woven_frames(64, 64, chroma, bit_depth, 8, 0)
+                .into_iter()
+                .zip(fade_frames(chroma, bit_depth, 8))
+                .enumerate()
+                .map(|(i, (moving, fading))| if i % 2 == 0 { moving } else { fading })
+                .collect();
+            let run = |b_weighting: Option<BWeighting>| -> (Vec<Access>, Vec<Vec<u8>>) {
+                let mut e = H264Encoder::new(Config {
+                    gop: 8,
+                    bframes,
+                    entropy,
+                    transform_8x8: tools,
+                    subparts: tools,
+                    weighted_pred: wpred,
+                    b_weighting,
+                    ..cfg(64, 64, chroma, bit_depth)
+                })
+                .unwrap_or_else(|err| panic!("{tag}: {err}"));
+                let mut units = Vec::new();
+                for f in &frames {
+                    units.extend(e.push(f).unwrap_or_else(|err| panic!("{tag}: {err}")));
+                }
+                units.extend(e.flush().unwrap_or_else(|err| panic!("{tag}: {err}")));
+                (units, e.reconstructions().to_vec())
+            };
+            let (implicit, recon) = run(Some(BWeighting::Implicit));
+            self_check(&tag, 8, &implicit, &recon);
+            let (default, _) = run(Some(BWeighting::Default));
+            assert_ne!(
+                implicit.iter().map(|a| &a.data).collect::<Vec<_>>(),
+                default.iter().map(|a| &a.data).collect::<Vec<_>>(),
+                "{tag}: implicit weighting coded the default-weighted stream"
+            );
+        }
+    }
+
+    /// B weighting asked for by name is refused where the encoder cannot
+    /// honour it: explicit without weighted prediction (the table is its
+    /// fit), implicit over interlaced coding or on a lossless stream, and
+    /// on H.265 anything but what it does anyway.
+    #[test]
+    fn b_weighting_is_refused_where_it_cannot_be_honoured() {
+        use crate::encode::{BWeighting, FieldOrder};
+        let base = Config { gop: 8, bframes: 2, ..cfg(64, 64, ChromaFormat::Yuv420, 8) };
+        let refuse = |c: Config, what: &str| {
+            let err = H264Encoder::new(c).err().unwrap_or_else(|| panic!("{what}: accepted"));
+            assert!(format!("{err}").contains("B weighting"), "{what}: {err}");
+        };
+        refuse(Config { b_weighting: Some(BWeighting::Explicit), ..base.clone() }, "explicit without weighted prediction");
+        refuse(Config { b_weighting: Some(BWeighting::Implicit), interlace: Some(FieldOrder::TopFirst), ..base.clone() }, "implicit interlaced");
+        refuse(Config { b_weighting: Some(BWeighting::Implicit), rate: RateControl::Lossless, ..base.clone() }, "implicit lossless");
+        for (wp, bw) in [(false, BWeighting::Default), (true, BWeighting::Default), (false, BWeighting::Implicit), (true, BWeighting::Implicit), (true, BWeighting::Explicit)] {
+            H264Encoder::new(Config { weighted_pred: wp, b_weighting: Some(bw), ..base.clone() })
+                .unwrap_or_else(|err| panic!("H.264 weighted_pred {wp} {bw:?}: {err}"));
+        }
+        let h265 = |wp: bool, bw: Option<BWeighting>| crate::encode::h265::H265Encoder::new(Config { weighted_pred: wp, b_weighting: bw, ..base.clone() });
+        for (wp, bw) in [(false, None), (true, None), (true, Some(BWeighting::Explicit)), (false, Some(BWeighting::Default))] {
+            h265(wp, bw).unwrap_or_else(|err| panic!("H.265 weighted_pred {wp} {bw:?}: {err}"));
+        }
+        for (wp, bw) in [(false, BWeighting::Implicit), (true, BWeighting::Implicit), (true, BWeighting::Default), (false, BWeighting::Explicit)] {
+            let err = h265(wp, Some(bw)).err().unwrap_or_else(|| panic!("H.265 weighted_pred {wp} {bw:?}: accepted"));
+            assert!(format!("{err}").contains("B weighting"), "H.265 {bw:?}: {err}");
+        }
     }
 
     /// 8.4.2.3's bound on an explicitly bi-predicted pair, at its edges:

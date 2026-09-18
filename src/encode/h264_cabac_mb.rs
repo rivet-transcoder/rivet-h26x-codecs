@@ -429,7 +429,7 @@ pub fn write_b_picture_cabac<S: Sample>(
     rec: &mut [Recon<S>],
     refs: [&[Recon<S>]; 2],
     col: &Colocated,
-    weights: Option<&crate::h264::slice::PredWeightTable>,
+    weights: crate::encode::h264_me::BWeights<'_>,
 ) -> PicMotion {
     let mbw = g.mbs_wide as usize;
     let total = mbw * g.mbs_high as usize;

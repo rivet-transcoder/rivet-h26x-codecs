@@ -534,6 +534,16 @@ EXCLUSIVE_TOKENS="ilace fdeep wsine"
 # fade with the 8x8 transform and sub-partitions, and under adaptive
 # quantisation; and both 10-bit fades. h26xenc's `wp B` line counts the B
 # pictures that took a table, were priced, and kept the defaults.
+# The h264-*imp* rows are H.264's implicit B weighting (`--bweight implicit`,
+# `weighted_bipred_idc` 2): no table, every bi-predicted block weighted by
+# the picture's distances to its anchors through the decoder's own
+# `implicit_pair`, so SELF holds the encoder to that derivation and CROSS
+# holds both to libavcodec's. It is opt-in (see `Config::b_weighting` for
+# the measurement: fades and motion gain, detail loses), so no other row
+# moved. One row over every 8-bit clip at two B pictures, one at three with
+# the 8x8 transform and sub-partitions under CAVLC at QP 40, the deep clips,
+# beside explicitly weighted P pictures on the fade, and on the native
+# 10-bit fade, where it gains most.
 # The h264-paff / h264-mbaff rows are H.264 interlaced coding. They visit the
 # two interlaced clips: src_interlace_96x96_420p8 (`@interlace`: fields 20 ms
 # apart, a scrolling half beside a held one, combed so that PAFF has field
@@ -741,6 +751,11 @@ h264-wp-t8x8-subparts-ipb@fade|--codec h264 --qp 26 --gop 8 --bframes 2 --t8x8 -
 h264-wp-aq-ipb@fade|--codec h264 --qp 26 --gop 8 --bframes 2 --aq 1.0 --wpred
 h264-10-wp-ipb@wsine10|--codec h264 --qp 26 --gop 8 --bframes 2 --wpred
 h264-10-wp40-ipb@fdeep10|--codec h264 --qp 40 --gop 8 --bframes 2 --wpred
+h264-imp-ipb|--codec h264 --qp 26 --gop 8 --bframes 2 --bweight implicit
+h264-imp40-cavlc-t8x8-subparts-b3|--codec h264 --qp 40 --gop 8 --bframes 3 --cavlc --t8x8 --subparts --bweight implicit
+h264-10-imp-ipb@p10|--codec h264 --qp 26 --gop 8 --bframes 2 --bweight implicit
+h264-imp-wp-ipb@fade|--codec h264 --qp 26 --gop 8 --bframes 2 --wpred --bweight implicit
+h264-10-imp-ipb@wsine10|--codec h264 --qp 26 --gop 8 --bframes 2 --bweight implicit
 "}
 
 # Split a clip's format token into its chroma format and sample depth:

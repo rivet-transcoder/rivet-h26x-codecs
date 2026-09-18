@@ -814,7 +814,7 @@ pub fn write_b_picture<S: Sample>(
     rec: &mut [Recon<S>],
     refs: [&[Recon<S>]; 2],
     col: &Colocated,
-    weights: Option<&crate::h264::slice::PredWeightTable>,
+    weights: crate::encode::h264_me::BWeights<'_>,
 ) -> PicMotion {
     let mbs_wide = g.mbs_wide as usize;
     let rows = if g.chroma == crate::picture::ChromaFormat::Yuv444 { 0 } else { g.chroma_mb().1 as usize / 4 };

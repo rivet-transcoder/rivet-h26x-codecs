@@ -25,7 +25,7 @@ use crate::encode::aq;
 use crate::encode::h264_deblock::{deblock_recon, nz_mask_of};
 use crate::encode::h264_intra::{IntraCtx, MbAvail, MbDecision, MbKind, code_macroblock, code_macroblock_modes8};
 use crate::encode::h264_me::{
-    BDecision, BMbKind, BRefs, InterDecision, InterMbKind, MbMotionState, PRef, b_weightings, code_macroblock_b,
+    BDecision, BMbKind, BRefs, BWeights, InterDecision, InterMbKind, MbMotionState, PRef, code_macroblock_b,
     code_macroblock_p, weighted_search_plane, weighting_gain, weighting_gain_b,
 };
 use crate::encode::h264_syntax::{Geometry, Plane, Recon};
@@ -842,8 +842,8 @@ pub enum BMb<'a> {
 /// direct derivation reads as colocated motion. `refs` are the list-0
 /// (past) and list-1 (future) reference planes, borders replicated.
 ///
-/// `weights` is the slice's `pred_weight_table` when the PPS sets
-/// `weighted_bipred_idc` 1: every prediction then takes the weighting the
+/// `weights` is how the slice weights its predictions ([`BWeights`]).
+/// Under an explicit table every prediction takes the weighting the
 /// reader's `explicit_weighting` derives from it for the reference pair it
 /// uses — one list's entry for a one-list prediction, both for a
 /// bi-predicted one, direct and skip at their derived pair — and each
@@ -851,7 +851,10 @@ pub enum BMb<'a> {
 /// picture's does. A table whose every entry is the default predicts
 /// exactly the samples default weighting does (`w = 1 << logWD`, `o = 0`
 /// reduce 8.4.2.3.2's formulas to 8.4.2.3.1's, one list and two), so it
-/// leaves the walk on default weighting and its average kernel.
+/// leaves the walk on default weighting and its average kernel. Under
+/// implicit weighting every bi-predicted block takes the slice's one pair
+/// of distance weights and every one-list block is plain, so the searches
+/// score on the plain references.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn code_b_picture<S: Sample>(
     g: &Geometry,
@@ -861,7 +864,7 @@ pub(crate) fn code_b_picture<S: Sample>(
     rec: &mut [Recon<S>],
     refs: [&[Recon<S>]; 2],
     col: &Colocated,
-    weights: Option<&PredWeightTable>,
+    weights: BWeights<'_>,
     mut emit: impl FnMut(usize, usize, BMb<'_>),
 ) -> PicMotion {
     let pc = PicCoding::new(g, tools, qp, planes);
@@ -873,8 +876,11 @@ pub(crate) fn code_b_picture<S: Sample>(
     // The references as the decisions see them: each kind of prediction's
     // weighting, the reader's own derivation for its reference pair, and
     // each list's search luma, weighted when that list's luma is.
-    let on = weights.is_some_and(|t| t.lists.iter().flatten().any(|e| e.luma_flag || e.chroma_flag));
-    let weighting = b_weightings(weights.filter(|_| on), g.bit_depth);
+    let on = matches!(weights, BWeights::Explicit(t) if t.lists.iter().flatten().any(|e| e.luma_flag || e.chroma_flag));
+    let weighting = match weights {
+        BWeights::Explicit(_) if !on => [Weighting::Default; 3],
+        w => w.weightings(g.bit_depth),
+    };
     let weighted_luma: [Option<Recon<S>>; 2] = [0usize, 1].map(|l| match weighting[l] {
         Weighting::Weighted { log_wd, w, o } if (w[0][l], o[0][l]) != (1 << log_wd[0], 0) => {
             Some(weighted_search_plane(&refs[l][0], log_wd[0], w[0][l], o[0][l], ctx.max))

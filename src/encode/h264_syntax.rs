@@ -23,7 +23,7 @@ use crate::encode::gop::Kind;
 use crate::h264::SliceType;
 use crate::h264::slice::PredWeightTable;
 use crate::h264::cabac_mb::{CabacState, MB_TYPE_I_PCM, write_mb_type_i_cabac};
-use crate::encode::{ColourDescription, Config, ContentLightLevel, Entropy, MasteringDisplay};
+use crate::encode::{BWeighting, ColourDescription, Config, ContentLightLevel, Entropy, MasteringDisplay, RateControl};
 use crate::picture::ChromaFormat;
 use crate::sample::Sample;
 
@@ -492,12 +492,18 @@ pub fn write_pps(cfg: &Config, qp: u8) -> Vec<u8> {
     w.ue(0); // num_ref_idx_l0_default_active_minus1
     w.ue(0); // num_ref_idx_l1_default_active_minus1
     // Explicit weighted prediction when asked for: every P slice carries a
-    // `pred_weight_table`, and so — `weighted_bipred_idc` 1, explicit — does
-    // every B slice of a stream that has B pictures. A stream without them
-    // keeps the idc at 0, so its PPS is the one it had before B slices were
-    // weighted.
+    // `pred_weight_table`. B slices are weighted as `b_weighting` resolves —
+    // explicitly, with a table in every B slice, implicitly by distance, or
+    // not at all. A stream without B pictures keeps the idc at 0, so its
+    // PPS is the one it had before B slices were weighted.
     w.flag(cfg.weighted_pred); // weighted_pred_flag
-    w.bits(2, u32::from(cfg.weighted_pred && cfg.bframes > 0)); // weighted_bipred_idc
+    let idc = match b_weighting(cfg) {
+        _ if cfg.bframes == 0 => 0,
+        BWeighting::Default => 0,
+        BWeighting::Explicit => 1,
+        BWeighting::Implicit => 2,
+    };
+    w.bits(2, idc); // weighted_bipred_idc
     w.se(qp as i32 - 26); // pic_init_qp_minus26
     w.se(0); // pic_init_qs_minus26
     w.se(0); // chroma_qp_index_offset
@@ -520,6 +526,19 @@ pub fn write_pps(cfg: &Config, qp: u8) -> Vec<u8> {
     }
     w.rbsp_trailing_bits();
     w.into_nal()
+}
+
+/// How the stream's B slices are weighted: [`Config::b_weighting`], or
+/// where it is `None` the encoder's choice — explicit beside
+/// `weighted_pred`, default otherwise, and default for an interlaced or
+/// lossless stream, whose B paths code the plain average.
+pub(crate) fn b_weighting(cfg: &Config) -> BWeighting {
+    match cfg.b_weighting {
+        Some(w) => w,
+        None if cfg.weighted_pred => BWeighting::Explicit,
+        None if cfg.interlace.is_some() || cfg.rate == RateControl::Lossless => BWeighting::Default,
+        None => BWeighting::Default,
+    }
 }
 
 /// A P or B slice's `pred_weight_table` as the writer spells it: the table
@@ -1540,5 +1559,20 @@ mod tests {
         assert_eq!(parse(&b).weighted_bipred_idc, 0, "B pictures without weighting");
         assert_eq!(parse(&Config { weighted_pred: true, bframes: 0, ..b.clone() }).weighted_bipred_idc, 0, "weighting without B pictures");
         assert_eq!(write_pps(&b, 26), write_pps(&Config { bframes: 0, ..b.clone() }, 26), "no weighting, no change");
+        // `b_weighting` asked for by name: implicit with or without weighted
+        // P slices, and default B slices beside weighted P ones.
+        use crate::encode::BWeighting;
+        for (wp, bw, idc) in [
+            (false, Some(BWeighting::Implicit), 2),
+            (true, Some(BWeighting::Implicit), 2),
+            (true, Some(BWeighting::Default), 0),
+            (true, Some(BWeighting::Explicit), 1),
+            (false, Some(BWeighting::Default), 0),
+        ] {
+            let pps = parse(&Config { weighted_pred: wp, b_weighting: bw, ..b.clone() });
+            assert_eq!((pps.weighted_pred, pps.weighted_bipred_idc), (wp, idc), "weighted_pred {wp}, {bw:?}");
+        }
+        let implicit = Config { b_weighting: Some(BWeighting::Implicit), ..b.clone() };
+        assert_eq!(parse(&Config { bframes: 0, ..implicit }).weighted_bipred_idc, 0, "implicit without B pictures");
     }
 }

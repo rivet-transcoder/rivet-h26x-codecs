@@ -128,7 +128,7 @@ use super::aq;
 use super::h265_wp;
 use super::h265_syntax::{self as syn, Cpb, PpsOptions};
 use crate::hevc::ctu::explicit_weighting;
-use super::{Access, Config, RateControl};
+use super::{Access, BWeighting, Config, RateControl};
 use crate::bitwriter::BitWriter;
 use crate::cabac_enc::CabacEncoder;
 use crate::dsp::distortion::DistortionDsp;
@@ -419,6 +419,21 @@ fn pad_plane<S: Sample>(src: &[S], sw: usize, sh: usize, tw: usize, th: usize) -
 
 impl<S: Sample> Core<S> {
     fn new(cfg: Config) -> Result<Self> {
+        match cfg.b_weighting {
+            None => {}
+            Some(BWeighting::Explicit) if cfg.weighted_pred => {}
+            Some(BWeighting::Default) if !cfg.weighted_pred => {}
+            Some(w) => {
+                // H.265's B slices are weighted explicitly exactly when its P
+                // slices are (`weighted_bipred_flag` beside
+                // `weighted_pred_flag`), and it has no implicit mode at all;
+                // anything else asked for on purpose is refused by name.
+                return Err(Error::unsupported(format!(
+                    "H.265 encode: B weighting {w:?} {} (H.265 has no implicit mode, and weights B slices explicitly exactly when weighted_pred is on)",
+                    if cfg.weighted_pred { "with weighted prediction" } else { "without weighted prediction" }
+                )));
+            }
+        }
         if cfg.interlace.is_some() {
             // Not "in progress": H.265 has no interlaced coding tools. What
             // it has is signalling — field_seq_flag and a pic_struct SEI
