@@ -358,12 +358,15 @@ pub struct Config {
     /// change a reference's brightness, so without this every block of a
     /// fading picture carries the level change as residual.
     ///
-    /// H.265 weights B slices too when the GOP has B pictures: the PPS
-    /// sets `weighted_bipred_flag` and every B slice's table carries an
-    /// entry for each list's reference, fitted the same way, which the
-    /// one-list and the bi predictions both apply (8.5.3.3.4.3). H.264's B
-    /// slices keep default weighting (`weighted_bipred_idc` 0). A lossless
-    /// H.264 stream refuses it, its inter pictures being exact copies.
+    /// Both codecs weight B slices too when the GOP has B pictures: the
+    /// PPS sets H.265's `weighted_bipred_flag` or H.264's
+    /// `weighted_bipred_idc` 1, and every B slice's table carries an entry
+    /// for each list's reference, fitted the same way, which the one-list
+    /// and the bi predictions both apply (8.5.3.3.4.3, 8.4.2.3). Each
+    /// codec prices a B picture's fitted table against a table of defaults
+    /// and keeps the cheaper, and H.264 a P picture's where no fit in it is
+    /// strong (`encode::h264`'s `code_attempt`). A lossless H.264 stream
+    /// refuses it, its inter pictures being exact copies.
     /// Off, the stream is byte-identical to one from an encoder that never
     /// had it.
     pub weighted_pred: bool,

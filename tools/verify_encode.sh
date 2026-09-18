@@ -736,7 +736,7 @@ hevc10-wp-ipb@wsine10|--codec h265 --qp 26 --gop 8 --bframes 2 --wpred
 hevc10-wp-ip@wsine10|--codec h265 --qp 26 --gop 8 --wpred
 hevc10-wp40-ipb@wsine10|--codec h265 --qp 40 --gop 8 --bframes 2 --wpred
 h264-wp40-ipb|--codec h264 --qp 40 --gop 8 --bframes 2 --wpred
-h264-wpoff-ipb@wpoff|--codec h264 --qp 26 --gop 8 --bframes 2 --wpred
+h264-wp-ipb@wpoff|--codec h264 --qp 26 --gop 8 --bframes 2 --wpred
 h264-wp-t8x8-subparts-ipb@fade|--codec h264 --qp 26 --gop 8 --bframes 2 --t8x8 --subparts --wpred
 h264-wp-aq-ipb@fade|--codec h264 --qp 26 --gop 8 --bframes 2 --aq 1.0 --wpred
 h264-10-wp-ipb@wsine10|--codec h264 --qp 26 --gop 8 --bframes 2 --wpred
