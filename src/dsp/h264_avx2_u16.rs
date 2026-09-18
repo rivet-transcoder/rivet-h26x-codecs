@@ -16,6 +16,16 @@
 //! transform, the DC adds, `copy` and the MBAFF eight-line edges keep the
 //! VEX-encoded 128-bit kernels: one row of those is one 128-bit vector
 //! already. The rungs' tests (`super::h264_x86_128_u16`) include this one.
+//!
+//! Chroma was tried here anyway, since it is the top kernel of a 10-bit
+//! decode (10.6% of self time, 1080p High 10): two eight-sample rows a
+//! vector, each source row loaded once for both rows that read it. It was
+//! bit-exact and 1.19x the AVX kernel on a hot source, and no measurable
+//! difference to the decode (B/A 1.016 with an 8% same-binary control
+//! span). A line profile says why: the kernel's samples sit on the loads of
+//! the reference rows and the first use of them, so its cost is the cache,
+//! not the lanes. Prefetching the next block's reference is what would move
+//! it.
 
 #![cfg(target_arch = "x86_64")]
 
