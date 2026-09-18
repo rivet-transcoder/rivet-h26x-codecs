@@ -232,6 +232,7 @@ impl Sps {
             50 => 110400,
             51 => 184320,
             52 => 184320,
+            60..=62 => 696320,
             _ => 184320,
         };
         let frame_mbs = self.pic_width_in_mbs * self.frame_height_in_mbs();
