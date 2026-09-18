@@ -666,6 +666,14 @@ pub struct SliceHeader {
     /// term reference picture set, in the order the reader expects —
     /// negatives nearest-first, then positives nearest-first.
     pub ref_deltas: Vec<i32>,
+    /// POC deltas of the pictures this slice does not reference but a
+    /// later picture will. They go in the same set with
+    /// `used_by_curr_pic` 0: the reader keeps them in the decoded picture
+    /// buffer and leaves them out of this slice's lists and of
+    /// `NumPicTotalCurr`. A picture the set leaves out is marked unused
+    /// for reference (8.3.2), and no later set can bring it back. Disjoint
+    /// from `ref_deltas`.
+    pub kept_deltas: Vec<i32>,
     /// The slice's SAO switches, or `None` when the SPS leaves
     /// `sample_adaptive_offset_enabled_flag` clear and the reader takes no
     /// bit here at all.
@@ -791,24 +799,27 @@ pub fn write_slice_header(h: &SliceHeader, pps_qp: i32, nal_type: u8, deblock: b
         w.flag(false); // short_term_ref_pic_set_sps_flag
         // st_ref_pic_set(0): with no earlier set to predict from,
         // inter_ref_pic_set_prediction_flag is not read at idx 0.
-        let mut negative: Vec<i32> = h.ref_deltas.iter().copied().filter(|d| *d < 0).collect();
-        let mut positive: Vec<i32> = h.ref_deltas.iter().copied().filter(|d| *d > 0).collect();
+        // Every picture the decoder must keep, each with whether this
+        // slice uses it.
+        let entries = || h.ref_deltas.iter().map(|&d| (d, true)).chain(h.kept_deltas.iter().map(|&d| (d, false)));
+        let mut negative: Vec<(i32, bool)> = entries().filter(|e| e.0 < 0).collect();
+        let mut positive: Vec<(i32, bool)> = entries().filter(|e| e.0 > 0).collect();
         // Nearest first, as the deltas are coded as successive differences.
-        negative.sort_by_key(|d| -d);
-        positive.sort();
+        negative.sort_by_key(|e| -e.0);
+        positive.sort_by_key(|e| e.0);
         w.ue(negative.len() as u32);
         w.ue(positive.len() as u32);
         let mut prev = 0i32;
-        for d in &negative {
+        for &(d, used) in &negative {
             w.ue((prev - d - 1) as u32); // delta_poc_s0_minus1
-            w.flag(true); // used_by_curr_pic_s0_flag
-            prev = *d;
+            w.flag(used); // used_by_curr_pic_s0_flag
+            prev = d;
         }
         let mut prev = 0i32;
-        for d in &positive {
+        for &(d, used) in &positive {
             w.ue((d - prev - 1) as u32); // delta_poc_s1_minus1
-            w.flag(true); // used_by_curr_pic_s1_flag
-            prev = *d;
+            w.flag(used); // used_by_curr_pic_s1_flag
+            prev = d;
         }
         // slice_temporal_mvp_enabled_flag is absent: the SPS disables
         // temporal MVP, so the reader never reads the slice-level flag —
@@ -830,8 +841,9 @@ pub fn write_slice_header(h: &SliceHeader, pps_qp: i32, nal_type: u8, deblock: b
     }
     if matches!(h.kind, Kind::P | Kind::B) {
         // How many references each list actually has, read off the very
-        // set this header just wrote: negatives become RefPicList0 and
-        // positives RefPicList1, so counting them is counting the lists.
+        // set this header just wrote: its used negatives become
+        // RefPicList0 and its used positives RefPicList1, so counting them
+        // is counting the lists. The kept entries are in neither.
         // Deriving it here rather than taking it as a parameter is what
         // keeps the two from disagreeing — a header that declares more
         // entries than its own reference picture set carries is a stream
@@ -1146,7 +1158,7 @@ mod tests {
                 let mut w = BitWriter::with_capacity(64);
                 w.bits(8, ((NAL_TRAIL_R as u32) & 0x3f) << 1);
                 w.bits(8, 1);
-                let h = SliceHeader { kind: Kind::P, poc_lsb: 2, qp: slice_qp, log2_max_poc_lsb: 16, ref_deltas: vec![-2], sao: None, pred_weights: None };
+                let h = SliceHeader { kind: Kind::P, poc_lsb: 2, qp: slice_qp, log2_max_poc_lsb: 16, ref_deltas: vec![-2], kept_deltas: Vec::new(), sao: None, pred_weights: None };
                 write_slice_header(&h, 26, NAL_TRAIL_R, true, &mut w);
                 w.flag(true);
                 w.align_zero();
@@ -1261,7 +1273,9 @@ mod tests {
     /// the same way. A B slice with one anchor either side is the
     /// smallest case that can tell the two arrangements apart — writing
     /// them interleaved parses as two negatives and puts the future
-    /// anchor in the past.
+    /// anchor in the past. Kept pictures (`kept_deltas`) must come back
+    /// in the same set, in delta order among the used ones, flagged
+    /// unused, with the active counts unchanged.
     #[test]
     fn a_slice_header_carries_its_reference_pictures_where_the_parser_looks() {
         use crate::nal::HevcNalHeader;
@@ -1275,11 +1289,14 @@ mod tests {
         pps.resolve_tiles(&sps).expect("tiles");
 
         // Coding order puts this picture between its anchors: POC 4, with
-        // POC 2 behind it and POC 8 ahead.
-        for (kind, deltas, want_neg, want_pos) in [
-            (Kind::P, vec![-2i32], vec![-2i32], vec![]),
-            (Kind::B, vec![-2, 4], vec![-2], vec![4]),
-            (Kind::B, vec![4, -2], vec![-2], vec![4]),
+        // POC 2 behind it and POC 8 ahead; POC 0 and -2 are older anchors
+        // a later picture still needs.
+        for (kind, deltas, kept, want_neg, want_pos) in [
+            (Kind::P, vec![-2i32], vec![], vec![(-2i32, true)], vec![]),
+            (Kind::B, vec![-2, 4], vec![], vec![(-2, true)], vec![(4, true)]),
+            (Kind::B, vec![4, -2], vec![], vec![(-2, true)], vec![(4, true)]),
+            (Kind::P, vec![-2], vec![-4], vec![(-2, true), (-4, false)], vec![]),
+            (Kind::B, vec![-2, 4], vec![-6, -4], vec![(-2, true), (-4, false), (-6, false)], vec![(4, true)]),
         ] {
             let h = SliceHeader {
                 kind,
@@ -1287,6 +1304,7 @@ mod tests {
                 qp: 30,
                 log2_max_poc_lsb: 16,
                 ref_deltas: deltas.clone(),
+                kept_deltas: kept.clone(),
                 sao: None,
                 pred_weights: None,
             };
@@ -1318,17 +1336,11 @@ mod tests {
                 "slice type"
             );
             assert_eq!(parsed.slice_qp, 30, "slice QP");
-            let neg: Vec<i32> = parsed.st_rps.neg.iter().map(|&(d, _)| d).collect();
-            let pos: Vec<i32> = parsed.st_rps.pos.iter().map(|&(d, _)| d).collect();
-            assert_eq!(neg, want_neg, "past references for {kind:?} {deltas:?}");
-            assert_eq!(pos, want_pos, "future references for {kind:?} {deltas:?}");
-            assert!(
-                parsed.st_rps.neg.iter().chain(parsed.st_rps.pos.iter()).all(|&(_, used)| used),
-                "every reference this encoder writes is used by the current picture"
-            );
+            assert_eq!(parsed.st_rps.neg, want_neg, "past references for {kind:?} {deltas:?} kept {kept:?}");
+            assert_eq!(parsed.st_rps.pos, want_pos, "future references for {kind:?} {deltas:?} kept {kept:?}");
             // One active reference per list, taken from the PPS defaults
             // rather than overridden — and B gets a second list where P
-            // does not.
+            // does not. Kept pictures add none.
             assert_eq!(
                 parsed.num_ref_idx,
                 match kind {
@@ -1408,7 +1420,7 @@ mod tests {
             if kind == Kind::B {
                 ref_deltas.push(2);
             }
-            let h = SliceHeader { kind, poc_lsb: 8, qp: 31, log2_max_poc_lsb: 16, ref_deltas, sao: None, pred_weights: Some(pw) };
+            let h = SliceHeader { kind, poc_lsb: 8, qp: 31, log2_max_poc_lsb: 16, ref_deltas, kept_deltas: Vec::new(), sao: None, pred_weights: Some(pw) };
             let mut w = BitWriter::with_capacity(64);
             w.bits(8, ((NAL_TRAIL_R as u32) & 0x3f) << 1);
             w.bits(8, 1);
