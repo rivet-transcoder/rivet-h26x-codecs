@@ -284,6 +284,9 @@ macro_rules! kernels_u16 {
             d.qpel_bi = qpel_bi16;
             d.epel_bi = epel_bi16;
             d.fused_mc = true;
+            d.intra_planar = intra_planar::<u16>;
+            d.intra_dc = intra_dc::<u16>;
+            d.intra_angular = intra_angular::<u16>;
             install_sao_u16(d);
             install_deblock_u16(d);
         }
@@ -669,6 +672,218 @@ macro_rules! kernels_u16 {
         #[allow(clippy::too_many_arguments)]
         fn epel_bi16(dst: &mut [u16], dst_stride: usize, src: &[u16], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], other: &[i16], bit_depth: u32) {
             fused16::<4, MODE_BI>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, other, bit_depth)
+        }
+
+        // ------------------------------------------------------------------
+        // Intra prediction
+        // ------------------------------------------------------------------
+        //
+        // Generic over the sample type: the reference samples are u16 for
+        // both tables, the arithmetic is the same i16 / i32 lanes, and only
+        // the store differs (`put`). `pmaddwd` reads the references as i16,
+        // so a reference above 32767 (a 16-bit stream) goes to the scalar
+        // kernel; no u8 reference can be.
+
+        /// Store the first `n` (≤ 8) lanes of `v` (values in sample range)
+        /// as samples of `S`.
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn put<S: crate::hevc::frame::Sample>(dst: *mut S, v: __m128i, n: usize) {
+            unsafe {
+                if S::BYTES == 2 {
+                    return store_n_u16(dst as *mut u16, v, n);
+                }
+                let b = _mm_packus_epi16(v, v);
+                match n {
+                    8 => _mm_storel_epi64(dst as *mut __m128i, b),
+                    4 => std::ptr::write_unaligned(dst as *mut u32, _mm_cvtsi128_si32(b) as u32),
+                    _ => {
+                        let mut t = [0u8; 16];
+                        _mm_storeu_si128(t.as_mut_ptr() as *mut __m128i, b);
+                        std::ptr::copy_nonoverlapping(t.as_ptr(), dst as *mut u8, n);
+                    }
+                }
+            }
+        }
+
+        /// Whether any of `r` is above 32767 — past what `pmaddwd` reads as
+        /// a positive i16. Never true of a u8 table's references.
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn over_i16<S: crate::hevc::frame::Sample>(r: &[u16]) -> bool {
+            unsafe {
+                if S::BYTES == 1 {
+                    return false;
+                }
+                let mut acc = _mm_setzero_si128();
+                let mut i = 0;
+                while i + 8 <= r.len() {
+                    acc = _mm_or_si128(acc, _mm_loadu_si128(r.as_ptr().add(i) as *const __m128i));
+                    i += 8;
+                }
+                _mm_movemask_epi8(acc) & 0xAAAA != 0 || r[i..].iter().any(|&v| v > 32767)
+            }
+        }
+
+        fn intra_planar<S: crate::hevc::frame::Sample>(dst: &mut [S], stride: usize, left: &[u16], top: &[u16], n: usize) {
+            let fits = left.len() > n && top.len() >= n.max(8) && (n - 1) * stride + n <= dst.len();
+            if !fits || !(4..=32).contains(&n) || unsafe { over_i16::<S>(&left[..=n]) || over_i16::<S>(&top[..=n]) } {
+                return (HevcDsp::<S>::scalar().intra_planar)(dst, stride, left, top, n);
+            }
+            unsafe { intra_planar_impl(dst.as_mut_ptr(), stride, left, top, n) }
+        }
+
+        /// Planar, eight columns a vector: `(n-1-x)·p[-1][y] + (x+1)·p[n][-1]`
+        /// is one `pmaddwd` of the per-column weight pairs against the
+        /// broadcast pair `(left[y], top[n])`, and `(n-1-y)·p[x][-1] +
+        /// (y+1)·p[-1][n]` another of the row's broadcast weights against
+        /// `(top[x], left[n])` interleaved.
+        #[target_feature(enable = $feat)]
+        unsafe fn intra_planar_impl<S: crate::hevc::frame::Sample>(dst: *mut S, stride: usize, left: &[u16], top: &[u16], n: usize) {
+            unsafe {
+                let sh = _mm_cvtsi32_si128(n.trailing_zeros() as i32 + 1);
+                let round = _mm_set1_epi32(n as i32);
+                let ln = _mm_set1_epi16(left[n] as i16);
+                let chunks = n.div_ceil(8);
+                let mut w = [(_mm_setzero_si128(), _mm_setzero_si128()); 4];
+                let mut t = [(_mm_setzero_si128(), _mm_setzero_si128()); 4];
+                for c in 0..chunks {
+                    let wx = |x: usize| pair16((n as i32 - 1 - x as i32) as i16, (x + 1) as i16);
+                    let x0 = 8 * c;
+                    w[c] = (
+                        _mm_setr_epi32(wx(x0), wx(x0 + 1), wx(x0 + 2), wx(x0 + 3)),
+                        _mm_setr_epi32(wx(x0 + 4), wx(x0 + 5), wx(x0 + 6), wx(x0 + 7)),
+                    );
+                    let tx = _mm_loadu_si128(top.as_ptr().add(x0) as *const __m128i);
+                    t[c] = (_mm_unpacklo_epi16(tx, ln), _mm_unpackhi_epi16(tx, ln));
+                }
+                for y in 0..n {
+                    let a = _mm_set1_epi32(pair16(left[y] as i16, top[n] as i16));
+                    let b = _mm_set1_epi32(pair16((n - 1 - y) as i16, (y + 1) as i16));
+                    for c in 0..chunks {
+                        let lo = _mm_add_epi32(_mm_add_epi32(_mm_madd_epi16(w[c].0, a), _mm_madd_epi16(t[c].0, b)), round);
+                        let hi = _mm_add_epi32(_mm_add_epi32(_mm_madd_epi16(w[c].1, a), _mm_madd_epi16(t[c].1, b)), round);
+                        let v = _mm_packs_epi32(_mm_sra_epi32(lo, sh), _mm_sra_epi32(hi, sh));
+                        put(dst.add(y * stride + 8 * c), v, (n - 8 * c).min(8));
+                    }
+                }
+            }
+        }
+
+        fn intra_dc<S: crate::hevc::frame::Sample>(dst: &mut [S], stride: usize, left: &[u16], top: &[u16], n: usize, edge: bool) {
+            if left.len() < n || top.len() < n || !(4..=32).contains(&n) || (n - 1) * stride + n > dst.len() {
+                return (HevcDsp::<S>::scalar().intra_dc)(dst, stride, left, top, n, edge);
+            }
+            let log2n = n.trailing_zeros();
+            let sum = n as i32 + top[..n].iter().chain(&left[..n]).map(|&v| v as i32).sum::<i32>();
+            let dc = sum >> (log2n + 1);
+            unsafe { intra_fill(dst.as_mut_ptr(), stride, n, dc) };
+            if edge {
+                dst[0] = S::from_i32((left[0] as i32 + 2 * dc + top[0] as i32 + 2) >> 2);
+                for x in 1..n {
+                    dst[x] = S::from_i32((top[x] as i32 + 3 * dc + 2) >> 2);
+                }
+                for y in 1..n {
+                    dst[y * stride] = S::from_i32((left[y] as i32 + 3 * dc + 2) >> 2);
+                }
+            }
+        }
+
+        /// Fill an `n x n` block with `v` (a sample value).
+        #[target_feature(enable = $feat)]
+        unsafe fn intra_fill<S: crate::hevc::frame::Sample>(dst: *mut S, stride: usize, n: usize, v: i32) {
+            unsafe {
+                let vv = _mm_set1_epi16(v as i16);
+                for y in 0..n {
+                    let mut x = 0;
+                    while x < n {
+                        put(dst.add(y * stride + x), vv, (n - x).min(8));
+                        x += 8;
+                    }
+                }
+            }
+        }
+
+        fn intra_angular<S: crate::hevc::frame::Sample>(dst: &mut [S], stride: usize, refs: &[u16], n: usize, angle: i32, transposed: bool) {
+            // Every load of the last vector of a row, from `ref[-n]` up.
+            let reach = 3 * n + 2 + 8;
+            if refs.len() < reach || !(4..=32).contains(&n) || (n - 1) * stride + n > dst.len() || unsafe { over_i16::<S>(&refs[..3 * n + 2]) } {
+                return (HevcDsp::<S>::scalar().intra_angular)(dst, stride, refs, n, angle, transposed);
+            }
+            unsafe { intra_angular_impl(dst.as_mut_ptr(), stride, refs.as_ptr(), n, angle, transposed) }
+        }
+
+        /// One row of the angular interpolation, eight samples at `p`
+        /// (`ref[x + iIdx + 1]`) with fraction `f`: `pmaddwd` of the
+        /// interleaved neighbours against `(32 - f, f)`.
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn angular8(p: *const u16, k: __m128i, f: i32) -> __m128i {
+            unsafe {
+                let a = _mm_loadu_si128(p as *const __m128i);
+                if f == 0 {
+                    return a;
+                }
+                let b = _mm_loadu_si128(p.add(1) as *const __m128i);
+                let r = _mm_set1_epi32(16);
+                let lo = _mm_srai_epi32(_mm_add_epi32(_mm_madd_epi16(_mm_unpacklo_epi16(a, b), k), r), 5);
+                let hi = _mm_srai_epi32(_mm_add_epi32(_mm_madd_epi16(_mm_unpackhi_epi16(a, b), k), r), 5);
+                _mm_packs_epi32(lo, hi)
+            }
+        }
+
+        /// Angular prediction. The vertical modes write their rows straight
+        /// into the block; the horizontal ones predict the transposed block
+        /// row by row into a scratch block, and an 8x8 (or 4x4) transpose
+        /// per tile writes it into place.
+        #[target_feature(enable = $feat)]
+        unsafe fn intra_angular_impl<S: crate::hevc::frame::Sample>(dst: *mut S, stride: usize, refs: *const u16, n: usize, angle: i32, transposed: bool) {
+            unsafe {
+                // Written before it is read, tile by tile, so not cleared:
+                // clearing 2 KB a call was a visible share of the kernel.
+                let mut tmp = [std::mem::MaybeUninit::<u16>::uninit(); 32 * 32];
+                for y in 0..n {
+                    let pos = (y as i32 + 1) * angle;
+                    let (i, f) = (pos >> 5, pos & 31);
+                    let k = _mm_set1_epi32(pair16((32 - f) as i16, f as i16));
+                    let p = refs.offset(n as isize + i as isize + 1);
+                    let mut x = 0;
+                    while x < n {
+                        let v = angular8(p.add(x), k, f);
+                        if transposed {
+                            store_n(tmp.as_mut_ptr().add(y * n + x) as *mut i16, v, (n - x).min(8));
+                        } else {
+                            put(dst.add(y * stride + x), v, (n - x).min(8));
+                        }
+                        x += 8;
+                    }
+                }
+                if !transposed {
+                    return;
+                }
+                let t = tmp.as_ptr() as *const u16;
+                if n == 4 {
+                    let r = |j: usize| _mm_loadl_epi64(t.add(4 * j) as *const __m128i);
+                    let a = _mm_unpacklo_epi16(r(0), r(1));
+                    let b = _mm_unpacklo_epi16(r(2), r(3));
+                    let c01 = _mm_unpacklo_epi32(a, b);
+                    let c23 = _mm_unpackhi_epi32(a, b);
+                    put(dst, c01, 4);
+                    put(dst.add(stride), _mm_srli_si128(c01, 8), 4);
+                    put(dst.add(2 * stride), c23, 4);
+                    put(dst.add(3 * stride), _mm_srli_si128(c23, 8), 4);
+                    return;
+                }
+                for by in (0..n).step_by(8) {
+                    for bx in (0..n).step_by(8) {
+                        let mut r: [__m128i; 8] = std::array::from_fn(|j| _mm_loadu_si128(t.add((by + j) * n + bx) as *const __m128i));
+                        transpose8_u16(&mut r);
+                        for (j, v) in r.iter().enumerate() {
+                            put(dst.add((bx + j) * stride + by), *v, 8);
+                        }
+                    }
+                }
+            }
         }
 
         // ------------------------------------------------------------------
@@ -1423,6 +1638,9 @@ macro_rules! kernels_u8 {
         pub(crate) fn install_all_u8(d: &mut HevcDsp<u8>) {
             d.idct = [idct::<4>, idct::<8>, idct::<16>, idct::<32>];
             d.idst4 = idst4;
+            d.intra_planar = intra_planar::<u8>;
+            d.intra_dc = intra_dc::<u8>;
+            d.intra_angular = intra_angular::<u8>;
             d.qpel_v2 = qpel_v2;
             d.epel_v2 = epel_v2;
             d.uni = uni_u8;
