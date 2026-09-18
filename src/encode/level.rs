@@ -108,6 +108,17 @@
 //!   within `[-MaxVmvR, MaxVmvR - 1/4]` frame samples — 64 at level 1, 512
 //!   from 3.1 — halved in a field macroblock's own rows. The motion search
 //!   clamps its window to it, as x264 does (`h264_me::search_rect`).
+//! - H.264 `MaxMvsPer2Mb` (A.3.2(i)): at most 32 motion vectors in any
+//!   two consecutive macroblocks at level 3, 16 from 3.1 — consecutive in
+//!   decoding order, across slices and pictures. Each 8x8 quarter of a
+//!   macroblock is held to an eighth of that, so no macroblock takes more
+//!   than half and no pair more than all, whatever its neighbours hold:
+//!   level 3 loses the bi-predicted 4x4 sub-macroblock, 3.1 every 4x4 and
+//!   every bi-predicted sub-macroblock below 8x8. Only `--subparts` offers
+//!   those shapes; everything else spends at most eight vectors.
+//! - H.264 `MinLumaBiPredSize` 8x8 (A.3.3(e), Table A-4, from 3.1): no
+//!   `B_Bi_8x4`, `B_Bi_4x8` or `B_Bi_4x4`, which the budget above already
+//!   excludes and the search refuses by name as well.
 //!
 //! # What is not checked here
 //!
@@ -175,36 +186,38 @@ struct H264Row {
     min_cr: u64,
     /// `MaxVmvR`, luma frame samples.
     max_vmv_r: i32,
+    /// `MaxMvsPer2Mb`, 0 where the level sets none.
+    max_mvs_per_2mb: u32,
 }
 
 #[allow(clippy::too_many_arguments)]
-const fn h264_row(idc: u8, name: &'static str, max_mbps: u64, max_fs: u64, max_dpb_mbs: u64, max_br: u64, max_cpb: u64, min_cr: u64, max_vmv_r: i32) -> H264Row {
-    H264Row { idc, name, max_mbps, max_fs, max_dpb_mbs, max_br, max_cpb, min_cr, max_vmv_r }
+const fn h264_row(idc: u8, name: &'static str, max_mbps: u64, max_fs: u64, max_dpb_mbs: u64, max_br: u64, max_cpb: u64, min_cr: u64, max_vmv_r: i32, max_mvs_per_2mb: u32) -> H264Row {
+    H264Row { idc, name, max_mbps, max_fs, max_dpb_mbs, max_br, max_cpb, min_cr, max_vmv_r, max_mvs_per_2mb }
 }
 
 /// Table A-1 in the order the standard ranks it (A.3.1: a row nearer the
 /// top is a lower level), 1b between 1 and 1.1.
 const H264_LEVELS: [H264Row; 20] = [
-    h264_row(10, "1", 1_485, 99, 396, 64, 175, 2, 64),
-    h264_row(9, "1b", 1_485, 99, 396, 128, 350, 2, 64),
-    h264_row(11, "1.1", 3_000, 396, 900, 192, 500, 2, 128),
-    h264_row(12, "1.2", 6_000, 396, 2_376, 384, 1_000, 2, 128),
-    h264_row(13, "1.3", 11_880, 396, 2_376, 768, 2_000, 2, 128),
-    h264_row(20, "2", 11_880, 396, 2_376, 2_000, 2_000, 2, 128),
-    h264_row(21, "2.1", 19_800, 792, 4_752, 4_000, 4_000, 2, 256),
-    h264_row(22, "2.2", 20_250, 1_620, 8_100, 4_000, 4_000, 2, 256),
-    h264_row(30, "3", 40_500, 1_620, 8_100, 10_000, 10_000, 2, 256),
-    h264_row(31, "3.1", 108_000, 3_600, 18_000, 14_000, 14_000, 4, 512),
-    h264_row(32, "3.2", 216_000, 5_120, 20_480, 20_000, 20_000, 4, 512),
-    h264_row(40, "4", 245_760, 8_192, 32_768, 20_000, 25_000, 4, 512),
-    h264_row(41, "4.1", 245_760, 8_192, 32_768, 50_000, 62_500, 2, 512),
-    h264_row(42, "4.2", 522_240, 8_704, 34_816, 50_000, 62_500, 2, 512),
-    h264_row(50, "5", 589_824, 22_080, 110_400, 135_000, 135_000, 2, 512),
-    h264_row(51, "5.1", 983_040, 36_864, 184_320, 240_000, 240_000, 2, 512),
-    h264_row(52, "5.2", 2_073_600, 36_864, 184_320, 240_000, 240_000, 2, 512),
-    h264_row(60, "6", 4_177_920, 139_264, 696_320, 240_000, 240_000, 2, 8192),
-    h264_row(61, "6.1", 8_355_840, 139_264, 696_320, 480_000, 480_000, 2, 8192),
-    h264_row(62, "6.2", 16_711_680, 139_264, 696_320, 800_000, 800_000, 2, 8192),
+    h264_row(10, "1", 1_485, 99, 396, 64, 175, 2, 64, 0),
+    h264_row(9, "1b", 1_485, 99, 396, 128, 350, 2, 64, 0),
+    h264_row(11, "1.1", 3_000, 396, 900, 192, 500, 2, 128, 0),
+    h264_row(12, "1.2", 6_000, 396, 2_376, 384, 1_000, 2, 128, 0),
+    h264_row(13, "1.3", 11_880, 396, 2_376, 768, 2_000, 2, 128, 0),
+    h264_row(20, "2", 11_880, 396, 2_376, 2_000, 2_000, 2, 128, 0),
+    h264_row(21, "2.1", 19_800, 792, 4_752, 4_000, 4_000, 2, 256, 0),
+    h264_row(22, "2.2", 20_250, 1_620, 8_100, 4_000, 4_000, 2, 256, 0),
+    h264_row(30, "3", 40_500, 1_620, 8_100, 10_000, 10_000, 2, 256, 32),
+    h264_row(31, "3.1", 108_000, 3_600, 18_000, 14_000, 14_000, 4, 512, 16),
+    h264_row(32, "3.2", 216_000, 5_120, 20_480, 20_000, 20_000, 4, 512, 16),
+    h264_row(40, "4", 245_760, 8_192, 32_768, 20_000, 25_000, 4, 512, 16),
+    h264_row(41, "4.1", 245_760, 8_192, 32_768, 50_000, 62_500, 2, 512, 16),
+    h264_row(42, "4.2", 522_240, 8_704, 34_816, 50_000, 62_500, 2, 512, 16),
+    h264_row(50, "5", 589_824, 22_080, 110_400, 135_000, 135_000, 2, 512, 16),
+    h264_row(51, "5.1", 983_040, 36_864, 184_320, 240_000, 240_000, 2, 512, 16),
+    h264_row(52, "5.2", 2_073_600, 36_864, 184_320, 240_000, 240_000, 2, 512, 16),
+    h264_row(60, "6", 4_177_920, 139_264, 696_320, 240_000, 240_000, 2, 8192, 16),
+    h264_row(61, "6.1", 8_355_840, 139_264, 696_320, 480_000, 480_000, 2, 8192, 16),
+    h264_row(62, "6.2", 16_711_680, 139_264, 696_320, 800_000, 800_000, 2, 8192, 16),
 ];
 
 /// `cpbBrVclFactor` (Table A-2) for the profiles this encoder writes.
@@ -360,21 +373,45 @@ pub struct MotionLimits {
     /// field macroblock, whose rows are every other frame row, has half
     /// the range in its own rows.
     pub max_vmv_r: i32,
+    /// The most motion vectors (`MvCnt`, 8.4.1) one 8x8 quarter of a
+    /// macroblock may carry: an eighth of `MaxMvsPer2Mb` (A.3.2(i)), so
+    /// that a macroblock's four quarters carry at most half of it and any
+    /// two consecutive macroblocks — the pairs the limit counts, in
+    /// decoding order, across slices and pictures — at most all of it.
+    /// Unlimited below level 3; four at 3; two from 3.1, where it rules
+    /// out every 4x4 sub-partition and every bi-predicted one below 8x8.
+    /// A direct 8x8 is at most two (`subMvCnt` counts only its first
+    /// sub-partition), so it is always allowed.
+    pub max_mvs_per_8x8: u32,
+    /// `MinLumaBiPredSize` 8x8 (A.3.3(e), Table A-4, level 3.1 and up):
+    /// no `B_Bi_8x4`, `B_Bi_4x8` or `B_Bi_4x4` sub-macroblock.
+    pub no_bi_below_8x8: bool,
 }
 
 impl MotionLimits {
     /// No limit at all: what a context that searches no H.264 motion (the
     /// H.265 encoder's, which shares the context type) carries.
-    pub const NONE: MotionLimits = MotionLimits { max_vmv_r: i32::MAX };
+    pub const NONE: MotionLimits = MotionLimits { max_vmv_r: i32::MAX, max_mvs_per_8x8: u32::MAX, no_bi_below_8x8: false };
 
     /// The limits of the H.264 level whose `level_idc` is `idc` (Table
     /// A-1). A `level_idc` outside the table — which the encoder never
     /// writes — gets none.
     pub fn h264(idc: u8) -> MotionLimits {
         match H264_LEVELS.iter().find(|row| row.idc == idc) {
-            Some(row) => MotionLimits { max_vmv_r: row.max_vmv_r },
+            Some(row) => MotionLimits {
+                max_vmv_r: row.max_vmv_r,
+                max_mvs_per_8x8: if row.max_mvs_per_2mb == 0 { u32::MAX } else { row.max_mvs_per_2mb / 8 },
+                // Table A-4: from level 3.1, the first with a MaxMvsPer2Mb of 16.
+                no_bi_below_8x8: row.max_mvs_per_2mb == 16,
+            },
             None => MotionLimits::NONE,
         }
+    }
+
+    /// Whether an 8x8 quarter may be coded as `parts` sub-partitions (1, 2
+    /// or 4) predicted from `lists` lists each (1, or 2 for bi-prediction).
+    pub fn allows_sub_8x8(&self, parts: usize, lists: usize) -> bool {
+        (parts == 1 || lists == 1 || !self.no_bi_below_8x8) && (parts * lists) as u64 <= u64::from(self.max_mvs_per_8x8)
     }
 
     /// The vertical range a search in rows of this kind may use, in full
@@ -685,6 +722,17 @@ mod tests {
         let l = MotionLimits::h264(31);
         assert_eq!((l.vertical_search(false), l.vertical_search(true)), (511, 255));
         assert_eq!(MotionLimits::NONE.vertical_search(true), i32::MAX / 2 - 1);
+        // MaxMvsPer2Mb over eight per 8x8 quarter, MinLumaBiPredSize from 3.1.
+        for (idc, per_8x8, no_bi) in [(22, u32::MAX, false), (30, 4, false), (31, 2, true), (62, 2, true)] {
+            let l = MotionLimits::h264(idc);
+            assert_eq!((l.max_mvs_per_8x8, l.no_bi_below_8x8), (per_8x8, no_bi), "level_idc {idc}");
+        }
+        // (parts, lists) for 8x8 / 8x4 / 4x4, one list and two.
+        let shapes = [(1, 1), (1, 2), (2, 1), (2, 2), (4, 1), (4, 2)];
+        let allowed = |idc| shapes.map(|(p, l)| MotionLimits::h264(idc).allows_sub_8x8(p, l));
+        assert_eq!(allowed(22), [true; 6]);
+        assert_eq!(allowed(30), [true, true, true, true, true, false], "level 3: no bi 4x4 (eight vectors)");
+        assert_eq!(allowed(31), [true, true, true, false, false, false], "3.1: no 4x4, no bi below 8x8");
     }
 
     /// Frame sizes and rates against Table A-1, each at or just past a row's
@@ -942,6 +990,103 @@ mod tests {
             let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&h265_syntax::write_sps(&c, &g, 8, None))).unwrap();
             for (set, ptl) in [("VPS", &vps.ptl), ("SPS", &sps.ptl)] {
                 assert_eq!((ptl.level_idc, ptl.tier), (idc, tier), "H.265 {set} {}x{}@{}", c.width, c.height, c.fps);
+            }
+        }
+    }
+
+    /// A smooth grating whose every 4x4 block moves its own way from one
+    /// picture to the next — up to two samples each way — so the motion
+    /// search, which converges on a grating, finds each block's own vector
+    /// and sub-8x8 partitions pay: the content that spends the most motion
+    /// vectors per macroblock.
+    fn shattered(w: usize, h: usize, n: usize) -> Vec<Vec<u8>> {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut roll = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 5) as i32 - 2
+        };
+        let grating = |x: i32, y: i32| (40 + 4 * ((x.rem_euclid(25)) - 12).abs() + 3 * ((y.rem_euclid(27)) - 13).abs()) as u8;
+        let mut at: Vec<(i32, i32)> = vec![(0, 0); (w / 4) * (h / 4)];
+        (0..n)
+            .map(|_| {
+                let mut f = vec![128u8; w * h * 3 / 2];
+                for by in 0..h / 4 {
+                    for bx in 0..w / 4 {
+                        let o = &mut at[by * (w / 4) + bx];
+                        *o = (o.0 + roll(), o.1 + roll());
+                        for y in 0..4 {
+                            for x in 0..4 {
+                                let (px, py) = (bx * 4 + x, by * 4 + y);
+                                f[py * w + px] = grating(px as i32 + o.0, py as i32 + o.1);
+                            }
+                        }
+                    }
+                }
+                f
+            })
+            .collect()
+    }
+
+    /// `MaxMvsPer2Mb` and `MinLumaBiPredSize` (A.3.2(i), A.3.3(e)), counted
+    /// on the output. The same `--subparts` content at 352x288 is level 1.3
+    /// at 30 pictures a second, 3 at 80 and 3.1 at 120 (MaxMBPS alone
+    /// decides it) — the three regimes of those limits for the price of a
+    /// CIF picture rather than a 720p one — at QP 4, where splitting is
+    /// cheap. Each stream is decoded on one thread with the decoder's census
+    /// on: every macroblock's `MvCnt` and whether it holds a bi-predicted
+    /// partition below 8x8. At 1.3 nothing is limited, and the content does
+    /// put more than 16 vectors in a macroblock, more than 32 in two and
+    /// bi-predicts below 8x8 (measured: 32, 52 and 527 macroblocks), so the
+    /// checks above it are not vacuous. At 3 every two consecutive
+    /// macroblocks — across pictures too — hold at most 32, and bi-predicted
+    /// 8x4s and 4x8s remain (3 has no `MinLumaBiPredSize`); at 3.1 at most
+    /// 16, and nothing bi-predicted is smaller than 8x8. Every picture
+    /// decodes to the encoder's reconstruction throughout.
+    #[test]
+    fn subpartitions_keep_the_levels_vector_limits() {
+        let frames = shattered(352, 288, 5);
+        for (fps, idc, pair_limit) in [(30u32, 13u8, None), (80, 30, Some(32u32)), (120, 31, Some(16))] {
+            let tag = format!("352x288@{fps}");
+            let c = Config {
+                gop: 250,
+                bframes: 1,
+                subparts: true,
+                rate: RateControl::ConstantQp(4),
+                ..cfg(352, 288, fps)
+            };
+            let mut e = H264Encoder::new(c).unwrap();
+            let mut units = Vec::new();
+            for f in &frames {
+                units.extend(e.push(f).unwrap());
+            }
+            units.extend(e.flush().unwrap());
+            let stream: Vec<u8> = units.iter().flat_map(|u| u.data.iter().copied()).collect();
+            let sps_nal = crate::nal::annexb_nals(&stream).find(|n| n[0] & 0x1f == 7).expect("an SPS");
+            let sps = crate::h264::Sps::parse(&crate::nal::unescape_rbsp(&sps_nal[1..])).unwrap();
+            assert_eq!(sps.level_idc, idc, "{tag}");
+            crate::h264::recon::MV_CENSUS.with(|c| *c.borrow_mut() = Some(Vec::new()));
+            let mut dec = crate::h264::H264Decoder::with_threads(1);
+            dec.push_annexb(&stream).unwrap_or_else(|err| panic!("{tag}: {err}"));
+            dec.flush().unwrap();
+            let census = crate::h264::recon::MV_CENSUS.with(|c| c.borrow_mut().take()).expect("census on");
+            round_trip(&tag, &units, e.reconstructions(), std::iter::from_fn(|| dec.next_picture().map(|p| p.into_packed())));
+            assert_eq!(census.len(), 396 * frames.len(), "{tag}: every macroblock counted");
+            let most = census.iter().map(|&(n, _)| n).max().unwrap();
+            let pair = census.windows(2).map(|w| w[0].0 + w[1].0).max().unwrap();
+            let bi_small = census.iter().filter(|&&(_, bi)| bi).count();
+            match pair_limit {
+                None => assert!(
+                    most > 16 && pair > 32 && bi_small > 0,
+                    "{tag}: the content spent at most {most} vectors on a macroblock, {pair} on two, bi-predicted below 8x8 in {bi_small}"
+                ),
+                Some(limit) => assert!(pair <= limit, "{tag}: two consecutive macroblocks hold {pair} vectors, above {limit}"),
+            }
+            match idc {
+                30 => assert!(bi_small > 0, "{tag}: level 3 has no MinLumaBiPredSize, yet nothing bi-predicted below 8x8"),
+                31 => assert_eq!(bi_small, 0, "{tag}: {bi_small} macroblocks bi-predict below 8x8"),
+                _ => {}
             }
         }
     }

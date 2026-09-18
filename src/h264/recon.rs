@@ -295,6 +295,39 @@ fn mb_geom<S: Sample>(ctx: &SliceCtx, cur: &Frame<S>, info: &PicInfo, nb: &MbNei
     geom
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: while `Some`, every macroblock [`derive`] completes on
+    /// this thread appends `(MvCnt, bi_below_8x8)` in decoding order — its
+    /// motion vector count (8.4.1), with a direct 8x8 counted at its most
+    /// (two: `subMvCnt` counts only its first sub-partition), and whether
+    /// it holds a bi-predicted sub-macroblock partition smaller than 8x8.
+    /// What `encode::level`'s tests count a stream's `MaxMvsPer2Mb` and
+    /// `MinLumaBiPredSize` with (A.3.2(i), A.3.3(e)); a decoder on one
+    /// thread derives on the caller's.
+    pub(crate) static MV_CENSUS: std::cell::RefCell<Option<Vec<(u32, bool)>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// See [`MV_CENSUS`].
+#[cfg(test)]
+fn mv_census(layer: &MbLayer) -> (u32, bool) {
+    use super::mb::PRED_BI;
+    let lists = |d: u8| u32::from(d & 1) + u32::from((d >> 1) & 1);
+    let d = &layer.pred_dir;
+    match layer.kind {
+        MbKind::PSkip => (1, false),
+        MbKind::BSkip | MbKind::BDirect16x16 => (8, false),
+        MbKind::Inter16x16 => (lists(d[0]), false),
+        MbKind::Inter16x8 => (lists(d[0]) + lists(d[2]), false),
+        MbKind::Inter8x16 => (lists(d[0]) + lists(d[1]), false),
+        MbKind::Inter8x8 => (0..4).fold((0, false), |(n, bi), q| match layer.sub_shape[q] {
+            SubMbShape::Direct => (n + 2, bi),
+            s => (n + s.count() as u32 * lists(d[q]), bi || (s != SubMbShape::S8x8 && d[q] == PRED_BI)),
+        }),
+        _ => (0, false),
+    }
+}
+
 /// The parse-side completion of a macroblock, run in decoding order right
 /// after its syntax was parsed (or, for a skipped one, inferred): the QPs
 /// (into the layer, for reconstruction), the motion of every partition
@@ -315,6 +348,12 @@ pub fn derive<S: Sample>(
     refs: &SliceRefs<S>,
     scratch: &mut DeriveScratch,
 ) -> Result<()> {
+    #[cfg(test)]
+    MV_CENSUS.with(|c| {
+        if let Some(log) = c.borrow_mut().as_mut() {
+            log.push(mv_census(layer));
+        }
+    });
     let addr = nb.addr;
     let geom = mb_geom(ctx, cur, info, nb, layer, refs);
     // QP (7.4.5): QPY wraps in −QpBdOffsetY..=51; the dequantiser takes

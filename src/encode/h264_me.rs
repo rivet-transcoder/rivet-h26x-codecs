@@ -1503,6 +1503,11 @@ fn trial_8x8<S: Sample>(
             SubMbShape::S4x8,
             SubMbShape::S4x4,
         ] {
+            // The level's vector budget (`MotionLimits`): 4x4 is gone from
+            // level 3.1 up; 8x8 is always allowed.
+            if !ctx.motion.allows_sub_8x8(shape.count(), 1) {
+                continue;
+            }
             *st = before;
             let (mut mvs, mut mvds) = (t.mvs, t.mvds);
             let mut satd = 0u32;
@@ -2266,6 +2271,13 @@ fn trial_b_8x8<S: Sample>(
             after,
         );
         for shape in [SubMbShape::S8x8, SubMbShape::S8x4, SubMbShape::S4x8, SubMbShape::S4x4] {
+            // The level's vector budget and bi-prediction size
+            // (`MotionLimits`): a shape no direction may take is not
+            // searched, and a direction it rules out not priced.
+            let limits = s.ctx.motion;
+            if !limits.allows_sub_8x8(shape.count(), 1) {
+                continue;
+            }
             // Provisional: both lists searched and committed per
             // sub-rectangle, so the later ones are seeded from something.
             *st = before;
@@ -2280,6 +2292,9 @@ fn trial_b_8x8<S: Sample>(
             // Each direction replayed exactly.
             for dir in B_DIRS {
                 let used = lists_of(dir);
+                if !limits.allows_sub_8x8(shape.count(), used.iter().filter(|&&u| u).count()) {
+                    continue;
+                }
                 *st = before;
                 let mut cand = BTrial::new(BMbKind::B8x8);
                 let mut satd = 0u32;
@@ -2723,7 +2738,7 @@ mod tests {
         let free = t.ctx(26);
         assert_eq!(at(&free, truth), truth, "no limit: the search finds the motion");
         for (field, range) in [(false, 4), (true, 2)] {
-            let ctx = MeCtx { field, motion: crate::encode::level::MotionLimits { max_vmv_r: 4 }, ..t.ctx(26) };
+            let ctx = MeCtx { field, motion: crate::encode::level::MotionLimits { max_vmv_r: 4, ..crate::encode::level::MotionLimits::NONE }, ..t.ctx(26) };
             for pred in [truth, Mv::new(0, -400), Mv::new(8, 400), Mv::ZERO] {
                 let mv = at(&ctx, pred);
                 assert!(
