@@ -16,6 +16,7 @@ use crate::hevc::tables::{EPEL_FILTERS, QPEL_FILTERS, TRANSFORM32};
 /// Replace the scalar entries of `d` with the NEON kernels.
 pub fn install(d: &mut HevcDsp<u16>) {
     d.idct = [idct_neon::<4>, idct_neon::<8>, idct_neon::<16>, idct_neon::<32>];
+    d.idst4 = idst4_neon;
     d.add_residual = add_residual_neon;
     d.qpel_copy = copy_neon;
     d.qpel_h = qpel_h_neon;
@@ -367,6 +368,57 @@ const fn build_t16() -> [[i16; 32]; 32] {
 
 static T16: [[i16; 32]; 32] = build_t16();
 
+/// The 4x4 DCT basis, `TRANSFORM32` at every eighth row.
+const DCT4: [[i16; 4]; 4] = [[64, 64, 64, 64], [83, 36, -36, -83], [64, -64, -64, 64], [36, -83, 83, -36]];
+/// The 4x4 DST basis (8.6.4.2, `trType == 1`).
+const DST4: [[i16; 4]; 4] = [[29, 55, 74, 84], [74, 74, 0, -74], [84, -29, -74, 55], [55, -84, 74, -29]];
+
+/// The 4x4 inverse DST (intra luma 4x4), for both sample tables.
+pub(super) fn idst4_neon(coeffs: &mut [i16], bd_shift: i32, _max_x: usize, _max_y: usize) {
+    assert!(coeffs.len() >= 16 && (1..=31).contains(&bd_shift));
+    unsafe { inv4(coeffs.as_mut_ptr(), bd_shift, &DST4) }
+}
+
+/// Transpose a 4x4 block of i16, one row a vector: `trn` at 16 and then 32
+/// bits.
+#[inline(always)]
+unsafe fn transpose4x4_s16(r: [int16x4_t; 4]) -> [int16x4_t; 4] {
+    unsafe {
+        let a = vtrn_s16(r[0], r[1]);
+        let b = vtrn_s16(r[2], r[3]);
+        let c = vtrn_s32(vreinterpret_s32_s16(a.0), vreinterpret_s32_s16(b.0));
+        let d = vtrn_s32(vreinterpret_s32_s16(a.1), vreinterpret_s32_s16(b.1));
+        [vreinterpret_s16_s32(c.0), vreinterpret_s16_s32(d.0), vreinterpret_s16_s32(c.1), vreinterpret_s16_s32(d.1)]
+    }
+}
+
+/// Both stages of the 4x4 inverse transform with basis `m` (8.6.4.2):
+/// output `i` of four lines at once is `sum_j m[j][i] * r[j]` by widening
+/// multiply-accumulate (`smlal` by scalar), the rounding term the
+/// accumulator's start, the shift an arithmetic `sshl` by a negative count
+/// and the 16-bit clip `sqxtn`. The second stage runs on the transposed
+/// intermediate, and one more transpose puts the result in raster order.
+unsafe fn inv4(c: *mut i16, bd_shift: i32, m: &[[i16; 4]; 4]) {
+    unsafe {
+        let stage = |r: [int16x4_t; 4], round: i32, shift: i32| -> [int16x4_t; 4] {
+            std::array::from_fn(|i| {
+                let mut acc = vdupq_n_s32(round);
+                for (j, rj) in r.iter().enumerate() {
+                    acc = vmlal_n_s16(acc, *rj, m[j][i]);
+                }
+                vqmovn_s32(vshlq_s32(acc, vdupq_n_s32(-shift)))
+            })
+        };
+        let rows = [vld1_s16(c), vld1_s16(c.add(4)), vld1_s16(c.add(8)), vld1_s16(c.add(12))];
+        let t = stage(rows, 64, 7);
+        let o = stage(transpose4x4_s16(t), 1 << (bd_shift - 1), bd_shift);
+        let r = transpose4x4_s16(o);
+        for (i, v) in r.iter().enumerate() {
+            vst1_s16(c.add(4 * i), *v);
+        }
+    }
+}
+
 pub(super) fn idct_neon<const N: usize>(coeffs: &mut [i16], bd_shift: i32, max_x: usize, max_y: usize) {
     if max_x == 0 && max_y == 0 {
         let round2 = 1i32 << (bd_shift - 1);
@@ -376,7 +428,8 @@ pub(super) fn idct_neon<const N: usize>(coeffs: &mut [i16], bd_shift: i32, max_x
         return;
     }
     if N == 4 {
-        return (HevcDsp::<u16>::SCALAR.idct[0])(coeffs, bd_shift, max_x, max_y);
+        assert!(coeffs.len() >= 16 && (1..=31).contains(&bd_shift));
+        return unsafe { inv4(coeffs.as_mut_ptr(), bd_shift, &DCT4) };
     }
     unsafe {
         let mut tmp = [0i16; 32 * 32];
@@ -889,6 +942,13 @@ mod tests {
                 (s.idct[(log2 - 2) as usize])(&mut a, bd_shift, mx, my);
                 (d.idct[(log2 - 2) as usize])(&mut b, bd_shift, mx, my);
                 assert_eq!(a, b, "idct n={n} trial={trial}");
+                if n == 4 {
+                    let mut a = c.clone();
+                    let mut b = c.clone();
+                    (s.idst4)(&mut a, bd_shift, 3, 3);
+                    (d.idst4)(&mut b, bd_shift, 3, 3);
+                    assert_eq!(a, b, "idst4 trial={trial}");
+                }
             }
         }
         let stride = 80;
