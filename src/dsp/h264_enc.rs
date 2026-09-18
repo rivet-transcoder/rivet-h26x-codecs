@@ -99,8 +99,8 @@ impl H264EncDsp {
     };
 
     /// The best table for `cpu`: the scalar reference, then each rung of
-    /// the ladder replacing the entries it has a kernel for. x86 only so
-    /// far; the chroma DC Hadamards stay scalar everywhere (see
+    /// the ladder replacing the entries it has a kernel for (x86 and wasm
+    /// `simd128`); the chroma DC Hadamards stay scalar everywhere (see
     /// `super::h264_enc_x86`).
     pub fn new(cpu: Cpu) -> Self {
         let mut d = Self::SCALAR;
@@ -109,6 +109,10 @@ impl H264EncDsp {
         if !super::enc_simd_disabled("h264_enc") {
             #[cfg(target_arch = "x86_64")]
             super::h264_enc_x86::install(&mut d, cpu);
+            #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+            if cpu.simd128 {
+                super::h264_enc_wasm128::install(&mut d);
+            }
         }
         d
     }

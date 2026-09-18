@@ -270,6 +270,14 @@ pub extern "C" fn h26x_hevc_dsp_check() -> u32 {
                 }
             }
             let bd_shift = 12 - (trial % 3) as i32 * 2;
+            if n == 4 {
+                // The 4x4 DST (intra luma), over the same blocks.
+                let mut a = c.clone();
+                let mut b = c.clone();
+                (s.idst4)(&mut a, bd_shift, 3, 3);
+                (d.idst4)(&mut b, bd_shift, 3, 3);
+                fails += (a != b) as u32;
+            }
             let mut a = c.clone();
             let mut b = c;
             (s.idct[(log2 - 2) as usize])(&mut a, bd_shift, mx, my);
@@ -841,8 +849,9 @@ fn h264_u16_table(cpu: h26x::dsp::Cpu) -> h26x::dsp::h264::H264Dsp<u16> {
 /// Which encode-side entries the installed tables replaced, as a bitmask:
 /// 1 = `distortion.sad`, 2 = `distortion.satd`, 4 = `distortion.ssd`,
 /// 8 = `hevc_enc.fdct` (all four), 16 = `hevc_enc.fdst4`, 32 =
-/// `hevc_enc.quant`, and 64 / 128 / 256 = the 16-bit `distortion` table's
-/// `sad` / `satd` / `ssd`.
+/// `hevc_enc.quant`, 64 / 128 / 256 = the 16-bit `distortion` table's
+/// `sad` / `satd` / `ssd`, 512 = `h264_enc`'s `fdct4`, `fdct8` and
+/// `hadamard4` (all three) and 1024 = its `quant4` and `quant8` (both).
 ///
 /// The encode sweep below compares the installed table with the scalar
 /// one, and a build whose tier installed nothing would agree with itself
@@ -868,6 +877,11 @@ pub extern "C" fn h26x_enc_installed() -> u32 {
     m |= ((d16.sad as usize != d16s.sad as usize) as u32) << 6;
     m |= ((d16.satd as usize != d16s.satd as usize) as u32) << 7;
     m |= ((d16.ssd as usize != d16s.ssd as usize) as u32) << 8;
+    let es = h264_enc_table(h26x::dsp::Cpu::SCALAR);
+    let e = h264_enc_table(cpu);
+    let t = e.fdct4 as usize != es.fdct4 as usize && e.fdct8 as usize != es.fdct8 as usize && e.hadamard4 as usize != es.hadamard4 as usize;
+    m |= (t as u32) << 9;
+    m |= ((e.quant4 as usize != es.quant4 as usize && e.quant8 as usize != es.quant8 as usize) as u32) << 10;
     m
 }
 
@@ -889,6 +903,11 @@ fn dist16_table(cpu: h26x::dsp::Cpu) -> h26x::dsp::distortion::DistortionDsp<u16
 #[inline(never)]
 fn hevc_enc_table(cpu: h26x::dsp::Cpu) -> h26x::dsp::hevc_enc::HevcEncDsp {
     h26x::dsp::hevc_enc::HevcEncDsp::new(cpu)
+}
+
+#[inline(never)]
+fn h264_enc_table(cpu: h26x::dsp::Cpu) -> h26x::dsp::h264_enc::H264EncDsp {
+    h26x::dsp::h264_enc::H264EncDsp::new(cpu)
 }
 
 /// Block shapes both encoders ask for, plus a few they do not, so the
@@ -960,7 +979,8 @@ fn residual_block(seed: &mut u64, n: usize, bit_depth: u32) -> Vec<i16> {
 /// against the scalar reference over randomised inputs, returning a
 /// bitmask of the groups that disagreed: 1 = sad, 2 = satd, 4 = ssd, 8 =
 /// fdct, 16 = fdst4, 32 = quant (the same bits as `h26x_enc_installed`),
-/// 64 = the 16-bit distortion table.
+/// 64 = the 16-bit distortion table, 128 = the H.264 forward transforms and
+/// Hadamard, 256 = the H.264 quantisers.
 ///
 /// The trials mirror the x86 modules' tests: 24 rounds over the sixteen
 /// distortion shapes with random strides and offsets; 40 rounds of each
@@ -1043,6 +1063,61 @@ pub extern "C" fn h26x_enc_dsp_check() -> u32 {
                     let nw = (s.quant)(&coeffs, &mut want, n, scale, qb, off);
                     let ng = (d.quant)(&coeffs, &mut got, n, scale, qb, off);
                     fail |= ((got != want || ng != nw) as u32) << 5;
+                }
+            }
+        }
+    }
+
+    // H.264: the x86 tests' sweep in small — residuals at 8 to 14 bits and
+    // the i16 extremes through the transforms, and every QP to 87 through
+    // the quantisers.
+    {
+        use h26x::dsp::h264_enc::{H264EncDsp, qbits4, qbits8, quant_offset};
+        let s = H264EncDsp::SCALAR;
+        let d = H264EncDsp::new(cpu);
+        let mut seed = 0x4dc7_u64;
+        for bit_depth in [8u32, 10, 12, 14] {
+            for _ in 0..100 {
+                let span = 1i32 << bit_depth;
+                let mut r = || match lcg(&mut seed) % 6 {
+                    0 => 32767i16,
+                    1 => -32768,
+                    _ => ((lcg(&mut seed) as i32 % (2 * span - 1)) - (span - 1)) as i16,
+                };
+                let r4: [i16; 16] = std::array::from_fn(|_| r());
+                let r8: [i16; 64] = std::array::from_fn(|_| r());
+                let (mut w4, mut g4, mut w8, mut g8) = ([0i32; 16], [0i32; 16], [0i32; 64], [0i32; 64]);
+                (s.fdct4)(&r4, &mut w4);
+                (d.fdct4)(&r4, &mut g4);
+                (s.fdct8)(&r8, &mut w8);
+                (d.fdct8)(&r8, &mut g8);
+                let (mut wh, mut gh) = (w4, w4);
+                (s.hadamard4)(&mut wh);
+                (d.hadamard4)(&mut gh);
+                fail |= ((g4 != w4 || g8 != w8 || gh != wh) as u32) << 7;
+            }
+        }
+        // Multipliers over the range scaling lists give them: the flat
+        // tables' 2893..=20972, and four times that for the smallest weight.
+        for scale in [1i32, 4] {
+            for qp in 0..=87 {
+                for intra in [true, false] {
+                    let (qb4, qb8) = (qbits4(qp), qbits8(qp));
+                    let c4: [i32; 16] = std::array::from_fn(|_| match lcg(&mut seed) % 8 {
+                        0 => i32::MAX,
+                        1 => i32::MIN + 1,
+                        _ => lcg(&mut seed) as i32 % 600_000,
+                    });
+                    let c8: [i32; 64] = std::array::from_fn(|_| lcg(&mut seed) as i32 % 2_400_000);
+                    let mf4: [i32; 16] = std::array::from_fn(|_| scale * (2893 + (lcg(&mut seed) % 18080) as i32));
+                    let mf8: [i32; 64] = std::array::from_fn(|_| scale * (2893 + (lcg(&mut seed) % 18080) as i32));
+                    let (mf4, mf8) = (&mf4, &mf8);
+                    let (mut w4, mut g4, mut w8, mut g8) = ([0i16; 16], [0i16; 16], [0i16; 64], [0i16; 64]);
+                    let nw4 = (s.quant4)(&c4, &mut w4, mf4, qb4, quant_offset(qb4, intra));
+                    let ng4 = (d.quant4)(&c4, &mut g4, mf4, qb4, quant_offset(qb4, intra));
+                    let nw8 = (s.quant8)(&c8, &mut w8, mf8, qb8, quant_offset(qb8, intra));
+                    let ng8 = (d.quant8)(&c8, &mut g8, mf8, qb8, quant_offset(qb8, intra));
+                    fail |= ((g4 != w4 || ng4 != nw4 || g8 != w8 || ng8 != nw8) as u32) << 8;
                 }
             }
         }

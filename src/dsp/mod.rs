@@ -90,6 +90,8 @@ pub(crate) mod distortion_wasm128;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod distortion_wasm128_u16;
 #[cfg(target_arch = "wasm32")]
+pub(crate) mod h264_enc_wasm128;
+#[cfg(target_arch = "wasm32")]
 pub(crate) mod hevc_enc_wasm128;
 
 /// Whether `H26X_ENC_NO_SIMD` asks the encode-only kernel table `table`

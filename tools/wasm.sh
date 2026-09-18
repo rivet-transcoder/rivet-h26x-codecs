@@ -147,8 +147,9 @@ fi
 # quantiser) have a simd128 tier of their own, and a rung of "SIMD128"
 # says nothing about whether *those* tables took it — they were scalar
 # for a long time while the rung said that. So: which entries each build
-# installed (all nine groups on simd128 — six 8-bit, and the 16-bit
-# distortion table's three — none on scalar), the randomised
+# installed (all eleven groups on simd128 — six 8-bit, the 16-bit
+# distortion table's three, and the H.264 transforms and quantisers —
+# none on scalar), the randomised
 # sweep against the scalar reference inside the module, and then an
 # encode round trip on both builds — bitstream, decoded pictures and the
 # encoder's own reconstruction hashed inside the module — which must
@@ -158,7 +159,7 @@ fi
 # from outside because the module has no clock.
 echo
 echo "== which encode-side kernels each build installed =="
-for w in scalar:0 simd128:511; do
+for w in scalar:0 simd128:2047; do
   b=${w%%:*}; want=${w##*:}
   got=$(node tools/wasm_enc.mjs "$TMP/$b.wasm" --installed 2>&1)
   printf "  %-8s mask %s
