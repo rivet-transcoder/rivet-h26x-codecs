@@ -221,6 +221,7 @@ QP 26. The machine was shared with two other gate sweeps throughout.
 
 SSE4.1 is not a rung for any of these: nothing in them has a better
 SSE4.1 instruction. `H264EncDsp` stays scalar on purpose — see below.
+*(It has SIMD since the simdfull round at the end of this note.)*
 `DistortionDsp<u16>` keeps the scalar reference.
 
 ### Per-kernel (microbench in each module's `kernel_bench`, ns per call group, release)
@@ -250,7 +251,8 @@ vectorises those fixed-size loops and the 64-bit product costs the SIMD
 form what it gains, so the module was not kept. Recorded so nobody writes
 it a third time; the remaining scalar hot spot in H.264 (`quant4` at 3–5%)
 wants a different idea — a 32-bit product under a proven bound — not
-wider lanes.
+wider lanes. *(They were written a third time, measured faster, and kept:
+see the simdfull round at the end of this note.)*
 
 ### End-to-end, one step at a time
 
@@ -310,7 +312,8 @@ design, not a serialisation fix, and was not attempted.
   (`psadbw` does not; a u16 SAD is `pabsw` of a difference and `pmaddwd`
   against ones), an afternoon's work once the u16 encoder path has a
   profile to point at.
-- **H.264 `quant4`** stays scalar for the reason above.
+- **H.264 `quant4`** stays scalar for the reason above. *(SIMD since the
+  simdfull round below.)*
 - **`fskip`, `hadamard*`, `fdct8`**: not in any profile's top ten.
 - **A README benchmark table per rung** for the encoders was not
   generated; the method (`tools/ab_enc.py`, `H26X_MAX_SIMD`) and this
@@ -489,3 +492,81 @@ attempt at that mutation, `offset + 1`, moved nothing on either rung:
 it changes a level only when `|c| * scale + offset` sits exactly one
 below a multiple of `2^qbits`, and `qbits` is 20 to 23 at 8 bits — a
 mutation the gate cannot be blamed for missing.
+
+## The simdfull round: the H.264 encode kernels on every tier (`agent/simdfull`, 2026-09-18)
+
+A 1080p profile (one thread, 10 frames IP at QP 27, `--t8x8 --subparts`,
+the AVX-512 rung for everything shared with the decoder) put the scalar
+`quant4`, `quant8`, `fdct4` and `fdct8` at 6.9% of an 8-bit encode's self
+time and 5.9% of a 10-bit one's. At that size, with the 8x8 transform
+on, `fdct8` and `quant8` are in the profile; on the 640x360 clip above
+they were not.
+
+### Inventory, before and after
+
+| table | kernel | x86-128 (SSE2 to AVX) | AVX2 | AVX-512 | NEON | simd128 |
+|---|---|---|---|---|---|---|
+| `h264_enc` | `fdct4`, `hadamard4` | — → yes | — → the AVX kernel | — → the AVX kernel | — → yes | — → yes |
+| `h264_enc` | `fdct8`, `quant4`, `quant8` | — → yes | — → yes (256-bit) | — → the AVX2 kernel | — → yes | — → yes |
+| `h264_enc` | `hadamard2x2`, `hadamard2x4` | — | — | — | — | — |
+| `distortion` | `satd` on 8-wide blocks (u8, u16) | yes | 128-bit → 256-bit | as AVX2 | yes | yes |
+
+The two chroma DC Hadamards stay scalar: four or eight values a
+macroblock are not a vector's worth of work, and neither is in a
+profile. The AVX2 SATD handles an 8x8 as one pass, rows 0 to 3 in the low
+128-bit lane and 4 to 7 in the high one; a 4-wide block stays on the
+128-bit kernel, which it half fills already.
+
+The kernels are the design the 2026-08-27 note describes: the reference's
+integer butterflies on i32 lanes with transposes around the first pass,
+and the quantiser's `(|c| * mf + offset) >> qbits` in 64 bits through
+`pmuludq` (NEON `umull` / `umull2`, simd128 `u64x2_extmul`), the level
+truncated to i16 as the reference's casts truncate. Each module's tests
+compare them with the scalar reference at bit depths 8 to 14.
+
+### What they measured
+
+Per kernel: `h264_enc_x86::tests::kernel_bench` (ignored; run it with
+`--ignored --nocapture`). Both sides are called through the table, as the
+encoder calls them. The figures are ns per call, the median of seven
+paired rounds, at 44–59% machine load, and the scalar row twice is the
+control.
+
+| kernel | scalar | scalar again | SSE2 | SSE4.1 | AVX | AVX2 |
+|---|---:|---:|---:|---:|---:|---:|
+| `fdct4` | 7.7 | 7.7 | 5.7 | 3.6 | 2.9 | 2.9 |
+| `fdct8` | 31.2 | 32.2 | 17.2 | 16.7 | 15.8 | 10.6 |
+| `hadamard4` | 9.1 | 9.1 | 4.0 | 3.6 | 2.9 | 2.9 |
+| `quant4` | 10.2 | 10.2 | 6.5 | 7.0 | 6.9 | 5.9 |
+| `quant8` | 39.3 | 39.2 | 21.9 | 17.8 | 17.4 | 12.3 |
+
+A run at 97–100% load gave the same ordering at lower ratios: `fdct4`
+1.6x, `fdct8` 3.3x, `hadamard4` 1.9x, `quant4` 1.2x, `quant8` 2.1x at
+AVX2. That is not the parity the 2026-08-27 note recorded for the same
+design. Its code is not in the tree, so the two cannot be compared; this
+bench is, and can be re-run.
+
+End to end: 1080p, 10 frames IP, QP 27, `--t8x8 --subparts --threads 1`,
+`tools/ab_enc.py`, seven paired rounds at 96–97% load.
+
+| | 8-bit | 10-bit |
+|---|---:|---:|
+| one binary, `H26X_ENC_NO_SIMD=h264_enc` against the table as shipped | 0.960 (0.855–1.080) | 0.935 (0.882–0.985) |
+| develop c5be83f against the batch (with the 4x4 inverse transforms and the AVX2 8x8 SATD) | 0.945 (0.895–0.985) | 0.933 (0.825–1.054) |
+| same-environment control | 1.000 (0.934–1.036) | 1.041 (0.909–1.097) |
+
+### Identity and the gates
+
+Every cell of `verify_encode.sh`'s 966 is byte for byte the same:
+- with the encode-side tables on and off (`identity_encode.sh`,
+  `H26X_ENC_NO_SIMD`);
+- against develop c5be83f's encoder;
+- on every rung of `verify_enc_ladder.sh`, SSE2 to AVX-512 (`LADDER
+  IDENTICAL`).
+
+The gate bites: doubling the AVX2 quantiser's rounding offset fails
+`quantisers_match_scalar`. The NEON tests pass under Docker Desktop's
+arm64 emulation (`rust:1-slim-bookworm`, `linux/arm64`). There is no
+arm64 hardware behind that result. On simd128, `tools/wasm.sh` now expects
+installed-mask 2047: bits 512 and 1024 are the H.264 transforms and
+quantisers.
