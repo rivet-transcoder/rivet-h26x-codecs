@@ -93,6 +93,7 @@ pub(crate) mod h265_sao;
 pub(crate) mod h265_wp;
 pub mod hrd;
 pub mod h265_syntax;
+pub mod level;
 
 /// How lossy, and by what means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,11 +271,14 @@ pub struct Config {
     /// constraint on a rate, and there is no rate to constrain at a fixed
     /// quantiser. Asking for one anyway refuses by name.
     pub cpb_ms: u32,
-    /// Frames per second. Nothing in either bitstream carries it — H.265
-    /// puts frame rate in the optional VUI, which this encoder does not
-    /// write — so it exists for exactly one reason: a target in bits per
-    /// *second* is meaningless without it. It is declared rather than
-    /// assumed so that a caller who cares can set it.
+    /// Frames per second. A target in bits per *second* is meaningless
+    /// without it, and so is a level: the level each stream claims is
+    /// chosen from its macroblocks or samples per second, among other
+    /// things (`encode::level`), so a caller who leaves the default 30
+    /// under a faster stream gets a level too low for it. The rate itself
+    /// reaches the bitstream only as the frame clock of a declared buffer's
+    /// VUI. It is declared rather than assumed so that a caller who cares
+    /// can set it.
     pub fps: u32,
     /// Sample adaptive offset, the second in-loop filter (H.265 only).
     ///
