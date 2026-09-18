@@ -265,6 +265,7 @@ macro_rules! kernels_u16 {
         /// Every 16-bit-sample kernel — the bottom rung, and the top one.
         pub(crate) fn install_all_u16(d: &mut HevcDsp<u16>) {
             d.idct = [idct::<4>, idct::<8>, idct::<16>, idct::<32>];
+            d.idst4 = idst4;
             d.add_residual = add_residual;
             d.qpel_copy = copy_u16;
             d.qpel_h = qpel_h;
@@ -684,10 +685,76 @@ macro_rules! kernels_u16 {
                 return;
             }
             if N == 4 {
-                // Not worth a vector: the scalar butterfly is 4 lines.
-                return (HevcDsp::<u16>::SCALAR.idct[0])(coeffs, bd_shift, max_x, max_y);
+                return idct4(coeffs, bd_shift, max_x, max_y);
             }
             unsafe { idct_impl::<N>(coeffs, bd_shift, max_x, max_y) }
+        }
+
+        /// The 4x4 DCT basis, `TRANSFORM32` at every eighth row.
+        const DCT4: [[i16; 4]; 4] = [[64, 64, 64, 64], [83, 36, -36, -83], [64, -64, -64, 64], [36, -83, 83, -36]];
+        /// The 4x4 DST basis (8.6.4.2, `trType == 1`).
+        const DST4: [[i16; 4]; 4] = [[29, 55, 74, 84], [74, 74, 0, -74], [84, -29, -74, 55], [55, -84, 74, -29]];
+
+        /// The 4x4 inverse DCT, all sixteen coefficients whatever `max_x` /
+        /// `max_y` say (the rest are zero, and cost nothing here). The DC
+        /// shortcut is `idct`'s. Shared with the AVX2 table, whose own
+        /// kernel has nothing to widen at this size.
+        pub(crate) fn idct4(coeffs: &mut [i16], bd_shift: i32, _max_x: usize, _max_y: usize) {
+            assert!(coeffs.len() >= 16 && (1..=31).contains(&bd_shift));
+            unsafe { inv4_impl(coeffs.as_mut_ptr(), bd_shift, &DCT4) }
+        }
+
+        /// The 4x4 inverse DST (intra luma 4x4).
+        pub(crate) fn idst4(coeffs: &mut [i16], bd_shift: i32, _max_x: usize, _max_y: usize) {
+            assert!(coeffs.len() >= 16 && (1..=31).contains(&bd_shift));
+            unsafe { inv4_impl(coeffs.as_mut_ptr(), bd_shift, &DST4) }
+        }
+
+        /// One stage of a 4-point inverse transform over four vectors of
+        /// four i16 (`r[j]`, coefficient `j` of four lines): output `i` of
+        /// each line is `sum_j m[j][i] * r[j]` — two `pmaddwd` over the
+        /// interleaved pairs `(r0, r1)` and `(r2, r3)` — then rounded,
+        /// shifted and saturated to i16, which is the reference's clip.
+        /// Returns outputs `[0 | 1]` and `[2 | 3]`.
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn inv4_stage(r: [__m128i; 4], m: &[[i16; 4]; 4], round: __m128i, sh: __m128i) -> (__m128i, __m128i) {
+            let p01 = _mm_unpacklo_epi16(r[0], r[1]);
+            let p23 = _mm_unpacklo_epi16(r[2], r[3]);
+            let out = |i: usize| {
+                let a = _mm_madd_epi16(p01, _mm_set1_epi32(pair16(m[0][i], m[1][i])));
+                let b = _mm_madd_epi16(p23, _mm_set1_epi32(pair16(m[2][i], m[3][i])));
+                _mm_sra_epi32(_mm_add_epi32(_mm_add_epi32(a, b), round), sh)
+            };
+            (_mm_packs_epi32(out(0), out(1)), _mm_packs_epi32(out(2), out(3)))
+        }
+
+        /// Transpose the 4x4 i16 block `[row0 | row1]`, `[row2 | row3]`
+        /// into its columns, one each in the low half of a vector.
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn columns4(a: __m128i, b: __m128i) -> [__m128i; 4] {
+            let u = _mm_unpacklo_epi16(a, b);
+            let v = _mm_unpackhi_epi16(a, b);
+            let c01 = _mm_unpacklo_epi16(u, v);
+            let c23 = _mm_unpackhi_epi16(u, v);
+            [c01, _mm_srli_si128(c01, 8), c23, _mm_srli_si128(c23, 8)]
+        }
+
+        /// Both stages of the 4x4 inverse transform with basis `m` (8.6.4.2):
+        /// columns, the 16-bit clip, rows. The second stage runs on the
+        /// transposed intermediate, so its output is the block's columns
+        /// and one more transpose puts it back in raster order.
+        #[target_feature(enable = $feat)]
+        unsafe fn inv4_impl(c: *mut i16, bd_shift: i32, m: &[[i16; 4]; 4]) {
+            unsafe {
+                let row = |j: usize| _mm_loadl_epi64(c.add(4 * j) as *const __m128i);
+                let (a, b) = inv4_stage([row(0), row(1), row(2), row(3)], m, _mm_set1_epi32(64), _mm_cvtsi32_si128(7));
+                let (a, b) = inv4_stage(columns4(a, b), m, _mm_set1_epi32(1 << (bd_shift - 1)), _mm_cvtsi32_si128(bd_shift));
+                let r = columns4(a, b);
+                _mm_storeu_si128(c as *mut __m128i, _mm_unpacklo_epi64(r[0], r[1]));
+                _mm_storeu_si128(c.add(8) as *mut __m128i, _mm_unpacklo_epi64(r[2], r[3]));
+            }
         }
 
         #[target_feature(enable = $feat)]
@@ -1186,6 +1253,7 @@ macro_rules! kernels_u8 {
         /// Every 8-bit-sample kernel — the bottom rung, and the top one.
         pub(crate) fn install_all_u8(d: &mut HevcDsp<u8>) {
             d.idct = [idct::<4>, idct::<8>, idct::<16>, idct::<32>];
+            d.idst4 = idst4;
             d.qpel_v2 = qpel_v2;
             d.epel_v2 = epel_v2;
             d.uni = uni_u8;
@@ -2344,6 +2412,102 @@ mod tests {
                         assert_eq!(a, b, "{name} wbi {w}x{h} {lwd} {wt} {o} max {max}");
                     }
                 }
+            }
+        }
+    }
+
+    /// The 4x4 inverse DCT and DST at every rung the host has, AVX2 and
+    /// AVX-512 included (they take this module's kernels at 4x4), in both
+    /// tables: coefficients across the whole of i16, so both stages' clips
+    /// are reached, dense and within a random bounding box, at the shifts of
+    /// 8, 10 and 12 bits.
+    #[test]
+    fn transforms4_match_scalar_at_every_rung() {
+        let mut cpus = rungs();
+        let top = Cpu::detect();
+        if top.avx2 {
+            cpus.push(("avx2", Cpu { avx512: false, avx512vnni: false, ..top }));
+        }
+        if top.avx512 {
+            cpus.push(("avx512", top));
+        }
+        let s = HevcDsp::<u16>::SCALAR;
+        let mut seed = 0x4d57_u64;
+        let mut n = 0;
+        for (name, cpu) in cpus {
+            let d16 = HevcDsp::<u16>::new(cpu);
+            let d8 = HevcDsp::<u8>::new(cpu);
+            for trial in 0..3000 {
+                let (mx, my) = if trial % 3 == 0 { (3, 3) } else { ((lcg(&mut seed) % 4) as usize, (lcg(&mut seed) % 4) as usize) };
+                let mut c = [0i16; 16];
+                for y in 0..=my {
+                    for x in 0..=mx {
+                        c[y * 4 + x] = match lcg(&mut seed) % 6 {
+                            0 => 32767,
+                            1 => -32768,
+                            2 => 0,
+                            _ => lcg(&mut seed) as i16,
+                        };
+                    }
+                }
+                let bd_shift = 12 - (trial % 3) as i32 * 2;
+                let mut want = c;
+                (s.idct[0])(&mut want, bd_shift, mx, my);
+                let mut want_dst = c;
+                (s.idst4)(&mut want_dst, bd_shift, 3, 3);
+                for (table, idct, idst) in [("u16", d16.idct[0], d16.idst4), ("u8", d8.idct[0], d8.idst4)] {
+                    let mut got = c;
+                    idct(&mut got, bd_shift, mx, my);
+                    assert_eq!(got, want, "{name} {table} idct4 trial {trial} max {mx},{my} shift {bd_shift} {c:?}");
+                    let mut got = c;
+                    idst(&mut got, bd_shift, 3, 3);
+                    assert_eq!(got, want_dst, "{name} {table} idst4 trial {trial} shift {bd_shift} {c:?}");
+                    n += 2;
+                }
+            }
+        }
+        assert!(n > 0);
+    }
+
+    /// ns per call of the 4x4 inverse DCT and DST, scalar against every
+    /// rung (AVX2 and AVX-512 take the AVX kernel), median of seven paired
+    /// rounds; the two scalar rows are the same-table control. `cargo test
+    /// --release --lib hevc_x86_128 -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn transforms4_bench() {
+        use std::time::Instant;
+        let mut seed = 0xb4d7_u64;
+        let blocks: Vec<[i16; 16]> = (0..64).map(|_| std::array::from_fn(|_| (lcg(&mut seed) % 2001) as i16 - 1000)).collect();
+        let s = HevcDsp::<u16>::SCALAR;
+        let mut tabs = vec![("scalar", s), ("scalar-again", s)];
+        tabs.extend(tables_u16());
+        const ROUNDS: usize = 7;
+        const PER: usize = 200_000;
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.total_cmp(b));
+            v[v.len() / 2]
+        };
+        for (label, dst) in [("idct4", false), ("idst4", true)] {
+            // `ns[round][table]`: every table back to back within a round.
+            let mut ns = vec![vec![0f64; tabs.len()]; ROUNDS];
+            let mut sink = 0i64;
+            for round in ns.iter_mut() {
+                for (slot, (_, d)) in round.iter_mut().zip(&tabs) {
+                    let f = if dst { d.idst4 } else { d.idct[0] };
+                    let start = Instant::now();
+                    for i in 0..PER {
+                        let mut c = blocks[i & 63];
+                        f(std::hint::black_box(&mut c), 12, 3, 3);
+                        sink = sink.wrapping_add(c[5] as i64);
+                    }
+                    *slot = start.elapsed().as_nanos() as f64 / PER as f64;
+                }
+            }
+            for (t, (name, _)) in tabs.iter().enumerate() {
+                let own = median(ns.iter().map(|r| r[t]).collect());
+                let ratio = median(ns.iter().map(|r| r[0] / r[t]).collect());
+                println!("{label} {name:13} {own:7.1} ns/call  {ratio:5.2}x scalar [{}]", sink & 1);
             }
         }
     }

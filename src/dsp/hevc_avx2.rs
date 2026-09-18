@@ -544,8 +544,8 @@ pub(super) fn idct_avx2<const N: usize>(coeffs: &mut [i16], bd_shift: i32, max_x
         return;
     }
     if N == 4 {
-        // Not worth a vector: the scalar butterfly is 4 lines.
-        return (HevcDsp::<u16>::SCALAR.idct[0])(coeffs, bd_shift, max_x, max_y);
+        // One 128-bit vector holds the block: the VEX-encoded 128-bit kernel.
+        return super::hevc_x86_128::avx::idct4(coeffs, bd_shift, max_x, max_y);
     }
     unsafe { idct_impl::<N>(coeffs, bd_shift, max_x, max_y) }
 }
