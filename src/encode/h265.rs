@@ -317,6 +317,11 @@ struct Core<S: Sample> {
     /// to see what that choice costs before it shows up as a slow encode
     /// nobody can account for.
     recoded: u64,
+    /// Extra codings of a picture planned from a seed alone that missed its
+    /// plan (`RateController::seed_recode`): the stream's first picture,
+    /// and the first P after it when the first was coded again. At most
+    /// two per stream, and none without a lookahead.
+    seed_recoded: u64,
     /// The coded picture buffer this stream declares, when it declares one.
     /// The *declared* values, snapped to what the syntax carries — the
     /// controller is handed these rather than the caller's request, so what
@@ -416,6 +421,14 @@ impl H265Encoder {
     /// can fail to fit.
     pub fn recodes(&self) -> u64 {
         with_core!(&self.inner, e => e.recoded)
+    }
+
+    /// How many extra codings the rate controller's seed cost: the
+    /// stream's first picture, and the first P after it, each coded again
+    /// once when it was planned from a seed alone and missed its plan by
+    /// far. At most two; zero without a lookahead.
+    pub fn seed_recodes(&self) -> u64 {
+        with_core!(&self.inner, e => e.seed_recoded)
     }
 
     /// The rate controller's model check: the mean distance, in quantiser
@@ -587,6 +600,7 @@ impl<S: Sample> Core<S> {
             pps_qp,
             emitted: 0,
             recoded: 0,
+            seed_recoded: 0,
             cfg,
             held: std::collections::BTreeMap::new(),
             recon: Vec::new(),
@@ -702,7 +716,9 @@ impl<S: Sample> Core<S> {
     }
 
     /// Code one picture, re-coding it at a higher quantiser if it will not
-    /// fit the buffer this stream declares.
+    /// fit the buffer this stream declares — and, under a lookahead, once
+    /// at the quantiser its own bits ask for when it was planned from a
+    /// seed alone and missed by far (`RateController::seed_recode`).
     ///
     /// The quantiser is chosen **once**. What the loop does is escalate
     /// from it, using the same law the controller steers by, and the
@@ -719,6 +735,15 @@ impl<S: Sample> Core<S> {
         for attempt in 0..super::rc::MAX_ATTEMPTS {
             let a = self.code_attempt(c, src, qp, bypass)?;
             let bits = a.access.data.len() as u64 * 8;
+            // A picture planned from a seed and nothing else: its own bits
+            // are the measurement the seed stood in for.
+            if attempt == 0 {
+                if let Some(again) = self.rc.as_mut().and_then(|rc| rc.seed_recode(bits)) {
+                    self.seed_recoded += 1;
+                    qp = again;
+                    continue;
+                }
+            }
             // What the buffer can hand over at this picture's removal time.
             // `None` means no buffer was declared and nothing can fail.
             let affordable = self.rc.as_ref().and_then(|rc| rc.affordable_bits());
@@ -3553,6 +3578,70 @@ mod tests {
             .err()
             .expect("a lookahead at a constant quantiser must refuse");
         assert!(format!("{err}").contains("lookahead"), "{err}");
+    }
+
+    /// **A seeded keyframe that misses by far is coded again, and the
+    /// stream still decodes to what the encoder kept.** A smooth gradient
+    /// costs far fewer bits per unit of lookahead cost than the calibration
+    /// assumes, so the stream's first picture, planned from the seed alone,
+    /// comes back far under its plan and is coded again lower
+    /// (`RateController::seed_recode`). What ships, and what the next
+    /// pictures predict from, must be the second coding: the decoder
+    /// reproduces the encoder's reconstructions picture for picture.
+    /// Without a lookahead nothing is seeded from the calibration and
+    /// nothing is coded again.
+    #[test]
+    fn a_seeded_keyframe_that_misses_is_coded_again_and_the_stream_still_decodes() {
+        let (w, h) = (64usize, 64usize);
+        let frames: Vec<Vec<u8>> = (0..8)
+            .map(|t| {
+                let mut f = vec![128u8; w * h * 3 / 2];
+                for (i, s) in f[..w * h].iter_mut().enumerate() {
+                    *s = (40 + (i % w) * 2 + (i / w) + t) as u8;
+                }
+                f
+            })
+            .collect();
+        let run = |lookahead: u32| -> (Vec<Access>, Vec<Vec<u8>>, u64) {
+            let mut e = H265Encoder::new(Config {
+                gop: 8,
+                lookahead,
+                fps: 25,
+                rate: super::super::RateControl::Bitrate { bps: 96_000 },
+                ..cfg(64, 64, ChromaFormat::Yuv420)
+            })
+            .unwrap();
+            let mut units = Vec::new();
+            for f in &frames {
+                units.extend(e.push(f).unwrap());
+            }
+            units.extend(e.flush().unwrap());
+            (units, e.reconstructions().to_vec(), e.seed_recodes())
+        };
+        let (with, recon, recodes) = run(8);
+        assert!((1..=2).contains(&recodes), "the seeded keyframe of a smooth gradient was not coded again: {recodes} extra codings");
+        let (_, _, none) = run(0);
+        assert_eq!(none, 0, "a stream without a lookahead was coded again");
+        // A seeded pick is never below the seed's floor, 26. The coding that
+        // ships is the second one, lower than that, so it is larger than
+        // the keyframe at 26.
+        let mut at_floor = H265Encoder::new(Config { gop: 8, rate: super::super::RateControl::ConstantQp(26), ..cfg(64, 64, ChromaFormat::Yuv420) }).unwrap();
+        let floor_bytes = at_floor.push(&frames[0]).unwrap()[0].data.len();
+        assert!(with[0].data.len() > floor_bytes * 3 / 2, "the keyframe shipped at {} bytes against {floor_bytes} at the seed's floor: the first coding shipped", with[0].data.len());
+
+        let mut dec = crate::hevc::HevcDecoder::new();
+        for u in &with {
+            dec.push_annexb(&u.data).unwrap();
+        }
+        dec.flush().unwrap();
+        let mut by_display = vec![None; with.len()];
+        for u in &with {
+            by_display[(u.poc / 2) as usize] = Some(u.encode_index as usize);
+        }
+        for (i, coded) in by_display.iter().enumerate() {
+            let got = dec.next_picture().unwrap_or_else(|| panic!("picture {i} missing"));
+            assert!(got.into_packed() == recon[coded.expect("every picture coded")], "picture {i} differs from the reconstruction the encoder kept");
+        }
     }
 
     /// Intra 4:2:0 codes for real now; everything else still refuses by
