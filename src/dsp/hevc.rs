@@ -57,6 +57,25 @@ pub type UniInterpFn<S> = fn(dst: &mut [S], dst_stride: usize, src: &[S], src_st
 /// other list's 14-bit prediction (`w * h`, stride `w`).
 pub type BiInterpFn<S> = fn(dst: &mut [S], dst_stride: usize, src: &[S], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], other: &[i16], bit_depth: u32);
 
+/// Planar intra prediction (8.4.4.2.5) of an `n x n` block at the start of
+/// `dst` (stride `stride`) from its reference samples `left[0..=n]`
+/// (`p[-1][y]`) and `top[0..=n]` (`p[x][-1]`), after substitution and any
+/// smoothing.
+pub type IntraPlanarFn<S> = fn(dst: &mut [S], stride: usize, left: &[u16], top: &[u16], n: usize);
+/// DC intra prediction (8.4.4.2.5) from `left[0..n]` and `top[0..n]`, with
+/// the edge filter of the first row and column when `edge` (luma, `n < 32`,
+/// the boundary filter enabled).
+pub type IntraDcFn<S> = fn(dst: &mut [S], stride: usize, left: &[u16], top: &[u16], n: usize, edge: bool);
+/// Angular intra prediction (8.4.4.2.6): with `iIdx = ((y + 1) * angle) >>
+/// 5` and `iFact = ((y + 1) * angle) & 31`, sample `(x, y)` is `((32 -
+/// iFact) * ref[x + iIdx + 1] + iFact * ref[x + iIdx + 2] + 16) >> 5`, or
+/// `ref[x + iIdx + 1]` when `iFact` is 0; `refs[n + k]` holds `ref[k]` for
+/// `k` in `-n..=2n` and may run on past `3n + 1` (a SIMD kernel may read
+/// there, and must not use what it reads). `transposed` stores sample `(x,
+/// y)` at `(y, x)`: the horizontal modes 2..=17, which predict along
+/// columns.
+pub type IntraAngularFn<S> = fn(dst: &mut [S], stride: usize, refs: &[u16], n: usize, angle: i32, transposed: bool);
+
 /// Scratch the fused interpolation kernels need: the horizontal stage of a
 /// 64x64 block over `64 + 7` rows, plus a 64x64 14-bit prediction.
 pub const MC_TMP_LEN: usize = 64 * (64 + 7) + 64 * 64;
@@ -119,6 +138,12 @@ pub struct HevcDsp<S: Sample = u16> {
     pub deblock_chroma_v: ChromaDeblockFn<S>,
     /// Deblocking: four 2-line chroma segments of a horizontal edge.
     pub deblock_chroma_h: ChromaDeblockFn<S>,
+    /// Intra prediction: planar.
+    pub intra_planar: IntraPlanarFn<S>,
+    /// Intra prediction: DC.
+    pub intra_dc: IntraDcFn<S>,
+    /// Intra prediction: the angular modes.
+    pub intra_angular: IntraAngularFn<S>,
 }
 
 /// Deblock eight lines of a luma edge — two 4-line segments with their own
@@ -162,6 +187,9 @@ impl<S: Sample> HevcDsp<S> {
             deblock_luma_h: |d, off, stride, beta, tc, np, nq, max| deblock_luma_scalar(d, off, stride, 1, beta, tc, np, nq, max),
             deblock_chroma_v: |d, off, stride, tc, np, nq, max| deblock_chroma_scalar(d, off, 1, stride, tc, np, nq, max),
             deblock_chroma_h: |d, off, stride, tc, np, nq, max| deblock_chroma_scalar(d, off, stride, 1, tc, np, nq, max),
+            intra_planar: intra_planar_scalar::<S>,
+            intra_dc: intra_dc_scalar::<S>,
+            intra_angular: intra_angular_scalar::<S>,
         }
     }
 
@@ -204,6 +232,9 @@ impl HevcDsp<u16> {
         deblock_luma_h: |d, off, stride, beta, tc, np, nq, max| deblock_luma_scalar(d, off, stride, 1, beta, tc, np, nq, max),
         deblock_chroma_v: |d, off, stride, tc, np, nq, max| deblock_chroma_scalar(d, off, 1, stride, tc, np, nq, max),
         deblock_chroma_h: |d, off, stride, tc, np, nq, max| deblock_chroma_scalar(d, off, stride, 1, tc, np, nq, max),
+        intra_planar: intra_planar_scalar::<u16>,
+        intra_dc: intra_dc_scalar::<u16>,
+        intra_angular: intra_angular_scalar::<u16>,
     };
 }
 
@@ -237,6 +268,9 @@ impl HevcDsp<u8> {
         deblock_luma_h: |d, off, stride, beta, tc, np, nq, max| deblock_luma_scalar(d, off, stride, 1, beta, tc, np, nq, max),
         deblock_chroma_v: |d, off, stride, tc, np, nq, max| deblock_chroma_scalar(d, off, 1, stride, tc, np, nq, max),
         deblock_chroma_h: |d, off, stride, tc, np, nq, max| deblock_chroma_scalar(d, off, stride, 1, tc, np, nq, max),
+        intra_planar: intra_planar_scalar::<u8>,
+        intra_dc: intra_dc_scalar::<u8>,
+        intra_angular: intra_angular_scalar::<u8>,
     };
 }
 
@@ -687,6 +721,55 @@ fn weighted_bi_scalar<S: Sample>(dst: &mut [S], stride: usize, a: &[i16], b: &[i
         for x in 0..w {
             let v = (a[y * w + x] as i32 * w0 + b[y * w + x] as i32 * w1 + round) >> (log2_wd + 1);
             dst[y * stride + x] = S::from_i32(v.clamp(0, max));
+        }
+    }
+}
+
+// ----------------------------------------------------------------------
+// Intra prediction
+// ----------------------------------------------------------------------
+
+fn intra_planar_scalar<S: Sample>(dst: &mut [S], stride: usize, left: &[u16], top: &[u16], n: usize) {
+    let log2n = n.trailing_zeros();
+    let (ln, tn) = (left[n] as i32, top[n] as i32);
+    for y in 0..n {
+        let row = &mut dst[y * stride..y * stride + n];
+        let (ly, ry) = (left[y] as i32, n as i32 - 1 - y as i32);
+        for (x, d) in row.iter_mut().enumerate() {
+            let v = ((n as i32 - 1 - x as i32) * ly + (x as i32 + 1) * tn + ry * top[x] as i32 + (y as i32 + 1) * ln + n as i32) >> (log2n + 1);
+            *d = S::from_i32(v);
+        }
+    }
+}
+
+fn intra_dc_scalar<S: Sample>(dst: &mut [S], stride: usize, left: &[u16], top: &[u16], n: usize, edge: bool) {
+    let log2n = n.trailing_zeros();
+    let sum = n as i32 + top[..n].iter().chain(&left[..n]).map(|&v| v as i32).sum::<i32>();
+    let dc = sum >> (log2n + 1);
+    for y in 0..n {
+        dst[y * stride..y * stride + n].fill(S::from_i32(dc));
+    }
+    if edge {
+        dst[0] = S::from_i32((left[0] as i32 + 2 * dc + top[0] as i32 + 2) >> 2);
+        for x in 1..n {
+            dst[x] = S::from_i32((top[x] as i32 + 3 * dc + 2) >> 2);
+        }
+        for y in 1..n {
+            dst[y * stride] = S::from_i32((left[y] as i32 + 3 * dc + 2) >> 2);
+        }
+    }
+}
+
+fn intra_angular_scalar<S: Sample>(dst: &mut [S], stride: usize, refs: &[u16], n: usize, angle: i32, transposed: bool) {
+    for y in 0..n {
+        let i_idx = ((y as i32 + 1) * angle) >> 5;
+        let i_fact = ((y as i32 + 1) * angle) & 31;
+        let start = (i_idx + 1 + n as i32) as usize;
+        for x in 0..n {
+            let (a, b) = (refs[start + x] as i32, refs[start + x + 1] as i32);
+            let v = if i_fact != 0 { ((32 - i_fact) * a + i_fact * b + 16) >> 5 } else { a };
+            let at = if transposed { x * stride + y } else { y * stride + x };
+            dst[at] = S::from_i32(v);
         }
     }
 }

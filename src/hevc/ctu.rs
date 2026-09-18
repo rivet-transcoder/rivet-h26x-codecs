@@ -1237,7 +1237,7 @@ impl<'a, S: Sample> SliceDec<'a, S> {
             1 => &mut self.frame.cb,
             _ => &mut self.frame.cr,
         };
-        intra_predict(plane, sc, x, y, n, mode, c_idx, filter, boundary_filter, bd, strong);
+        intra_predict(&self.dsp, plane, sc, x, y, n, mode, c_idx, filter, boundary_filter, bd, strong);
     }
 
     /// Cross-component prediction for a chroma block without a residual of
