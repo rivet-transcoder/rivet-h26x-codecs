@@ -214,6 +214,303 @@
 //! past-only controller exactly, which is what [`RateController::pick_qp`]
 //! passes — so a stream that does not ask for lookahead is coded by the
 //! same arithmetic it always was.
+//!
+//! ## Fade pictures in lookahead ABR (the cap implemented, the rest measured)
+//!
+//! On a fade the lookahead controller ends over its target. The gate's
+//! fade clip (`src_fade`, a luma gain fade) ended at 1.083x at 64 kbps,
+//! 1.030x at 96 kbps and 1.109x with two B pictures at 64 kbps. The two
+//! gain-and-offset fades, which no lookahead row of the gate visits, end
+//! at 1.280x (`src_wpoff`, 8 bits) and 1.248x (`src_fdeep10`) at 96 kbps,
+//! their P pictures at 1.15x and 1.18x of plan in total. Two mechanisms
+//! were measured:
+//!
+//! - **The intra cap is fixed here.** It stays on a picture whose change
+//!   is more than a brightness step, and it never applies under
+//!   `--wpred` (`encode::h265::PicCost::inter_cost`).
+//! - **The first mechanism is not.** A model fix for it was built and
+//!   tried in 23 configurations, and none met the bar. This is the record
+//!   of why.
+//!
+//! Measured 2026-09-14 on h26x 5dde3bb, whose encoder source is develop's
+//! up to this change, with the model on the branch `agent/rcfix3`
+//! (ed5ed4d); rechecked, and the cap measured and implemented, 2026-09-18.
+//!
+//! **The cost does not see what a fade's bits pay for.** The inter cost
+//! is mostly the fade. An SATD over 4x4 Hadamard tiles prices a one-level
+//! shift of an 8x8 block at 32 units: each tile's DC coefficient takes 16
+//! levels and the tile sum is halved to 8. On the fade clip the mean moves
+//! about 420 levels a picture summed over its blocks — 13.4k units, every
+//! picture — against 3k to 6k for everything else the picture does. The
+//! codec codes a brightness step cheaply. What costs bits is the rest, and
+//! the three fades built on `testsrc2` (fade, wpoff, fdeep10) change a
+//! small element on odd pictures. At a fixed quantiser those pictures cost
+//! about twice the even ones, while the cost moves by an eighth:
+//!
+//! ```text
+//!     src_fade at quantiser 20, no rate control   display 4   display 5
+//!     bits                                            1408        3160   2.24x
+//!     inter cost (zero-motion SATD)                  15252       17104   1.12x
+//!       of which not the mean shift                   2991        5411   1.81x
+//! ```
+//!
+//! `k` is blended half and half with the last observation, so every P
+//! picture is planned from a picture of the other parity and is about
+//! twice wrong, alternately each way. At 96 kbps with `--lookahead 8`
+//! those two pictures code at 20 and 18 for 1480 and 4184 bits, 0.55 and
+//! 1.43 of their plan, and the clip's P pictures range from 0.45 to 1.50
+//! of plan. On the gain fade the misses nearly cancel (0.95x of plan over
+//! all its P pictures at 96 kbps). On the gain-and-offset fades they do
+//! not. The native 10-bit fade (`src_wsine10`) has no such element and
+//! does not alternate.
+//!
+//! This was first read as skip-lag: a coarse quantiser rounding the step
+//! away and the next picture coding two steps. The reconstruction rules
+//! that out. No 8x8 block of any P picture of that run is identical to the
+//! same block of the picture before it. The reconstructed luma mean tracks
+//! the source to within 0.11 levels on every picture. And the alternation
+//! is there at a fixed quantiser, with no controller to lag.
+//!
+//! **The intra cap changes units at the end of a fade.** An inter picture
+//! was planned at `min(intra, max(inter, floor))`. The intra cost is taken
+//! against each block's own mean, so it has no DC at all, while the inter
+//! cost carries the whole brightness step. As a fade reaches black the
+//! texture goes, the intra cost falls under the inter cost, and the plan
+//! falls with it while the bits do not:
+//!
+//! ```text
+//!     src_wpoff at 96 kbps, last GOP      display 9    10      11
+//!     intra cost                              16000    11196    6000
+//!     inter cost                              21665    19740   19508
+//!     plan (bits)                              4206     3504    2415
+//!     spent                                    5136     4176    7688   3.18x plan at display 11
+//!     at quantiser 13, no rate control         4760     3488    6600
+//! ```
+//!
+//! `src_fdeep10`'s display 11 is the same story: intra 7920 against inter
+//! 21883, and 2.87x its plan. The cap matters less than the first mechanism.
+//! Over every lookahead cell it binds on only 10 distinct pictures: the
+//! last one to three of each fade, and the cut clip's cut, where it is
+//! right. See *What is implemented* below.
+//!
+//! **What predicts a fade picture's bits.** For each candidate cost, the
+//! spread of `log2(bits * 2^(qp / 6) / cost)` within a cell — how far one
+//! `k` misses across a clip — pooled over 447 P pictures of the 28
+//! lookahead cells without B pictures (the four fades against the rest).
+//! "Fade bias" is the fades' mean `log2 k` less everyone else's. The
+//! SATD is the encoder's own tiled kernel, reproduced offline to zero
+//! mismatches against its costs. An earlier fit with a plain 8x8 Hadamard
+//! gave 0.33 for the reference cost, and that number was wrong.
+//!
+//! ```text
+//!     cost                                         fade    other   fade bias
+//!     today: min(intra, max(inter, floor))        0.586    0.518     -1.902
+//!     SATD against the previous source            0.447    1.078     -3.886
+//!     SATD against the reconstructed reference    0.431    0.522     -1.146
+//!       each block's mean difference removed      0.340    0.518     +0.121
+//!       removed, then 8 per level added back      0.374    0.519     -0.361
+//! ```
+//!
+//! The mean-removed difference against the reference is the best
+//! predictor for fades and no worse for anything else. That is the first
+//! mechanism in numbers: the bits follow the part of the difference that
+//! is not the fade.
+//!
+//! **Telling a fade apart.** A picture is fade-like when its mean shift,
+//! priced at the SATD's own 32 per level, is at least everything else:
+//! `dc > 0 && 32 * dc >= inter_ac`. Here `inter_ac` is the inter SATD with
+//! each block's mean difference removed and `dc` is the summed absolute
+//! mean difference. Over the distinct inter pictures of every lookahead
+//! cell:
+//!
+//! ```text
+//!     32 * dc / inter_ac    pictures    min     p50     p90     max
+//!     the four fades             40    1.341   2.630   4.493   6.548
+//!     everything else           172    0.036   0.094   0.197   0.760   (20 with dc = 0)
+//! ```
+//!
+//! A threshold of 1.0 sits between the cut clip's cut (0.760) and
+//! wsine10's first P picture (1.341). Outside the corpus, at 1280x720:
+//!
+//! - A cinema trailer, 1525 pictures: 48 flagged in 8 runs. Each run is a
+//!   real fade or grading pulse (a logo fading in, clouds fading up, a
+//!   lighting pulse, a fade out).
+//! - A UHD stock clip, 207 pictures: none flagged, maximum 0.366.
+//! - A 1080p clip, 750 pictures: none flagged, maximum 0.137.
+//!
+//! The detector is the part that works.
+//!
+//! **What was tried.** The fix in `agent/rcfix3` used the detector:
+//!
+//! - A P picture it flagged, outside `--wpred`, had its quantiser inverted
+//!   from a *model* cost, the SATD of its luma against the reconstructed
+//!   reference it predicts from.
+//! - That model cost had its own bits-per-cost estimate, while the window
+//!   shares kept the source costs.
+//! - A picture not flagged was untouched, and in every configuration no
+//!   byte of any non-fade rate cell moved.
+//!
+//! The bar, for the five fade lookahead cells the gate then visited
+//! (wsine10 by the 10-bit row; since a35a614 only `@wsine10` rows visit
+//! it, and none of them is a lookahead row):
+//!
+//! - **(a)** Non-fade cells byte-identical.
+//! - **(b)** Mean `|ratio - 1|` below 0.0474 over the five cells (mean5),
+//!   or below 0.0585 over the four that are not wsine10 (mean4). None of
+//!   those four more than 0.01 further from target.
+//! - **(c)** No plane of a moved cell more than 0.30 dB under the quality
+//!   floor.
+//! - **(d)** No cell both larger and worse.
+//!
+//! Every configuration, by the names the round files use, scored against
+//! that bar:
+//!
+//! ```text
+//!     round  configuration            mean5   mean4  >0.01  la-ipb dCb   dCr   fails
+//!            base (5dde3bb)          0.0474  0.0585
+//!       1    model (ed5ed4d)         0.0586  0.0570     0      -0.60   -0.56   c d
+//!       1    ac                      0.0524  0.0628     2      -0.36   -0.32   b c d
+//!       1    damp=0.25               0.0646  0.0470     0      -0.46   -0.46   c
+//!       1    ac,damp=0.25            0.0588  0.0595     1      -0.36   -0.32   b c d
+//!       1    anchor=2                0.0578  0.0570     0      -0.60   -0.56   c d
+//!       1    ac,anchor=2             0.0506  0.0628     2      -0.36   -0.32   b c d
+//!       1    anchor=1                0.0622  0.0648     2      -0.46   -0.46   b c d
+//!       1    ac,damp=0.25,anchor=1   0.0596  0.0610     1      -0.36   -0.32   b c d
+//!       1    step=1                  0.1672  0.0467     1      -0.72   -0.70   b c
+//!       1    ac,step=1,anchor=1      0.1710  0.0532     1      -0.57   -0.53   b c
+//!       2    ac,rise=1               0.0504  0.0628     2      -0.36   -0.32   b c d
+//!       2    ac,rise=2               0.0506  0.0628     2      -0.36   -0.32   b c d
+//!       2    ac,rise=3               0.0524  0.0628     2      -0.36   -0.32   b c d
+//!       2    ac,dcw=8,rise=2         0.0532  0.0585     1      -0.48   -0.40   b c
+//!       2    ac,dcw=16,rise=2        0.0582  0.0648     2      -0.46   -0.46   b c
+//!       2    rise=2                  0.0592  0.0588     0      -0.46   -0.46   b c d
+//!       3    tail                    0.0528  0.0655     2      -0.40   -0.40   b c d
+//!       3    ac,tail                 0.0556  0.0693     2      -0.40   -0.40   b c
+//!       3    ac,rise=2,tail          0.0556  0.0693     2      -0.40   -0.40   b c
+//!       3    damp=0.25,tail          0.0624  0.0613     1      -0.40   -0.40   b c d
+//!       3    ac,damp=0.25,tail       0.0520  0.0645     2      -0.40   -0.40   b c
+//!       3    ac,dcw=8,tail           0.0572  0.0665     2      -0.40   -0.40   b c
+//! ```
+//!
+//! - `model`: the committed fix.
+//! - `ac`: its cost with each block's mean difference removed.
+//! - `dcw=w`: `ac` plus `w` per level of mean difference.
+//! - `damp=a`: the model's `k` moves `a` of the way to each observation,
+//!   not half.
+//! - `anchor=d`: the quantiser at most `d` above the last reference
+//!   picture's.
+//! - `rise=d`: at most `d` above the last fade-planned P's.
+//! - `step=s`: within `s` of it. The `step=1` rows put wsine10 at 0.351x
+//!   and 0.358x, out of the band.
+//! - `tail`: the window's last P planned by today's cost.
+//!
+//! Round 2 ran `ac` again as its control, and it scored the same.
+//!
+//! Before the model, four families were scored on rate alone:
+//!
+//! - **The inter cost as `inter_ac + w * dc` for every picture**
+//!   (w 0 to 16). Moved 11 to 19 of the 32 non-fade lookahead cells, 7 to
+//!   10 of them further from target. A cost change for everyone is not a
+//!   fade fix.
+//! - **The reference cost for every P picture, ungated.** The gate's mean
+//!   `|ratio - 1|` went from 0.0782 to 0.0764, but 29 non-fade cells
+//!   moved and 15 of them went further.
+//! - **The cap raised to `intra + w * dc`.** Moved the four cut-clip
+//!   cells, whose cut is capped. It did the most for the gain-and-offset
+//!   fades (1.082x and 1.084x at w = 32) and pushed wsine10 to 0.888.
+//! - **The cap dropped where `inter_ac + w * dc <= intra`.** This is
+//!   what is implemented (below). As first measured it applied under
+//!   `--wpred` too, and there it failed (b) on one cell, the weighted
+//!   la-ipb row: 0.988 to 0.975, 0.013 further from target.
+//!
+//! **What is implemented.** The cap is dropped on a P or B picture where
+//! `inter_ac + 16 * dc <= intra`: the change, its brightness step priced
+//! at half the SATD's own 32 per level, still fits under the intra cost.
+//! It is never dropped under `--wpred`, where the encoder takes the step
+//! out itself with the weights. Scored on all 128 rate cells against the
+//! same bar and base (`D:/rivet-rcfix4/capwp/capwp.txt`), it passes:
+//!
+//! ```text
+//!     cell                                  before   after   bytes        dY     dCb    dCr
+//!     src_fade hevc-abr-la-64k               1.083   1.070   3464 -> 3424  -0.02  -0.03  -0.02
+//!     src_fade hevc-abr-la-96k               1.030   1.019   4942 -> 4889  -0.04  -0.02  -0.02
+//!     src_fade hevc-abr-la-ipb-64k           1.109   1.102   3549 -> 3526  -0.04  -0.22  -0.11
+//!     src_wsine10 hevc10-abr-la-96k          1.003   0.995   4815 -> 4776  +0.00  -0.01  -0.01
+//!     every other rate cell, the weighted la-ipb row included: byte-identical
+//!     mean5 0.0474 -> 0.0416, mean4 0.0585 -> 0.0508, none further, floor held
+//! ```
+//!
+//! Every moved cell spends less, so every one loses a little PSNR, 0.02
+//! to 0.22 dB. On the gain-and-offset fades, which no gate row visits,
+//! fdeep10 goes from 1.248x to 1.229x and wpoff from 1.280x to 1.289x.
+//! On wpoff the rule uncaps only display 9, which then spends 0.96 of
+//! its plan instead of 1.22. Displays 10 and 11 are darker, their intra
+//! cost has fallen under even `inter_ac + 16 * dc`, and they keep the
+//! cap. Display 11 still spends 3.23x its plan (`latrace_b16`).
+//!
+//! The price was tried at 8 and 16. At 8 the same four gate cells moved
+//! the same way except wsine10, which fell to 0.888: its capped end
+//! pictures had been cancelling an under-spent keyframe, and a cheaper
+//! price uncaps more of them.
+//!
+//! **Why la-ipb is the blocker.** The fade is luma only, so its chroma is
+//! still. Chroma quality is set by the anchors — the IDR and P pictures —
+//! and every B picture inherits it. The model moves spend inside the
+//! first GOP: P 6 goes 2632 to 2376 bits, and B 5 goes 904 to 1496. The
+//! IDR at display 8 then gets 3912 bits instead of 4152, and the second
+//! GOP loses chroma in every variant: display 9 Cb -1.79 to -2.23. The
+//! committed model also prices the last P (display 11, nearly black,
+//! coded before displays 9 and 10) from its reference and raises it from
+//! quantiser 24 to 29. It spends 3408 bits instead of 4608, as planned,
+//! but its Cb falls from 41.19 to 36.72 dB (-4.47), display 10 loses 1.30
+//! and display 6 loses 1.02. Exempting that picture (round 3) left -0.40
+//! on both chroma planes, the same in all six variants. The IDR still
+//! lost its bits, and the pictures after it still lost chroma (display 9
+//! Cb -2.15, display 11 -2.03). A fade P picture is cheap in its own bits
+//! and expensive in its dependants', and a per-picture model cannot see
+//! the second part.
+//!
+//! **What a fix would need.**
+//!
+//! 1. **An anchor-aware quantiser.** An anchor's cost to the clip has to
+//!    include the pictures predicted from it: a propagation of each
+//!    picture's inter cost back to its references, as x264's MB-tree
+//!    does. The lookahead already holds the window and the picture types
+//!    to do it. Without that, anything that takes spend off a fade anchor
+//!    fails la-ipb's chroma.
+//! 2. **A `k` that is not fooled by alternation.** A half-and-half blend
+//!    with the last picture is twice wrong on every picture of content that
+//!    alternates. Planning fades from the mean-removed reference cost
+//!    narrowed the swing: at la-96k, displays 5 and 6 coded at 3672 and
+//!    1768 bits against the base's 4152 and 1152. It still did not beat the
+//!    base ratio (1.044 against 1.030). Damping the model's `k` to 0.25 met
+//!    the rate conditions and failed only the floor.
+//! 3. **Gate rows where the overspend is.** The gain fade's P pictures
+//!    are already near plan in total. The overspend is on wpoff and
+//!    fdeep10 (1.280x, 1.248x), which no lookahead row visits. A fix
+//!    should arrive with `@wpoff` and `@fdeep10` lookahead rows and a floor
+//!    recorded for them.
+//!
+//! wsine10's 1.003 was two errors cancelling: keyframes at 0.25 and 0.24
+//! of plan against capped end pictures overspending (display 11 at
+//! 2.19x). Anything that fixes the end pictures moves it off 1.0 until the
+//! keyframe seed is fixed, which is a separate problem.
+//!
+//! **Where the evidence is.** The measurements are on the machine they
+//! were taken on, under `D:/rivet-rcfix3` and `D:/rivet-rcfix4`:
+//!
+//! - The alternation and the skip-lag refutation: `cqp/` (bits at a fixed
+//!   quantiser) and `skiplag_fade96.out`. The zero copied blocks and the
+//!   0.11-level mean came from the same reconstruction, `recon/`.
+//! - The traces: `ftrace/*.log` and `latrace_ctl2/`.
+//! - The fit: `refcost_recon.out`, from `refcost.py`.
+//! - The detector: `detector_margin.out` and `detector_natural2.log`.
+//! - The rounds: `round1.txt` to `round3.txt`, rescored in `rescore.txt`
+//!   and `rescore_table.out`.
+//! - The earlier families: `cmp_prerounds.out`.
+//! - The cap: `capb/capb.txt` (under `--wpred`), `capwp/capwp.txt` (as
+//!   implemented) and `latrace_b16/` (its per-picture trace).
+//! - la-ipb: `ipb_psnr.out` and `ipb_variants_psnr.out`.
 
 /// The largest quantiser change between consecutive pictures. Rate control
 /// that lurches is worse to watch than rate control that misses: a picture
