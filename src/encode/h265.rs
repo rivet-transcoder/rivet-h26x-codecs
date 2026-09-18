@@ -713,16 +713,13 @@ impl<S: Sample> Core<S> {
     /// still to code, and everything the scheduler has not released yet,
     /// each with the kind it will be coded as ([`Scheduler::preview`])
     /// and the cost that kind pays: an intra picture its intra cost, an
-    /// inter picture the cheaper of the two, since a block the previous
-    /// picture predicts badly is still coded intra — with the inter cost
-    /// held above the reference's quantisation noise
-    /// ([`PicCost::inter_floor`]) at the quantiser the last picture was
-    /// coded at.
+    /// inter picture [`PicCost::inter_cost`] at the quantiser the last
+    /// picture was coded at.
     fn lookahead_window(&self, c: &Coded, upcoming: &[Coded]) -> (f64, Vec<(PicKind, f64)>) {
         let qp_ref = self.last_qp.map_or(26, i32::from);
         let cost_of = |kind: Kind, display: u64| -> f64 {
             let pc = self.costs.get(&display).copied().unwrap_or_default();
-            let cost = if kind.is_intra() { pc.intra } else { pc.intra.min(pc.inter.max(pc.inter_floor(qp_ref))) };
+            let cost = if kind.is_intra() { pc.intra } else { pc.inter_cost(qp_ref, self.cfg.weighted_pred) };
             (cost as f64).max(1.0)
         };
         let mine = cost_of(c.kind, c.display);
@@ -1518,6 +1515,14 @@ pub(crate) struct PicCost {
     /// Sum of 8x8 SATDs against the previous source picture; equal to
     /// `intra` for the first picture, which has none.
     pub inter: u64,
+    /// `inter` with each block's mean difference taken out of the previous
+    /// picture first: what is left of the change once the brightness has
+    /// been matched. Equal to `intra` for the first picture.
+    pub inter_ac: u64,
+    /// The mean differences taken out for `inter_ac`, summed as absolute
+    /// levels over the blocks: how far the brightness moved. 0 for the
+    /// first picture.
+    pub dc: u64,
 }
 
 /// The share of a picture's intra cost that predicting it from a
@@ -1549,7 +1554,54 @@ const REF_NOISE_AT_45: f64 = 0.14;
 /// controller reports is where a third point would show.
 const REF_NOISE_HALVING: f64 = 12.0;
 
+/// What [`PicCost::inter_cost`] charges per level of a block's mean
+/// difference when it asks whether a picture's inter cost is only a
+/// brightness step: half of the 32 units the SATD itself charges (four 4x4
+/// tiles, each taking a one-level shift of the block as 16 levels of DC and
+/// halving its sum to 8).
+///
+/// The intra cost is taken against each block's own mean, so it has no DC
+/// at all, while the inter cost carries the whole brightness step. As a
+/// fade reaches black its texture goes and the intra cost falls under the
+/// inter cost — and capping the inter cost there plans the picture at the
+/// intra cost of a nearly flat frame while it still codes the fade: on the
+/// gain-and-offset fade at 96 kbps the last three P pictures were planned
+/// at 4206, 3504 and 2415 bits and spent 5136, 4176 and 7688, the last at
+/// 3.18 times its plan. So a picture whose change, the brightness step
+/// priced at this rate, still fits under its intra cost is planned at its
+/// inter cost uncapped: it is predictable, and the cap only saw the step.
+///
+/// Measured over every rate row of the gate, 2026-09-18 (the module docs
+/// of `encode::rc` hold the table): the cap binds on ten distinct pictures
+/// of the corpus's lookahead cells — the cut clip's cut, which keeps it,
+/// and the last one to three pictures of each fade — and no other rate
+/// cell moves. At 16 the gain fade's three unweighted lookahead cells move
+/// from 1.083, 1.030 and 1.109 of target to 1.070, 1.019 and 1.102, and
+/// the native 10-bit fade from 1.003 to 0.995. At 8 that fade fell to
+/// 0.888: its end pictures had been cancelling an under-spent keyframe,
+/// and a cheaper price uncaps more of them.
+const CAP_DC_PRICE: u64 = 16;
+
 impl PicCost {
+    /// The cost an inter picture is planned at, predicted from a reference
+    /// coded at `qp_ref`: its inter cost held above the reference's
+    /// quantisation noise ([`PicCost::inter_floor`]), and capped at its
+    /// intra cost — a block the previous picture predicts badly is still
+    /// coded intra — **unless** the difference is a brightness step and
+    /// nothing more ([`CAP_DC_PRICE`]).
+    ///
+    /// Not under weighted prediction (`weighted`): there the encoder takes
+    /// the brightness step out itself, with the weights, and a picture it
+    /// weights is not the one the cap misjudges.
+    fn inter_cost(&self, qp_ref: i32, weighted: bool) -> u64 {
+        let predicted = self.inter.max(self.inter_floor(qp_ref));
+        if !weighted && self.inter_ac + CAP_DC_PRICE * self.dc <= self.intra {
+            predicted
+        } else {
+            self.intra.min(predicted)
+        }
+    }
+
     /// The least an inter picture predicted from a reference coded at
     /// `qp_ref` can cost: [`REF_NOISE_AT_45`] of the intra cost, scaled
     /// by the reference's step size.
@@ -1575,7 +1627,9 @@ impl PicCost {
         let dist = DistortionDsp::<S>::new(Cpu::detect_honouring_env());
         let (bw, bh) = (w / 8, h / 8);
         let mut flat = [S::default(); 64];
-        let (mut intra, mut inter) = (0u64, 0u64);
+        let mut shifted = [S::default(); 64];
+        let top = (1i32 << bit_depth) - 1;
+        let (mut intra, mut inter, mut inter_ac, mut dc) = (0u64, 0u64, 0u64, 0u64);
         for by in 0..bh {
             for bx in 0..bw {
                 let at = by * 8 * w + bx * 8;
@@ -1590,12 +1644,31 @@ impl PicCost {
                 intra += u64::from((dist.satd)(block, w, &flat, 8, 8, 8));
                 if let Some(p) = prev {
                     inter += u64::from((dist.satd)(block, w, &p[at..], w, 8, 8));
+                    // The block's mean difference, rounded half away from
+                    // zero, and the previous block moved by it.
+                    let mut diff = 0i32;
+                    for y in 0..8 {
+                        for x in 0..8 {
+                            diff += block[y * w + x].to_i32() - p[at + y * w + x].to_i32();
+                        }
+                    }
+                    let mean = (diff + if diff >= 0 { 32 } else { -32 }) / 64;
+                    for y in 0..8 {
+                        for x in 0..8 {
+                            shifted[y * 8 + x] = S::from_i32((p[at + y * w + x].to_i32() + mean).clamp(0, top));
+                        }
+                    }
+                    inter_ac += u64::from((dist.satd)(block, w, &shifted, 8, 8, 8));
+                    dc += u64::from(mean.unsigned_abs());
                 }
             }
         }
         let shift = bit_depth.saturating_sub(8);
-        let (intra, inter) = (intra >> shift, inter >> shift);
-        PicCost { intra, inter: if prev.is_some() { inter } else { intra } }
+        let (intra, inter, inter_ac, dc) = (intra >> shift, inter >> shift, inter_ac >> shift, dc >> shift);
+        match prev {
+            Some(_) => PicCost { intra, inter, inter_ac, dc },
+            None => PicCost { intra, inter: intra, inter_ac: intra, dc: 0 },
+        }
     }
 }
 
@@ -2909,6 +2982,61 @@ mod tests {
             let (lo, hi) = (a.min(b) as f64, a.max(b) as f64);
             assert!(hi / lo < 1.01, "{name}: 8-bit {a} against 10-bit {b}");
         }
+    }
+
+    /// The lookahead tells a brightness step from the rest of a change. A
+    /// picture that is the one before it five levels darker everywhere
+    /// costs exactly the SATD's price of the step — 32 units per level per
+    /// 8x8 block — and nothing once the step is matched; the same picture
+    /// moved one sample sideways keeps most of its cost with the step
+    /// matched.
+    /// At 10 bits, in 8-bit units like every other cost.
+    #[test]
+    fn a_brightness_step_is_measured_apart_from_the_rest_of_the_change() {
+        let (w, h) = (64usize, 64usize);
+        let blocks = (w / 8 * (h / 8)) as u64;
+        let pic = |dx: usize| -> Vec<u8> { (0..w * h).map(|i| (40 + ((i % w + dx) * 7 + (i / w) * 3) % 150) as u8).collect() };
+        let prev = pic(0);
+        let darker: Vec<u8> = prev.iter().map(|&s| s - 5).collect();
+        let fade = PicCost::measure(&darker, w, h, Some(&prev[..]), 8);
+        assert_eq!((fade.inter, fade.inter_ac, fade.dc), (32 * 5 * blocks, 0, 5 * blocks), "a uniform step: {fade:?}");
+
+        let moved = PicCost::measure(&pic(1), w, h, Some(&prev[..]), 8);
+        assert!(moved.inter_ac > 10_000 && 32 * moved.dc < moved.inter_ac / 4, "motion is mostly not a brightness step: {moved:?}");
+
+        let widen = |p: &[u8]| p.iter().map(|&s| u16::from(s) << 2).collect::<Vec<u16>>();
+        let fade10 = PicCost::measure(&widen(&darker), w, h, Some(&widen(&prev)[..]), 10);
+        assert_eq!((fade10.inter, fade10.inter_ac, fade10.dc), (fade.inter, fade.inter_ac, fade.dc), "10-bit: {fade10:?}");
+
+        let first = PicCost::measure(&prev, w, h, None, 8);
+        assert_eq!((first.inter, first.inter_ac, first.dc), (first.intra, first.intra, 0), "no previous picture: {first:?}");
+    }
+
+    /// The intra cap on an inter picture's planning cost is dropped
+    /// exactly when the change, its brightness step priced at 16 per level,
+    /// fits under the intra cost — and never under weighted prediction,
+    /// which takes the step out itself. A picture cheaper to predict than
+    /// to code intra is planned at its inter cost either way, held above
+    /// the reference's noise.
+    #[test]
+    fn the_intra_cap_is_dropped_exactly_when_the_change_is_a_brightness_step() {
+        // qp_ref 21: the noise floor is 0.14 * 2^-2 = 0.035 of intra, far
+        // under every inter cost here.
+        let step = |inter_ac: u64, dc: u64| PicCost { intra: 1000, inter: 3000, inter_ac, dc };
+        assert_eq!(step(200, 50).inter_cost(21, false), 3000, "200 + 16 * 50 = 1000: a step, uncapped");
+        assert_eq!(step(200, 51).inter_cost(21, false), 1000, "200 + 16 * 51 = 1016: more than a step, capped");
+        assert_eq!(step(1001, 0).inter_cost(21, false), 1000, "no step at all, and dearer than intra: capped");
+        assert_eq!(step(0, 62).inter_cost(21, false), 3000, "all step: uncapped");
+        assert_eq!(step(0, 63).inter_cost(21, false), 1000, "16 * 63 = 1008: capped");
+        for (ac, dc) in [(200, 50), (0, 62)] {
+            assert_eq!(step(ac, dc).inter_cost(21, true), 1000, "weighted prediction keeps the cap ({ac}, {dc})");
+        }
+        let cheap = PicCost { intra: 5000, inter: 3000, inter_ac: 2900, dc: 100 };
+        for weighted in [false, true] {
+            assert_eq!(cheap.inter_cost(21, weighted), 3000, "cheaper than intra: the inter cost (weighted {weighted})");
+        }
+        let held = PicCost { intra: 100_000, inter: 0, inter_ac: 0, dc: 0 };
+        assert_eq!(held.inter_cost(45, false), 14_000, "a held picture is planned at the reference's noise");
     }
 
     /// Pictures whose four CTBs differ sharply in variance — flat, a
