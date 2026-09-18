@@ -165,11 +165,12 @@ impl Geometry {
 /// Whether a coded luma picture of `width` by `height` exceeds level 4.1's
 /// limits (A.4.1, Table A.8): more than `MaxLumaPs` = 2,228,224 samples, or
 /// a side longer than `sqrt(8 * MaxLumaPs)`, 4222. Only levels 5 and up
-/// admit such a picture, and they require a CTB of 32 or more.
+/// admit such a picture, and they require a CTB of 32 or more. Read off
+/// the level table the parameter sets' level is chosen from
+/// (`encode::level`), so the two cannot disagree about where level 4.1
+/// ends.
 fn beyond_level_4_1(width: u32, height: u32) -> bool {
-    const MAX_LUMA_PS: u64 = 2_228_224;
-    const MAX_SIDE: u32 = 4222;
-    u64::from(width) * u64::from(height) > MAX_LUMA_PS || width > MAX_SIDE || height > MAX_SIDE
+    crate::encode::level::h265_beyond_ctb16(width, height)
 }
 
 fn chroma_idc(c: ChromaFormat) -> u32 {

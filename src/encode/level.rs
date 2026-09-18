@@ -99,15 +99,18 @@
 //!
 //! # What is not checked here
 //!
-//! Some limits constrain the encoder's *decisions*, not its parameters,
-//! and choosing a level cannot satisfy them:
-//!
-//! - H.264 `MaxVmvR`, the vertical motion vector range.
-//! - H.264 `MaxMvsPer2Mb` and `MinLumaBiPredSize` (level 3 and above:
-//!   sub-8x8 partitions, bi-predicted ones especially).
-//! - The per-picture `MinCR` / `MinCr` bound for anything but lossless.
-//!
-//! They applied equally to the constant these encoders used to write.
+//! - **The rate of a constant-quantiser stream.** See above: no bound
+//!   below the raw rate can be justified, so it is left to the caller's
+//!   quantiser, as x264 and x265 leave it without a VBV.
+//! - **The per-picture `MinCR` / `MinCr` bound** for anything but
+//!   lossless. At a declared buffer each picture is held to the buffer
+//!   instead, which `h26xhrd` checks.
+//! - **The buffer against the level.** `h26xhrd` (examples/) walks the
+//!   coded picture buffer the stream *declares* and nothing else. It does
+//!   not compare that buffer with the level's `MaxBR` / `MaxCPB`. The
+//!   derivation here keeps the declared `BitRate` and `CpbSize` within
+//!   the VCL factor times those limits by construction, so a stream that
+//!   passes `h26xhrd` also meets its level's rate limits.
 
 use crate::Result;
 use crate::encode::h264_syntax;
@@ -374,6 +377,34 @@ const H265_LEVELS: [H265Row; 13] = [
     h265_row(186, "6.2", 35_651_584, [240_000, 800_000], 4_278_190_080, [240_000, 800_000], [6, 4]),
 ];
 
+impl H265Row {
+    /// A.4.1(a) to (c): what a coded luma picture of `width` by `height`
+    /// breaks at this level, if anything.
+    fn picture_exceeds(&self, width: u64, height: u64) -> Option<String> {
+        if width * height > self.max_luma_ps {
+            Some(format!("{} luma samples a picture is above MaxLumaPs {}", width * height, self.max_luma_ps))
+        } else if width * width > 8 * self.max_luma_ps || height * height > 8 * self.max_luma_ps {
+            Some(format!("{width}x{height} exceeds Sqrt(MaxLumaPs * 8) on a side"))
+        } else {
+            None
+        }
+    }
+}
+
+/// `general_level_idc` of the lowest level that requires a coding tree
+/// block of 32 or more (A.4.1(d)): level 5.
+const H265_CTB_32_FROM: u8 = 150;
+
+/// Whether a coded luma picture of `width` by `height` is too large for
+/// every level that still admits a 16x16 coding tree block — beyond level
+/// 4.1's `MaxLumaPs` or its longest side (A.4.1(a) to (c)) — so that only
+/// a CTB of 32 or more can code it at any level at all (A.4.1(d)).
+/// `h265_syntax::Geometry::new` asks this before it takes a 16x16 CTB.
+pub(crate) fn h265_beyond_ctb16(width: u32, height: u32) -> bool {
+    let top = H265_LEVELS.iter().rev().find(|row| row.idc < H265_CTB_32_FROM).expect("levels below 5 are in the table");
+    top.picture_exceeds(u64::from(width), u64::from(height)).is_some()
+}
+
 /// Level 8.5 (A.4.1): the label for a stream beyond every other level,
 /// which the standard requires to be High tier.
 const H265_LEVEL_8_5: Level = Level { idc: 255, high_tier: true, name: "8.5" };
@@ -484,19 +515,13 @@ impl H265Stream {
         if self.fps > 300 {
             why.push(format!("{} pictures/s is above the 300 fR allows", self.fps));
         }
-        // A.4.1(a) to (c).
-        if pic > row.max_luma_ps {
-            why.push(format!("{pic} luma samples a picture is above MaxLumaPs {}", row.max_luma_ps));
-        }
-        if self.width * self.width > 8 * row.max_luma_ps || self.height * self.height > 8 * row.max_luma_ps {
-            why.push(format!("{}x{} exceeds Sqrt(MaxLumaPs * 8) on a side", self.width, self.height));
-        }
+        why.extend(row.picture_exceeds(self.width, self.height));
         // A.4.2(a).
         if pic * self.fps > row.max_luma_sr {
             why.push(format!("{} luma samples/s is above MaxLumaSr {}", pic * self.fps, row.max_luma_sr));
         }
         // A.4.1(d).
-        if row.idc >= 150 && self.ctb < 32 {
+        if row.idc >= H265_CTB_32_FROM && self.ctb < 32 {
             why.push(format!("a {}x{0} coding tree block is below the 32 level 5 and up require", self.ctb));
         }
         // A.4.1(e).
@@ -730,11 +755,47 @@ mod tests {
     }
 
     /// A.4.1(d): level 5 and up need a 32 or 64 coding tree block. A 2160p
-    /// picture in 16x16 blocks is beyond every level, and is labelled 8.5.
+    /// picture in 16x16 blocks would be beyond every level — labelled 8.5 —
+    /// and the encoder's geometry never builds one: at every coding tree
+    /// depth, whole CTBs or the quadtree's, 2160p codes in 32x32 CTBs and
+    /// claims level 5 at 30 pictures a second, 5.1 at 60.
     #[test]
     fn h265_a_16x16_ctb_cannot_claim_level_5() {
         assert_eq!(h265_with(&cfg(3840, 2160, 30), Some(4)), H265_LEVEL_8_5);
         assert_eq!(h265_with(&cfg(1920, 1080, 30), Some(4)).name, "4", "below level 5 any CTB will do");
+        for depth in [Some(0), Some(1), None] {
+            for (fps, want) in [(30, "5"), (60, "5.1")] {
+                let c = Config { max_cu_depth: depth, ..cfg(3840, 2160, fps) };
+                assert_eq!(h265_syntax::Geometry::new(&c).log2_ctb, 5, "2160p cu depth {depth:?}");
+                assert_eq!(h265_name(&c), want, "2160p{fps} cu depth {depth:?}");
+            }
+        }
+    }
+
+    /// `Geometry::new` asks the level table where a 16x16 CTB stops being
+    /// possible, and the answer is where level 4.1 ends: the largest
+    /// picture at level 4.1, and one macroblock row or column past it,
+    /// each way the limit can be crossed — `MaxLumaPs` 2,228,224 (2048x1088
+    /// is exactly that) and the longest side, Sqrt(8 * MaxLumaPs) = 4222.
+    #[test]
+    fn h265_ctb16_stops_where_level_4_1_does() {
+        for (w, h, beyond) in [
+            (2048, 1088, false),
+            (2048, 1096, true),
+            (4222, 8, false),
+            (4224, 8, true),
+            (8, 4222, false),
+            (8, 4224, true),
+        ] {
+            assert_eq!(h265_beyond_ctb16(w, h), beyond, "{w}x{h}");
+            // The same picture in 16x16 CTBs, at one picture a second so
+            // that only its size decides: level 4.1 or below, or none.
+            let c = Config { max_cu_depth: Some(0), ..cfg(w, h, 1) };
+            let mut g = h265_syntax::Geometry::new(&c);
+            (g.log2_ctb, g.coded_width, g.coded_height) = (4, w, h);
+            let l = h265(&c, &g);
+            assert_eq!(l == H265_LEVEL_8_5, beyond, "{w}x{h} in 16x16 CTBs claims level {}", l.name);
+        }
     }
 
     /// `MaxDpbSize` (Equation A-2) against `sps_max_dec_pic_buffering`:
