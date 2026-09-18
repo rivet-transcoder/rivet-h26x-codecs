@@ -1069,9 +1069,14 @@ impl<S: Sample> Core<S> {
     /// alone, and the stream came out 2 to 3% larger than one weighted
     /// throughout (rivet's 640x360 fade). So a P picture's table is priced
     /// only when no fit in it is strong ([`h265_wp::PlaneFit::strong`]: it
-    /// removes at least half the zero-motion SAD) — a fade's fits are, the
-    /// drift a coarse reconstruction takes on pans and zooms is not (its
-    /// fits remove 2 to 21%) — and a strong fit is kept as it stands.
+    /// removes at least 30% of the zero-motion SAD) — a fade's fits mostly
+    /// are, the drift a coarse reconstruction takes on pans and zooms is not
+    /// (its fits remove 2 to 21%) — and a strong fit is kept as it stands.
+    /// Where the line sits was measured on that fade and on the pans, zooms
+    /// and cut: at 50% the fade's QP 45 point still came out 2.8% larger;
+    /// at 70% it is within 0.4%, the fade's BD-rate against pricing every
+    /// table improves by 0.2 to 0.7%, and the non-fade cells are where
+    /// pricing every table put them; at 90% the fade gains nothing.
     fn code_attempt(&self, c: &Coded, src: &[S], qp: u8) -> Result<Attempt<S>> {
         let fitted = self.code_attempt_weighted(c, src, qp, true)?;
         if !fitted.motion.weighting.on || fitted.strong_fit {
@@ -2902,10 +2907,9 @@ mod tests {
     }
 
     /// A P picture's fitted table is priced against the defaults only when
-    /// no fit in it is strong. At QP 26 the fade's P fits all remove most
-    /// of the zero-motion residual: every P picture takes its table, and
-    /// none is coded twice. At QP 40, over a coarser keyframe, some of
-    /// them fall short of strong and are priced — and win. A textured
+    /// no fit in it is strong. The fade's P fits all remove most of the
+    /// zero-motion residual, at QP 26 and over QP 40's coarser keyframe:
+    /// every P picture takes its table, and none is coded twice. A textured
     /// picture moving three samples a frame does not change brightness,
     /// but its fit against a reconstruction still lowers the zero-motion
     /// residual by the few percent that count as used: each such table is
@@ -2931,11 +2935,11 @@ mod tests {
             e.shape_census().clone()
         };
         let fade = fade_frames(ChromaFormat::Yuv420, 8, 12);
-        let c = census(&fade, 26);
-        assert!(c.wp_on[1] > 0, "fade QP 26: no P picture took its table: {c:?}");
-        assert_eq!(c.wp_priced[1], 0, "fade QP 26: a strong fit was priced: {c:?}");
-        let c = census(&fade, 40);
-        assert!(c.wp_priced[1] > 0 && c.wp_rd_default[1] == 0, "fade QP 40: the priced tables should all win: {c:?}");
+        for qp in [26u8, 40] {
+            let c = census(&fade, qp);
+            assert!(c.wp_on[1] > 0, "fade QP {qp}: no P picture took its table: {c:?}");
+            assert_eq!(c.wp_priced[1], 0, "fade QP {qp}: a strong fit was priced: {c:?}");
+        }
         let moving = census(&woven_frames(64, 64, ChromaFormat::Yuv420, 8, 12, 0), 26);
         assert!(moving.wp_priced[1] > 0, "moving texture: no weak fit was priced: {moving:?}");
         assert!(moving.wp_rd_default[1] > 0, "moving texture: every weak fit beat the defaults: {moving:?}");

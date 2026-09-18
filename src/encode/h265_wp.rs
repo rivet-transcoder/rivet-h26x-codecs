@@ -103,13 +103,14 @@ impl PlaneFit {
         (self.weight != 1 << self.log2_denom || self.offset != 0) && (self.sad_weighted as f64) < self.sad_plain as f64 * (1.0 - MIN_GAIN)
     }
 
-    /// Whether the fit is used and removes at least half the plain SAD —
+    /// Whether the fit is used and removes at least 30% of the plain SAD —
     /// what a real change of brightness does and a reconstruction merely
-    /// drifting in level from its source does not. H.264's P pictures keep
-    /// such a fit without pricing it against the defaults (see
+    /// drifting in level from its source does not (such fits remove 2 to
+    /// 21% on the pans, zooms and cut measured). H.264's P pictures keep
+    /// a strong fit without pricing it against the defaults (see
     /// `encode::h264`'s `code_attempt`).
     pub(crate) fn strong(&self) -> bool {
-        self.used() && (self.sad_weighted as f64) < self.sad_plain as f64 * 0.5
+        self.used() && (self.sad_weighted as f64) < self.sad_plain as f64 * 0.7
     }
 
     /// The identity: default weighting, never [`PlaneFit::used`].
