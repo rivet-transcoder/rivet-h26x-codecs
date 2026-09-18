@@ -72,16 +72,18 @@
 //! reason: the deblocking filters, the inverse transform and the 14-bit
 //! second stage are sample-size independent, and `install_u16` installs
 //! the very same fn items for them. The u16 kernels mirror that file's
-//! `kernels_u16!` widening choices — see the section comment. One
-//! extension past x86 parity: **fused MC for u16**. No x86 or NEON rung
-//! installs it (their u8 fused paths bake the bit-8 shifts in and the
-//! 16-bit tables run two-pass); here the output-stage constants travel in
-//! `Out16` at runtime, so 10/12-bit decode gets the same
-//! straight-out-of-the-filter path the 8-bit tier got.
+//! `kernels_u16!` widening choices — see the section comment.
 //!
-//! What stays on the scalar reference, deliberately: **`idst4`** and the
-//! 4x4 IDCT — the scalar butterfly is 4 lines (`hevc_x86_128.rs` reaches
-//! the same verdict for the 4x4).
+//! **Fused MC for u16**: the output-stage
+//! constants travel in `Out16` at runtime, so 10/12-bit decode gets the
+//! same straight-out-of-the-filter path the 8-bit tier got (the x86 rungs
+//! took the same design since).
+//!
+//! **The 4x4 inverse DCT and DST** are two `i32x4_dot_i16x8` per output
+//! over interleaved coefficient pairs, with an i16 transpose between the
+//! stages and after, as in `hevc_x86_128.rs`: the scalar 4x4 clears a
+//! 32x32 scratch on every call and is many times slower than its four
+//! lines suggest.
 //!
 //! There is one rung here, not four: `simd128` is a compile-time target
 //! feature, so this module is compiled only when it holds, and
@@ -132,7 +134,7 @@ pub fn install(d: &mut HevcDsp<u8>) {
     d.deblock_luma_h = deblock_luma_h;
     d.deblock_chroma_v = deblock_chroma_v;
     d.deblock_chroma_h = deblock_chroma_h;
-    // idst4 keeps the scalar reference — see the module header for why.
+    d.idst4 = idst4;
 }
 
 /// Replace the scalar entries of `d` with the simd128 kernels (16-bit
@@ -167,7 +169,7 @@ pub fn install_u16(d: &mut HevcDsp<u16>) {
     d.deblock_luma_h = deblock_luma_h16;
     d.deblock_chroma_v = deblock_chroma_v16;
     d.deblock_chroma_h = deblock_chroma_h16;
-    // idst4 keeps the scalar reference — see the module header for why.
+    d.idst4 = idst4;
 }
 
 
@@ -1002,10 +1004,64 @@ fn idct<const N: usize>(coeffs: &mut [i16], bd_shift: i32, max_x: usize, max_y: 
         return;
     }
     if N == 4 {
-        // Not worth a vector: the scalar butterfly is 4 lines.
-        return (HevcDsp::<u8>::SCALAR.idct[0])(coeffs, bd_shift, max_x, max_y);
+        return inv4(coeffs, bd_shift, &DCT4);
     }
     unsafe { idct_impl::<N>(coeffs, bd_shift, max_x, max_y) }
+}
+
+/// The 4x4 DCT basis, `TRANSFORM32` at every eighth row.
+const DCT4: [[i16; 4]; 4] = [[64, 64, 64, 64], [83, 36, -36, -83], [64, -64, -64, 64], [36, -83, 83, -36]];
+/// The 4x4 DST basis (8.6.4.2, `trType == 1`).
+const DST4: [[i16; 4]; 4] = [[29, 55, 74, 84], [74, 74, 0, -74], [84, -29, -74, 55], [55, -84, 74, -29]];
+
+/// The 4x4 inverse DST (intra luma 4x4).
+fn idst4(coeffs: &mut [i16], bd_shift: i32, _max_x: usize, _max_y: usize) {
+    inv4(coeffs, bd_shift, &DST4)
+}
+
+/// One stage of a 4-point inverse transform over four vectors of four i16
+/// (`r[j]`, coefficient `j` of four lines): output `i` of each line is
+/// `sum_j m[j][i] * r[j]`, two dot products over the interleaved pairs
+/// `(r0, r1)` and `(r2, r3)`, rounded, shifted and narrowed with the
+/// saturation that is the reference's 16-bit clip. Outputs `[0 | 1]` and
+/// `[2 | 3]`.
+#[inline]
+fn inv4_stage(r: [v128; 4], m: &[[i16; 4]; 4], round: v128, shift: u32) -> (v128, v128) {
+    let p01 = zip_lo16(r[0], r[1]);
+    let p23 = zip_lo16(r[2], r[3]);
+    let out = |i: usize| {
+        let a = i32x4_dot_i16x8(p01, i32x4_splat(pair16(m[0][i], m[1][i])));
+        let b = i32x4_dot_i16x8(p23, i32x4_splat(pair16(m[2][i], m[3][i])));
+        i32x4_shr(i32x4_add(i32x4_add(a, b), round), shift)
+    };
+    (i16x8_narrow_i32x4(out(0), out(1)), i16x8_narrow_i32x4(out(2), out(3)))
+}
+
+/// The columns of the 4x4 i16 block `[row0 | row1]`, `[row2 | row3]`, one
+/// each in the low half of a vector.
+#[inline]
+fn columns4(a: v128, b: v128) -> [v128; 4] {
+    let u = zip_lo16(a, b);
+    let v = zip_hi16(a, b);
+    let c01 = zip_lo16(u, v);
+    let c23 = zip_hi16(u, v);
+    [c01, i64x2_shuffle::<1, 1>(c01, c01), c23, i64x2_shuffle::<1, 1>(c23, c23)]
+}
+
+/// Both stages of the 4x4 inverse transform with basis `m`: columns, the
+/// 16-bit clip, rows (on the transposed intermediate, so one more
+/// transpose puts the result back in raster order).
+fn inv4(coeffs: &mut [i16], bd_shift: i32, m: &[[i16; 4]; 4]) {
+    assert!(coeffs.len() >= 16 && (1..=31).contains(&bd_shift));
+    unsafe {
+        let c = coeffs.as_mut_ptr();
+        let row = |j: usize| v128_load64_zero(c.add(4 * j) as *const u64);
+        let (a, b) = inv4_stage([row(0), row(1), row(2), row(3)], m, i32x4_splat(64), 7);
+        let (a, b) = inv4_stage(columns4(a, b), m, i32x4_splat(1 << (bd_shift - 1)), bd_shift as u32);
+        let r = columns4(a, b);
+        v128_store(c as *mut v128, i64x2_shuffle::<0, 2>(r[0], r[1]));
+        v128_store(c.add(8) as *mut v128, i64x2_shuffle::<0, 2>(r[2], r[3]));
+    }
 }
 
 unsafe fn idct_impl<const N: usize>(coeffs: &mut [i16], bd_shift: i32, max_x: usize, max_y: usize) {
