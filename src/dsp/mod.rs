@@ -48,6 +48,8 @@ pub(crate) mod distortion_x86;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod distortion_x86_u16;
 #[cfg(target_arch = "x86_64")]
+pub(crate) mod h264_enc_x86;
+#[cfg(target_arch = "x86_64")]
 pub(crate) mod hevc_enc_x86;
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod distortion_neon;

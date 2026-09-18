@@ -98,13 +98,18 @@ impl H264EncDsp {
         quant8: quant8_scalar,
     };
 
-    /// The best table for `cpu`. No rung replaces anything yet: which of
-    /// these is worth hand-writing is a question for a profile of a real
-    /// encoder, not for a guess, and the ladder lets them arrive one at a
-    /// time.
+    /// The best table for `cpu`: the scalar reference, then each rung of
+    /// the ladder replacing the entries it has a kernel for. x86 only so
+    /// far; the chroma DC Hadamards stay scalar everywhere (see
+    /// `super::h264_enc_x86`).
     pub fn new(cpu: Cpu) -> Self {
         let mut d = Self::SCALAR;
         d.cpu = cpu;
+        #[allow(unused_variables)]
+        if !super::enc_simd_disabled("h264_enc") {
+            #[cfg(target_arch = "x86_64")]
+            super::h264_enc_x86::install(&mut d, cpu);
+        }
         d
     }
 }
@@ -259,7 +264,7 @@ fn hadamard2x4_scalar(dc: &mut [i32; 8]) {
 // Quantisation
 // ----------------------------------------------------------------------
 
-fn quant4_scalar(coeffs: &[i32; 16], levels: &mut [i16; 16], mf: &[i32; 16], qbits: u32, offset: i32) -> u32 {
+pub(crate) fn quant4_scalar(coeffs: &[i32; 16], levels: &mut [i16; 16], mf: &[i32; 16], qbits: u32, offset: i32) -> u32 {
     let mut nz = 0;
     for i in 0..16 {
         let c = coeffs[i];
@@ -271,7 +276,7 @@ fn quant4_scalar(coeffs: &[i32; 16], levels: &mut [i16; 16], mf: &[i32; 16], qbi
     nz
 }
 
-fn quant8_scalar(coeffs: &[i32; 64], levels: &mut [i16; 64], mf: &[i32; 64], qbits: u32, offset: i32) -> u32 {
+pub(crate) fn quant8_scalar(coeffs: &[i32; 64], levels: &mut [i16; 64], mf: &[i32; 64], qbits: u32, offset: i32) -> u32 {
     let mut nz = 0;
     for i in 0..64 {
         let c = coeffs[i];
