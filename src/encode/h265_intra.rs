@@ -424,7 +424,7 @@ impl Geo {
     /// `w4` that disagrees with the picture silently corrupts every
     /// availability answer instead of failing.
     pub(crate) fn new(log2_ctb: u32, width: usize, height: usize, cat: u32) -> Self {
-        Geo { log2_ctb, wc: width >> log2_ctb, w4: width / 4, width, height, cat }
+        Geo { log2_ctb, wc: width.div_ceil(1 << log2_ctb), w4: width / 4, width, height, cat }
     }
 }
 
@@ -485,8 +485,10 @@ impl<S: Sample> IntraPicture<S> {
     /// model yet are refused by name rather than mis-coded.
     pub fn new_with_chroma(width: usize, height: usize, log2_cu: u32, bit_depth: u32, chroma: ChromaFormat) -> Self {
         assert!((3..=5).contains(&log2_cu), "log2_cu {log2_cu} outside 3..=5");
-        let n = 1usize << log2_cu;
-        assert!(width.is_multiple_of(n) && height.is_multiple_of(n), "{width}x{height} is not a whole number of {n}x{n} CTUs");
+        // Whole minimum coding blocks; the CTBs along the right and bottom
+        // edges may be partial, which only the coding quadtree codes.
+        let m = 1usize << MIN_CB_LOG2;
+        assert!(width.is_multiple_of(m) && height.is_multiple_of(m), "{width}x{height} is not a whole number of {m}x{m} coding blocks");
         let cat = match chroma {
             ChromaFormat::Monochrome => 0,
             ChromaFormat::Yuv420 => 1,
@@ -602,6 +604,23 @@ impl<S: Sample> IntraPicture<S> {
         src: &Srcs<'_, S>,
         out: &mut Vec<TreeCu<CuDecision>>,
     ) -> f64 {
+        // A node crossing the picture edge is never coded whole and carries
+        // no `split_cu_flag`: the reader infers the split and visits only
+        // the children that start inside the picture. The coded size is a
+        // multiple of the 8x8 minimum coding block, so every chain of such
+        // splits ends in units wholly inside.
+        let size = 1usize << log2;
+        if x0 + size > self.geo.width || y0 + size > self.geo.height {
+            let half = size / 2;
+            let mut j = 0.0;
+            for i in 0..4 {
+                let (x, y) = (x0 + (i & 1) * half, y0 + (i >> 1) * half);
+                if x < self.geo.width && y < self.geo.height {
+                    j += self.tree_node(ctx, want, max_depth, x, y, log2 - 1, depth + 1, src, out);
+                }
+            }
+            return j;
+        }
         let qp = want(x0, y0, log2);
         let cctx = IntraCtx { qp, ..*ctx };
         let lam = ssd_lambda(qp, ctx.bit_depth);

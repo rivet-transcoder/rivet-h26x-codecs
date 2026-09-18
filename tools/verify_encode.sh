@@ -395,24 +395,32 @@ EXCLUSIVE_TOKENS="ilace fdeep wsine"
 # untagged hevc row exercises it; the `hevc*-cu0-*` rows (`--cu-depth 0`)
 # keep the whole-CTB path — the geometry of every stream before the
 # quadtree — under the same properties, and `hevc-cu1-ipb` the one-split
-# depth. Which clip carries what is worth knowing. Depth 2 (8x8 units,
-# PART_NxN) is reachable only on 32x32 CTBs: the odd clip's 16x16 CTBs stop at depth
-# 1 whatever the row asks, and grad's smooth gradients split almost nowhere
-# (its cells prove the syntax). detail, motion, cut and fade split at every
-# depth in every picture kind; NxN is taken on every clip in I pictures and
-# on seven of them inside P/B. The @big clip, src_big_256x160_420p8 — the
+# depth. Which clip carries what is worth knowing. Under the quadtree the CTB
+# is 32x32 and the coded picture the smallest legal size, partial CTBs
+# along the right and bottom edges — except below 64 both ways, where every
+# row keeps whole CTBs, 16 or 32 by least padding (`Geometry::new` has the
+# measurement that exception is fitted to). So the odd clip (50x34) codes
+# whole 16x16 CTBs (64x48) in every row, where the quadtree stops at depth
+# 1 whatever the row asks. grad's smooth gradients split almost nowhere
+# (its cells prove the syntax). detail, motion, cut and fade split at
+# every depth in every picture kind; NxN is taken on every clip in I pictures
+# and on seven of them inside P/B. The @big clip, src_big_256x160_420p8 — the
 # one clip larger than 64x64, forty CTBs of four unrelated contents — is
 # spelled with a depth token so every row without an `@` skips it (the deep
 # clips' rule); its `hevc-cu0-*@big` rows are the depth-0 twins of the
-# `hevc-cu2-*@big` ones.
+# `hevc-cu2-*@big` ones. The @edge clip, src_edge_88x44_420p8 (coded 88x48),
+# is the one partial-CTB clip: a bottom row 16 high, the remainder 1280x720
+# and 3840x2160 leave, beside a right column 24 wide. Its `hevc-cu1-edge-ipb`
+# row splits past its depth where the edge forces it, and
+# `hevc-cu0-edge-ipb` is the whole-CTB geometry (16x16 CTBs, 96x48).
 #
 # The quadtree's mutations, each run once against these rows: the split
 # decision ignored by the writer, the split_cu_flag neighbour context
 # reported at depth 0, and the quantiser prediction read at the unit
-# instead of its quantisation group all fail SELF (the last is invisible
-# on the odd clip, whose 8x8 groups are the minimum unit — the AQ rows on
-# detail, cut and @big carry it); 4:4:4 PART_NxN's four chroma modes
-# written in reverse fails SELF on the 4:4:4 clips.
+# instead of its quantisation group all fail SELF (the last on 5 of 7 AQ
+# cells, on cut, detail and @big; it is invisible on the odd clip, whose
+# 8x8 groups on 16x16 CTBs are the minimum unit); 4:4:4 PART_NxN's four
+# chroma modes written in reverse fails SELF on the 4:4:4 clips.
 #
 # Nothing below this line may be a comment. CONFIGS is a quoted string, so
 # a leading # is data: the reader takes the whole line as a configuration
@@ -670,6 +678,13 @@ hevc-cu2-intra@big|--codec h265 --qp 26 --gop 0 --cu-depth 2
 hevc-cu2-ipb@big|--codec h265 --qp 26 --gop 8 --bframes 2 --cu-depth 2
 hevc-cu2-aq40-ipb@big|--codec h265 --qp 40 --gop 8 --bframes 2 --aq 1.0 --cu-depth 2
 hevc-cu2-40-sao-ip@big|--codec h265 --qp 40 --gop 8 --sao --cu-depth 2
+hevc-edge-intra@edge|--codec h265 --qp 26 --gop 0
+hevc-edge-ipb@edge|--codec h265 --qp 26 --gop 8 --bframes 2
+hevc-edge-40-sao-ip@edge|--codec h265 --qp 40 --gop 8 --sao
+hevc-edge-aq40-ipb@edge|--codec h265 --qp 40 --gop 8 --bframes 2 --aq 1.0
+hevc-edge-lossless-ip@edge|--codec h265 --lossless --gop 8
+hevc-cu1-edge-ipb@edge|--codec h265 --qp 26 --gop 8 --bframes 2 --cu-depth 1
+hevc-cu0-edge-ipb@edge|--codec h265 --qp 26 --gop 8 --bframes 2 --cu-depth 0
 hevc-wp40-ipb|--codec h265 --qp 40 --gop 8 --bframes 2 --wpred
 hevc-wp-sao-ipb|--codec h265 --qp 26 --gop 8 --bframes 2 --sao --wpred
 hevc10-wp-ipb@p10|--codec h265 --qp 26 --gop 8 --bframes 2 --wpred

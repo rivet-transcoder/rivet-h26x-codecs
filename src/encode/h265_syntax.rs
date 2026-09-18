@@ -89,33 +89,63 @@ pub struct Geometry {
 impl Geometry {
     /// Derive the coded geometry from a configuration.
     ///
-    /// The CTU size is chosen rather than configured: 64x64 unless the
-    /// picture is smaller than that, because a CTU larger than the picture is
-    /// legal but wastes header bits describing a tree that cannot split.
+    /// The CTB size is chosen rather than configured. Where the coding
+    /// quadtree may split (`max_cu_depth` above 0, the default), the CTB is
+    /// 32x32 and the coded picture is the smallest legal one, a whole number
+    /// of 8x8 minimum coding blocks: the CTBs along the right and bottom
+    /// edges are partial, and the tree decisions and the writer produce the
+    /// splits the reader infers there (`tree_steps` in `encode::h265`).
+    /// Otherwise the coded picture is a whole number of CTBs, 16 or 32,
+    /// whichever pads less, the larger on a tie — the geometry every stream
+    /// had before partial CTBs. That is the rule at `max_cu_depth` 0, where
+    /// a whole-CTB unit cannot be partial, and, under the quadtree, for a
+    /// picture narrower *and* shorter than 64.
+    ///
+    /// That size exception is fitted to one measured clip, not derived.
+    /// The 50x34 gate clip coded as partial 32x32 CTBs (56x40) against the
+    /// whole 16x16 ones (64x48), per-plane YUV BD-rate at QP 22-40 (34-43
+    /// in brackets): IP +1.08% (+1.66%), IPB +1.33% (+3.74%), AQ IP +8.58%
+    /// (+11.75%), AQ IPB +7.51% (+11.40%), all-intra -0.56% (-0.62%). 32x32
+    /// CTBs padded to whole ones (64x64) lost as much in AQ (IP +11.1%, IPB
+    /// +10.6% at QP 22-40), so the AQ loss is CTB 32 with adaptive
+    /// quantisation on a picture that small, not the partial geometry. The
+    /// 88x44 gate clip, partial 32x32 CTBs against whole 16x16 ones, gains
+    /// in every family measured (IP -7.6%, AQ IP -6.0% YUV at QP 22-40), as
+    /// do 1280x720 and 3840x2160 (the module doc of `encode::h265`). No
+    /// picture between 50x34 and 88x44 was measured: 64 is where the rule
+    /// was drawn, not where the loss was found to end.
+    ///
+    /// The whole-CTB rule never takes 16 where the picture 16x16 CTBs would
+    /// code is beyond level 4.1 (`beyond_level_4_1`). Levels 5 and above
+    /// require a CTB of at least 32 (A.4.1 d), so such a stream would fit
+    /// no level at all. 3840x2160 at `max_cu_depth` 0 was one: CTB 16 pads
+    /// nothing there, so the rule took it. It now codes 3840x2176 in 32x32
+    /// CTBs. Under the quadtree the CTB is 32 anyway, and the small-picture
+    /// exception never gets near the limit.
+    ///
+    /// The conformance window crops whatever is coded beyond the requested
+    /// size. The standard's CTB floor is 16 (an 8x8 CTB is illegal — this
+    /// crate's own SPS parser rejects it, which is how that constraint was
+    /// rediscovered), and the decision machinery's ceiling is 32; 64x64
+    /// CTBs are not produced.
     pub fn new(cfg: &Config) -> Self {
         let log2_min_cb = 3;
-        // The coded picture is a whole number of CTUs, with the conformance
-        // window cropping the rest — not the minimal legal size, which only
-        // needs a multiple of the minimum coding block. Whole CTUs because a
-        // partial edge CTU needs the splits the reader infers at the
-        // picture edge, which the decision machinery does not produce — it
-        // codes a whole CTB, or a quadtree of it by choice; the
-        // padding costs a few edge blocks of replicated content, and the
-        // window hides them. The standard's CTB floor is 16 (an 8x8 CTB is
-        // illegal — this crate's own SPS parser rejects it, which is how
-        // that constraint was rediscovered), and the decision machinery's
-        // ceiling is 32, so the choice is 16 or 32: whichever pads less,
-        // the larger on a tie.
-        let (log2_ctb, coded_width, coded_height) = [5u32, 4]
-            .into_iter()
-            .map(|v| {
-                let n = 1u32 << v;
-                let w = cfg.width.div_ceil(n) * n;
-                let h = cfg.height.div_ceil(n) * n;
-                (v, w, h)
-            })
-            .min_by_key(|&(v, w, h)| (w * h, u32::MAX - v))
-            .unwrap();
+        let tree = cfg.max_cu_depth.unwrap_or(crate::encode::h265::DEFAULT_CU_DEPTH) > 0;
+        let small = cfg.width < 64 && cfg.height < 64;
+        let (log2_ctb, coded_width, coded_height) = if tree && !small {
+            let m = 1u32 << log2_min_cb;
+            (5, cfg.width.div_ceil(m) * m, cfg.height.div_ceil(m) * m)
+        } else {
+            [5u32, 4]
+                .into_iter()
+                .map(|v| {
+                    let n = 1u32 << v;
+                    (v, cfg.width.div_ceil(n) * n, cfg.height.div_ceil(n) * n)
+                })
+                .filter(|&(v, w, h)| v > 4 || !beyond_level_4_1(w, h))
+                .min_by_key(|&(v, w, h)| (w * h, u32::MAX - v))
+                .unwrap()
+        };
         let ctb = 1u32 << log2_ctb;
         Self {
             log2_ctb,
@@ -130,6 +160,16 @@ impl Geometry {
             bit_depth: cfg.bit_depth,
         }
     }
+}
+
+/// Whether a coded luma picture of `width` by `height` exceeds level 4.1's
+/// limits (A.4.1, Table A.8): more than `MaxLumaPs` = 2,228,224 samples, or
+/// a side longer than `sqrt(8 * MaxLumaPs)`, 4222. Only levels 5 and up
+/// admit such a picture, and they require a CTB of 32 or more.
+fn beyond_level_4_1(width: u32, height: u32) -> bool {
+    const MAX_LUMA_PS: u64 = 2_228_224;
+    const MAX_SIDE: u32 = 4222;
+    u64::from(width) * u64::from(height) > MAX_LUMA_PS || width > MAX_SIDE || height > MAX_SIDE
 }
 
 fn chroma_idc(c: ChromaFormat) -> u32 {
@@ -1126,31 +1166,85 @@ mod tests {
         }
     }
 
+    /// Whole CTBs (50x34, below 64 both ways) and partial ones (90x34)
+    /// both crop back to the requested size.
     #[test]
     fn the_conformance_window_recovers_the_requested_size() {
-        let (cfg, g) = geom(50, 34, ChromaFormat::Yuv420);
-        assert_eq!((g.coded_width, g.coded_height), (64, 48));
-        let sps = write_sps(&cfg, &g, 8, None);
-        let parsed = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&sps)).unwrap();
-        let (l, r, t, b) = parsed.conf_win;
-        assert_eq!(g.coded_width - l - r, 50);
-        assert_eq!(g.coded_height - t - b, 34);
+        for (w, h, coded) in [(50, 34, (64, 48)), (90, 34, (96, 40))] {
+            let (cfg, g) = geom(w, h, ChromaFormat::Yuv420);
+            assert_eq!((g.coded_width, g.coded_height), coded, "{w}x{h}");
+            let sps = write_sps(&cfg, &g, 8, None);
+            let parsed = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&sps)).unwrap();
+            let (l, r, t, b) = parsed.conf_win;
+            assert_eq!((g.coded_width - l - r, g.coded_height - t - b), (w, h), "{w}x{h}");
+        }
     }
 
-    /// The coded picture is a whole number of CTUs, CTB 16 or 32 by least
-    /// padding — see `Geometry::new` for why partial edge CTUs are avoided.
+    /// Under the coding quadtree the CTB is 32 and the coded picture the
+    /// smallest legal one, whole 8x8 minimum coding blocks, whatever the
+    /// edge CTBs are left holding — unless the picture is narrower and
+    /// shorter than 64. There, and at depth 0, it is whole CTBs, 16 or 32 by
+    /// least padding. See `Geometry::new`.
     #[test]
-    fn the_coded_picture_is_whole_ctus_with_least_padding() {
-        let g = Geometry::new(&geom(64, 64, ChromaFormat::Yuv420).0);
-        assert_eq!((g.log2_ctb, g.coded_width, g.coded_height), (5, 64, 64));
-        let g = Geometry::new(&geom(48, 48, ChromaFormat::Yuv420).0);
-        assert_eq!((g.log2_ctb, g.coded_width, g.coded_height), (4, 48, 48));
+    fn the_coded_picture_is_minimal_under_the_quadtree_and_whole_ctus_at_depth_0_or_below_64() {
+        let at = |w: u32, h: u32, depth: Option<u32>| {
+            let g = Geometry::new(&Config { max_cu_depth: depth, ..geom(w, h, ChromaFormat::Yuv420).0 });
+            (g.log2_ctb, g.coded_width, g.coded_height, g.ctbs_wide, g.ctbs_high)
+        };
+        for depth in [None, Some(1), Some(2)] {
+            assert_eq!(at(64, 64, depth), (5, 64, 64, 2, 2));
+            // One side of 64 is enough to leave the exception: 16x16 CTBs
+            // would code 64x48 whole, and the quadtree codes 32x32 ones.
+            assert_eq!(at(64, 48, depth), (5, 64, 48, 2, 2));
+            assert_eq!(at(48, 64, depth), (5, 48, 64, 2, 2));
+            assert_eq!(at(88, 44, depth), (5, 88, 48, 3, 2));
+            assert_eq!(at(1280, 720, depth), (5, 1280, 720, 40, 23));
+            assert_eq!(at(1366, 768, depth), (5, 1368, 768, 43, 24));
+            assert_eq!(at(3840, 2160, depth), (5, 3840, 2160, 120, 68));
+            // Narrower and shorter than 64: the depth-0 geometry. 50x34 is
+            // the clip the exception was fitted to; 63x40 and 40x63 sit on
+            // its edge. 63x63 codes 64x64 either way, 32x32 CTBs on a tie.
+            for (w, h) in [(50, 34), (48, 48), (24, 24), (63, 63), (63, 40), (40, 63)] {
+                assert_eq!(at(w, h, depth), at(w, h, Some(0)), "{w}x{h} depth {depth:?}");
+            }
+            assert_eq!(at(50, 34, depth), (4, 64, 48, 4, 3));
+            assert_eq!(at(63, 40, depth), (4, 64, 48, 4, 3));
+            assert_eq!(at(63, 63, depth), (5, 64, 64, 2, 2));
+        }
+        assert_eq!(at(64, 64, Some(0)), (5, 64, 64, 2, 2));
+        assert_eq!(at(64, 48, Some(0)), (4, 64, 48, 4, 3));
+        assert_eq!(at(48, 48, Some(0)), (4, 48, 48, 3, 3));
         // 24x24 pads to 32x32 under either CTB size; the tie goes to 32.
-        let g = Geometry::new(&geom(24, 24, ChromaFormat::Yuv420).0);
-        assert_eq!((g.log2_ctb, g.coded_width, g.coded_height), (5, 32, 32));
+        assert_eq!(at(24, 24, Some(0)), (5, 32, 32, 1, 1));
         // 50x34: CTB 16 pads to 64x48, CTB 32 to 64x64 — 16 pads less.
-        let g = Geometry::new(&geom(50, 34, ChromaFormat::Yuv420).0);
-        assert_eq!((g.log2_ctb, g.coded_width, g.coded_height), (4, 64, 48));
+        assert_eq!(at(50, 34, Some(0)), (4, 64, 48, 4, 3));
+        assert_eq!(at(88, 44, Some(0)), (4, 96, 48, 6, 3));
+        assert_eq!(at(1280, 720, Some(0)), (4, 1280, 720, 80, 45));
+    }
+
+    /// The whole-CTB rule never codes 16x16 CTBs beyond level 4.1, where
+    /// every level requires 32 or more (A.4.1 d). Each pair sits either
+    /// side of one limit, and in each CTB 16 pads less: 2032x1088 is
+    /// 2,210,816 samples in 16x16 CTBs and 2064x1088 is 2,245,632, against
+    /// `MaxLumaPs` 2,228,224. 4208 and 4224 fall either side of the longest
+    /// side, 4222, in both directions. 3840x2160 is the size that used to
+    /// take CTB 16.
+    #[test]
+    fn whole_ctbs_are_never_16_beyond_level_4_1() {
+        let at = |w: u32, h: u32| {
+            let g = Geometry::new(&Config { max_cu_depth: Some(0), ..geom(w, h, ChromaFormat::Yuv420).0 });
+            (g.log2_ctb, g.coded_width, g.coded_height)
+        };
+        assert_eq!(at(3840, 2160), (5, 3840, 2176));
+        assert_eq!(at(2032, 1088), (4, 2032, 1088));
+        assert_eq!(at(2064, 1088), (5, 2080, 1088));
+        assert_eq!(at(4208, 16), (4, 4208, 16));
+        assert_eq!(at(4224, 16), (5, 4224, 32));
+        assert_eq!(at(16, 4208), (4, 16, 4208));
+        assert_eq!(at(16, 4224), (5, 32, 4224));
+        // The quadtree's partial CTBs are 32 at every size.
+        let g = Geometry::new(&geom(3840, 2160, ChromaFormat::Yuv420).0);
+        assert_eq!((g.log2_ctb, g.coded_width, g.coded_height), (5, 3840, 2160));
     }
 
     /// The reference picture set a P or B slice carries is written here

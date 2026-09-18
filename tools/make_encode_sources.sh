@@ -184,6 +184,21 @@ deep detail12 "testsrc2=size=64x64:rate=25"  8 64x64 420 12
 # checkout of those scripts, including ones older than the clip.
 gen big    "testsrc2=size=128x80:rate=25,format=yuv420p[a];mandelbrot=size=128x80:rate=25,format=yuv420p[b];gradients=size=128x80:rate=25:c0=0x2050a0:c1=0xe0b040:x0=0:y0=0:x1=127:y1=79:nb_colors=2:seed=1:speed=0.01:type=linear,format=yuv420p[c];smptehdbars=size=128x80:rate=25,format=yuv420p[d];[a][b]hstack=inputs=2[top];[c][d]hstack=inputs=2[bot];[top][bot]vstack=inputs=2" 16 256x160_420p8 yuv420p
 
+# The partial-CTB clip. Under the coding quadtree the CTB is 32x32 and the
+# coded picture the smallest legal size, so a picture that is not whole
+# CTBs ends in partial ones whose splits the reader infers. 88x44 codes as
+# 88x48: a right column of CTBs 24 wide (a 32 node crossing the edge, its
+# right 16 children crossing again) and a bottom row 16 high (a crossing 32
+# whose lower children lie outside) behind a conformance window of 4 rows —
+# the remainder 1280x720 and 3840x2160 leave at the bottom. It is the one
+# partial-CTB clip: the odd clip (50x34) is below 64 both ways, where the
+# encoder keeps whole CTBs (`Geometry::new`). 88x44 is 64 or more one way,
+# which is enough. testsrc2 moves, so inter pictures split at the edges too.
+#
+# VISITED ONLY BY ROWS THAT NAME IT (`@edge`): the `420p8` depth token keeps
+# every untagged row off it, as on the big clip.
+gen edge   "testsrc2=size=88x44:rate=25" 12 88x44_420p8 yuv420p
+
 # The interlaced clip. Every clip above is progressive — each frame one
 # instant — so an interlaced encode of them has fields that agree and a
 # frame/field decision with nothing to decide. This one is 16 progressive

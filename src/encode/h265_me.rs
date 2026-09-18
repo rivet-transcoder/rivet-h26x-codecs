@@ -567,8 +567,10 @@ impl<S: Sample> InterPicture<S> {
     pub fn new(sps: &Sps, pps: &Pps, cur_poc: i32) -> Self {
         assert!((4..=5).contains(&sps.log2_ctb_size), "log2_ctb {} outside 4..=5", sps.log2_ctb_size);
         let (w, h) = (sps.width as usize, sps.height as usize);
-        let n = 1usize << sps.log2_ctb_size;
-        assert!(w.is_multiple_of(n) && h.is_multiple_of(n), "{w}x{h} is not a whole number of {n}x{n} CTUs");
+        // Whole minimum coding blocks; edge CTBs may be partial (see
+        // `tree_node`).
+        let m = 1usize << MIN_CB_LOG2;
+        assert!(w.is_multiple_of(m) && h.is_multiple_of(m), "{w}x{h} is not a whole number of {m}x{m} coding blocks");
         let geo = std::sync::Arc::new(Geometry::new(sps, pps));
         let info = PicInfo::new(geo);
         // The reconstruction is built in the SPS's own chroma format, and
@@ -1368,6 +1370,20 @@ impl<S: Sample> InterPicture<S> {
         src: &Srcs<'_, S>,
         out: &mut Vec<TreeCu<PCuDecision>>,
     ) -> f64 {
+        // A node crossing the picture edge: the split the reader infers,
+        // over the children inside the picture — as in an I picture.
+        let size = 1usize << log2;
+        if x0 + size > self.geo.width || y0 + size > self.geo.height {
+            let half = size / 2;
+            let mut j = 0.0;
+            for i in 0..4 {
+                let (x, y) = (x0 + (i & 1) * half, y0 + (i >> 1) * half);
+                if x < self.geo.width && y < self.geo.height {
+                    j += self.tree_node(ctx, want, max_depth, refs, x, y, log2 - 1, depth + 1, src, out);
+                }
+            }
+            return j;
+        }
         let qp = want(x0, y0, log2);
         let cctx = IntraCtx { qp, ..*ctx };
         let init = if matches!(refs, TreeRefs::B(..)) { 2 } else { 1 };

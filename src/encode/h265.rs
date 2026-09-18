@@ -117,6 +117,70 @@
 //! above at 34-43), whose rate points lie within 1% of each other so that
 //! BD-rate cannot rank them, and the 50x34 clip's IP Cr at QP 34-43
 //! (+1.1%).
+//!
+//! ## CTB size (2026-09-14)
+//!
+//! Under the coding quadtree every picture 64 or more in either direction
+//! codes 32x32 CTBs, partial along the right and bottom edges, and the
+//! coded size is the smallest legal one — whole 8x8 minimum coding blocks
+//! (`h265_syntax::Geometry::new`, `tree_steps`). The rule before picked 16
+//! or 32, whichever padded less, so 1280x720, 3840x2160 and 640x360 coded
+//! 16x16 CTBs, where the quadtree can split once and depth 2 buys nothing.
+//! One binary, 16 frames, QP 22/27/32/37, against that rule (bytes summed
+//! over the QPs; BD-rate of luma and of YUV 6:1:1; per-process CPU
+//! seconds):
+//!
+//! ```text
+//!                          CTB 32 padded to whole CTBs     CTB 32 partial at the edges
+//!                          bytes  BD Y  BD YUV  CPU        bytes  BD Y  BD YUV  CPU
+//!   1280x720  testsrc2 I   -3.3%  -5.4   -6.2  1.00x       -3.2%  -5.3   -6.2  0.96x
+//!                      IP  -6.2%  -7.4   -8.5  0.82x       -6.1%  -7.4   -8.5  0.83x
+//!             natural  I   -3.6%  -4.8   -5.7  1.41x       -4.6%  -5.8   -6.7  1.35x
+//!                      IP -22.9% -28.5  -29.0  0.93x      -24.0% -29.4  -29.8  0.88x
+//!   3840x2160 testsrc2 I   -4.4%  -7.4   -8.8  0.82x       -4.4%  -7.4   -8.8  0.82x
+//!                      IP  -6.3%  -8.0   -9.8  0.65x       -6.3%  -8.0   -9.8  0.64x
+//!             natural  I  -16.1% -18.8  -22.3  1.03x      -16.5% -19.1  -22.6  1.03x
+//!                      IP -38.8% -45.2  -46.5  0.85x      -39.1% -45.4  -46.7  0.84x
+//! ```
+//!
+//! Partial CTBs code the fewest bytes of the three everywhere — by up to a
+//! point on the natural 720p clip, whose padded bottom rows were replicated
+//! content the coder still paid for — at the same CPU. The 1280x720 CPU
+//! figures overlap other encoding on the machine and carry that noise; the
+//! 3840x2160 ones do not. At `max_cu_depth` 0 a whole-CTB unit cannot be
+//! partial, so that geometry keeps the old rule, with one change: it never
+//! takes CTB 16 beyond level 4.1's picture limits, where no level admits
+//! it. So 3840x2160 at depth 0 codes 32x32 CTBs, 3840x2176.
+//!
+//! So do pictures below 64 both ways, and that exception is fitted to one
+//! clip. Partial CTB 32 against the old rule's whole CTBs (16x16 on both
+//! clips; per-plane YUV BD-rate, QP 22-40 and in brackets 34-43, AQ at
+//! `--aq 1.0`):
+//!
+//! ```text
+//!              50x34 (coded 56x40, was 64x48)   88x44 (coded 88x48, was 96x48)
+//!   I          -0.56%  (-0.62%)                  -0.80%  (-1.61%)
+//!   IP         +1.08%  (+1.66%)                  -7.64%  (-9.67%)
+//!   IPB        +1.33%  (+3.74%)                  -7.24%  (-9.80%)
+//!   AQ IP      +8.58% (+11.75%)                  -5.98%  (-6.60%)
+//!   AQ IPB     +7.51% (+11.40%)                  -4.94%  (-6.98%)
+//! ```
+//!
+//! CTB 32 padded to whole CTBs (64x64) lost as much on 50x34 with AQ (IP
+//! +11.1%, IPB +10.6%), and 8x8 groups on the partial CTBs still lost 8.2%
+//! and 8.0%, so it is CTB 32 on a picture that small, not the partial
+//! geometry or the group size. 50x34 keeps the old rule and codes as it
+//! did; 88x44, 64 or more one way, takes partial CTBs. No size between the
+//! two was measured, so 64 marks where the rule was drawn, not where the
+//! loss ends.
+//!
+//! The quantisation group adaptive quantisation uses follows the stream:
+//! the CTB in an all-intra stream, half the CTB where pictures are
+//! predicted from others (`Core::new` records the measurement; CTB groups
+//! in every stream regressed the fading clip in IP and IPB). It does so at
+//! either CTB size: on 50x34's 16x16 CTBs the all-intra group of 16
+//! against the 8 before gains 1.9% YUV at QP 22-40 (3.3% at 34-43), every
+//! plane better.
 
 use super::gop::{Coded, Kind, Scheduler};
 use super::h265_deblock::{deblock_inter_picture, deblock_picture};
@@ -449,17 +513,24 @@ impl<S: Sample> Core<S> {
         let g = syn::Geometry::new(&cfg);
         // Adaptive quantisation is the one thing that varies the
         // quantiser below the slice, so it is what turns the PPS switch
-        // on. The group is the CTB where every CTB is one coding unit —
-        // the granularity that decision has — and half the CTB once the
-        // coding quadtree may split it, so that a group can follow the
-        // units it holds without a delta per 8x8 unit.
+        // on. The group is the CTB where every CTB is one coding unit — the
+        // granularity that decision has — and in an all-intra stream; it
+        // is half the CTB where the coding quadtree codes pictures that
+        // others predict from. Measured 2026-09-14 on the 32x32-CTB
+        // geometry, per-plane BD-rate against half-CTB groups, ten clips at
+        // `--aq 1.0`: CTB groups gain 6.3% YUV all-intra at QP 22-40 (5.5%
+        // at 34-43) with no clip worse, but in IP and IPB streams they
+        // regress the fading clip (+0.9% and +2.1% YUV at QP 22-40, +3.7%
+        // IP at 34-43). The anchor I picture's groups cause it: CTB-level
+        // groups on the I picture alone, half-CTB ones on its P and B
+        // pictures, regressed that clip too. So the choice is per stream.
         // Weighted prediction sets the P-slice flag, and the B-slice flag
         // when the GOP codes B pictures: every P and B slice then carries
         // a table. Without B pictures the second flag would be a PPS bit
         // no slice reads, and one every such stream coded before B slices
         // were weighted does not have.
         let pps_opts = PpsOptions {
-            cu_qp_delta_depth: (cfg.aq_strength > 0.0).then_some(u32::from(tree_depth(&cfg, &g) > 0)),
+            cu_qp_delta_depth: (cfg.aq_strength > 0.0).then_some(u32::from(tree_depth(&cfg, &g) > 0 && cfg.gop != 0)),
             weighted_pred: cfg.weighted_pred,
             weighted_bipred: cfg.weighted_pred && cfg.bframes > 0,
         };
@@ -1626,7 +1697,7 @@ fn tree_depth(cfg: &Config, g: &syn::Geometry) -> u32 {
 /// quantiser a single delta can give it.
 fn cu_want(pic_qp: u8, offsets: Option<&[i32]>, width: usize, log2_qg: u32, x0: usize, y0: usize, log2: u32) -> i32 {
     let Some(o) = offsets else { return i32::from(pic_qp) };
-    let wq = width >> log2_qg;
+    let wq = width.div_ceil(1 << log2_qg);
     let (gx, gy) = (x0 >> log2_qg, y0 >> log2_qg);
     let off = if log2 <= log2_qg {
         o[gy * wq + gx]
@@ -1828,9 +1899,11 @@ impl CodedUnit for PCuDecision {
 /// One step of the reader's walk over a CTB's coding quadtree, in the
 /// order `coding_quadtree` takes them.
 enum TreeStep {
-    /// A node begins: its `split_cu_flag` is coded here (above the minimum
-    /// coding block), and a quantisation group may start.
-    Enter { x0: usize, y0: usize, log2: u32, depth: u32, split: bool },
+    /// A node begins: a quantisation group may start, and its
+    /// `split_cu_flag` is coded here when `flag` — above the minimum coding
+    /// block and wholly inside the picture; a node crossing the picture
+    /// edge is split by inference.
+    Enter { x0: usize, y0: usize, log2: u32, depth: u32, split: bool, flag: bool },
     /// The coding unit at this index of the CTB's units.
     Unit(usize),
     /// The node ends: a quantisation group may end.
@@ -1840,27 +1913,39 @@ enum TreeStep {
 /// The walk over one CTB's units, read back from their placements: a node
 /// is a leaf exactly when the next unit covers it whole. The units must
 /// tile the CTB in z-scan order, which every tree decision produces.
-fn tree_steps<D>(ctu: &[TreeCu<D>], (x_ctb, y_ctb): (usize, usize), log2_ctb: u32) -> Vec<TreeStep> {
-    fn node<D>(ctu: &[TreeCu<D>], idx: &mut usize, x0: usize, y0: usize, log2: u32, depth: u32, out: &mut Vec<TreeStep>) {
+///
+/// `(pw, ph)` is the coded picture size. A CTB along its right or bottom
+/// edge may be partial: a node crossing the edge is split with no coded
+/// flag and a child starting outside the picture is not visited, which is
+/// `coding_quadtree`'s inference (the flag is read only where `x0 + size <=
+/// pic_width` and `y0 + size <= pic_height`), mirrored.
+fn tree_steps<D>(ctu: &[TreeCu<D>], (x_ctb, y_ctb): (usize, usize), log2_ctb: u32, (pw, ph): (usize, usize)) -> Vec<TreeStep> {
+    #[allow(clippy::too_many_arguments)]
+    fn node<D>(ctu: &[TreeCu<D>], idx: &mut usize, x0: usize, y0: usize, log2: u32, depth: u32, pic: (usize, usize), out: &mut Vec<TreeStep>) {
+        let size = 1usize << log2;
+        let inside = x0 + size <= pic.0 && y0 + size <= pic.1;
         let cu = &ctu[*idx];
-        let leaf = cu.x0 == x0 && cu.y0 == y0 && cu.log2 == log2;
+        let leaf = inside && cu.x0 == x0 && cu.y0 == y0 && cu.log2 == log2;
         debug_assert!(leaf || (cu.log2 < log2 && log2 > MIN_CB_LOG2), "units do not tile the node of {} at ({x0},{y0})", 1 << log2);
-        out.push(TreeStep::Enter { x0, y0, log2, depth, split: !leaf });
+        out.push(TreeStep::Enter { x0, y0, log2, depth, split: !leaf, flag: inside && log2 > MIN_CB_LOG2 });
         if leaf {
             debug_assert_eq!(cu.depth, depth, "a unit's recorded depth disagrees with its place in the tree");
             out.push(TreeStep::Unit(*idx));
             *idx += 1;
         } else {
-            let half = 1usize << (log2 - 1);
+            let half = size / 2;
             for i in 0..4 {
-                node(ctu, idx, x0 + (i & 1) * half, y0 + (i >> 1) * half, log2 - 1, depth + 1, out);
+                let (x, y) = (x0 + (i & 1) * half, y0 + (i >> 1) * half);
+                if x < pic.0 && y < pic.1 {
+                    node(ctu, idx, x, y, log2 - 1, depth + 1, pic, out);
+                }
             }
         }
         out.push(TreeStep::Leave { x0, y0, log2 });
     }
     let mut out = Vec::with_capacity(3 * ctu.len() + 8);
     let mut idx = 0;
-    node(ctu, &mut idx, x_ctb, y_ctb, log2_ctb, 0, &mut out);
+    node(ctu, &mut idx, x_ctb, y_ctb, log2_ctb, 0, (pw, ph), &mut out);
     assert_eq!(idx, ctu.len(), "units left over after the CTB's quadtree was walked");
     out
 }
@@ -1872,7 +1957,7 @@ fn settle_tree<D: CodedUnit>(chain: &mut QgChain, cus: &mut [TreeCu<D>], ctu_sta
     for (k, range) in ctu_start.windows(2).enumerate() {
         let ctu = &mut cus[range[0]..range[1]];
         let at = ((k % wc) << g.log2_ctb, (k / wc) << g.log2_ctb);
-        for step in tree_steps(ctu, at, g.log2_ctb) {
+        for step in tree_steps(ctu, at, g.log2_ctb, (g.coded_width as usize, g.coded_height as usize)) {
             match step {
                 TreeStep::Enter { x0, y0, log2, .. } => chain.enter(x0, y0, log2),
                 TreeStep::Unit(i) => {
@@ -1893,6 +1978,8 @@ fn settle_tree<D: CodedUnit>(chain: &mut QgChain, cus: &mut [TreeCu<D>], ctu_sta
 /// availability is the picture edge.
 struct TreeCtx {
     w4: usize,
+    /// The coded picture size, where the reader's split inference begins.
+    pic: (usize, usize),
     ct_depth: Vec<u8>,
     skip: Vec<u8>,
 }
@@ -1900,7 +1987,7 @@ struct TreeCtx {
 impl TreeCtx {
     fn new(g: &syn::Geometry) -> Self {
         let (w4, h4) = (g.coded_width as usize / 4, g.coded_height as usize / 4);
-        TreeCtx { w4, ct_depth: vec![0; w4 * h4], skip: vec![0; w4 * h4] }
+        TreeCtx { w4, pic: (g.coded_width as usize, g.coded_height as usize), ct_depth: vec![0; w4 * h4], skip: vec![0; w4 * h4] }
     }
 
     fn at(&self, grid: &[u8], x: usize, y: usize) -> u8 {
@@ -1929,10 +2016,10 @@ fn write_tree<D: CodedUnit>(
     leaf: &mut LeafWriter<'_, D>,
 ) -> u64 {
     let mut deltas = 0;
-    for step in tree_steps(ctu, at, log2_ctb) {
+    for step in tree_steps(ctu, at, log2_ctb, tc.pic) {
         match step {
-            TreeStep::Enter { x0, y0, log2, depth, split } => {
-                if log2 > MIN_CB_LOG2 {
+            TreeStep::Enter { x0, y0, log2, depth, split, flag } => {
+                if flag {
                     let nb = SplitCuNb {
                         left_depth: (x0 > 0).then(|| tc.at(&tc.ct_depth, x0 - 1, y0)),
                         above_depth: (y0 > 0).then(|| tc.at(&tc.ct_depth, x0, y0 - 1)),
@@ -4513,6 +4600,82 @@ mod tests {
             .collect()
     }
 
+    /// Partial edge CTBs round-trip. Where the picture is not whole 32x32
+    /// CTBs (and not below 64 both ways, see `Geometry::new`) the coded
+    /// picture is the smallest legal one and the CTBs along the right and
+    /// bottom edges are partial, their splits inferred rather than coded:
+    /// 1280x720 leaves a bottom row of 16, 1366x768 a right column of 24
+    /// behind a conformance window of 2, and the small sizes take the other
+    /// remainders (8, 16, 24) in each direction, intra, P and B, through the
+    /// production decoder.
+    #[test]
+    fn partial_edge_ctbs_round_trip() {
+        for (w, h, gop, bframes, frames) in [
+            (1280usize, 720usize, 8u32, 0u32, 2usize),
+            (1366, 768, 8, 0, 2),
+            (88, 44, 8, 2, 4),
+            (72, 56, 8, 2, 4),
+            (80, 34, 0, 0, 2),
+        ] {
+            let tag = format!("{w}x{h} gop={gop} bframes={bframes}");
+            let config = Config { gop, bframes, ..cfg(w as u32, h as u32, ChromaFormat::Yuv420) };
+            let g = syn::Geometry::new(&config);
+            assert_eq!(g.log2_ctb, 5, "{tag}");
+            assert!(!g.coded_width.is_multiple_of(32) || !g.coded_height.is_multiple_of(32), "{tag}: no partial CTB to test");
+            let frames = tree_frames(w, h, ChromaFormat::Yuv420, 8, frames);
+            let mut e = H265Encoder::new(config).unwrap_or_else(|err| panic!("{tag}: {err}"));
+            let mut units = Vec::new();
+            for f in &frames {
+                units.extend(e.push(f).unwrap_or_else(|err| panic!("{tag}: {err}")));
+            }
+            units.extend(e.flush().unwrap());
+            let mut dec = crate::hevc::HevcDecoder::new();
+            for u in &units {
+                dec.push_annexb(&u.data).unwrap_or_else(|err| panic!("{tag}: the decoder rejected the stream: {err}"));
+            }
+            dec.flush().unwrap();
+            let mut by_display = vec![None; units.len()];
+            for u in &units {
+                by_display[u.display as usize] = Some(u.encode_index as usize);
+            }
+            for (i, coded) in by_display.iter().enumerate() {
+                let want = &e.reconstructions()[coded.unwrap_or_else(|| panic!("{tag}: display index {i} never coded"))];
+                let got = dec.next_picture().unwrap_or_else(|| panic!("{tag}: picture {i} missing"));
+                assert!(got.into_packed() == *want, "{tag}: picture {i} decoded differently than the encoder reconstructed it");
+            }
+        }
+    }
+
+    /// Adaptive quantisation's group follows the stream: the CTB in an
+    /// all-intra stream and wherever every CTB is one unit, half the CTB
+    /// where the coding quadtree codes pictures that others predict from —
+    /// the measured split recorded in `Core::new` — and the quantiser moves
+    /// under each.
+    #[test]
+    fn adaptive_quantisation_groups_follow_the_stream() {
+        for (gop, max_cu_depth, want) in [(0u32, None, 0u32), (8, None, 1), (8, Some(1), 1), (0, Some(0), 0), (8, Some(0), 0)] {
+            let tag = format!("gop {gop} max_cu_depth {max_cu_depth:?}");
+            let frames = tree_frames(64, 64, ChromaFormat::Yuv420, 8, 3);
+            let config = Config { gop, aq_strength: 2.0, max_cu_depth, ..cfg(64, 64, ChromaFormat::Yuv420) };
+            let mut e = H265Encoder::new(config).unwrap_or_else(|err| panic!("{tag}: {err}"));
+            let mut units = Vec::new();
+            for f in &frames {
+                units.extend(e.push(f).unwrap_or_else(|err| panic!("{tag}: {err}")));
+            }
+            units.extend(e.flush().unwrap());
+            let depths: Vec<u32> = units
+                .iter()
+                .flat_map(|u| crate::nal::annexb_nals(&u.data))
+                .filter(|nal| (nal[0] >> 1) & 0x3f == syn::NAL_PPS)
+                .map(|nal| crate::hevc::pps::Pps::parse(&crate::nal::unescape_rbsp(&nal[2..])).unwrap().diff_cu_qp_delta_depth)
+                .collect();
+            assert!(!depths.is_empty(), "{tag}: no PPS in the stream");
+            assert!(depths.iter().all(|&d| d == want), "{tag}: diff_cu_qp_delta_depth {depths:?}, want {want}");
+            let moved: u64 = e.census().by_kind.iter().map(|k| k.qp_moved).sum();
+            assert!(moved > 0, "{tag}: no unit left the picture quantiser");
+        }
+    }
+
     /// The coding quadtree codes and round-trips — intra, P and B, every
     /// chroma format, 10 bits, adaptive quantisation over quantisation
     /// groups smaller than the CTB, lossless, and a 16x16-CTB picture —
@@ -4539,6 +4702,7 @@ mod tests {
             (64, 64, ChromaFormat::Monochrome, 8, 8, 0, ConstantQp(30), 0.0, 2),
             (64, 64, ChromaFormat::Yuv420, 10, 8, 2, ConstantQp(30), 0.0, 2),
             (64, 64, ChromaFormat::Yuv420, 8, 8, 2, ConstantQp(30), 2.0, 2),
+            (64, 64, ChromaFormat::Yuv420, 8, 0, 0, ConstantQp(30), 2.0, 2),
             (64, 64, ChromaFormat::Yuv444, 8, 8, 0, ConstantQp(26), 2.0, 1),
             (64, 64, ChromaFormat::Yuv420, 8, 8, 2, Lossless, 0.0, 2),
             (48, 40, ChromaFormat::Yuv420, 8, 8, 0, ConstantQp(30), 2.0, 2),
