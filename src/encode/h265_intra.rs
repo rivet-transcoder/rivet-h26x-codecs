@@ -87,7 +87,7 @@ use crate::dsp::hevc::HevcDsp;
 use crate::dsp::hevc_enc::{HevcEncDsp, qbits, quant_offset, quant_scale};
 use crate::hevc::ctu::chroma_qp;
 use crate::hevc::frame::{Frame, Plane16};
-use crate::hevc::intra::{IntraScratch, RefAvail, predict};
+use crate::hevc::intra::{IntraScratch, RefAvail, predict, predict_prepared, prepare};
 use crate::hevc::pic::PicInfo;
 use crate::hevc::residual::{ScalingSource, scale_coefficients};
 use crate::picture::ChromaFormat;
@@ -1577,13 +1577,16 @@ fn search_luma_mode<S: Sample>(
     let n = 1usize << log2;
     let off = plane.offset(x as isize, y as isize);
     fill_ref_avail(geo, &mut sc.avail, x, y, n, 1, 1);
+    // The references are gathered once for all 35 trials (and smoothed
+    // once, by the first mode that wants them smoothed).
+    prepare(plane, sc, x, y, n, ctx.bit_depth);
     let rate_scale = satd_lambda_scale(ctx.bit_depth);
     let mut best = (f32::MAX, 1u8);
     for mode in 0..35u8 {
         // The decoder's flags for a luma block under this SPS: reference
         // smoothing on (predict itself skips DC and 4x4), boundary filter
         // on (no implicit RDPCM to suspend it).
-        predict(ctx.dsp, plane, sc, x, y, n, mode as u32, 0, true, true, ctx.bit_depth, ctx.strong_smoothing);
+        predict_prepared(ctx.dsp, plane, sc, x, y, n, mode as u32, 0, true, true, ctx.bit_depth, ctx.strong_smoothing);
         let satd = (ctx.dist.satd)(src, src_stride, &plane.data[off..], plane.stride, n, n);
         let signal = match cands.iter().position(|&c| c == mode as u32) {
             Some(i) => ModeSignal::LumaMpm(i as u8),
@@ -1904,6 +1907,38 @@ fn search_chroma_mode<S: Sample>(
     let (sw, sh) = sub_wh(geo.cat);
     let rate_scale = satd_lambda_scale(ctx.bit_depth);
     let mut best = (f32::MAX, 4u8);
+    let score = |syntax: u8, satd: u32, best: &mut (f32, u8)| {
+        let signal = if syntax == 4 { ModeSignal::ChromaDerived } else { ModeSignal::ChromaExplicit };
+        let cost = satd as f32 + mode_signalling_cost(ctx.qp, signal) * rate_scale;
+        if cost < best.0 {
+            *best = (cost, syntax);
+        }
+    };
+    if ntb == 1 {
+        // One transform block: each plane's references are gathered once
+        // for all five trials, which then run plane by plane. Nothing a
+        // trial writes is another trial's reference, so this is the
+        // interleaved loop below reordered; with two blocks (4:2:2) the
+        // second predicts from the first's trial, and the order matters.
+        let (ax, ay) = tbs[0];
+        let (cx, cy) = (ax / sw, ay / sh);
+        let soff = (cy - yl / sh) * c_stride + (cx - xl / sw);
+        fill_ref_avail(geo, &mut sc.avail, ax, ay, nc, sw, sh);
+        let mut satd = [0u32; 5];
+        for (plane, src) in [(&mut *cb, src_cb), (&mut *cr, src_cr)] {
+            prepare(plane, sc, cx, cy, nc, ctx.bit_depth);
+            let off = plane.offset(cx as isize, cy as isize);
+            for syntax in 0..5u8 {
+                let mode = chroma_mode_for(geo.cat, syntax, luma0) as u32;
+                predict_prepared(ctx.dsp, plane, sc, cx, cy, nc, mode, 1, geo.cat == 3, false, ctx.bit_depth, ctx.strong_smoothing);
+                satd[syntax as usize] += (ctx.dist.satd)(&src[soff..], c_stride, &plane.data[off..], plane.stride, nc, nc);
+            }
+        }
+        for syntax in 0..5u8 {
+            score(syntax, satd[syntax as usize], &mut best);
+        }
+        return (best.1, chroma_mode_for(geo.cat, best.1, luma0));
+    }
     for syntax in 0..5u8 {
         let mode = chroma_mode_for(geo.cat, syntax, luma0) as u32;
         let mut satd = 0u32;
@@ -1920,11 +1955,7 @@ fn search_chroma_mode<S: Sample>(
                 satd += (ctx.dist.satd)(&src[soff..], c_stride, &plane.data[off..], plane.stride, nc, nc);
             }
         }
-        let signal = if syntax == 4 { ModeSignal::ChromaDerived } else { ModeSignal::ChromaExplicit };
-        let cost = satd as f32 + mode_signalling_cost(ctx.qp, signal) * rate_scale;
-        if cost < best.0 {
-            best = (cost, syntax);
-        }
+        score(syntax, satd, &mut best);
     }
     (best.1, chroma_mode_for(geo.cat, best.1, luma0))
 }
