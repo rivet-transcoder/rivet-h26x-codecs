@@ -131,7 +131,7 @@ fn main() {
             // let the rate controller see them. H.264 refuses it by name.
             "--lookahead" => cfg.lookahead = val(&mut i, &args, "--lookahead").parse().unwrap_or_else(|_| die("--lookahead")),
             // Both codecs: weighted prediction, a fitted gain and offset per
-            // reference in every P slice.
+            // reference in every P and B slice.
             "--wpred" => cfg.weighted_pred = true,
             // How many past pictures a P slice may choose between. 1 is
             // the default and every stream written with it is
@@ -412,8 +412,8 @@ fn main() {
                 continue;
             }
             eprintln!(
-                "wp {name}: {} of {} pictures weighted, {} macroblocks won, {} lost, {} kept the defaults",
-                c.wp_on[pic], c.pictures[pic], c.wp_won[pic], c.wp_lost[pic], c.wp_rd_default[pic]
+                "wp {name}: {} of {} pictures weighted, {} macroblocks won, {} lost; {} priced against the defaults, {} kept them",
+                c.wp_on[pic], c.pictures[pic], c.wp_won[pic], c.wp_lost[pic], c.wp_priced[pic], c.wp_rd_default[pic]
             );
         }
     }

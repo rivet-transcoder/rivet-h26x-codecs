@@ -157,9 +157,12 @@ pub struct WeightCensus {
     pub won: u64,
     /// The same, higher weighted than plain — the fit's prediction failing.
     pub lost: u64,
-    /// The picture's fitted table lost the picture-level check to a table
-    /// of defaults, and the picture was kept coded under the defaults
-    /// (`on` is then false: the kept table weights nothing).
+    /// The picture's fitted table was priced against a table of defaults
+    /// (the picture coded both ways).
+    pub priced: bool,
+    /// The picture's fitted table lost that check, and the picture was
+    /// kept coded under the defaults (`on` is then false: the kept table
+    /// weights nothing).
     pub rd_default: bool,
 }
 

@@ -463,6 +463,10 @@ struct Attempt<S: Sample> {
     /// An interlaced frame's two fields, when it was coded as field
     /// pictures (`recon` and `motion` are then empty).
     fields: Option<FieldsOut<S>>,
+    /// A P picture's fitted table holds a strong fit
+    /// ([`h265_wp::PlaneFit::strong`]), which `code_attempt` keeps without
+    /// pricing. False for every other attempt.
+    strong_fit: bool,
 }
 
 /// How many macroblocks of each kind the stream's pictures took, per
@@ -500,9 +504,11 @@ pub struct ShapeCensus {
     pub wp_won: [u64; 3],
     /// The same, higher weighted than plain: the fit's model check failing.
     pub wp_lost: [u64; 3],
-    /// Pictures whose fitted table lost the picture-level check to a table
-    /// of defaults and were kept coded under the defaults, per picture
-    /// type — the fit declined after the fact.
+    /// Pictures whose fitted table was priced against a table of defaults
+    /// — coded twice — per picture type.
+    pub wp_priced: [u64; 3],
+    /// Of those, the pictures whose fitted table lost and which were kept
+    /// coded under the defaults — the fit declined after the fact.
     pub wp_rd_default: [u64; 3],
     /// Field pictures coded — two per frame of an interlaced stream coded
     /// as fields, and what proves a field row coded fields rather than
@@ -550,6 +556,7 @@ impl ShapeCensus {
         self.wp_on[pic] += u64::from(weighting.on);
         self.wp_won[pic] += weighting.won;
         self.wp_lost[pic] += weighting.lost;
+        self.wp_priced[pic] += u64::from(weighting.priced);
         self.wp_rd_default[pic] += u64::from(weighting.rd_default);
     }
 
@@ -1031,24 +1038,43 @@ impl<S: Sample> Core<S> {
         a.access
     }
 
-    /// Code one picture at a given quantiser, keeping nothing — and when it
-    /// is a B picture whose fitted `pred_weight_table` weights something,
-    /// price that table rather than trust it.
+    /// Code one picture at a given quantiser, keeping nothing — and when
+    /// its fitted `pred_weight_table` weights something, price that table
+    /// rather than trust it.
     ///
-    /// The fit is judged at zero motion one list at a time, while a
-    /// bi-predicted block predicts from both weighted anchors at once — and
-    /// on a fade the default average of a brighter and a darker anchor is
-    /// often already near the picture's level — so a table can cost its
-    /// bits and steer the search for little. The picture is coded again
-    /// under a table of defaults, and the cheaper of the two is kept: the
-    /// squared error of its displayed reconstruction plus the bits of its
-    /// access unit, at `h264_intra::lambda` scaled to the depth — the
-    /// Lagrangian `code_attempt_paff` prices its two codings by, and
-    /// H.265's twin of this check (`h265::code_attempt`). Both attempts
-    /// are side-effect free, so the one not kept leaves no trace.
+    /// The fit is a whole-picture line at zero motion. A B picture's is
+    /// judged one list at a time, while a bi-predicted block predicts from
+    /// both weighted anchors at once — and on a fade the default average of
+    /// a brighter and a darker anchor is often already near the picture's
+    /// level. A P picture's is taken wherever it lowers the zero-motion
+    /// residual by two percent, which a coarse reconstruction drifting in
+    /// level from its source does without any fade: on content that pans
+    /// or zooms at QP 40 and above, P pictures took weightings that cost
+    /// bytes and bought nothing (rivet measured up to +0.8% bytes at the
+    /// same quality). Either way a table can cost its bits and steer the
+    /// search for little. So the picture is coded again under a table of
+    /// defaults, and the cheaper of the two is kept: the squared error of
+    /// its displayed reconstruction plus the bits of its access unit, at
+    /// `h264_intra::lambda` scaled to the depth — the Lagrangian
+    /// `code_attempt_paff` prices its two codings by, and H.265's twin of
+    /// this check (`h265::code_attempt`). Both attempts are side-effect
+    /// free, so the one not kept leaves no trace.
+    ///
+    /// The price is the picture's own. A B picture is not a reference, so
+    /// for it that is the whole price. A P picture is, and what its
+    /// weighting does for the pictures predicting from it is not counted —
+    /// which is where the check went wrong when it priced every P table:
+    /// through a fade's near-black end, whose fits are its strongest, it
+    /// kept the defaults picture after picture at QP 40 and 45, each cheaper
+    /// alone, and the stream came out 2 to 3% larger than one weighted
+    /// throughout (rivet's 640x360 fade). So a P picture's table is priced
+    /// only when no fit in it is strong ([`h265_wp::PlaneFit::strong`]: it
+    /// removes at least half the zero-motion SAD) — a fade's fits are, the
+    /// drift a coarse reconstruction takes on pans and zooms is not (its
+    /// fits remove 2 to 21%) — and a strong fit is kept as it stands.
     fn code_attempt(&self, c: &Coded, src: &[S], qp: u8) -> Result<Attempt<S>> {
         let fitted = self.code_attempt_weighted(c, src, qp, true)?;
-        if c.kind != Kind::B || !fitted.motion.weighting.on {
+        if !fitted.motion.weighting.on || fitted.strong_fit {
             return Ok(fitted);
         }
         let mut plain = self.code_attempt_weighted(c, src, qp, false)?;
@@ -1056,9 +1082,12 @@ impl<S: Sample> Core<S> {
         let lam = f64::from(super::h264_intra::lambda(i32::from(qp))) * scale;
         let cost = |a: &Attempt<S>| ssd_packed(src, &a.rec) as f64 + lam * (a.access.data.len() * 8) as f64;
         if cost(&plain) < cost(&fitted) {
+            plain.motion.weighting.priced = true;
             plain.motion.weighting.rd_default = true;
             return Ok(plain);
         }
+        let mut fitted = fitted;
+        fitted.motion.weighting.priced = true;
         Ok(fitted)
     }
 
@@ -1185,9 +1214,12 @@ impl<S: Sample> Core<S> {
         // pair to the bound on their sum, see `b_weights`). The table
         // travels in the slice header; the walks predict with what the
         // reader derives from it.
+        let mut strong_fit = false;
         let wp = match c.kind {
             Kind::P if self.cfg.weighted_pred && transform_p => {
-                Some(self.p_weights(&planes, &self.refs[past.expect("checked above")].1, fit))
+                let (table, strong) = self.p_weights(&planes, &self.refs[past.expect("checked above")].1, fit);
+                strong_fit = strong;
+                Some(table)
             }
             Kind::B if self.cfg.weighted_pred && transform_b => Some(self.b_weights(
                 &planes,
@@ -1462,6 +1494,7 @@ impl<S: Sample> Core<S> {
             recon,
             motion,
             fields: None,
+            strong_fit,
         })
     }
 
@@ -1689,6 +1722,7 @@ impl<S: Sample> Core<S> {
             recon: Vec::new(),
             motion: super::h264_pic::PicMotion::new(0, 0),
             fields: Some(FieldsOut { model, frame: cur, census, frame_coded: false, pairs: [0; 2] }),
+            strong_fit: false,
         })
     }
 
@@ -1937,6 +1971,7 @@ impl<S: Sample> Core<S> {
                 frame_coded: true,
                 pairs: motion.pairs,
             }),
+            strong_fit: false,
         })
     }
 
@@ -1986,8 +2021,9 @@ impl<S: Sample> Core<S> {
     /// reference `rf`, each component its own fit at the denominator
     /// [`h265_wp::LOG2_DENOM`] — the default wherever the fit is not used,
     /// and everywhere when not `fit` (the table of defaults a fitted one
-    /// is priced against).
-    fn p_weights(&self, planes: &[syn::Plane<'_, S>], rf: &[syn::Recon<S>], fit: bool) -> syn::PredWeights {
+    /// is priced against) — and whether any of the fits is
+    /// [`h265_wp::PlaneFit::strong`].
+    fn p_weights(&self, planes: &[syn::Plane<'_, S>], rf: &[syn::Recon<S>], fit: bool) -> (syn::PredWeights, bool) {
         let fits: Vec<h265_wp::PlaneFit> = (0..self.plane_dims.len())
             .map(|p| {
                 if !fit {
@@ -1998,19 +2034,19 @@ impl<S: Sample> Core<S> {
                 h265_wp::fit_samples(planes[p].data, planes[p].stride, refs, pw as usize, ph as usize, self.cfg.bit_depth, h265_wp::H264_WEIGHTS)
             })
             .collect();
-        let default = (1i32 << h265_wp::LOG2_DENOM, 0i32);
-        let comp = |f: &h265_wp::PlaneFit| if f.used() { (f.weight, f.offset) } else { default };
-        let luma = comp(&fits[0]);
-        let chroma = if fits.len() == 3 { [comp(&fits[1]), comp(&fits[2])] } else { [default; 2] };
-        let entry = WeightEntry { luma, chroma, luma_flag: luma != default, chroma_flag: chroma != [default; 2] };
-        syn::PredWeights {
-            table: PredWeightTable {
-                luma_log2_denom: h265_wp::LOG2_DENOM,
-                chroma_log2_denom: h265_wp::LOG2_DENOM,
-                lists: [vec![entry], Vec::new()],
-            },
+        // A component class the fit leaves at the defaults takes
+        // denominator 0, the cheapest to write, as a B table's does.
+        let luma_d = if fits[0].used() { h265_wp::LOG2_DENOM } else { 0 };
+        let chroma_d = if fits[1..].iter().any(h265_wp::PlaneFit::used) { h265_wp::LOG2_DENOM } else { 0 };
+        let comp = |f: &h265_wp::PlaneFit, d: u32| if f.used() { (f.weight, f.offset) } else { (1i32 << d, 0i32) };
+        let luma = comp(&fits[0], luma_d);
+        let chroma = if fits.len() == 3 { [comp(&fits[1], chroma_d), comp(&fits[2], chroma_d)] } else { [(1i32 << chroma_d, 0i32); 2] };
+        let entry = WeightEntry { luma, chroma, luma_flag: luma != (1 << luma_d, 0), chroma_flag: chroma != [(1 << chroma_d, 0); 2] };
+        let table = syn::PredWeights {
+            table: PredWeightTable { luma_log2_denom: luma_d, chroma_log2_denom: chroma_d, lists: [vec![entry], Vec::new()] },
             chroma: self.cfg.chroma != crate::ChromaFormat::Monochrome,
-        }
+        };
+        (table, fits.iter().any(h265_wp::PlaneFit::strong))
     }
 
     /// A B picture's `pred_weight_table`: an entry for list 0's past
@@ -2859,10 +2895,50 @@ mod tests {
         };
         let kept = census(26, 2);
         assert!(kept.wp_on[2] > 0, "bframes=2 QP 26: no B picture took a fitted table: {kept:?}");
+        assert_eq!(kept.wp_priced[2], kept.wp_on[2], "bframes=2 QP 26: every B table is priced: {kept:?}");
         assert_eq!(kept.wp_rd_default[2], 0, "bframes=2 QP 26: a fitted table lost to the defaults: {kept:?}");
         let mid = census(40, 1);
         assert!(mid.wp_rd_default[2] > 0, "bframes=1 QP 40: every fitted table was kept: {mid:?}");
-        assert_eq!(mid.wp_rd_default[1], 0, "a P picture is never priced: {mid:?}");
+    }
+
+    /// A P picture's fitted table is priced against the defaults only when
+    /// no fit in it is strong. At QP 26 the fade's P fits all remove most
+    /// of the zero-motion residual: every P picture takes its table, and
+    /// none is coded twice. At QP 40, over a coarser keyframe, some of
+    /// them fall short of strong and are priced — and win. A textured
+    /// picture moving three samples a frame does not change brightness,
+    /// but its fit against a reconstruction still lowers the zero-motion
+    /// residual by the few percent that count as used: each such table is
+    /// priced, and the defaults win it. Comparing the costs the wrong way
+    /// round keeps those tables and loses the fade's; pricing strong fits
+    /// too codes the fade's P pictures twice.
+    #[test]
+    fn a_p_pictures_table_is_priced_only_when_its_fits_are_weak() {
+        let census = |frames: &[Vec<u8>], qp: u8| {
+            let mut e = H264Encoder::new(Config {
+                gop: 12,
+                weighted_pred: true,
+                rate: RateControl::ConstantQp(qp),
+                ..cfg(64, 64, ChromaFormat::Yuv420, 8)
+            })
+            .unwrap();
+            let mut units = Vec::new();
+            for f in frames {
+                units.extend(e.push(f).unwrap());
+            }
+            units.extend(e.flush().unwrap());
+            self_check(&format!("QP {qp}"), 12, &units, e.reconstructions());
+            e.shape_census().clone()
+        };
+        let fade = fade_frames(ChromaFormat::Yuv420, 8, 12);
+        let c = census(&fade, 26);
+        assert!(c.wp_on[1] > 0, "fade QP 26: no P picture took its table: {c:?}");
+        assert_eq!(c.wp_priced[1], 0, "fade QP 26: a strong fit was priced: {c:?}");
+        let c = census(&fade, 40);
+        assert!(c.wp_priced[1] > 0 && c.wp_rd_default[1] == 0, "fade QP 40: the priced tables should all win: {c:?}");
+        let moving = census(&woven_frames(64, 64, ChromaFormat::Yuv420, 8, 12, 0), 26);
+        assert!(moving.wp_priced[1] > 0, "moving texture: no weak fit was priced: {moving:?}");
+        assert!(moving.wp_rd_default[1] > 0, "moving texture: every weak fit beat the defaults: {moving:?}");
     }
 
     /// 8.4.2.3's bound on an explicitly bi-predicted pair, at its edges:
