@@ -500,34 +500,101 @@ pub(crate) fn h265_beyond_ctb16(width: u32, height: u32) -> bool {
 /// which the standard requires to be High tier.
 const H265_LEVEL_8_5: Level = Level { idc: 255, high_tier: true, name: "8.5" };
 
-/// The Table A.10 row for a format: `CpbVclFactor`, then
-/// `FormatCapabilityFactor` in thousandths and `MinCrScaleFactor` in
-/// tenths, so that every comparison stays in integers.
+/// The H.265 profile a stream is coded under: what `write_ptl` claims,
+/// and the Table A.10 factors its levels are measured with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct H265Profile {
+    /// `general_profile_idc`: 1 Main, 2 Main 10, 4 the format range
+    /// extensions profiles.
+    pub idc: u8,
+    /// The profile's name, as Table A.2 prints it.
+    pub name: &'static str,
+    /// For `idc` 4, the nine Table A.2 constraint flags in syntax order:
+    /// `general_max_12bit`, `max_10bit`, `max_8bit`, `max_422chroma`,
+    /// `max_420chroma`, `max_monochrome`, `intra`, `one_picture_only` and
+    /// `lower_bit_rate_constraint_flag`. Main and Main 10 carry none.
+    pub flags: [bool; 9],
+    /// `CpbVclFactor` (Table A.10).
+    cpb_vcl_factor: u64,
+    /// `FormatCapabilityFactor`, thousandths.
+    fcf_milli: u64,
+    /// `MinCrScaleFactor`, tenths.
+    min_cr_scale_tenths: u64,
+}
+
+impl H265Profile {
+    /// `HbrFactor` (A.4.2): 1 for Main and Main 10, `2 -
+    /// general_lower_bit_rate_constraint_flag` for the format range
+    /// extensions profiles.
+    fn hbr_factor(&self) -> u64 {
+        if self.idc == 4 { 2 - u64::from(self.flags[8]) } else { 1 }
+    }
+}
+
+const fn rext(name: &'static str, flags: [u8; 9], cpb_vcl_factor: u64, fcf_milli: u64, min_cr_scale_tenths: u64) -> H265Profile {
+    let mut f = [false; 9];
+    let mut i = 0;
+    while i < 9 {
+        f[i] = flags[i] == 1;
+        i += 1;
+    }
+    H265Profile { idc: 4, name, flags: f, cpb_vcl_factor, fcf_milli, min_cr_scale_tenths }
+}
+
+const H265_MAIN: H265Profile = H265Profile { idc: 1, name: "Main", flags: [false; 9], cpb_vcl_factor: 1_000, fcf_milli: 1_500, min_cr_scale_tenths: 10 };
+const H265_MAIN_10: H265Profile = H265Profile { idc: 2, name: "Main 10", flags: [false; 9], cpb_vcl_factor: 1_000, fcf_milli: 1_875, min_cr_scale_tenths: 10 };
+// Table A.2's rows (max 12, 10 and 8 bit; max 4:2:2, 4:2:0, monochrome;
+// intra; one picture; lower bit rate) with Table A.10's factors.
+const H265_MONOCHROME: H265Profile = rext("Monochrome", [1, 1, 1, 1, 1, 1, 0, 0, 1], 667, 1_000, 10);
+const H265_MONOCHROME_10: H265Profile = rext("Monochrome 10", [1, 1, 0, 1, 1, 1, 0, 0, 1], 833, 1_250, 10);
+const H265_MONOCHROME_12: H265Profile = rext("Monochrome 12", [1, 0, 0, 1, 1, 1, 0, 0, 1], 1_000, 1_500, 10);
+const H265_MONOCHROME_16: H265Profile = rext("Monochrome 16", [0, 0, 0, 1, 1, 1, 0, 0, 1], 1_333, 2_000, 10);
+const H265_MAIN_12: H265Profile = rext("Main 12", [1, 0, 0, 1, 1, 0, 0, 0, 1], 1_500, 2_250, 10);
+const H265_MAIN_422_10: H265Profile = rext("Main 4:2:2 10", [1, 1, 0, 1, 0, 0, 0, 0, 1], 1_667, 2_500, 5);
+const H265_MAIN_422_12: H265Profile = rext("Main 4:2:2 12", [1, 0, 0, 1, 0, 0, 0, 0, 1], 2_000, 3_000, 5);
+const H265_MAIN_444: H265Profile = rext("Main 4:4:4", [1, 1, 1, 0, 0, 0, 0, 0, 1], 2_000, 3_000, 5);
+const H265_MAIN_444_10: H265Profile = rext("Main 4:4:4 10", [1, 1, 0, 0, 0, 0, 0, 0, 1], 2_500, 3_750, 5);
+const H265_MAIN_444_12: H265Profile = rext("Main 4:4:4 12", [1, 0, 0, 0, 0, 0, 0, 0, 1], 3_000, 4_500, 5);
+// The intra-only profile a 13- or 14-bit picture in colour has, its
+// "0 or 1" lower-bit-rate flag written 1 (HbrFactor 1, the stricter).
+const H265_MAIN_444_16_INTRA: H265Profile = rext("Main 4:4:4 16 Intra", [0, 0, 0, 0, 0, 0, 1, 0, 1], 4_000, 6_000, 5);
+
+/// The profile an H.265 stream of this configuration is coded under: the
+/// one Table A.2 names for its format, the narrowest — which is also the
+/// one the most decoders must accept, since a decoder of a wider profile
+/// decodes every stream whose flags are at least its own (a Main 12
+/// decoder decodes a Monochrome 12 stream, A.3.5). 8-bit 4:2:0 is Main
+/// and 9- or 10-bit 4:2:0 Main 10; everything else is a format range
+/// extensions profile: Monochrome to 8, 10, 12 and 16 bits, Main 12, Main
+/// 4:2:2 10 (8 bits too) and 12, Main 4:4:4 at 8, 10 and 12.
 ///
-/// The profile is the one the format needs, which is what `write_ptl`
-/// claims: Main for 8-bit 4:2:0, Main 10 up to 10 bits, and for
-/// everything else the format range extensions profile that admits it —
-/// the Monochrome profiles, Main 12, Main 4:2:2 10 and 12, Main 4:4:4 up
-/// to 12. Past 12 bits the only such profiles are the 16-bit ones
-/// (Monochrome 16, Main 4:4:4 16 Intra). `HbrFactor` is taken as 1 —
-/// `BrVclFactor` then equals `CpbVclFactor` — the value every
-/// non-intra range extensions profile has
-/// (`general_lower_bit_rate_constraint_flag` 1), and the smaller one.
-fn h265_format(chroma: ChromaFormat, depth: u32) -> (u64, u64, u64) {
-    match (chroma, depth) {
-        (ChromaFormat::Yuv420, 8) => (1_000, 1_500, 10),
-        (ChromaFormat::Yuv420, 9..=10) => (1_000, 1_875, 10),
-        (ChromaFormat::Yuv420, 11..=12) => (1_500, 2_250, 10),
-        (ChromaFormat::Monochrome, 8) => (667, 1_000, 10),
-        (ChromaFormat::Monochrome, 9..=10) => (833, 1_250, 10),
-        (ChromaFormat::Monochrome, 11..=12) => (1_000, 1_500, 10),
-        (ChromaFormat::Monochrome, _) => (1_333, 2_000, 10),
-        (ChromaFormat::Yuv422, 8..=10) => (1_667, 2_500, 5),
-        (ChromaFormat::Yuv422, 11..=12) => (2_000, 3_000, 5),
-        (ChromaFormat::Yuv444, 8) => (2_000, 3_000, 5),
-        (ChromaFormat::Yuv444, 9..=10) => (2_500, 3_750, 5),
-        (ChromaFormat::Yuv444, 11..=12) => (3_000, 4_500, 5),
-        _ => (4_000, 6_000, 5),
+/// Above 12 bits in colour the only such profile is Main 4:4:4 16 Intra,
+/// which an all-intra stream (`gop` 0) is. An inter stream there has no
+/// profile at all — High Throughput 4:4:4 14 would need wavefront
+/// parallel processing, which this encoder does not write — and is coded
+/// with the flags that describe it (no bit-depth limit below 16, its
+/// chroma limits, not intra, lower bit rate): a combination Table A.2
+/// reserves, which no decoder is required to accept, and says so.
+pub fn h265_profile(cfg: &Config, g: &h265_syntax::Geometry) -> H265Profile {
+    match (g.chroma, g.bit_depth) {
+        (ChromaFormat::Yuv420, 8) => H265_MAIN,
+        (ChromaFormat::Yuv420, 9..=10) => H265_MAIN_10,
+        (ChromaFormat::Yuv420, 11..=12) => H265_MAIN_12,
+        (ChromaFormat::Monochrome, 8) => H265_MONOCHROME,
+        (ChromaFormat::Monochrome, 9..=10) => H265_MONOCHROME_10,
+        (ChromaFormat::Monochrome, 11..=12) => H265_MONOCHROME_12,
+        (ChromaFormat::Monochrome, _) => H265_MONOCHROME_16,
+        (ChromaFormat::Yuv422, 8..=10) => H265_MAIN_422_10,
+        (ChromaFormat::Yuv422, 11..=12) => H265_MAIN_422_12,
+        (ChromaFormat::Yuv444, 8) => H265_MAIN_444,
+        (ChromaFormat::Yuv444, 9..=10) => H265_MAIN_444_10,
+        (ChromaFormat::Yuv444, 11..=12) => H265_MAIN_444_12,
+        _ if cfg.gop == 0 => H265_MAIN_444_16_INTRA,
+        (chroma, _) => H265Profile {
+            name: "none (inter coding above 12 bits in colour)",
+            flags: [false, false, false, chroma != ChromaFormat::Yuv444, chroma == ChromaFormat::Yuv420, false, false, false, true],
+            ..H265_MAIN_444_16_INTRA
+        },
     }
 }
 
@@ -545,10 +612,8 @@ struct H265Stream {
     rate: Option<u64>,
     cpb: Option<u64>,
     au_bytes: Option<u64>,
-    /// `h265_format`.
-    vcl_factor: u64,
-    fcf_milli: u64,
-    min_cr_scale_tenths: u64,
+    /// The profile, for its Table A.10 factors.
+    profile: H265Profile,
 }
 
 impl H265Stream {
@@ -560,7 +625,7 @@ impl H265Stream {
         // every entry used by it: a P picture's list 0, a B picture's two
         // anchors.
         let total_curr = u64::from(if cfg.bframes > 0 { cfg.max_refs.max(2) } else { cfg.max_refs.max(1) });
-        let (vcl_factor, fcf_milli, min_cr_scale_tenths) = h265_format(g.chroma, g.bit_depth);
+        let profile = h265_profile(cfg, g);
         let (mut rate, mut cpb, mut au_bytes) = match (declared_cpb(cfg), cfg.rate) {
             (Some(c), _) => (Some(c.bit_rate), Some(c.size), None),
             (None, RateControl::Bitrate { bps }) => (Some(u64::from(bps)), None, None),
@@ -587,9 +652,7 @@ impl H265Stream {
             rate,
             cpb,
             au_bytes,
-            vcl_factor,
-            fcf_milli,
-            min_cr_scale_tenths,
+            profile,
         }
     }
 
@@ -632,20 +695,23 @@ impl H265Stream {
         if self.dpb > max_dpb {
             why.push(format!("a DPB of {} pictures is above MaxDpbSize {max_dpb}", self.dpb));
         }
-        // A.4.1(g) and A.4.2(e), and the VCL HRD the NAL one implies.
-        let f = self.vcl_factor;
-        if let Some(r) = self.rate.filter(|&r| r > f * row.max_br[t]) {
-            why.push(format!("{r} bits/s is above {} (MaxBR {} x {f})", f * row.max_br[t], row.max_br[t]));
+        // A.4.1(g) and A.4.2(e), and the VCL HRD the NAL one implies: the
+        // rate at BrVclFactor = CpbVclFactor * HbrFactor, the buffer at
+        // CpbVclFactor.
+        let p = &self.profile;
+        let (fb, fc) = (p.cpb_vcl_factor * p.hbr_factor(), p.cpb_vcl_factor);
+        if let Some(r) = self.rate.filter(|&r| r > fb * row.max_br[t]) {
+            why.push(format!("{r} bits/s is above {} (MaxBR {} x {fb})", fb * row.max_br[t], row.max_br[t]));
         }
-        if let Some(c) = self.cpb.filter(|&c| c > f * row.max_cpb[t]) {
-            why.push(format!("a {c}-bit buffer is above {} (MaxCPB {} x {f})", f * row.max_cpb[t], row.max_cpb[t]));
+        if let Some(c) = self.cpb.filter(|&c| c > fc * row.max_cpb[t]) {
+            why.push(format!("a {c}-bit buffer is above {} (MaxCPB {} x {fc})", fc * row.max_cpb[t], row.max_cpb[t]));
         }
         // A.4.2(h): an access unit is at most FormatCapabilityFactor *
         // MaxLumaSr * (tr(n) - tr(n - 1)) / MinCr bytes, MinCr being
         // MinCrBase * MinCrScaleFactor / HbrFactor.
         if let Some(b) = self.au_bytes {
-            let lhs = u128::from(b) * u128::from(self.fps) * u128::from(row.min_cr_base[t]) * u128::from(self.min_cr_scale_tenths) * 1_000;
-            let rhs = u128::from(self.fcf_milli) * u128::from(row.max_luma_sr) * 10;
+            let lhs = u128::from(b) * u128::from(self.fps) * u128::from(row.min_cr_base[t]) * u128::from(p.min_cr_scale_tenths) * 1_000;
+            let rhs = u128::from(p.fcf_milli) * u128::from(row.max_luma_sr) * 10 * u128::from(p.hbr_factor());
             if lhs > rhs {
                 why.push(format!("a {b}-byte picture is above FormatCapabilityFactor * MaxLumaSr / MinCr per picture"));
             }
@@ -961,6 +1027,52 @@ mod tests {
     fn h265_lossless_is_held_to_its_raw_rate() {
         assert_eq!(h265_name(&cfg(64, 64, 30)), "1");
         assert_eq!(h265_name(&Config { rate: RateControl::Lossless, ..cfg(64, 64, 30) }), "2");
+    }
+
+    /// Each format's H.265 profile is Table A.2's row for it, flag for flag,
+    /// in both parameter sets: `general_profile_idc`, then — for the format
+    /// range extensions profiles — the nine constraint flags that follow the
+    /// four source flags (bits 44..53 of the profile_tier_level, which the
+    /// VPS starts at bit 32 and the SPS at bit 8). Main and Main 10 leave
+    /// the 43 bits zero. The rows are the standard's, typed out again here
+    /// rather than read from the table they check.
+    #[test]
+    fn h265_profiles_follow_table_a2() {
+        let bit = |rbsp: &[u8], at: usize| rbsp[at / 8] >> (7 - at % 8) & 1 == 1;
+        for (chroma, depth, gop, idc, name, row) in [
+            (ChromaFormat::Yuv420, 8, 8, 1, "Main", "000000000"),
+            (ChromaFormat::Yuv420, 10, 8, 2, "Main 10", "000000000"),
+            (ChromaFormat::Yuv420, 12, 8, 4, "Main 12", "100110001"),
+            (ChromaFormat::Monochrome, 8, 8, 4, "Monochrome", "111111001"),
+            (ChromaFormat::Monochrome, 10, 8, 4, "Monochrome 10", "110111001"),
+            (ChromaFormat::Monochrome, 12, 8, 4, "Monochrome 12", "100111001"),
+            (ChromaFormat::Monochrome, 14, 8, 4, "Monochrome 16", "000111001"),
+            (ChromaFormat::Yuv422, 8, 8, 4, "Main 4:2:2 10", "110100001"),
+            (ChromaFormat::Yuv422, 10, 8, 4, "Main 4:2:2 10", "110100001"),
+            (ChromaFormat::Yuv422, 12, 8, 4, "Main 4:2:2 12", "100100001"),
+            (ChromaFormat::Yuv444, 8, 8, 4, "Main 4:4:4", "111000001"),
+            (ChromaFormat::Yuv444, 10, 8, 4, "Main 4:4:4 10", "110000001"),
+            (ChromaFormat::Yuv444, 12, 8, 4, "Main 4:4:4 12", "100000001"),
+            (ChromaFormat::Yuv444, 14, 0, 4, "Main 4:4:4 16 Intra", "000000101"),
+            (ChromaFormat::Yuv420, 14, 0, 4, "Main 4:4:4 16 Intra", "000000101"),
+            (ChromaFormat::Yuv422, 14, 8, 4, "none (inter coding above 12 bits in colour)", "000100001"),
+        ] {
+            let tag = format!("{chroma:?} {depth}-bit gop {gop}");
+            let c = Config { chroma, bit_depth: depth, gop, ..cfg(64, 64, 30) };
+            let g = h265_syntax::Geometry::new(&c);
+            let p = h265_profile(&c, &g);
+            assert_eq!((p.idc, p.name), (idc, name), "{tag}");
+            for (set, rbsp, ptl) in [
+                ("VPS", crate::nal::unescape_rbsp(&h265_syntax::write_vps(&c, &g)), 32),
+                ("SPS", crate::nal::unescape_rbsp(&h265_syntax::write_sps(&c, &g, 8, None)), 8),
+            ] {
+                assert_eq!(rbsp[ptl / 8] & 0x1f, idc, "{tag} {set}: general_profile_idc");
+                assert!(bit(&rbsp, ptl + 8 + usize::from(idc)), "{tag} {set}: compatibility flag {idc}");
+                let flags: String = (0..9).map(|k| if bit(&rbsp, ptl + 44 + k) { '1' } else { '0' }).collect();
+                assert_eq!(flags, row, "{tag} {set}: Table A.2 flags");
+                assert!((ptl + 53..ptl + 88).all(|k| !bit(&rbsp, k)), "{tag} {set}: reserved bits and inbld");
+            }
+        }
     }
 
     /// The writers carry what the derivation chose — both H.265 parameter
