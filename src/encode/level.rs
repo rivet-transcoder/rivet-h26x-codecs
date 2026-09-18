@@ -292,10 +292,9 @@ impl H264Stream {
         }
         // A.3.3(j), the High profile only: an access unit is at most
         // 384 * MaxMBPS * (tr(n) - tr(n - 1)) / MinCR bytes.
-        if let Some(b) = self.au_bytes.filter(|_| self.profile_idc == 100) {
-            if b * self.fps * row.min_cr > 384 * row.max_mbps {
-                why.push(format!("a {b}-byte picture is above 384 * MaxMBPS / MinCR {} per picture", 384 * row.max_mbps / row.min_cr / self.fps));
-            }
+        let min_cr_limit = |b: &u64| self.profile_idc == 100 && b * self.fps * row.min_cr > 384 * row.max_mbps;
+        if let Some(b) = self.au_bytes.filter(min_cr_limit) {
+            why.push(format!("a {b}-byte picture is above 384 * MaxMBPS / MinCR {} per picture", 384 * row.max_mbps / row.min_cr / self.fps));
         }
         // A.3.3(d) and Table A-4: frame_mbs_only_flag at 1..=2 and 4.2 up.
         if self.interlaced && (row.idc <= 20 || row.idc >= 42) {
@@ -789,14 +788,18 @@ mod tests {
     /// sets, which must agree — rather than any constant.
     #[test]
     fn the_parameter_sets_carry_the_derived_level() {
-        for (c, idc) in [
-            (cfg(176, 144, 15), 10),
-            (Config { rate: RateControl::Bitrate { bps: 100_000 }, ..cfg(176, 144, 15) }, 9),
-            (cfg(1920, 1080, 60), 42),
+        // With the DPB the decoder in this crate sizes from each: Table A-1's
+        // MaxDpbMbs over the frame, at most 16 — level 6's 696320 is five
+        // 8K frames.
+        for (c, idc, dpb) in [
+            (cfg(176, 144, 15), 10, 4),
+            (Config { rate: RateControl::Bitrate { bps: 100_000 }, ..cfg(176, 144, 15) }, 9, 4),
+            (cfg(1920, 1080, 60), 42, 4),
+            (cfg(7680, 4320, 30), 60, 5),
         ] {
             let g = h264_syntax::Geometry::new(&c);
             let sps = crate::h264::Sps::parse(&crate::nal::unescape_rbsp(&h264_syntax::write_sps(&c, &g, 16, 16, None))).unwrap();
-            assert_eq!(sps.level_idc, idc, "H.264 {}x{}@{}", c.width, c.height, c.fps);
+            assert_eq!((sps.level_idc, sps.level_max_dpb_frames()), (idc, dpb), "H.264 {}x{}@{}", c.width, c.height, c.fps);
         }
         for (c, idc, tier) in [
             (cfg(176, 144, 15), 30, false),
