@@ -551,9 +551,10 @@
 //! over the 36 lookahead cells goes from 0.0795 to 0.0523:
 //!
 //! - **What moves.** 15 cells move, all with luma up 0.65 to 10.37 dB.
-//!   13 end closer to target, and the two that end further are below. No
-//!   plane falls more than 0.30 dB, nothing is larger and worse, and no
-//!   cell outside the lookahead rows moves.
+//!   12 end closer to target. The motion clip at 64 kbps goes from 1.035
+//!   to 1.037, with luma up 2.71 dB. The two that end further by more than
+//!   0.01 are below. No plane falls more than 0.30 dB, nothing is larger
+//!   and worse, and no cell outside the lookahead rows moves.
 //! - **The fade clip at 96 kbps: 1.019 to 1.077**, with luma up 2.14 dB.
 //!   Its P pictures alternate as the fade section above records, now
 //!   0.53 to 1.57 of plan against 0.46 to 1.47. Over the clip the P
