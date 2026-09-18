@@ -386,9 +386,10 @@ pub(crate) mod avx {
     kernels!("avx", sse41);
 }
 
-/// AVX2: sixteen samples a vector, for the block widths that have them.
-/// Narrower blocks take the [`avx`] kernels — the 256-bit body would spend
-/// half its lanes on nothing.
+/// AVX2: sixteen samples a vector, for the block widths that have them,
+/// and the SATD of eight-wide blocks in whole 8x8s (two rows a vector,
+/// four tiles a transform). Narrower blocks take the [`avx`] kernels — the
+/// 256-bit body would spend half its lanes on nothing.
 pub(crate) mod avx2 {
     use std::arch::x86_64::*;
 
@@ -545,15 +546,15 @@ pub(crate) mod avx2 {
         ]
     }
 
-    /// Four tiles across, two per 128-bit lane: the 128-bit `satd_pair`
-    /// twice over, since every unpack and shuffle here stays in its lane.
-    /// Returns `[A, A, B, B, C, C, D, D]`, rounded per tile.
+    /// Four tiles, two per 128-bit lane, from four rows of sixteen i16
+    /// differences: the 128-bit `satd_pair` twice over, since every unpack
+    /// and shuffle here stays in its lane. Returns `[A, A, B, B, C, C, D,
+    /// D]`, rounded per tile.
     #[target_feature(enable = "avx2")]
     #[inline]
-    unsafe fn satd_quad(a: *const u8, sa: usize, b: *const u8, sb: usize) -> __m256i {
+    unsafe fn satd_rows(d: [__m256i; 4]) -> __m256i {
         unsafe {
-            let row = |y: usize| _mm256_sub_epi16(load16w(a.add(y * sa)), load16w(b.add(y * sb)));
-            let [t0, t1, t2, t3] = butterfly(row(0), row(1), row(2), row(3));
+            let [t0, t1, t2, t3] = butterfly(d[0], d[1], d[2], d[3]);
             let u0 = _mm256_unpacklo_epi16(t0, t1);
             let u1 = _mm256_unpacklo_epi16(t2, t3);
             let u2 = _mm256_unpackhi_epi16(t0, t1);
@@ -577,6 +578,33 @@ pub(crate) mod avx2 {
         }
     }
 
+    /// Four tiles across a sixteen-wide strip of four rows.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn satd_quad(a: *const u8, sa: usize, b: *const u8, sb: usize) -> __m256i {
+        unsafe {
+            let row = |y: usize| _mm256_sub_epi16(load16w(a.add(y * sa)), load16w(b.add(y * sb)));
+            satd_rows([row(0), row(1), row(2), row(3)])
+        }
+    }
+
+    /// The four tiles of an 8x8 block: rows 0..4 in the low lane, 4..8 in
+    /// the high one, where the 128-bit kernel takes two pairs.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn satd_8x8(a: *const u8, sa: usize, b: *const u8, sb: usize) -> __m256i {
+        unsafe {
+            let two = |p: *const u8, s: usize, y: usize| {
+                _mm256_cvtepu8_epi16(_mm_unpacklo_epi64(
+                    _mm_loadl_epi64(p.add(y * s) as *const __m128i),
+                    _mm_loadl_epi64(p.add((y + 4) * s) as *const __m128i),
+                ))
+            };
+            let row = |y: usize| _mm256_sub_epi16(two(a, sa, y), two(b, sb, y));
+            satd_rows([row(0), row(1), row(2), row(3)])
+        }
+    }
+
     #[target_feature(enable = "avx2")]
     unsafe fn satd_impl(
         a: *const u8,
@@ -589,6 +617,12 @@ pub(crate) mod avx2 {
         unsafe {
             let mut acc = _mm256_setzero_si256();
             let mut y = 0;
+            if w == 8 {
+                while y < h {
+                    acc = _mm256_add_epi32(acc, satd_8x8(a.add(y * sa), sa, b.add(y * sb), sb));
+                    y += 8;
+                }
+            }
             while y < h {
                 let ra = a.add(y * sa);
                 let rb = b.add(y * sb);
@@ -610,7 +644,10 @@ pub(crate) mod avx2 {
     }
 
     fn satd(a: &[u8], a_stride: usize, b: &[u8], b_stride: usize, w: usize, h: usize) -> u32 {
-        if w % 16 != 0 || h % 4 != 0 || h == 0 {
+        // Sixteen or more wide, or eight wide in whole 8x8 blocks; the rest
+        // is a pair of tiles or fewer, one 128-bit vector's work.
+        let ours = if w == 8 { h % 8 == 0 } else { w % 16 == 0 && h % 4 == 0 };
+        if !ours || h == 0 {
             return super::avx::satd(a, a_stride, b, b_stride, w, h);
         }
         assert!(
