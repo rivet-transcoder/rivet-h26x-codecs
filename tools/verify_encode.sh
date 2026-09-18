@@ -459,9 +459,13 @@ EXCLUSIVE_TOKENS="ilace fdeep wsine"
 # decline on content that does not fade (h26xenc's `wp` line counts the P
 # pictures that took a weighting: none on detail, motion or static). At QP 40
 # it does not decline: a reconstruction that coarse has drifted in level from
-# its source, the fit takes a weighting to correct it (21 of 84 P pictures on
-# the cut clip at QP 38), and that is the weighted path on content the fade
-# rows never show it — a row at QP 26 alone proved it only on the fade.
+# its source, and the fit takes a weighting to correct it — a weak one, which
+# the picture-level check prices against a table of defaults (23 of the cut
+# clip's 84 P pictures at QP 40, 21 of them going back to the defaults, the
+# `priced` and `kept them` counts of the `wp` line). That is the weighted
+# path, and the check, on content the fade rows never show them — a row at
+# QP 26 alone proved them only on the fade, whose fits are strong and are
+# never priced.
 #
 # The fade is a pure gain, so the offsets its weighting carries round to zero,
 # and a writer that flipped the sign of every weighting offset failed only 11
@@ -508,6 +512,28 @@ EXCLUSIVE_TOKENS="ilace fdeep wsine"
 # same encoder's on its 8-bit twin, on fewer bytes; its B pictures take both
 # outcomes of the table-against-defaults check. Its name carries `wsine`,
 # one of EXCLUSIVE_TOKENS.
+# The H.264 --wpred rows with --bframes are H.264's explicit weighted
+# bi-prediction. The PPS sets weighted_bipred_idc 1 and every B slice carries
+# a table with an entry for each list's anchor; a B picture whose table
+# weights something is priced against a table of defaults, and a component
+# class left at the defaults writes denominator 0. A B pair whose weights
+# would sum past 8.4.2.3's bound at sixty-fourths takes a coarser
+# denominator (on the fade the first B picture of each GOP codes its luma in
+# thirty-seconds). So every H.264 --wpred row with --bframes moved when that
+# landed — `h264-wp-ipb@fade`, `h264-10-wp-cavlc-ipb@p10` and
+# `h264-wpoff-cavlc-ipb@wpoff` included — and with them, since P pictures'
+# weak fits are priced the same way and their default tables got shorter,
+# every H.264 --wpred row. Against the encoder before it (P weighted, B
+# default) at --bframes 2 over QP 22..40: BD-rate -13.5% on the fade, -17.3%
+# on the gain-and-offset fade, -12.4% on fdeep10, -22.9% on wsine10; on the
+# untagged clips the reconstruction is the default-weighted one to the byte
+# and each B slice a table of defaults (about a byte) larger. The rows below
+# `hevc10-wp40-ipb@wsine10` add the B-slice weighting's own cells: QP 40 over
+# every 8-bit clip, where B pictures take and decline tables; the
+# gain-and-offset fade under CABAC (its CAVLC twin was already there); the
+# fade with the 8x8 transform and sub-partitions, and under adaptive
+# quantisation; and both 10-bit fades. h26xenc's `wp B` line counts the B
+# pictures that took a table, were priced, and kept the defaults.
 # The h264-paff / h264-mbaff rows are H.264 interlaced coding. They visit the
 # two interlaced clips: src_interlace_96x96_420p8 (`@interlace`: fields 20 ms
 # apart, a scrolling half beside a held one, combed so that PAFF has field
@@ -709,6 +735,12 @@ h264-verdict-g2-256k@settle|--codec h264 --bitrate 256000 --gop 2
 hevc10-wp-ipb@wsine10|--codec h265 --qp 26 --gop 8 --bframes 2 --wpred
 hevc10-wp-ip@wsine10|--codec h265 --qp 26 --gop 8 --wpred
 hevc10-wp40-ipb@wsine10|--codec h265 --qp 40 --gop 8 --bframes 2 --wpred
+h264-wp40-ipb|--codec h264 --qp 40 --gop 8 --bframes 2 --wpred
+h264-wpoff-ipb@wpoff|--codec h264 --qp 26 --gop 8 --bframes 2 --wpred
+h264-wp-t8x8-subparts-ipb@fade|--codec h264 --qp 26 --gop 8 --bframes 2 --t8x8 --subparts --wpred
+h264-wp-aq-ipb@fade|--codec h264 --qp 26 --gop 8 --bframes 2 --aq 1.0 --wpred
+h264-10-wp-ipb@wsine10|--codec h264 --qp 26 --gop 8 --bframes 2 --wpred
+h264-10-wp40-ipb@fdeep10|--codec h264 --qp 40 --gop 8 --bframes 2 --wpred
 "}
 
 # Split a clip's format token into its chroma format and sample depth:
