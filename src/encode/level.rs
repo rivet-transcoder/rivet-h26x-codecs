@@ -1009,8 +1009,11 @@ mod tests {
         assert_eq!(h265_with(&abr(1_000_000_000), None), H265_LEVEL_8_5);
         // A 2 s buffer at 12 Mbit/s: 24 Mbit, past level 4.1's 20.
         assert_eq!(got(&Config { cpb_ms: 2000, ..abr(12_000_000) }), ("5", false));
-        // 4:4:4 is Main 4:4:4, CpbVclFactor 2000: level 4 carries 24 Mbit/s.
+        // 4:4:4 is Main 4:4:4, CpbVclFactor 2000: level 4 carries 24 Mbit/s,
+        // and not 48 — the profile's lower-bit-rate flag is written, so
+        // its HbrFactor is 1.
         assert_eq!(got(&Config { chroma: ChromaFormat::Yuv444, ..abr(20_000_000) }), ("4", false));
+        assert_eq!(got(&Config { chroma: ChromaFormat::Yuv444, ..abr(30_000_000) }), ("4.1", false));
     }
 
     /// What no level up to 6.2 admits is level 8.5, High tier (A.4.1).
