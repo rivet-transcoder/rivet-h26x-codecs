@@ -814,6 +814,7 @@ pub fn write_b_picture<S: Sample>(
     rec: &mut [Recon<S>],
     refs: [&[Recon<S>]; 2],
     col: &Colocated,
+    weights: Option<&crate::h264::slice::PredWeightTable>,
 ) -> PicMotion {
     let mbs_wide = g.mbs_wide as usize;
     let rows = if g.chroma == crate::picture::ChromaFormat::Yuv444 { 0 } else { g.chroma_mb().1 as usize / 4 };
@@ -821,7 +822,7 @@ pub fn write_b_picture<S: Sample>(
     st.field = g.field_pic;
     let mut skip_run: u32 = 0;
     let t8x8 = tools.transform_8x8;
-    let fmbs = code_b_picture(g, tools, qp, planes, rec, refs, col, |mb_x, mb_y, mb| match mb {
+    let fmbs = code_b_picture(g, tools, qp, planes, rec, refs, col, weights, |mb_x, mb_y, mb| match mb {
         BMb::Skip(_) => {
             skip_run += 1;
             skip_nz(&mut st, mb_x);

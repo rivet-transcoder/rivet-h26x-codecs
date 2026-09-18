@@ -491,12 +491,13 @@ pub fn write_pps(cfg: &Config, qp: u8) -> Vec<u8> {
     w.ue(0); // num_slice_groups_minus1
     w.ue(0); // num_ref_idx_l0_default_active_minus1
     w.ue(0); // num_ref_idx_l1_default_active_minus1
-    // Explicit weighted prediction for P slices when asked for, and then
-    // every P slice carries a `pred_weight_table`. B slices keep default
-    // weighting — `weighted_bipred_idc` stays 0 — because the fit is one
-    // line per reference and a two-list decision would need its own.
+    // Explicit weighted prediction when asked for: every P slice carries a
+    // `pred_weight_table`, and so — `weighted_bipred_idc` 1, explicit — does
+    // every B slice of a stream that has B pictures. A stream without them
+    // keeps the idc at 0, so its PPS is the one it had before B slices were
+    // weighted.
     w.flag(cfg.weighted_pred); // weighted_pred_flag
-    w.bits(2, 0); // weighted_bipred_idc
+    w.bits(2, u32::from(cfg.weighted_pred && cfg.bframes > 0)); // weighted_bipred_idc
     w.se(qp as i32 - 26); // pic_init_qp_minus26
     w.se(0); // pic_init_qs_minus26
     w.se(0); // chroma_qp_index_offset
@@ -521,13 +522,14 @@ pub fn write_pps(cfg: &Config, qp: u8) -> Vec<u8> {
     w.into_nal()
 }
 
-/// A P slice's `pred_weight_table` as the writer spells it: the table a
-/// decoder will hold, and whether the stream has chroma — the reader's
+/// A P or B slice's `pred_weight_table` as the writer spells it: the table
+/// a decoder will hold, and whether the stream has chroma — the reader's
 /// `ChromaArrayType != 0` gate on the table's chroma half.
 #[derive(Debug, Clone)]
 pub struct PredWeights {
-    /// The table: one list-0 entry per active reference, offsets in the
-    /// syntax's 8-bit units (the reader shifts them to the sample depth).
+    /// The table: one entry per active reference of list 0 and, for a B
+    /// slice, of list 1; offsets in the syntax's 8-bit units (the reader
+    /// shifts them to the sample depth).
     pub table: PredWeightTable,
     /// Whether the chroma denominator and weights are present.
     pub chroma: bool,
@@ -569,8 +571,8 @@ pub struct SliceHeader {
     /// temporal direct over zero colocated motion.
     pub direct_spatial: bool,
     /// `pred_weight_table()`: present exactly for a P slice under a PPS
-    /// that sets `weighted_pred_flag`, and `None` for every I and B slice
-    /// (`weighted_bipred_idc` is 0).
+    /// that sets `weighted_pred_flag` and a B slice under one whose
+    /// `weighted_bipred_idc` is 1, and `None` for every other slice.
     pub pred_weights: Option<PredWeights>,
     /// The SPS writes `frame_mbs_only_flag` 0, so `field_pic_flag` is in
     /// the header — and, since this encoder's PPS sets
@@ -631,8 +633,8 @@ pub fn write_slice_header(h: &SliceHeader, pps_qp: u8, w: &mut BitWriter) {
     // pred_weight_table(), between the list modifications and the reference
     // marking (7.3.3).
     if let Some(pw) = h.pred_weights.as_ref() {
-        debug_assert_eq!(h.kind, Kind::P, "only a P slice carries a table: weighted_bipred_idc is 0");
-        write_pred_weight_table(pw, w);
+        debug_assert!(matches!(h.kind, Kind::P | Kind::B), "only an inter slice carries a table");
+        write_pred_weight_table(pw, h.kind == Kind::B, w);
     }
     if h.reference {
         if h.kind == Kind::Idr {
@@ -660,17 +662,19 @@ pub fn write_slice_header(h: &SliceHeader, pps_qp: u8, w: &mut BitWriter) {
     }
 }
 
-/// Write `pred_weight_table()` for a P slice (7.3.3.2): the exact inverse of
-/// the reader's parse (src/h264/slice.rs) for a table it will hold as
-/// `pw.table` — `luma_log2_weight_denom`, `chroma_log2_weight_denom` when
-/// the stream has chroma, then per list-0 entry the luma flag with the
-/// weight and offset behind it, and the chroma flag with both components'
-/// weights and offsets behind that. A flag is set exactly when the entry
-/// differs from the default `(1 << denom, 0)` the reader infers for an
-/// unflagged one, so a table of defaults costs its flags and nothing more.
-/// Weights and offsets are the syntax's own values: the weight itself (not
-/// a delta, unlike H.265), the offset in 8-bit units.
-pub fn write_pred_weight_table(pw: &PredWeights, w: &mut BitWriter) {
+/// Write `pred_weight_table()` for a P slice, or for a B slice when
+/// `b_slice` (7.3.3.2): the exact inverse of the reader's parse
+/// (src/h264/slice.rs) for a table it will hold as `pw.table` —
+/// `luma_log2_weight_denom`, `chroma_log2_weight_denom` when the stream has
+/// chroma, then per list-0 entry the luma flag with the weight and offset
+/// behind it, and the chroma flag with both components' weights and
+/// offsets behind that; then, for a B slice, list 1's entries the same way.
+/// A flag is set exactly when the entry differs from the default `(1 <<
+/// denom, 0)` the reader infers for an unflagged one, so a table of
+/// defaults costs its flags and nothing more. Weights and offsets are the
+/// syntax's own values: the weight itself (not a delta, unlike H.265), the
+/// offset in 8-bit units.
+pub fn write_pred_weight_table(pw: &PredWeights, b_slice: bool, w: &mut BitWriter) {
     let t = &pw.table;
     w.ue(t.luma_log2_denom); // luma_log2_weight_denom
     if pw.chroma {
@@ -678,20 +682,22 @@ pub fn write_pred_weight_table(pw: &PredWeights, w: &mut BitWriter) {
     }
     let luma_default = (1i32 << t.luma_log2_denom, 0i32);
     let chroma_default = [(1i32 << t.chroma_log2_denom, 0i32); 2];
-    for e in &t.lists[0] {
-        let luma = e.luma != luma_default;
-        w.flag(luma); // luma_weight_l0_flag
-        if luma {
-            w.se(e.luma.0); // luma_weight_l0
-            w.se(e.luma.1); // luma_offset_l0
-        }
-        if pw.chroma {
-            let chroma = e.chroma != chroma_default;
-            w.flag(chroma); // chroma_weight_l0_flag
-            if chroma {
-                for (cw, co) in e.chroma {
-                    w.se(cw); // chroma_weight_l0
-                    w.se(co); // chroma_offset_l0
+    for list in &t.lists[..if b_slice { 2 } else { 1 }] {
+        for e in list {
+            let luma = e.luma != luma_default;
+            w.flag(luma); // luma_weight_lX_flag
+            if luma {
+                w.se(e.luma.0); // luma_weight_lX
+                w.se(e.luma.1); // luma_offset_lX
+            }
+            if pw.chroma {
+                let chroma = e.chroma != chroma_default;
+                w.flag(chroma); // chroma_weight_lX_flag
+                if chroma {
+                    for (cw, co) in e.chroma {
+                        w.se(cw); // chroma_weight_lX
+                        w.se(co); // chroma_offset_lX
+                    }
                 }
             }
         }
@@ -1443,5 +1449,96 @@ mod tests {
         let plain = Config { width: 64, height: 64, ..Config::default() };
         assert_eq!(write_pps(&plain, 26).len(), 3, "no switch, the historical PPS");
         assert_ne!(write_pps(&plain, 26), write_pps(&Config { weighted_pred: true, ..plain.clone() }, 26));
+    }
+
+    /// A B slice header carrying a two-list `pred_weight_table` — each
+    /// list its own entry, and one list left at the defaults in turn, at a
+    /// denominator other than six (a B pair's weights may need a coarser
+    /// one) — comes back through the production slice parser as the table
+    /// written, both lists in place and the quantiser after them intact, at
+    /// 8 and 10 bits for 4:2:0, 4:2:2, 4:4:4 and monochrome. The PPS says
+    /// explicit (`weighted_bipred_idc` 1) exactly for a weighted stream with
+    /// B pictures: without them it stays the P-only PPS.
+    #[test]
+    fn a_b_pred_weight_table_round_trips_through_the_slice_parser() {
+        use crate::h264::slice::WeightEntry;
+        let at = |d: u32, luma: (i32, i32), chroma: [(i32, i32); 2]| WeightEntry {
+            luma,
+            chroma,
+            luma_flag: luma != (1 << d, 0),
+            chroma_flag: chroma != [(1 << d, 0); 2],
+        };
+        // (luma denominator, chroma denominator, list 0, list 1).
+        let pairs = |luma_d: u32, chroma_d: u32| {
+            let def = |d: u32| (1i32 << d, 0i32);
+            [
+                (at(luma_d, (30, -3), [(34, 5), (29, -9)]), at(luma_d, (37, 4), [(31, -2), (36, 7)])),
+                (at(luma_d, (27, 12), [(33, -1), def(chroma_d)]), at(luma_d, def(luma_d), [def(chroma_d); 2])),
+                (at(luma_d, def(luma_d), [def(chroma_d); 2]), at(luma_d, (-40, -128), [(90, 127), (-128, -7)])),
+                (at(luma_d, def(luma_d), [def(chroma_d); 2]), at(luma_d, def(luma_d), [def(chroma_d); 2])),
+            ]
+        };
+        for chroma in [ChromaFormat::Yuv420, ChromaFormat::Yuv422, ChromaFormat::Yuv444, ChromaFormat::Monochrome] {
+            for depth in [8u32, 10] {
+                let cfg = Config { width: 64, height: 64, chroma, bit_depth: depth, bframes: 2, weighted_pred: true, ..Config::default() };
+                let g = Geometry::new(&cfg);
+                let sps = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 16, 16, None))).unwrap();
+                let sps_look = |_id: u32| Some(sps.clone());
+                let pps = crate::h264::pps::Pps::parse(&crate::nal::unescape_rbsp(&write_pps(&cfg, 26)), &sps_look).unwrap();
+                assert!(pps.weighted_pred, "{chroma:?}: weighted_pred_flag");
+                assert_eq!(pps.weighted_bipred_idc, 1, "{chroma:?}: B slices are explicitly weighted");
+                let pps_look = |_id: u32| Some(pps.clone());
+                let has_chroma = chroma != ChromaFormat::Monochrome;
+                let (luma_d, chroma_d) = (5u32, if has_chroma { 5 } else { 0 });
+                for (e0, e1) in pairs(luma_d, chroma_d) {
+                    let strip = |e: WeightEntry| if has_chroma { e } else { WeightEntry { chroma: [(1, 0); 2], chroma_flag: false, ..e } };
+                    let (e0, e1) = (strip(e0), strip(e1));
+                    let table = PredWeightTable { luma_log2_denom: luma_d, chroma_log2_denom: chroma_d, lists: [vec![e0], vec![e1]] };
+                    let tag = format!("{chroma:?} {depth}-bit {e0:?} / {e1:?}");
+                    let mut w = BitWriter::new();
+                    write_slice_header(
+                        &SliceHeader {
+                            kind: Kind::B,
+                            frame_num: 3,
+                            idr_pic_id: 0,
+                            poc_lsb: 6,
+                            qp: 33,
+                            log2_max_frame_num: 16,
+                            log2_max_poc_lsb: 16,
+                            reference: false,
+                            deblock: true,
+                            cabac: true,
+                            direct_spatial: true,
+                            pred_weights: Some(PredWeights { table: table.clone(), chroma: has_chroma }),
+                            interlaced: false,
+                            bottom_field: None,
+                            delta_poc_bottom: 0,
+                        },
+                        26,
+                        &mut w,
+                    );
+                    w.rbsp_trailing_bits();
+                    let nal = annexb(NAL_SLICE, 0, &w.into_nal());
+                    let rbsp = crate::nal::unescape_rbsp(&nal[4..]);
+                    let hdr = crate::nal::H264NalHeader::parse(&nal[4..]).unwrap();
+                    let (parsed, _, _) = crate::h264::slice::SliceHeader::parse(&rbsp, hdr, &pps_look, &sps_look)
+                        .unwrap_or_else(|err| panic!("{tag}: slice header rejected: {err}"));
+                    let got = parsed.pred_weights.as_ref().unwrap_or_else(|| panic!("{tag}: no table read"));
+                    assert_eq!(got, &table, "{tag}: the table read back");
+                    assert_eq!((got.lists[0].len(), got.lists[1].len()), (1, 1), "{tag}: one entry per list");
+                    assert!(parsed.direct_spatial_mv_pred, "{tag}: the flag before the table");
+                    assert_eq!(parsed.slice_qp, 33, "{tag}: the quantiser after the table");
+                }
+            }
+        }
+        let b = Config { width: 64, height: 64, bframes: 2, ..Config::default() };
+        let parse = |cfg: &Config| {
+            let g = Geometry::new(cfg);
+            let sps = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&write_sps(cfg, &g, 16, 16, None))).unwrap();
+            crate::h264::pps::Pps::parse(&crate::nal::unescape_rbsp(&write_pps(cfg, 26)), &|_id: u32| Some(sps.clone())).unwrap()
+        };
+        assert_eq!(parse(&b).weighted_bipred_idc, 0, "B pictures without weighting");
+        assert_eq!(parse(&Config { weighted_pred: true, bframes: 0, ..b.clone() }).weighted_bipred_idc, 0, "weighting without B pictures");
+        assert_eq!(write_pps(&b, 26), write_pps(&Config { bframes: 0, ..b.clone() }, 26), "no weighting, no change");
     }
 }

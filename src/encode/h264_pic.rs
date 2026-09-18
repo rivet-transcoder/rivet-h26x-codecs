@@ -25,8 +25,8 @@ use crate::encode::aq;
 use crate::encode::h264_deblock::{deblock_recon, nz_mask_of};
 use crate::encode::h264_intra::{IntraCtx, MbAvail, MbDecision, MbKind, code_macroblock, code_macroblock_modes8};
 use crate::encode::h264_me::{
-    BDecision, BMbKind, InterDecision, InterMbKind, MbMotionState, PRef, code_macroblock_b,
-    code_macroblock_p, weighted_search_plane, weighting_gain,
+    BDecision, BMbKind, BRefs, InterDecision, InterMbKind, MbMotionState, PRef, b_weightings, code_macroblock_b,
+    code_macroblock_p, weighted_search_plane, weighting_gain, weighting_gain_b,
 };
 use crate::encode::h264_syntax::{Geometry, Plane, Recon};
 use crate::h264::frame::{BlockMotion, Frame, Mv};
@@ -146,7 +146,7 @@ pub struct PicMotion {
     pub(crate) pairs: [u64; 2],
 }
 
-/// What a P picture's explicit weighting did, for the census.
+/// What a P or B picture's explicit weighting did, for the census.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WeightCensus {
     /// The picture's table weights something: some entry is not the default.
@@ -157,6 +157,10 @@ pub struct WeightCensus {
     pub won: u64,
     /// The same, higher weighted than plain — the fit's prediction failing.
     pub lost: u64,
+    /// The picture's fitted table lost the picture-level check to a table
+    /// of defaults, and the picture was kept coded under the defaults
+    /// (`on` is then false: the kept table weights nothing).
+    pub rd_default: bool,
 }
 
 impl PicMotion {
@@ -834,6 +838,17 @@ pub enum BMb<'a> {
 /// motion record (the vec a previous walk returned), which the spatial
 /// direct derivation reads as colocated motion. `refs` are the list-0
 /// (past) and list-1 (future) reference planes, borders replicated.
+///
+/// `weights` is the slice's `pred_weight_table` when the PPS sets
+/// `weighted_bipred_idc` 1: every prediction then takes the weighting the
+/// reader's `explicit_weighting` derives from it for the reference pair it
+/// uses — one list's entry for a one-list prediction, both for a
+/// bi-predicted one, direct and skip at their derived pair — and each
+/// weighted list's search scores against its weighted luma, as a P
+/// picture's does. A table whose every entry is the default predicts
+/// exactly the samples default weighting does (`w = 1 << logWD`, `o = 0`
+/// reduce 8.4.2.3.2's formulas to 8.4.2.3.1's, one list and two), so it
+/// leaves the walk on default weighting and its average kernel.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn code_b_picture<S: Sample>(
     g: &Geometry,
@@ -843,6 +858,7 @@ pub(crate) fn code_b_picture<S: Sample>(
     rec: &mut [Recon<S>],
     refs: [&[Recon<S>]; 2],
     col: &Colocated,
+    weights: Option<&PredWeightTable>,
     mut emit: impl FnMut(usize, usize, BMb<'_>),
 ) -> PicMotion {
     let pc = PicCoding::new(g, tools, qp, planes);
@@ -850,6 +866,25 @@ pub(crate) fn code_b_picture<S: Sample>(
     let (mbs_wide, mbs_high) = (pc.mbs_wide, pc.mbs_high);
     let (src_y, src_cb, src_cr) = (&pc.src_y[..], &pc.src_cb[..], &pc.src_cr[..]);
     debug_assert_eq!(col.frame.mb_width, mbs_wide, "the colocated picture is the same width");
+
+    // The references as the decisions see them: each kind of prediction's
+    // weighting, the reader's own derivation for its reference pair, and
+    // each list's search luma, weighted when that list's luma is.
+    let on = weights.is_some_and(|t| t.lists.iter().flatten().any(|e| e.luma_flag || e.chroma_flag));
+    let weighting = b_weightings(weights.filter(|_| on), g.bit_depth);
+    let weighted_luma: [Option<Recon<S>>; 2] = [0usize, 1].map(|l| match weighting[l] {
+        Weighting::Weighted { log_wd, w, o } if (w[0][l], o[0][l]) != (1 << log_wd[0], 0) => {
+            Some(weighted_search_plane(&refs[l][0], log_wd[0], w[0][l], o[0][l], ctx.max))
+        }
+        _ => None,
+    });
+    let brefs = BRefs {
+        planes: refs,
+        search: [0usize, 1].map(|l| weighted_luma[l].as_ref().unwrap_or(&refs[l][0])),
+        weighting,
+    };
+    let luma_weighted = weighted_luma.iter().any(Option::is_some);
+    let mut wstats = WeightCensus { on, ..WeightCensus::default() };
 
     let mut top_modes: Vec<[Option<u8>; 4]> = vec![[None; 4]; mbs_wide];
     let mut pm = PicMotion::new(mbs_wide, mbs_high);
@@ -867,7 +902,7 @@ pub(crate) fn code_b_picture<S: Sample>(
             let mut dec = code_macroblock_b(
                 ctx,
                 rec,
-                refs,
+                &brefs,
                 mb_x,
                 mb_y,
                 src_y,
@@ -880,6 +915,16 @@ pub(crate) fn code_b_picture<S: Sample>(
                 false,
                 col.map.cur_parity,
             );
+            // The weighting's model check, at the vectors and lists this
+            // macroblock chose (direct and skip at their derived ones).
+            if luma_weighted && dec.kind != BMbKind::UseIntra {
+                let mut rects = [(0usize, 0usize, 0usize, 0usize); 16];
+                let n = dec.rects(&mut rects);
+                let (plain, weighted) =
+                    weighting_gain_b(ctx, &brefs, mb_x * 16, mb_y * 16, src_y, pc.luma_stride, &rects[..n], st.motion());
+                wstats.won += u64::from(weighted < plain);
+                wstats.lost += u64::from(weighted > plain);
+            }
             if dec.kind == BMbKind::UseIntra {
                 let mb = MbAvail {
                     left: mb_x > 0,
@@ -974,6 +1019,7 @@ pub(crate) fn code_b_picture<S: Sample>(
         }
     }
     deblock_recon(&tools.dsp, g, &mut pm, rec);
+    pm.weighting = wstats;
     pm
 }
 
@@ -1359,10 +1405,10 @@ impl<S: Sample> MbaffWalk<'_, '_, S> {
                 }
             }
             MbaffRefs::B { frame, fields, col } => {
-                let refs2: [&[Recon<S>]; 2] = if field { [fields[0][b], fields[1][b]] } else { *frame };
+                let refs2 = BRefs::plain(if field { [fields[0][b], fields[1][b]] } else { *frame });
                 self.st.start_mbaff(&self.pm.frame, &self.pm.info, addr, field, &mut self.nb);
                 let mut dec =
-                    code_macroblock_b(&ctx, rec, refs2, vx, vy, ys, ls, [cbs, crs], cs, &mut self.st, col, addr, field, parity);
+                    code_macroblock_b(&ctx, rec, &refs2, vx, vy, ys, ls, [cbs, crs], cs, &mut self.st, col, addr, field, parity);
                 if dec.kind == BMbKind::UseIntra {
                     let (idec, modes) =
                         code_macroblock_modes8(&ctx, rec, vx, vy, ys, ls, [cbs, crs], cs, avail, &left4, &top4, &left8);

@@ -403,13 +403,19 @@ fn main() {
     }
     // The weighting census, when weighted prediction was asked for: how
     // many P pictures chose a weighting, and whether it lowered the luma
-    // residual at the vectors the search chose, macroblock by macroblock.
+    // residual at the vectors the search chose, macroblock by macroblock —
+    // and the same for the B pictures, when there are any.
     if wpred {
         let c = enc.shape_census();
-        eprintln!(
-            "wp P: {} of {} pictures weighted, {} macroblocks won, {} lost",
-            c.wp_on[1], c.pictures[1], c.wp_won[1], c.wp_lost[1]
-        );
+        for (pic, name) in [(1usize, "P"), (2, "B")] {
+            if pic == 2 && c.pictures[2] == 0 {
+                continue;
+            }
+            eprintln!(
+                "wp {name}: {} of {} pictures weighted, {} macroblocks won, {} lost, {} kept the defaults",
+                c.wp_on[pic], c.pictures[pic], c.wp_won[pic], c.wp_lost[pic], c.wp_rd_default[pic]
+            );
+        }
     }
     // The interlace census, when interlaced coding was asked for: how many
     // field pictures the frames were coded as.
