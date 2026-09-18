@@ -570,3 +570,60 @@ arm64 emulation (`rust:1-slim-bookworm`, `linux/arm64`). There is no
 arm64 hardware behind that result. On simd128, `tools/wasm.sh` now expects
 installed-mask 2047: bits 512 and 1024 are the H.264 transforms and
 quantisers.
+
+## The simdfull round, continued: intra prediction and the SAO statistics (2026-09-18)
+
+The same 1080p profile, H.265 with `--sao`, put two scalar passes at the top:
+- the intra predictor, called once for each candidate mode: 22.3% of an 8-bit encode's self time and 20.9% of a 10-bit one's;
+- the SAO decision's edge classification and per-category error sums: 11.2% and 9.0%.
+
+### What changed
+
+- **Intra prediction.** `hevc::intra` gathers and substitutes the references once, in `prepare` (8.4.4.2.2). `predict_prepared` then smooths on first need, keeping the result for the block's later modes (8.4.4.2.3), and predicts.
+  - The three predictors are `HevcDsp` entries: `intra_planar`, `intra_dc` and `intra_angular`. The horizontal angular modes predict the transposed block and transpose it on the way out.
+  - SIMD on every x86 rung (128-bit; AVX2 and AVX-512 keep those), NEON and simd128.
+  - The encoder's luma search prepares a block once for its 35 trials. The chroma search does the same per plane when the chroma block is one transform block.
+  - A test keeps the old predictor verbatim and checks the new one against it on every table the host builds: every mode, size and availability pattern, and every filter configuration.
+- **SAO statistics.** A new `DistortionDsp` entry, `sao_edge_stats`: per edge category, the count and the error sum over a region whose neighbours are all inside the picture.
+  - The picture-edge rows and columns keep the scalar loop.
+  - Samples within reach of a rail come back one by one, as the reference reports them.
+  - x86 SSE2 / SSE4.1 / AVX. Every sum is an integer, so lane order cannot change a result. NEON and simd128 run the scalar reference.
+  - The decision's "leave the CTB alone" distortion is now the table's SSD.
+
+### What they measured
+
+Per kernel: ns per call, through the table, median of seven paired rounds, 44–59% machine load. The bench crate that produced these is outside the tree; each call includes a small buffer allocation. Speedups are over scalar, at AVX2.
+
+| kernel | 4x4 | 8x8 | 16x16 | 32x32 |
+|---|---:|---:|---:|---:|
+| `intra_angular`, four modes, 8-bit | 1.6x | 3.0x | 4.0x | 4.2x |
+| `intra_angular`, four modes, 10-bit | 1.5x | 2.7x | 4.2x | 4.3x |
+| `intra_planar` + `intra_dc`, 8-bit | 1.1x | 1.4x | 1.8x | 1.8x |
+
+`sao_edge_stats`:
+- 8-bit: 3.1x on a 64x64 region, 2.5x on 32x32;
+- 10-bit: 4.2x on 64x64, 3.5x on 32x32.
+
+End to end: 1080p, 10 frames IP, QP 27, `--sao --threads 1`. `tools/ab_enc.py`, seven paired rounds, at 14–17% load.
+
+| | 8-bit | 10-bit |
+|---|---:|---:|
+| encode, before these two against after | 0.777 (0.766–0.783) | 0.829 (0.816–0.836) |
+| same-binary control | 0.995 (0.913–1.073) | 0.989 (0.979–1.005) |
+
+The decoder runs the same predictors, but intra prediction is a few percent of a decode. An H.265 decode read 0.974 (0.925–1.054) at 8 bits and 1.000 (0.959–1.061) at 10, which is no measurable change.
+
+The whole simdfull round was also measured in the same session: develop c5be83f against all three batches, 1080p, one thread.
+
+| | H.264 8-bit | H.264 10-bit | H.265 8-bit | H.265 10-bit |
+|---|---:|---:|---:|---:|
+| encode | 0.924 (0.913–0.924) | 0.940 (0.934–0.958) | 0.722 (0.685–0.755) | 0.770 (0.737–0.779) |
+| decode | 1.000 (0.966–1.051) | 0.985 (0.951–1.031) | 0.975 (0.952–1.027) | 0.881 (0.800–1.185) |
+
+The 10-bit H.265 decode row is the fused 16-bit interpolation. Against its own base that change read 0.824 (0.640–0.978) over 25 rounds.
+
+Every stream is byte for byte what it was:
+- all 966 cells of `verify_encode.sh`, with the encode-side tables on and off;
+- the same 966 cells against the previous encoder;
+- every rung of `verify_enc_ladder.sh`;
+- every rung of the decoder fixtures against `baseline.txt`.
