@@ -97,17 +97,43 @@
 //!   level (A.4.1: "a suitable label for bitstreams that can exceed the
 //!   limits of all other specified levels"). It is not refused.
 //!
-//! # What is not checked here
+//! # What the encoder keeps for its level
 //!
 //! Some limits constrain the encoder's *decisions*, not its parameters,
-//! and choosing a level cannot satisfy them:
+//! and no choice of level can meet them on its behalf. The encoder derives
+//! the level first and then holds its decisions to it
+//! ([`MotionLimits`]):
 //!
-//! - H.264 `MaxVmvR`, the vertical motion vector range.
-//! - H.264 `MaxMvsPer2Mb` and `MinLumaBiPredSize` (level 3 and above:
-//!   sub-8x8 partitions, bi-predicted ones especially).
-//! - The per-picture `MinCR` / `MinCr` bound for anything but lossless.
+//! - H.264 `MaxVmvR` (A.3.2(g)): every luma vector's vertical component
+//!   within `[-MaxVmvR, MaxVmvR - 1/4]` frame samples — 64 at level 1, 512
+//!   from 3.1 — halved in a field macroblock's own rows. The motion search
+//!   clamps its window to it, as x264 does (`h264_me::search_rect`).
+//! - H.264 `MaxMvsPer2Mb` (A.3.2(i)): at most 32 motion vectors in any
+//!   two consecutive macroblocks at level 3, 16 from 3.1 — consecutive in
+//!   decoding order, across slices and pictures. Each 8x8 quarter of a
+//!   macroblock is held to an eighth of that, so no macroblock takes more
+//!   than half and no pair more than all, whatever its neighbours hold:
+//!   level 3 loses the bi-predicted 4x4 sub-macroblock, 3.1 every 4x4 and
+//!   every bi-predicted sub-macroblock below 8x8. Only `--subparts` offers
+//!   those shapes; everything else spends at most eight vectors.
+//! - H.264 `MinLumaBiPredSize` 8x8 (A.3.3(e), Table A-4, from 3.1): no
+//!   `B_Bi_8x4`, `B_Bi_4x8` or `B_Bi_4x4`, which the budget above already
+//!   excludes and the search refuses by name as well.
 //!
-//! They applied equally to the constant these encoders used to write.
+//! # What is not checked here
+//!
+//! - **The rate of a constant-quantiser stream.** See above: no bound
+//!   below the raw rate can be justified, so it is left to the caller's
+//!   quantiser, as x264 and x265 leave it without a VBV.
+//! - **The per-picture `MinCR` / `MinCr` bound** for anything but
+//!   lossless. At a declared buffer each picture is held to the buffer
+//!   instead, which `h26xhrd` checks.
+//! - **The buffer against the level.** `h26xhrd` (examples/) walks the
+//!   coded picture buffer the stream *declares* and nothing else. It does
+//!   not compare that buffer with the level's `MaxBR` / `MaxCPB`. The
+//!   derivation here keeps the declared `BitRate` and `CpbSize` within
+//!   the VCL factor times those limits by construction, so a stream that
+//!   passes `h26xhrd` also meets its level's rate limits.
 
 use crate::Result;
 use crate::encode::h264_syntax;
@@ -158,36 +184,40 @@ struct H264Row {
     max_cpb: u64,
     /// `MinCR`.
     min_cr: u64,
+    /// `MaxVmvR`, luma frame samples.
+    max_vmv_r: i32,
+    /// `MaxMvsPer2Mb`, 0 where the level sets none.
+    max_mvs_per_2mb: u32,
 }
 
 #[allow(clippy::too_many_arguments)]
-const fn h264_row(idc: u8, name: &'static str, max_mbps: u64, max_fs: u64, max_dpb_mbs: u64, max_br: u64, max_cpb: u64, min_cr: u64) -> H264Row {
-    H264Row { idc, name, max_mbps, max_fs, max_dpb_mbs, max_br, max_cpb, min_cr }
+const fn h264_row(idc: u8, name: &'static str, max_mbps: u64, max_fs: u64, max_dpb_mbs: u64, max_br: u64, max_cpb: u64, min_cr: u64, max_vmv_r: i32, max_mvs_per_2mb: u32) -> H264Row {
+    H264Row { idc, name, max_mbps, max_fs, max_dpb_mbs, max_br, max_cpb, min_cr, max_vmv_r, max_mvs_per_2mb }
 }
 
 /// Table A-1 in the order the standard ranks it (A.3.1: a row nearer the
 /// top is a lower level), 1b between 1 and 1.1.
 const H264_LEVELS: [H264Row; 20] = [
-    h264_row(10, "1", 1_485, 99, 396, 64, 175, 2),
-    h264_row(9, "1b", 1_485, 99, 396, 128, 350, 2),
-    h264_row(11, "1.1", 3_000, 396, 900, 192, 500, 2),
-    h264_row(12, "1.2", 6_000, 396, 2_376, 384, 1_000, 2),
-    h264_row(13, "1.3", 11_880, 396, 2_376, 768, 2_000, 2),
-    h264_row(20, "2", 11_880, 396, 2_376, 2_000, 2_000, 2),
-    h264_row(21, "2.1", 19_800, 792, 4_752, 4_000, 4_000, 2),
-    h264_row(22, "2.2", 20_250, 1_620, 8_100, 4_000, 4_000, 2),
-    h264_row(30, "3", 40_500, 1_620, 8_100, 10_000, 10_000, 2),
-    h264_row(31, "3.1", 108_000, 3_600, 18_000, 14_000, 14_000, 4),
-    h264_row(32, "3.2", 216_000, 5_120, 20_480, 20_000, 20_000, 4),
-    h264_row(40, "4", 245_760, 8_192, 32_768, 20_000, 25_000, 4),
-    h264_row(41, "4.1", 245_760, 8_192, 32_768, 50_000, 62_500, 2),
-    h264_row(42, "4.2", 522_240, 8_704, 34_816, 50_000, 62_500, 2),
-    h264_row(50, "5", 589_824, 22_080, 110_400, 135_000, 135_000, 2),
-    h264_row(51, "5.1", 983_040, 36_864, 184_320, 240_000, 240_000, 2),
-    h264_row(52, "5.2", 2_073_600, 36_864, 184_320, 240_000, 240_000, 2),
-    h264_row(60, "6", 4_177_920, 139_264, 696_320, 240_000, 240_000, 2),
-    h264_row(61, "6.1", 8_355_840, 139_264, 696_320, 480_000, 480_000, 2),
-    h264_row(62, "6.2", 16_711_680, 139_264, 696_320, 800_000, 800_000, 2),
+    h264_row(10, "1", 1_485, 99, 396, 64, 175, 2, 64, 0),
+    h264_row(9, "1b", 1_485, 99, 396, 128, 350, 2, 64, 0),
+    h264_row(11, "1.1", 3_000, 396, 900, 192, 500, 2, 128, 0),
+    h264_row(12, "1.2", 6_000, 396, 2_376, 384, 1_000, 2, 128, 0),
+    h264_row(13, "1.3", 11_880, 396, 2_376, 768, 2_000, 2, 128, 0),
+    h264_row(20, "2", 11_880, 396, 2_376, 2_000, 2_000, 2, 128, 0),
+    h264_row(21, "2.1", 19_800, 792, 4_752, 4_000, 4_000, 2, 256, 0),
+    h264_row(22, "2.2", 20_250, 1_620, 8_100, 4_000, 4_000, 2, 256, 0),
+    h264_row(30, "3", 40_500, 1_620, 8_100, 10_000, 10_000, 2, 256, 32),
+    h264_row(31, "3.1", 108_000, 3_600, 18_000, 14_000, 14_000, 4, 512, 16),
+    h264_row(32, "3.2", 216_000, 5_120, 20_480, 20_000, 20_000, 4, 512, 16),
+    h264_row(40, "4", 245_760, 8_192, 32_768, 20_000, 25_000, 4, 512, 16),
+    h264_row(41, "4.1", 245_760, 8_192, 32_768, 50_000, 62_500, 2, 512, 16),
+    h264_row(42, "4.2", 522_240, 8_704, 34_816, 50_000, 62_500, 2, 512, 16),
+    h264_row(50, "5", 589_824, 22_080, 110_400, 135_000, 135_000, 2, 512, 16),
+    h264_row(51, "5.1", 983_040, 36_864, 184_320, 240_000, 240_000, 2, 512, 16),
+    h264_row(52, "5.2", 2_073_600, 36_864, 184_320, 240_000, 240_000, 2, 512, 16),
+    h264_row(60, "6", 4_177_920, 139_264, 696_320, 240_000, 240_000, 2, 8192, 16),
+    h264_row(61, "6.1", 8_355_840, 139_264, 696_320, 480_000, 480_000, 2, 8192, 16),
+    h264_row(62, "6.2", 16_711_680, 139_264, 696_320, 800_000, 800_000, 2, 8192, 16),
 ];
 
 /// `cpbBrVclFactor` (Table A-2) for the profiles this encoder writes.
@@ -330,6 +360,70 @@ pub fn h264(cfg: &Config, g: &h264_syntax::Geometry) -> Result<Level> {
     )))
 }
 
+/// What an H.264 level asks of the encoder's motion *decisions* rather
+/// than of its parameters: limits no choice of level can meet on the
+/// encoder's behalf, which the motion search therefore keeps for the
+/// level the stream claims. Derived from that level — the level first,
+/// then the search held to it — so the claim and the vectors cannot
+/// disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MotionLimits {
+    /// `MaxVmvR` (A.3.2(g)): every luma vector's vertical component lies
+    /// in `[-max_vmv_r, max_vmv_r - 1/4]`, in luma *frame* samples — so a
+    /// field macroblock, whose rows are every other frame row, has half
+    /// the range in its own rows.
+    pub max_vmv_r: i32,
+    /// The most motion vectors (`MvCnt`, 8.4.1) one 8x8 quarter of a
+    /// macroblock may carry: an eighth of `MaxMvsPer2Mb` (A.3.2(i)), so
+    /// that a macroblock's four quarters carry at most half of it and any
+    /// two consecutive macroblocks — the pairs the limit counts, in
+    /// decoding order, across slices and pictures — at most all of it.
+    /// Unlimited below level 3; four at 3; two from 3.1, where it rules
+    /// out every 4x4 sub-partition and every bi-predicted one below 8x8.
+    /// A direct 8x8 is at most two (`subMvCnt` counts only its first
+    /// sub-partition), so it is always allowed.
+    pub max_mvs_per_8x8: u32,
+    /// `MinLumaBiPredSize` 8x8 (A.3.3(e), Table A-4, level 3.1 and up):
+    /// no `B_Bi_8x4`, `B_Bi_4x8` or `B_Bi_4x4` sub-macroblock.
+    pub no_bi_below_8x8: bool,
+}
+
+impl MotionLimits {
+    /// No limit at all: what a context that searches no H.264 motion (the
+    /// H.265 encoder's, which shares the context type) carries.
+    pub const NONE: MotionLimits = MotionLimits { max_vmv_r: i32::MAX, max_mvs_per_8x8: u32::MAX, no_bi_below_8x8: false };
+
+    /// The limits of the H.264 level whose `level_idc` is `idc` (Table
+    /// A-1). A `level_idc` outside the table — which the encoder never
+    /// writes — gets none.
+    pub fn h264(idc: u8) -> MotionLimits {
+        match H264_LEVELS.iter().find(|row| row.idc == idc) {
+            Some(row) => MotionLimits {
+                max_vmv_r: row.max_vmv_r,
+                max_mvs_per_8x8: if row.max_mvs_per_2mb == 0 { u32::MAX } else { row.max_mvs_per_2mb / 8 },
+                // Table A-4: from level 3.1, the first with a MaxMvsPer2Mb of 16.
+                no_bi_below_8x8: row.max_mvs_per_2mb == 16,
+            },
+            None => MotionLimits::NONE,
+        }
+    }
+
+    /// Whether an 8x8 quarter may be coded as `parts` sub-partitions (1, 2
+    /// or 4) predicted from `lists` lists each (1, or 2 for bi-prediction).
+    pub fn allows_sub_8x8(&self, parts: usize, lists: usize) -> bool {
+        (parts == 1 || lists == 1 || !self.no_bi_below_8x8) && (parts * lists) as u64 <= u64::from(self.max_mvs_per_8x8)
+    }
+
+    /// The vertical range a search in rows of this kind may use, in full
+    /// samples of those rows: `±(range - 1)`, so that a quarter-sample
+    /// refinement of at most three quarters either way stays inside
+    /// `[-range, range - 1/4]`.
+    pub fn vertical_search(&self, field: bool) -> i32 {
+        let range = if field { self.max_vmv_r / 2 } else { self.max_vmv_r };
+        range.saturating_sub(1)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // H.265
 // ---------------------------------------------------------------------------
@@ -374,38 +468,133 @@ const H265_LEVELS: [H265Row; 13] = [
     h265_row(186, "6.2", 35_651_584, [240_000, 800_000], 4_278_190_080, [240_000, 800_000], [6, 4]),
 ];
 
+impl H265Row {
+    /// A.4.1(a) to (c): what a coded luma picture of `width` by `height`
+    /// breaks at this level, if anything.
+    fn picture_exceeds(&self, width: u64, height: u64) -> Option<String> {
+        if width * height > self.max_luma_ps {
+            Some(format!("{} luma samples a picture is above MaxLumaPs {}", width * height, self.max_luma_ps))
+        } else if width * width > 8 * self.max_luma_ps || height * height > 8 * self.max_luma_ps {
+            Some(format!("{width}x{height} exceeds Sqrt(MaxLumaPs * 8) on a side"))
+        } else {
+            None
+        }
+    }
+}
+
+/// `general_level_idc` of the lowest level that requires a coding tree
+/// block of 32 or more (A.4.1(d)): level 5.
+const H265_CTB_32_FROM: u8 = 150;
+
+/// Whether a coded luma picture of `width` by `height` is too large for
+/// every level that still admits a 16x16 coding tree block — beyond level
+/// 4.1's `MaxLumaPs` or its longest side (A.4.1(a) to (c)) — so that only
+/// a CTB of 32 or more can code it at any level at all (A.4.1(d)).
+/// `h265_syntax::Geometry::new` asks this before it takes a 16x16 CTB.
+pub(crate) fn h265_beyond_ctb16(width: u32, height: u32) -> bool {
+    let top = H265_LEVELS.iter().rev().find(|row| row.idc < H265_CTB_32_FROM).expect("levels below 5 are in the table");
+    top.picture_exceeds(u64::from(width), u64::from(height)).is_some()
+}
+
 /// Level 8.5 (A.4.1): the label for a stream beyond every other level,
 /// which the standard requires to be High tier.
 const H265_LEVEL_8_5: Level = Level { idc: 255, high_tier: true, name: "8.5" };
 
-/// The Table A.10 row for a format: `CpbVclFactor`, then
-/// `FormatCapabilityFactor` in thousandths and `MinCrScaleFactor` in
-/// tenths, so that every comparison stays in integers.
+/// The H.265 profile a stream is coded under: what `write_ptl` claims,
+/// and the Table A.10 factors its levels are measured with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct H265Profile {
+    /// `general_profile_idc`: 1 Main, 2 Main 10, 4 the format range
+    /// extensions profiles.
+    pub idc: u8,
+    /// The profile's name, as Table A.2 prints it.
+    pub name: &'static str,
+    /// For `idc` 4, the nine Table A.2 constraint flags in syntax order:
+    /// `general_max_12bit`, `max_10bit`, `max_8bit`, `max_422chroma`,
+    /// `max_420chroma`, `max_monochrome`, `intra`, `one_picture_only` and
+    /// `lower_bit_rate_constraint_flag`. Main and Main 10 carry none.
+    pub flags: [bool; 9],
+    /// `CpbVclFactor` (Table A.10).
+    cpb_vcl_factor: u64,
+    /// `FormatCapabilityFactor`, thousandths.
+    fcf_milli: u64,
+    /// `MinCrScaleFactor`, tenths.
+    min_cr_scale_tenths: u64,
+}
+
+impl H265Profile {
+    /// `HbrFactor` (A.4.2): 1 for Main and Main 10, `2 -
+    /// general_lower_bit_rate_constraint_flag` for the format range
+    /// extensions profiles.
+    fn hbr_factor(&self) -> u64 {
+        if self.idc == 4 { 2 - u64::from(self.flags[8]) } else { 1 }
+    }
+}
+
+const fn rext(name: &'static str, flags: [u8; 9], cpb_vcl_factor: u64, fcf_milli: u64, min_cr_scale_tenths: u64) -> H265Profile {
+    let mut f = [false; 9];
+    let mut i = 0;
+    while i < 9 {
+        f[i] = flags[i] == 1;
+        i += 1;
+    }
+    H265Profile { idc: 4, name, flags: f, cpb_vcl_factor, fcf_milli, min_cr_scale_tenths }
+}
+
+const H265_MAIN: H265Profile = H265Profile { idc: 1, name: "Main", flags: [false; 9], cpb_vcl_factor: 1_000, fcf_milli: 1_500, min_cr_scale_tenths: 10 };
+const H265_MAIN_10: H265Profile = H265Profile { idc: 2, name: "Main 10", flags: [false; 9], cpb_vcl_factor: 1_000, fcf_milli: 1_875, min_cr_scale_tenths: 10 };
+// Table A.2's rows (max 12, 10 and 8 bit; max 4:2:2, 4:2:0, monochrome;
+// intra; one picture; lower bit rate) with Table A.10's factors.
+const H265_MONOCHROME: H265Profile = rext("Monochrome", [1, 1, 1, 1, 1, 1, 0, 0, 1], 667, 1_000, 10);
+const H265_MONOCHROME_10: H265Profile = rext("Monochrome 10", [1, 1, 0, 1, 1, 1, 0, 0, 1], 833, 1_250, 10);
+const H265_MONOCHROME_12: H265Profile = rext("Monochrome 12", [1, 0, 0, 1, 1, 1, 0, 0, 1], 1_000, 1_500, 10);
+const H265_MONOCHROME_16: H265Profile = rext("Monochrome 16", [0, 0, 0, 1, 1, 1, 0, 0, 1], 1_333, 2_000, 10);
+const H265_MAIN_12: H265Profile = rext("Main 12", [1, 0, 0, 1, 1, 0, 0, 0, 1], 1_500, 2_250, 10);
+const H265_MAIN_422_10: H265Profile = rext("Main 4:2:2 10", [1, 1, 0, 1, 0, 0, 0, 0, 1], 1_667, 2_500, 5);
+const H265_MAIN_422_12: H265Profile = rext("Main 4:2:2 12", [1, 0, 0, 1, 0, 0, 0, 0, 1], 2_000, 3_000, 5);
+const H265_MAIN_444: H265Profile = rext("Main 4:4:4", [1, 1, 1, 0, 0, 0, 0, 0, 1], 2_000, 3_000, 5);
+const H265_MAIN_444_10: H265Profile = rext("Main 4:4:4 10", [1, 1, 0, 0, 0, 0, 0, 0, 1], 2_500, 3_750, 5);
+const H265_MAIN_444_12: H265Profile = rext("Main 4:4:4 12", [1, 0, 0, 0, 0, 0, 0, 0, 1], 3_000, 4_500, 5);
+// The intra-only profile a 13- or 14-bit picture in colour has, its
+// "0 or 1" lower-bit-rate flag written 1 (HbrFactor 1, the stricter).
+const H265_MAIN_444_16_INTRA: H265Profile = rext("Main 4:4:4 16 Intra", [0, 0, 0, 0, 0, 0, 1, 0, 1], 4_000, 6_000, 5);
+
+/// The profile an H.265 stream of this configuration is coded under: the
+/// one Table A.2 names for its format, the narrowest — which is also the
+/// one the most decoders must accept, since a decoder of a wider profile
+/// decodes every stream whose flags are at least its own (a Main 12
+/// decoder decodes a Monochrome 12 stream, A.3.5). 8-bit 4:2:0 is Main
+/// and 9- or 10-bit 4:2:0 Main 10; everything else is a format range
+/// extensions profile: Monochrome to 8, 10, 12 and 16 bits, Main 12, Main
+/// 4:2:2 10 (8 bits too) and 12, Main 4:4:4 at 8, 10 and 12.
 ///
-/// The profile is the one the format needs, which is what `write_ptl`
-/// claims: Main for 8-bit 4:2:0, Main 10 up to 10 bits, and for
-/// everything else the format range extensions profile that admits it —
-/// the Monochrome profiles, Main 12, Main 4:2:2 10 and 12, Main 4:4:4 up
-/// to 12. Past 12 bits the only such profiles are the 16-bit ones
-/// (Monochrome 16, Main 4:4:4 16 Intra). `HbrFactor` is taken as 1 —
-/// `BrVclFactor` then equals `CpbVclFactor` — the value every
-/// non-intra range extensions profile has
-/// (`general_lower_bit_rate_constraint_flag` 1), and the smaller one.
-fn h265_format(chroma: ChromaFormat, depth: u32) -> (u64, u64, u64) {
-    match (chroma, depth) {
-        (ChromaFormat::Yuv420, 8) => (1_000, 1_500, 10),
-        (ChromaFormat::Yuv420, 9..=10) => (1_000, 1_875, 10),
-        (ChromaFormat::Yuv420, 11..=12) => (1_500, 2_250, 10),
-        (ChromaFormat::Monochrome, 8) => (667, 1_000, 10),
-        (ChromaFormat::Monochrome, 9..=10) => (833, 1_250, 10),
-        (ChromaFormat::Monochrome, 11..=12) => (1_000, 1_500, 10),
-        (ChromaFormat::Monochrome, _) => (1_333, 2_000, 10),
-        (ChromaFormat::Yuv422, 8..=10) => (1_667, 2_500, 5),
-        (ChromaFormat::Yuv422, 11..=12) => (2_000, 3_000, 5),
-        (ChromaFormat::Yuv444, 8) => (2_000, 3_000, 5),
-        (ChromaFormat::Yuv444, 9..=10) => (2_500, 3_750, 5),
-        (ChromaFormat::Yuv444, 11..=12) => (3_000, 4_500, 5),
-        _ => (4_000, 6_000, 5),
+/// Above 12 bits in colour the only such profile is Main 4:4:4 16 Intra,
+/// which an all-intra stream (`gop` 0) is. An inter stream there has no
+/// profile at all — High Throughput 4:4:4 14 would need wavefront
+/// parallel processing, which this encoder does not write — and is coded
+/// with the flags that describe it (no bit-depth limit below 16, its
+/// chroma limits, not intra, lower bit rate): a combination Table A.2
+/// reserves, which no decoder is required to accept, and says so.
+pub fn h265_profile(cfg: &Config, g: &h265_syntax::Geometry) -> H265Profile {
+    match (g.chroma, g.bit_depth) {
+        (ChromaFormat::Yuv420, 8) => H265_MAIN,
+        (ChromaFormat::Yuv420, 9..=10) => H265_MAIN_10,
+        (ChromaFormat::Yuv420, 11..=12) => H265_MAIN_12,
+        (ChromaFormat::Monochrome, 8) => H265_MONOCHROME,
+        (ChromaFormat::Monochrome, 9..=10) => H265_MONOCHROME_10,
+        (ChromaFormat::Monochrome, 11..=12) => H265_MONOCHROME_12,
+        (ChromaFormat::Monochrome, _) => H265_MONOCHROME_16,
+        (ChromaFormat::Yuv422, 8..=10) => H265_MAIN_422_10,
+        (ChromaFormat::Yuv422, 11..=12) => H265_MAIN_422_12,
+        (ChromaFormat::Yuv444, 8) => H265_MAIN_444,
+        (ChromaFormat::Yuv444, 9..=10) => H265_MAIN_444_10,
+        (ChromaFormat::Yuv444, 11..=12) => H265_MAIN_444_12,
+        _ if cfg.gop == 0 => H265_MAIN_444_16_INTRA,
+        (chroma, _) => H265Profile {
+            name: "none (inter coding above 12 bits in colour)",
+            flags: [false, false, false, chroma != ChromaFormat::Yuv444, chroma == ChromaFormat::Yuv420, false, false, false, true],
+            ..H265_MAIN_444_16_INTRA
+        },
     }
 }
 
@@ -423,10 +612,8 @@ struct H265Stream {
     rate: Option<u64>,
     cpb: Option<u64>,
     au_bytes: Option<u64>,
-    /// `h265_format`.
-    vcl_factor: u64,
-    fcf_milli: u64,
-    min_cr_scale_tenths: u64,
+    /// The profile, for its Table A.10 factors.
+    profile: H265Profile,
 }
 
 impl H265Stream {
@@ -438,7 +625,7 @@ impl H265Stream {
         // every entry used by it: a P picture's list 0, a B picture's two
         // anchors.
         let total_curr = u64::from(if cfg.bframes > 0 { cfg.max_refs.max(2) } else { cfg.max_refs.max(1) });
-        let (vcl_factor, fcf_milli, min_cr_scale_tenths) = h265_format(g.chroma, g.bit_depth);
+        let profile = h265_profile(cfg, g);
         let (mut rate, mut cpb, mut au_bytes) = match (declared_cpb(cfg), cfg.rate) {
             (Some(c), _) => (Some(c.bit_rate), Some(c.size), None),
             (None, RateControl::Bitrate { bps }) => (Some(u64::from(bps)), None, None),
@@ -465,9 +652,7 @@ impl H265Stream {
             rate,
             cpb,
             au_bytes,
-            vcl_factor,
-            fcf_milli,
-            min_cr_scale_tenths,
+            profile,
         }
     }
 
@@ -484,19 +669,13 @@ impl H265Stream {
         if self.fps > 300 {
             why.push(format!("{} pictures/s is above the 300 fR allows", self.fps));
         }
-        // A.4.1(a) to (c).
-        if pic > row.max_luma_ps {
-            why.push(format!("{pic} luma samples a picture is above MaxLumaPs {}", row.max_luma_ps));
-        }
-        if self.width * self.width > 8 * row.max_luma_ps || self.height * self.height > 8 * row.max_luma_ps {
-            why.push(format!("{}x{} exceeds Sqrt(MaxLumaPs * 8) on a side", self.width, self.height));
-        }
+        why.extend(row.picture_exceeds(self.width, self.height));
         // A.4.2(a).
         if pic * self.fps > row.max_luma_sr {
             why.push(format!("{} luma samples/s is above MaxLumaSr {}", pic * self.fps, row.max_luma_sr));
         }
         // A.4.1(d).
-        if row.idc >= 150 && self.ctb < 32 {
+        if row.idc >= H265_CTB_32_FROM && self.ctb < 32 {
             why.push(format!("a {}x{0} coding tree block is below the 32 level 5 and up require", self.ctb));
         }
         // A.4.1(e).
@@ -516,20 +695,23 @@ impl H265Stream {
         if self.dpb > max_dpb {
             why.push(format!("a DPB of {} pictures is above MaxDpbSize {max_dpb}", self.dpb));
         }
-        // A.4.1(g) and A.4.2(e), and the VCL HRD the NAL one implies.
-        let f = self.vcl_factor;
-        if let Some(r) = self.rate.filter(|&r| r > f * row.max_br[t]) {
-            why.push(format!("{r} bits/s is above {} (MaxBR {} x {f})", f * row.max_br[t], row.max_br[t]));
+        // A.4.1(g) and A.4.2(e), and the VCL HRD the NAL one implies: the
+        // rate at BrVclFactor = CpbVclFactor * HbrFactor, the buffer at
+        // CpbVclFactor.
+        let p = &self.profile;
+        let (fb, fc) = (p.cpb_vcl_factor * p.hbr_factor(), p.cpb_vcl_factor);
+        if let Some(r) = self.rate.filter(|&r| r > fb * row.max_br[t]) {
+            why.push(format!("{r} bits/s is above {} (MaxBR {} x {fb})", fb * row.max_br[t], row.max_br[t]));
         }
-        if let Some(c) = self.cpb.filter(|&c| c > f * row.max_cpb[t]) {
-            why.push(format!("a {c}-bit buffer is above {} (MaxCPB {} x {f})", f * row.max_cpb[t], row.max_cpb[t]));
+        if let Some(c) = self.cpb.filter(|&c| c > fc * row.max_cpb[t]) {
+            why.push(format!("a {c}-bit buffer is above {} (MaxCPB {} x {fc})", fc * row.max_cpb[t], row.max_cpb[t]));
         }
         // A.4.2(h): an access unit is at most FormatCapabilityFactor *
         // MaxLumaSr * (tr(n) - tr(n - 1)) / MinCr bytes, MinCr being
         // MinCrBase * MinCrScaleFactor / HbrFactor.
         if let Some(b) = self.au_bytes {
-            let lhs = u128::from(b) * u128::from(self.fps) * u128::from(row.min_cr_base[t]) * u128::from(self.min_cr_scale_tenths) * 1_000;
-            let rhs = u128::from(self.fcf_milli) * u128::from(row.max_luma_sr) * 10;
+            let lhs = u128::from(b) * u128::from(self.fps) * u128::from(row.min_cr_base[t]) * u128::from(p.min_cr_scale_tenths) * 1_000;
+            let rhs = u128::from(p.fcf_milli) * u128::from(row.max_luma_sr) * 10 * u128::from(p.hbr_factor());
             if lhs > rhs {
                 why.push(format!("a {b}-byte picture is above FormatCapabilityFactor * MaxLumaSr / MinCr per picture"));
             }
@@ -591,6 +773,32 @@ mod tests {
         let l = h265_with(c, None);
         assert!(!l.high_tier, "{}x{}@{}: High tier at level {}", c.width, c.height, c.fps, l.name);
         l.name
+    }
+
+    /// `MaxVmvR` by level (Table A-1), and the search window it leaves: a
+    /// full-sample search within `±(range - 1)` whose quarter refinement
+    /// cannot leave `[-range, range - 1/4]`, half the rows for a field
+    /// macroblock.
+    #[test]
+    fn motion_limits_follow_table_a1() {
+        for (idc, vmv) in [(10, 64), (9, 64), (11, 128), (20, 128), (21, 256), (30, 256), (31, 512), (52, 512), (60, 8192), (62, 8192)] {
+            assert_eq!(MotionLimits::h264(idc).max_vmv_r, vmv, "level_idc {idc}");
+        }
+        assert_eq!(MotionLimits::h264(99), MotionLimits::NONE);
+        let l = MotionLimits::h264(31);
+        assert_eq!((l.vertical_search(false), l.vertical_search(true)), (511, 255));
+        assert_eq!(MotionLimits::NONE.vertical_search(true), i32::MAX / 2 - 1);
+        // MaxMvsPer2Mb over eight per 8x8 quarter, MinLumaBiPredSize from 3.1.
+        for (idc, per_8x8, no_bi) in [(22, u32::MAX, false), (30, 4, false), (31, 2, true), (62, 2, true)] {
+            let l = MotionLimits::h264(idc);
+            assert_eq!((l.max_mvs_per_8x8, l.no_bi_below_8x8), (per_8x8, no_bi), "level_idc {idc}");
+        }
+        // (parts, lists) for 8x8 / 8x4 / 4x4, one list and two.
+        let shapes = [(1, 1), (1, 2), (2, 1), (2, 2), (4, 1), (4, 2)];
+        let allowed = |idc| shapes.map(|(p, l)| MotionLimits::h264(idc).allows_sub_8x8(p, l));
+        assert_eq!(allowed(22), [true; 6]);
+        assert_eq!(allowed(30), [true, true, true, true, true, false], "level 3: no bi 4x4 (eight vectors)");
+        assert_eq!(allowed(31), [true, true, true, false, false, false], "3.1: no 4x4, no bi below 8x8");
     }
 
     /// Frame sizes and rates against Table A-1, each at or just past a row's
@@ -730,11 +938,47 @@ mod tests {
     }
 
     /// A.4.1(d): level 5 and up need a 32 or 64 coding tree block. A 2160p
-    /// picture in 16x16 blocks is beyond every level, and is labelled 8.5.
+    /// picture in 16x16 blocks would be beyond every level — labelled 8.5 —
+    /// and the encoder's geometry never builds one: at every coding tree
+    /// depth, whole CTBs or the quadtree's, 2160p codes in 32x32 CTBs and
+    /// claims level 5 at 30 pictures a second, 5.1 at 60.
     #[test]
     fn h265_a_16x16_ctb_cannot_claim_level_5() {
         assert_eq!(h265_with(&cfg(3840, 2160, 30), Some(4)), H265_LEVEL_8_5);
         assert_eq!(h265_with(&cfg(1920, 1080, 30), Some(4)).name, "4", "below level 5 any CTB will do");
+        for depth in [Some(0), Some(1), None] {
+            for (fps, want) in [(30, "5"), (60, "5.1")] {
+                let c = Config { max_cu_depth: depth, ..cfg(3840, 2160, fps) };
+                assert_eq!(h265_syntax::Geometry::new(&c).log2_ctb, 5, "2160p cu depth {depth:?}");
+                assert_eq!(h265_name(&c), want, "2160p{fps} cu depth {depth:?}");
+            }
+        }
+    }
+
+    /// `Geometry::new` asks the level table where a 16x16 CTB stops being
+    /// possible, and the answer is where level 4.1 ends: the largest
+    /// picture at level 4.1, and one macroblock row or column past it,
+    /// each way the limit can be crossed — `MaxLumaPs` 2,228,224 (2048x1088
+    /// is exactly that) and the longest side, Sqrt(8 * MaxLumaPs) = 4222.
+    #[test]
+    fn h265_ctb16_stops_where_level_4_1_does() {
+        for (w, h, beyond) in [
+            (2048, 1088, false),
+            (2048, 1096, true),
+            (4222, 8, false),
+            (4224, 8, true),
+            (8, 4222, false),
+            (8, 4224, true),
+        ] {
+            assert_eq!(h265_beyond_ctb16(w, h), beyond, "{w}x{h}");
+            // The same picture in 16x16 CTBs, at one picture a second so
+            // that only its size decides: level 4.1 or below, or none.
+            let c = Config { max_cu_depth: Some(0), ..cfg(w, h, 1) };
+            let mut g = h265_syntax::Geometry::new(&c);
+            (g.log2_ctb, g.coded_width, g.coded_height) = (4, w, h);
+            let l = h265(&c, &g);
+            assert_eq!(l == H265_LEVEL_8_5, beyond, "{w}x{h} in 16x16 CTBs claims level {}", l.name);
+        }
     }
 
     /// `MaxDpbSize` (Equation A-2) against `sps_max_dec_pic_buffering`:
@@ -765,8 +1009,11 @@ mod tests {
         assert_eq!(h265_with(&abr(1_000_000_000), None), H265_LEVEL_8_5);
         // A 2 s buffer at 12 Mbit/s: 24 Mbit, past level 4.1's 20.
         assert_eq!(got(&Config { cpb_ms: 2000, ..abr(12_000_000) }), ("5", false));
-        // 4:4:4 is Main 4:4:4, CpbVclFactor 2000: level 4 carries 24 Mbit/s.
+        // 4:4:4 is Main 4:4:4, CpbVclFactor 2000: level 4 carries 24 Mbit/s,
+        // and not 48 — the profile's lower-bit-rate flag is written, so
+        // its HbrFactor is 1.
         assert_eq!(got(&Config { chroma: ChromaFormat::Yuv444, ..abr(20_000_000) }), ("4", false));
+        assert_eq!(got(&Config { chroma: ChromaFormat::Yuv444, ..abr(30_000_000) }), ("4.1", false));
     }
 
     /// What no level up to 6.2 admits is level 8.5, High tier (A.4.1).
@@ -783,6 +1030,52 @@ mod tests {
     fn h265_lossless_is_held_to_its_raw_rate() {
         assert_eq!(h265_name(&cfg(64, 64, 30)), "1");
         assert_eq!(h265_name(&Config { rate: RateControl::Lossless, ..cfg(64, 64, 30) }), "2");
+    }
+
+    /// Each format's H.265 profile is Table A.2's row for it, flag for flag,
+    /// in both parameter sets: `general_profile_idc`, then — for the format
+    /// range extensions profiles — the nine constraint flags that follow the
+    /// four source flags (bits 44..53 of the profile_tier_level, which the
+    /// VPS starts at bit 32 and the SPS at bit 8). Main and Main 10 leave
+    /// the 43 bits zero. The rows are the standard's, typed out again here
+    /// rather than read from the table they check.
+    #[test]
+    fn h265_profiles_follow_table_a2() {
+        let bit = |rbsp: &[u8], at: usize| rbsp[at / 8] >> (7 - at % 8) & 1 == 1;
+        for (chroma, depth, gop, idc, name, row) in [
+            (ChromaFormat::Yuv420, 8, 8, 1, "Main", "000000000"),
+            (ChromaFormat::Yuv420, 10, 8, 2, "Main 10", "000000000"),
+            (ChromaFormat::Yuv420, 12, 8, 4, "Main 12", "100110001"),
+            (ChromaFormat::Monochrome, 8, 8, 4, "Monochrome", "111111001"),
+            (ChromaFormat::Monochrome, 10, 8, 4, "Monochrome 10", "110111001"),
+            (ChromaFormat::Monochrome, 12, 8, 4, "Monochrome 12", "100111001"),
+            (ChromaFormat::Monochrome, 14, 8, 4, "Monochrome 16", "000111001"),
+            (ChromaFormat::Yuv422, 8, 8, 4, "Main 4:2:2 10", "110100001"),
+            (ChromaFormat::Yuv422, 10, 8, 4, "Main 4:2:2 10", "110100001"),
+            (ChromaFormat::Yuv422, 12, 8, 4, "Main 4:2:2 12", "100100001"),
+            (ChromaFormat::Yuv444, 8, 8, 4, "Main 4:4:4", "111000001"),
+            (ChromaFormat::Yuv444, 10, 8, 4, "Main 4:4:4 10", "110000001"),
+            (ChromaFormat::Yuv444, 12, 8, 4, "Main 4:4:4 12", "100000001"),
+            (ChromaFormat::Yuv444, 14, 0, 4, "Main 4:4:4 16 Intra", "000000101"),
+            (ChromaFormat::Yuv420, 14, 0, 4, "Main 4:4:4 16 Intra", "000000101"),
+            (ChromaFormat::Yuv422, 14, 8, 4, "none (inter coding above 12 bits in colour)", "000100001"),
+        ] {
+            let tag = format!("{chroma:?} {depth}-bit gop {gop}");
+            let c = Config { chroma, bit_depth: depth, gop, ..cfg(64, 64, 30) };
+            let g = h265_syntax::Geometry::new(&c);
+            let p = h265_profile(&c, &g);
+            assert_eq!((p.idc, p.name), (idc, name), "{tag}");
+            for (set, rbsp, ptl) in [
+                ("VPS", crate::nal::unescape_rbsp(&h265_syntax::write_vps(&c, &g)), 32),
+                ("SPS", crate::nal::unescape_rbsp(&h265_syntax::write_sps(&c, &g, 8, None)), 8),
+            ] {
+                assert_eq!(rbsp[ptl / 8] & 0x1f, idc, "{tag} {set}: general_profile_idc");
+                assert!(bit(&rbsp, ptl + 8 + usize::from(idc)), "{tag} {set}: compatibility flag {idc}");
+                let flags: String = (0..9).map(|k| if bit(&rbsp, ptl + 44 + k) { '1' } else { '0' }).collect();
+                assert_eq!(flags, row, "{tag} {set}: Table A.2 flags");
+                assert!((ptl + 53..ptl + 88).all(|k| !bit(&rbsp, k)), "{tag} {set}: reserved bits and inbld");
+            }
+        }
     }
 
     /// The writers carry what the derivation chose — both H.265 parameter
@@ -812,6 +1105,103 @@ mod tests {
             let sps = crate::hevc::sps::Sps::parse(&crate::nal::unescape_rbsp(&h265_syntax::write_sps(&c, &g, 8, None))).unwrap();
             for (set, ptl) in [("VPS", &vps.ptl), ("SPS", &sps.ptl)] {
                 assert_eq!((ptl.level_idc, ptl.tier), (idc, tier), "H.265 {set} {}x{}@{}", c.width, c.height, c.fps);
+            }
+        }
+    }
+
+    /// A smooth grating whose every 4x4 block moves its own way from one
+    /// picture to the next — up to two samples each way — so the motion
+    /// search, which converges on a grating, finds each block's own vector
+    /// and sub-8x8 partitions pay: the content that spends the most motion
+    /// vectors per macroblock.
+    fn shattered(w: usize, h: usize, n: usize) -> Vec<Vec<u8>> {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut roll = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 5) as i32 - 2
+        };
+        let grating = |x: i32, y: i32| (40 + 4 * ((x.rem_euclid(25)) - 12).abs() + 3 * ((y.rem_euclid(27)) - 13).abs()) as u8;
+        let mut at: Vec<(i32, i32)> = vec![(0, 0); (w / 4) * (h / 4)];
+        (0..n)
+            .map(|_| {
+                let mut f = vec![128u8; w * h * 3 / 2];
+                for by in 0..h / 4 {
+                    for bx in 0..w / 4 {
+                        let o = &mut at[by * (w / 4) + bx];
+                        *o = (o.0 + roll(), o.1 + roll());
+                        for y in 0..4 {
+                            for x in 0..4 {
+                                let (px, py) = (bx * 4 + x, by * 4 + y);
+                                f[py * w + px] = grating(px as i32 + o.0, py as i32 + o.1);
+                            }
+                        }
+                    }
+                }
+                f
+            })
+            .collect()
+    }
+
+    /// `MaxMvsPer2Mb` and `MinLumaBiPredSize` (A.3.2(i), A.3.3(e)), counted
+    /// on the output. The same `--subparts` content at 352x288 is level 1.3
+    /// at 30 pictures a second, 3 at 80 and 3.1 at 120 (MaxMBPS alone
+    /// decides it) — the three regimes of those limits for the price of a
+    /// CIF picture rather than a 720p one — at QP 4, where splitting is
+    /// cheap. Each stream is decoded on one thread with the decoder's census
+    /// on: every macroblock's `MvCnt` and whether it holds a bi-predicted
+    /// partition below 8x8. At 1.3 nothing is limited, and the content does
+    /// put more than 16 vectors in a macroblock, more than 32 in two and
+    /// bi-predicts below 8x8 (measured: 32, 52 and 527 macroblocks), so the
+    /// checks above it are not vacuous. At 3 every two consecutive
+    /// macroblocks — across pictures too — hold at most 32, and bi-predicted
+    /// 8x4s and 4x8s remain (3 has no `MinLumaBiPredSize`); at 3.1 at most
+    /// 16, and nothing bi-predicted is smaller than 8x8. Every picture
+    /// decodes to the encoder's reconstruction throughout.
+    #[test]
+    fn subpartitions_keep_the_levels_vector_limits() {
+        let frames = shattered(352, 288, 5);
+        for (fps, idc, pair_limit) in [(30u32, 13u8, None), (80, 30, Some(32u32)), (120, 31, Some(16))] {
+            let tag = format!("352x288@{fps}");
+            let c = Config {
+                gop: 250,
+                bframes: 1,
+                subparts: true,
+                rate: RateControl::ConstantQp(4),
+                ..cfg(352, 288, fps)
+            };
+            let mut e = H264Encoder::new(c).unwrap();
+            let mut units = Vec::new();
+            for f in &frames {
+                units.extend(e.push(f).unwrap());
+            }
+            units.extend(e.flush().unwrap());
+            let stream: Vec<u8> = units.iter().flat_map(|u| u.data.iter().copied()).collect();
+            let sps_nal = crate::nal::annexb_nals(&stream).find(|n| n[0] & 0x1f == 7).expect("an SPS");
+            let sps = crate::h264::Sps::parse(&crate::nal::unescape_rbsp(&sps_nal[1..])).unwrap();
+            assert_eq!(sps.level_idc, idc, "{tag}");
+            crate::h264::recon::MV_CENSUS.with(|c| *c.borrow_mut() = Some(Vec::new()));
+            let mut dec = crate::h264::H264Decoder::with_threads(1);
+            dec.push_annexb(&stream).unwrap_or_else(|err| panic!("{tag}: {err}"));
+            dec.flush().unwrap();
+            let census = crate::h264::recon::MV_CENSUS.with(|c| c.borrow_mut().take()).expect("census on");
+            round_trip(&tag, &units, e.reconstructions(), std::iter::from_fn(|| dec.next_picture().map(|p| p.into_packed())));
+            assert_eq!(census.len(), 396 * frames.len(), "{tag}: every macroblock counted");
+            let most = census.iter().map(|&(n, _)| n).max().unwrap();
+            let pair = census.windows(2).map(|w| w[0].0 + w[1].0).max().unwrap();
+            let bi_small = census.iter().filter(|&&(_, bi)| bi).count();
+            match pair_limit {
+                None => assert!(
+                    most > 16 && pair > 32 && bi_small > 0,
+                    "{tag}: the content spent at most {most} vectors on a macroblock, {pair} on two, bi-predicted below 8x8 in {bi_small}"
+                ),
+                Some(limit) => assert!(pair <= limit, "{tag}: two consecutive macroblocks hold {pair} vectors, above {limit}"),
+            }
+            match idc {
+                30 => assert!(bi_small > 0, "{tag}: level 3 has no MinLumaBiPredSize, yet nothing bi-predicted below 8x8"),
+                31 => assert_eq!(bi_small, 0, "{tag}: {bi_small} macroblocks bi-predict below 8x8"),
+                _ => {}
             }
         }
     }

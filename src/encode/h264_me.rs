@@ -621,6 +621,12 @@ fn search_rect<S: Sample>(
     let pad = r.pad as i32;
     let (lo_x, hi_x) = (3 - pad - x, r.width as i32 + pad - (w as i32 + 3) - x);
     let (lo_y, hi_y) = (3 - pad - y, r.height as i32 + pad - (h as i32 + 3) - y);
+    // And within the level's vertical vector range (`MaxVmvR`), in this
+    // macroblock's own rows — the search and its refinement both stay
+    // inside it, and every other vector (skip, direct, the predictors) is
+    // a median or copy of searched ones.
+    let vr = ctx.motion.vertical_search(ctx.field);
+    let (lo_y, hi_y) = (lo_y.max(-vr), hi_y.min(vr));
     debug_assert!(lo_x <= hi_x && lo_y <= hi_y, "plane too small to search");
 
     // Seed at the predictor rounded to full samples, clamped legal; the
@@ -1497,6 +1503,11 @@ fn trial_8x8<S: Sample>(
             SubMbShape::S4x8,
             SubMbShape::S4x4,
         ] {
+            // The level's vector budget (`MotionLimits`): 4x4 is gone from
+            // level 3.1 up; 8x8 is always allowed.
+            if !ctx.motion.allows_sub_8x8(shape.count(), 1) {
+                continue;
+            }
             *st = before;
             let (mut mvs, mut mvds) = (t.mvs, t.mvds);
             let mut satd = 0u32;
@@ -2260,6 +2271,13 @@ fn trial_b_8x8<S: Sample>(
             after,
         );
         for shape in [SubMbShape::S8x8, SubMbShape::S8x4, SubMbShape::S4x8, SubMbShape::S4x4] {
+            // The level's vector budget and bi-prediction size
+            // (`MotionLimits`): a shape no direction may take is not
+            // searched, and a direction it rules out not priced.
+            let limits = s.ctx.motion;
+            if !limits.allows_sub_8x8(shape.count(), 1) {
+                continue;
+            }
             // Provisional: both lists searched and committed per
             // sub-rectangle, so the later ones are seeded from something.
             *st = before;
@@ -2274,6 +2292,9 @@ fn trial_b_8x8<S: Sample>(
             // Each direction replayed exactly.
             for dir in B_DIRS {
                 let used = lists_of(dir);
+                if !limits.allows_sub_8x8(shape.count(), used.iter().filter(|&&u| u).count()) {
+                    continue;
+                }
                 *st = before;
                 let mut cand = BTrial::new(BMbKind::B8x8);
                 let mut satd = 0u32;
@@ -2590,6 +2611,7 @@ mod tests {
                 subparts: false,
                 field: false,
                 chroma_mv_dy: [0; 2],
+                motion: crate::encode::level::MotionLimits::NONE,
             }
         }
     }
@@ -2698,6 +2720,33 @@ mod tests {
             }
         }
         src
+    }
+
+    /// The search keeps the level's vertical vector range (`MaxVmvR`,
+    /// A.3.2(g)) whatever the content asks for: the true motion here is
+    /// ten rows up, found exactly with no limit, and with a range of four
+    /// frame rows every vector lands in `[-4, 4 - 1/4]` — two field rows in
+    /// a field macroblock, whose rows are every other frame row — however
+    /// far the predictor seeds it.
+    #[test]
+    fn the_search_keeps_the_levels_vertical_range() {
+        let t = Tables::new();
+        let refp = grating_plane(48, 48, LUMA_PAD);
+        let truth = Mv::new(0, -40);
+        let src = translated_luma(&refp, truth);
+        let at = |ctx: &MeCtx<u8>, pred: Mv| search_rect(ctx, &refp, 16, 16, 16, 16, &src[16 * 48 + 16..], 48, pred).0;
+        let free = t.ctx(26);
+        assert_eq!(at(&free, truth), truth, "no limit: the search finds the motion");
+        for (field, range) in [(false, 4), (true, 2)] {
+            let ctx = MeCtx { field, motion: crate::encode::level::MotionLimits { max_vmv_r: 4, ..crate::encode::level::MotionLimits::NONE }, ..t.ctx(26) };
+            for pred in [truth, Mv::new(0, -400), Mv::new(8, 400), Mv::ZERO] {
+                let mv = at(&ctx, pred);
+                assert!(
+                    (-4 * range..4 * range).contains(&(mv.y as i32)),
+                    "field {field}: {mv:?} from predictor {pred:?} leaves [-{range}, {range} - 1/4] rows"
+                );
+            }
+        }
     }
 
     /// Fresh (zeroed) reconstruction planes matching [`reference`].

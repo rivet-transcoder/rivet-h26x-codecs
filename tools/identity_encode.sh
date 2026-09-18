@@ -23,7 +23,8 @@
 #                   switch (default: the same binary)
 #   MASK=level      a cell whose bitstreams differ only in the level they
 #                   claim (tools/level_mask.py: H.264 SPS level_idc, H.265
-#                   VPS/SPS general_tier_flag and general_level_idc), with
+#                   VPS/SPS general_tier_flag, general_level_idc and the
+#                   nine range extensions profile constraint flags), with
 #                   identical reconstructions, is LEVEL-ONLY rather than
 #                   MOVED — for a change to how the level is chosen, which
 #                   moves that one field in nearly every stream and nothing
