@@ -17,6 +17,9 @@ use crate::hevc::tables::{EPEL_FILTERS, QPEL_FILTERS, TRANSFORM32};
 pub fn install(d: &mut HevcDsp<u16>) {
     d.idct = [idct_neon::<4>, idct_neon::<8>, idct_neon::<16>, idct_neon::<32>];
     d.idst4 = idst4_neon;
+    d.intra_planar = intra_planar_neon::<u16>;
+    d.intra_dc = intra_dc_neon::<u16>;
+    d.intra_angular = intra_angular_neon::<u16>;
     d.add_residual = add_residual_neon;
     d.qpel_copy = copy_neon;
     d.qpel_h = qpel_h_neon;
@@ -525,6 +528,177 @@ const fn build_t16() -> [[i16; 32]; 32] {
 }
 
 static T16: [[i16; 32]; 32] = build_t16();
+
+// ----------------------------------------------------------------------
+// Intra prediction
+// ----------------------------------------------------------------------
+//
+// `hevc_x86_128.rs`'s intra kernels on NEON, generic over the sample type
+// (both tables' references are u16; only the store differs). NEON widens
+// unsigned: `umull` / `umlal` by scalar into u32 and `rshrn` / `ushl` back,
+// so, unlike the x86 and wasm kernels, these are exact for any u16 and
+// need no range test.
+
+/// Store the first `n` (≤ 8) lanes of `v` (values in sample range) as
+/// samples of `S`.
+#[inline(always)]
+unsafe fn put<S: crate::hevc::frame::Sample>(dst: *mut S, v: uint16x8_t, n: usize) {
+    unsafe {
+        if S::BYTES == 2 {
+            return store_n_u16(dst as *mut u16, v, n);
+        }
+        let b = vmovn_u16(v);
+        match n {
+            8 => vst1_u8(dst as *mut u8, b),
+            4 => std::ptr::write_unaligned(dst as *mut u32, vget_lane_u32::<0>(vreinterpret_u32_u8(b))),
+            _ => {
+                let mut t = [0u8; 8];
+                vst1_u8(t.as_mut_ptr(), b);
+                std::ptr::copy_nonoverlapping(t.as_ptr(), dst as *mut u8, n);
+            }
+        }
+    }
+}
+
+/// Transpose eight 8-lane u16 rows: `trn` at 16, 32 and 64 bits.
+#[inline(always)]
+unsafe fn transpose8_u16(r: &mut [uint16x8_t; 8]) {
+    unsafe {
+        let t16 = |a: uint16x8_t, b: uint16x8_t| (vtrn1q_u16(a, b), vtrn2q_u16(a, b));
+        let (a0, a1) = t16(r[0], r[1]);
+        let (a2, a3) = t16(r[2], r[3]);
+        let (a4, a5) = t16(r[4], r[5]);
+        let (a6, a7) = t16(r[6], r[7]);
+        let w = |v: uint16x8_t| vreinterpretq_u32_u16(v);
+        let t32 = |a: uint16x8_t, b: uint16x8_t| (vtrn1q_u32(w(a), w(b)), vtrn2q_u32(w(a), w(b)));
+        let (b0, b2) = t32(a0, a2);
+        let (b1, b3) = t32(a1, a3);
+        let (b4, b6) = t32(a4, a6);
+        let (b5, b7) = t32(a5, a7);
+        let q = |v: uint32x4_t| vreinterpretq_u64_u32(v);
+        let t64 = |a: uint32x4_t, b: uint32x4_t| (vreinterpretq_u16_u64(vtrn1q_u64(q(a), q(b))), vreinterpretq_u16_u64(vtrn2q_u64(q(a), q(b))));
+        (r[0], r[4]) = t64(b0, b4);
+        (r[1], r[5]) = t64(b1, b5);
+        (r[2], r[6]) = t64(b2, b6);
+        (r[3], r[7]) = t64(b3, b7);
+    }
+}
+
+pub(super) fn intra_planar_neon<S: crate::hevc::frame::Sample>(dst: &mut [S], stride: usize, left: &[u16], top: &[u16], n: usize) {
+    let fits = left.len() > n && top.len() >= n.max(8) && (n - 1) * stride + n <= dst.len();
+    if !fits || !(4..=32).contains(&n) {
+        return (HevcDsp::<S>::scalar().intra_planar)(dst, stride, left, top, n);
+    }
+    unsafe {
+        let d = dst.as_mut_ptr();
+        let sh = vdupq_n_s32(-(n.trailing_zeros() as i32 + 1));
+        let (ln, tn) = (left[n], top[n]);
+        let idx: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+        let lanes = vld1q_u16(idx.as_ptr());
+        for (y, &ly) in left[..n].iter().enumerate() {
+            let ry = (n - 1 - y) as u16;
+            let mut x = 0;
+            while x < n {
+                let xs = vaddq_u16(lanes, vdupq_n_u16(x as u16));
+                let wl = vsubq_u16(vdupq_n_u16((n - 1) as u16), xs); // n-1-x
+                let wr = vaddq_u16(xs, vdupq_n_u16(1)); // x+1
+                let t = vld1q_u16(top.as_ptr().add(x));
+                let base = vdupq_n_u32((y as u32 + 1) * ln as u32 + n as u32);
+                let lo = vmlal_n_u16(vmlal_n_u16(vmlal_n_u16(base, vget_low_u16(wl), ly), vget_low_u16(wr), tn), vget_low_u16(t), ry);
+                let hi = vmlal_high_n_u16(vmlal_high_n_u16(vmlal_high_n_u16(base, wl, ly), wr, tn), t, ry);
+                let v = vcombine_u16(vmovn_u32(vshlq_u32(lo, sh)), vmovn_u32(vshlq_u32(hi, sh)));
+                put(d.add(y * stride + x), v, (n - x).min(8));
+                x += 8;
+            }
+        }
+    }
+}
+
+pub(super) fn intra_dc_neon<S: crate::hevc::frame::Sample>(dst: &mut [S], stride: usize, left: &[u16], top: &[u16], n: usize, edge: bool) {
+    if left.len() < n || top.len() < n || !(4..=32).contains(&n) || (n - 1) * stride + n > dst.len() {
+        return (HevcDsp::<S>::scalar().intra_dc)(dst, stride, left, top, n, edge);
+    }
+    let log2n = n.trailing_zeros();
+    let sum = n as i32 + top[..n].iter().chain(&left[..n]).map(|&v| v as i32).sum::<i32>();
+    let dc = sum >> (log2n + 1);
+    unsafe {
+        let d = dst.as_mut_ptr();
+        let v = vdupq_n_u16(dc as u16);
+        for y in 0..n {
+            let mut x = 0;
+            while x < n {
+                put(d.add(y * stride + x), v, (n - x).min(8));
+                x += 8;
+            }
+        }
+    }
+    if edge {
+        dst[0] = S::from_i32((left[0] as i32 + 2 * dc + top[0] as i32 + 2) >> 2);
+        for x in 1..n {
+            dst[x] = S::from_i32((top[x] as i32 + 3 * dc + 2) >> 2);
+        }
+        for (y, &l) in left[..n].iter().enumerate().skip(1) {
+            dst[y * stride] = S::from_i32((l as i32 + 3 * dc + 2) >> 2);
+        }
+    }
+}
+
+pub(super) fn intra_angular_neon<S: crate::hevc::frame::Sample>(dst: &mut [S], stride: usize, refs: &[u16], n: usize, angle: i32, transposed: bool) {
+    // Every load of the last vector of a row, from `ref[-n]` up.
+    if refs.len() < 3 * n + 2 + 8 || !(4..=32).contains(&n) || (n - 1) * stride + n > dst.len() {
+        return (HevcDsp::<S>::scalar().intra_angular)(dst, stride, refs, n, angle, transposed);
+    }
+    unsafe {
+        let d = dst.as_mut_ptr();
+        // Written before it is read, tile by tile, so not cleared.
+        let mut tmp = [std::mem::MaybeUninit::<u16>::uninit(); 32 * 32];
+        for y in 0..n {
+            let pos = (y as i32 + 1) * angle;
+            let (i, f) = (pos >> 5, (pos & 31) as u16);
+            let p = refs.as_ptr().offset(n as isize + i as isize + 1);
+            let mut x = 0;
+            while x < n {
+                let a = vld1q_u16(p.add(x));
+                let v = if f == 0 {
+                    a
+                } else {
+                    // ((32 - f) * a + f * b + 16) >> 5, widened: `rshrn` is the +16 >> 5.
+                    let b = vld1q_u16(p.add(x + 1));
+                    let lo = vmlal_n_u16(vmull_n_u16(vget_low_u16(a), 32 - f), vget_low_u16(b), f);
+                    let hi = vmlal_high_n_u16(vmull_high_n_u16(a, 32 - f), b, f);
+                    vcombine_u16(vrshrn_n_u32::<5>(lo), vrshrn_n_u32::<5>(hi))
+                };
+                if transposed {
+                    store_n_u16(tmp.as_mut_ptr().add(y * n + x) as *mut u16, v, (n - x).min(8));
+                } else {
+                    put(d.add(y * stride + x), v, (n - x).min(8));
+                }
+                x += 8;
+            }
+        }
+        if !transposed {
+            return;
+        }
+        let t = tmp.as_ptr() as *const u16;
+        if n == 4 {
+            let rows: [int16x4_t; 4] = std::array::from_fn(|j| vld1_s16(t.add(4 * j) as *const i16));
+            let c = transpose4x4_s16(rows);
+            for (j, v) in c.iter().enumerate() {
+                put(d.add(j * stride), vreinterpretq_u16_s16(vcombine_s16(*v, *v)), 4);
+            }
+            return;
+        }
+        for by in (0..n).step_by(8) {
+            for bx in (0..n).step_by(8) {
+                let mut r: [uint16x8_t; 8] = std::array::from_fn(|j| vld1q_u16(t.add((by + j) * n + bx)));
+                transpose8_u16(&mut r);
+                for (j, v) in r.iter().enumerate() {
+                    put(d.add((bx + j) * stride + by), *v, 8);
+                }
+            }
+        }
+    }
+}
 
 /// The 4x4 DCT basis, `TRANSFORM32` at every eighth row.
 const DCT4: [[i16; 4]; 4] = [[64, 64, 64, 64], [83, 36, -36, -83], [64, -64, -64, 64], [36, -83, 83, -36]];
