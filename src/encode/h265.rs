@@ -148,7 +148,9 @@
 //! content the coder still paid for — at the same CPU. The 1280x720 CPU
 //! figures overlap other encoding on the machine and carry that noise; the
 //! 3840x2160 ones do not. At `max_cu_depth` 0 a whole-CTB unit cannot be
-//! partial, so that geometry keeps the old rule.
+//! partial, so that geometry keeps the old rule, with one change: it never
+//! takes CTB 16 beyond level 4.1's picture limits, where no level admits
+//! it. So 3840x2160 at depth 0 codes 32x32 CTBs, 3840x2176.
 //!
 //! So do pictures below 64 both ways, and that exception is fitted to one
 //! clip. Partial CTB 32 against the old rule's whole CTBs (16x16 on both

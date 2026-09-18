@@ -115,6 +115,14 @@ impl Geometry {
     /// picture between 50x34 and 88x44 was measured: 64 is where the rule
     /// was drawn, not where the loss was found to end.
     ///
+    /// The whole-CTB rule never takes 16 where the picture 16x16 CTBs would
+    /// code is beyond level 4.1 (`beyond_level_4_1`). Levels 5 and above
+    /// require a CTB of at least 32 (A.4.1 d), so such a stream would fit
+    /// no level at all. 3840x2160 at `max_cu_depth` 0 was one: CTB 16 pads
+    /// nothing there, so the rule took it. It now codes 3840x2176 in 32x32
+    /// CTBs. Under the quadtree the CTB is 32 anyway, and the small-picture
+    /// exception never gets near the limit.
+    ///
     /// The conformance window crops whatever is coded beyond the requested
     /// size. The standard's CTB floor is 16 (an 8x8 CTB is illegal — this
     /// crate's own SPS parser rejects it, which is how that constraint was
@@ -134,6 +142,7 @@ impl Geometry {
                     let n = 1u32 << v;
                     (v, cfg.width.div_ceil(n) * n, cfg.height.div_ceil(n) * n)
                 })
+                .filter(|&(v, w, h)| v > 4 || !beyond_level_4_1(w, h))
                 .min_by_key(|&(v, w, h)| (w * h, u32::MAX - v))
                 .unwrap()
         };
@@ -151,6 +160,16 @@ impl Geometry {
             bit_depth: cfg.bit_depth,
         }
     }
+}
+
+/// Whether a coded luma picture of `width` by `height` exceeds level 4.1's
+/// limits (A.4.1, Table A.8): more than `MaxLumaPs` = 2,228,224 samples, or
+/// a side longer than `sqrt(8 * MaxLumaPs)`, 4222. Only levels 5 and up
+/// admit such a picture, and they require a CTB of 32 or more.
+fn beyond_level_4_1(width: u32, height: u32) -> bool {
+    const MAX_LUMA_PS: u64 = 2_228_224;
+    const MAX_SIDE: u32 = 4222;
+    u64::from(width) * u64::from(height) > MAX_LUMA_PS || width > MAX_SIDE || height > MAX_SIDE
 }
 
 fn chroma_idc(c: ChromaFormat) -> u32 {
@@ -1201,6 +1220,31 @@ mod tests {
         assert_eq!(at(50, 34, Some(0)), (4, 64, 48, 4, 3));
         assert_eq!(at(88, 44, Some(0)), (4, 96, 48, 6, 3));
         assert_eq!(at(1280, 720, Some(0)), (4, 1280, 720, 80, 45));
+    }
+
+    /// The whole-CTB rule never codes 16x16 CTBs beyond level 4.1, where
+    /// every level requires 32 or more (A.4.1 d). Each pair sits either
+    /// side of one limit, and in each CTB 16 pads less: 2032x1088 is
+    /// 2,210,816 samples in 16x16 CTBs and 2064x1088 is 2,245,632, against
+    /// `MaxLumaPs` 2,228,224. 4208 and 4224 fall either side of the longest
+    /// side, 4222, in both directions. 3840x2160 is the size that used to
+    /// take CTB 16.
+    #[test]
+    fn whole_ctbs_are_never_16_beyond_level_4_1() {
+        let at = |w: u32, h: u32| {
+            let g = Geometry::new(&Config { max_cu_depth: Some(0), ..geom(w, h, ChromaFormat::Yuv420).0 });
+            (g.log2_ctb, g.coded_width, g.coded_height)
+        };
+        assert_eq!(at(3840, 2160), (5, 3840, 2176));
+        assert_eq!(at(2032, 1088), (4, 2032, 1088));
+        assert_eq!(at(2064, 1088), (5, 2080, 1088));
+        assert_eq!(at(4208, 16), (4, 4208, 16));
+        assert_eq!(at(4224, 16), (5, 4224, 32));
+        assert_eq!(at(16, 4208), (4, 16, 4208));
+        assert_eq!(at(16, 4224), (5, 32, 4224));
+        // The quadtree's partial CTBs are 32 at every size.
+        let g = Geometry::new(&geom(3840, 2160, ChromaFormat::Yuv420).0);
+        assert_eq!((g.log2_ctb, g.coded_width, g.coded_height), (5, 3840, 2160));
     }
 
     /// The reference picture set a P or B slice carries is written here
