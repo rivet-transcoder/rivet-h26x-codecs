@@ -77,39 +77,45 @@ fn write_hrd(w: &mut BitWriter, cpb: &Cpb) {
     w.bits(5, 0); // time_offset_length — no pic_struct, so no time_offset
 }
 
-/// `vui_parameters()` (E.1.1) carrying only what was asked for: the
+/// `vui_parameters()` (E.1.1): the frame clock on every stream, the
 /// colour description and the chroma siting when the caller gave them,
-/// and the clock the removal delays are counted in plus the NAL HRD when
-/// a buffer was declared. Everything else is absent by its own flag — a
-/// VUI is optional and this encoder wrote none until a buffer needed one
-/// — and each part is present only under its own condition, so a stream
-/// with a buffer and no colour is byte-identical to one from before
-/// colour existed. The inverse of `h264::sps::parse_vui`, which keeps
-/// every field written here.
+/// and the NAL HRD when a buffer was declared. Everything else is absent
+/// by its own flag, and each part is present only under its own
+/// condition. The inverse of `h264::sps::parse_vui`, which keeps every
+/// field written here.
+///
+/// The clock is written whatever else is: a raw Annex-B stream carries
+/// its frame rate nowhere else, and a player that finds none guesses —
+/// ffmpeg's raw demuxer takes 25 pictures a second — as x264, which
+/// always writes it, never lets it. `fixed_frame_rate_flag` is set where
+/// it is true, a progressive stream (every picture a frame, one frame
+/// interval after the last in output order, E.2.1); an interlaced one,
+/// whose field pictures would each have to sit one tick apart in the
+/// output timing, claims nothing.
 fn write_vui(
     w: &mut BitWriter,
     colour: Option<&ColourDescription>,
     chroma_loc: Option<u8>,
     cpb: Option<&Cpb>,
     (fps_num, fps_den): (u32, u32),
+    fixed_rate: bool,
 ) {
     w.flag(false); // aspect_ratio_info_present_flag
     w.flag(false); // overscan_info_present_flag
     write_video_signal_type(w, colour);
     write_chroma_loc(w, chroma_loc);
+    w.flag(true); // timing_info_present_flag
+    w.bits(32, fps_den); // num_units_in_tick
+    w.bits(32, TICKS_PER_FRAME * fps_num); // time_scale
+    w.flag(fixed_rate); // fixed_frame_rate_flag
     match cpb {
         Some(cpb) => {
-            w.flag(true); // timing_info_present_flag
-            w.bits(32, fps_den); // num_units_in_tick
-            w.bits(32, TICKS_PER_FRAME * fps_num); // time_scale
-            w.flag(true); // fixed_frame_rate_flag
             w.flag(true); // nal_hrd_parameters_present_flag
             write_hrd(w, cpb);
             w.flag(false); // vcl_hrd_parameters_present_flag
             w.flag(false); // low_delay_hrd_flag (present: a NAL HRD is)
         }
         None => {
-            w.flag(false); // timing_info_present_flag
             w.flag(false); // nal_hrd_parameters_present_flag
             w.flag(false); // vcl_hrd_parameters_present_flag
             // low_delay_hrd_flag is absent: neither HRD is present.
@@ -385,11 +391,9 @@ fn has_chroma_extension(profile: u8) -> bool {
     matches!(profile, 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135)
 }
 
-/// Sequence parameter set. With a coded picture buffer declared it
-/// carries a VUI — the frame clock and the NAL HRD — and with a colour
-/// description the VUI carries that; with neither, no VUI at all, so a
-/// stream that declares no buffer and no colour is byte-identical to one
-/// from before either existed.
+/// Sequence parameter set, with a VUI on every stream: the frame clock
+/// always, and the NAL HRD, the colour description and the chroma siting
+/// when they were asked for (`write_vui`).
 pub fn write_sps(
     cfg: &Config,
     g: &Geometry,
@@ -469,12 +473,8 @@ pub fn write_sps(
     } else {
         w.flag(false);
     }
-    if cpb.is_some() || cfg.colour.is_some() || cfg.chroma_loc.is_some() {
-        w.flag(true); // vui_parameters_present_flag
-        write_vui(&mut w, cfg.colour.as_ref(), cfg.chroma_loc, cpb, cfg.frame_rate());
-    } else {
-        w.flag(false); // vui_parameters_present_flag
-    }
+    w.flag(true); // vui_parameters_present_flag
+    write_vui(&mut w, cfg.colour.as_ref(), cfg.chroma_loc, cpb, cfg.frame_rate(), !g.interlaced);
     w.rbsp_trailing_bits();
     w.into_nal()
 }
@@ -1030,7 +1030,9 @@ mod tests {
             &cfg, &g, 16, 16, None,
         )))
         .unwrap();
-        assert!(sps.vui.is_none(), "no buffer, no VUI");
+        let vui = sps.vui.expect("a VUI on every stream");
+        assert_eq!(vui.timing, Some((1, 60)), "no buffer, the clock alone");
+        assert!(vui.nal_hrd.is_none() && vui.colour_description.is_none(), "no buffer, no HRD");
     }
 
     /// A deep SPS survives the production parser with the depth it was
@@ -1312,7 +1314,7 @@ mod tests {
             assert_eq!(m, c.matrix, "{c:?}: matrix");
             assert_eq!(vui.full_range, c.full_range, "{c:?}: range");
             assert_eq!(vui.chroma_loc, None, "{c:?}: no siting asked for, none written");
-            assert_eq!(vui.timing, None, "{c:?}: no buffer, no clock");
+            assert_eq!(vui.timing, Some((1, 60)), "{c:?}: the clock on every stream");
             assert_eq!(vui.nal_hrd, None, "{c:?}: no buffer, no HRD");
             assert!(!vui.bitstream_restriction);
         }
@@ -1355,10 +1357,12 @@ mod tests {
         let vui = sps.vui.as_ref().expect("VUI");
         assert_eq!(vui.colour_description, Some((9, 16, 9)));
         assert_eq!(vui.chroma_loc, Some((1, 1)));
-        // Neither: the bytes from before either existed.
+        // Neither: the VUI is the clock alone.
         let plain = write_sps(&base, &g, 16, 16, None);
         let sps = crate::h264::sps::Sps::parse(&crate::nal::unescape_rbsp(&plain)).expect("SPS");
-        assert!(sps.vui.is_none(), "no buffer, no colour and no siting, no VUI");
+        let vui = sps.vui.as_ref().expect("a VUI on every stream");
+        assert_eq!(vui.timing, Some((1, 60)), "no buffer, no colour and no siting: the clock alone");
+        assert!(vui.colour_description.is_none() && vui.chroma_loc.is_none() && vui.nal_hrd.is_none());
         assert_ne!(plain, write_sps(&Config { colour: Some(colours[0]), ..base.clone() }, &g, 16, 16, None));
         assert_ne!(plain, write_sps(&Config { chroma_loc: Some(0), ..base }, &g, 16, 16, None));
     }

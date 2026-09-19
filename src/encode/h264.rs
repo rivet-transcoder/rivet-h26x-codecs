@@ -150,6 +150,10 @@ struct Core<S: Sample> {
     /// came out too large for it and were coded again at a higher
     /// quantiser. Reported rather than hidden, as on the H.265 side.
     recoded: u64,
+    /// The SPS and PPS payloads a decoder of the stream so far holds —
+    /// what the last committed access unit to carry them carried — or
+    /// `None` before the first. See [`Core::param_sets`].
+    sent_sets: Option<(Vec<u8>, Vec<u8>)>,
     /// The interlaced state, when the configuration asked for interlaced
     /// coding: `None` for a progressive stream, whose every path above is
     /// what it was before interlacing existed.
@@ -886,6 +890,7 @@ impl<S: Sample> Core<S> {
             cpb,
             last_bp_encode: 0,
             recoded: 0,
+            sent_sets: None,
         })
     }
 
@@ -1014,6 +1019,9 @@ impl<S: Sample> Core<S> {
     /// trace.
     fn commit(&mut self, c: &Coded, a: Attempt<S>, qp: u8) -> Access {
         let idr = c.kind == Kind::Idr;
+        // Whatever this access unit carried, the decoder now holds the
+        // current sets: they went out in it, or they were what it held.
+        self.sent_sets = Some(self.current_sets());
         self.recon.push(a.rec);
         if let Some(out) = a.fields {
             // An interlaced frame: its fields' census, the model the
@@ -1068,6 +1076,42 @@ impl<S: Sample> Core<S> {
             }
         }
         a.access
+    }
+
+    /// The stream's SPS and PPS payloads as they stand.
+    fn current_sets(&self) -> (Vec<u8>, Vec<u8>) {
+        (
+            syn::write_sps(&self.cfg, &self.geom, LOG2_MAX_FRAME_NUM, LOG2_MAX_POC_LSB, self.cpb.as_ref()),
+            syn::write_pps(&self.cfg, self.pps_qp),
+        )
+    }
+
+    /// The parameter sets that open an access unit: the SPS and the PPS in
+    /// every IDR access unit, where a decoder may begin, and in any other
+    /// only when a set is new or has changed since the decoder last saw it
+    /// — a parameter set stays in force until replaced (7.4.1.2.1), so a
+    /// byte-identical repeat tells a decoder nothing. x264 and this crate's
+    /// H.265 encoder do the same. Random access begins only at an IDR, so
+    /// nothing is lost: a stream cut at any IDR (an HLS segment, a TS
+    /// chunk) still opens with both sets.
+    ///
+    /// Today both sets are constant over a stream, so they ride the IDRs
+    /// alone; the "new or changed" half is what a second PPS would follow
+    /// (h264wbipred's stage B: a PPS 1 goes out in the first access unit
+    /// whose slices use it and whenever its bytes change, and rides every
+    /// IDR after that like PPS 0). Every H.264 access unit used to repeat
+    /// both: 21 to 28 bytes a picture over the gate's corpus, 39 to 45
+    /// with a declared buffer's HRD — a lot of a 64 kbit/s stream.
+    fn param_sets(&self, idr: bool) -> Vec<u8> {
+        let now = self.current_sets();
+        let mut out = Vec::new();
+        if idr || self.sent_sets.as_ref().is_none_or(|s| s.0 != now.0) {
+            out.extend_from_slice(&syn::annexb(syn::NAL_SPS, 3, &now.0));
+        }
+        if idr || self.sent_sets.as_ref().is_none_or(|s| s.1 != now.1) {
+            out.extend_from_slice(&syn::annexb(syn::NAL_PPS, 3, &now.1));
+        }
+        out
     }
 
     /// Code one picture at a given quantiser, keeping nothing — and when
@@ -1274,13 +1318,7 @@ impl<S: Sample> Core<S> {
             )),
             _ => None,
         };
-        let mut out = Vec::new();
-        out.extend_from_slice(&syn::annexb(
-            syn::NAL_SPS,
-            3,
-            &syn::write_sps(&self.cfg, &g, LOG2_MAX_FRAME_NUM, LOG2_MAX_POC_LSB, self.cpb.as_ref()),
-        ));
-        out.extend_from_slice(&syn::annexb(syn::NAL_PPS, 3, &syn::write_pps(&self.cfg, self.pps_qp)));
+        let mut out = self.param_sets(idr);
         if let Some(cpb) = self.cpb.as_ref() {
             // A buffering period begins at every IDR, carrying the initial
             // removal delay; and every access unit of a stream with a NAL
@@ -1783,17 +1821,11 @@ impl<S: Sample> Core<S> {
         })
     }
 
-    /// The parameter sets, and at an IDR the HDR10 SEIs, that open every
-    /// interlaced access unit — the progressive envelope less the buffer
-    /// SEIs, which interlaced coding refuses.
+    /// The parameter sets ([`Core::param_sets`]), and at an IDR the HDR10
+    /// SEIs, that open an interlaced access unit — the progressive
+    /// envelope less the buffer SEIs, which interlaced coding refuses.
     fn interlaced_prefix(&self, idr: bool) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&syn::annexb(
-            syn::NAL_SPS,
-            3,
-            &syn::write_sps(&self.cfg, &self.geom, LOG2_MAX_FRAME_NUM, LOG2_MAX_POC_LSB, self.cpb.as_ref()),
-        ));
-        out.extend_from_slice(&syn::annexb(syn::NAL_PPS, 3, &syn::write_pps(&self.cfg, self.pps_qp)));
+        let mut out = self.param_sets(idr);
         if idr {
             if let Some(m) = self.cfg.mastering_display.as_ref() {
                 out.extend_from_slice(&syn::annexb(syn::NAL_SEI, 0, &syn::write_mastering_display_sei(m)));
@@ -2352,6 +2384,62 @@ mod tests {
                 coded += out.len();
             }
             assert_eq!(coded, 4, "{entropy:?}: every pushed picture codes");
+        }
+    }
+
+    /// The parameter sets ride the IDR access units only: each IDR opens
+    /// with one SPS and one PPS, and no other access unit carries either.
+    /// A stream cut at a later IDR — as an HLS segment or a TS chunk is —
+    /// still opens with both, and decodes on its own to exactly the
+    /// encoder's pictures from there on. Progressive with and without B
+    /// pictures, and interlaced as field pairs, PAFF and MBAFF alike.
+    #[test]
+    fn parameter_sets_ride_the_idrs_only() {
+        let (w, h) = (64usize, 64usize);
+        let frames: Vec<Vec<u8>> = (0..20)
+            .map(|i| {
+                let mut f = vec![128u8; w * h * 3 / 2];
+                for y in 0..h {
+                    for x in 0..w {
+                        f[y * w + x] = (((x + 3 * i) * 7) ^ ((y + 2 * i) * 5) ^ (y % 2 * 40)) as u8;
+                    }
+                }
+                f
+            })
+            .collect();
+        let ilace = |coding| Config { interlace: Some(FieldOrder::TopFirst), field_coding: coding, ..cfg(64, 64, ChromaFormat::Yuv420, 8) };
+        for (tag, config) in [
+            ("progressive", cfg(64, 64, ChromaFormat::Yuv420, 8)),
+            ("progressive IPB", Config { bframes: 2, ..cfg(64, 64, ChromaFormat::Yuv420, 8) }),
+            ("field pairs", ilace(FieldCoding::Field)),
+            ("PAFF", ilace(FieldCoding::Paff)),
+            ("MBAFF", ilace(FieldCoding::Mbaff)),
+        ] {
+            let mut e = H264Encoder::new(Config { gop: 8, rate: RateControl::ConstantQp(28), ..config }).unwrap();
+            let mut units = Vec::new();
+            for f in &frames {
+                units.extend(e.push(f).unwrap());
+            }
+            units.extend(e.flush().unwrap());
+            for u in &units {
+                let kinds: Vec<u8> = crate::nal::annexb_nals(&u.data).map(|n| n[0] & 0x1f).collect();
+                let sets = (kinds.iter().filter(|&&t| t == 7).count(), kinds.iter().filter(|&&t| t == 8).count());
+                let want = if u.keyframe { (1, 1) } else { (0, 0) };
+                assert_eq!(sets, want, "{tag}: picture {} (keyframe {}) carries {sets:?} SPS/PPS", u.encode_index, u.keyframe);
+            }
+            let cut = units.iter().position(|u| u.keyframe && u.encode_index > 0).expect("a second IDR");
+            let mut dec = crate::h264::H264Decoder::new();
+            for u in &units[cut..] {
+                dec.push_annexb(&u.data).unwrap_or_else(|err| panic!("{tag}: a stream cut at an IDR: {err}"));
+            }
+            dec.flush().unwrap();
+            let mut order: Vec<&Access> = units[cut..].iter().collect();
+            order.sort_by_key(|u| u.display);
+            for u in order {
+                let got = dec.next_picture().unwrap_or_else(|| panic!("{tag}: picture {} missing after the cut", u.display));
+                assert!(got.into_packed() == e.reconstructions()[u.encode_index as usize], "{tag}: picture {} after the cut", u.display);
+            }
+            assert!(dec.next_picture().is_none(), "{tag}: more pictures out than in after the cut");
         }
     }
 
