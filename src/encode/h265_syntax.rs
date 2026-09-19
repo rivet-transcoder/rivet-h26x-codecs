@@ -356,18 +356,17 @@ fn write_hrd(w: &mut BitWriter, cpb: &Cpb, fps: u32) {
     w.flag(false); // cbr_flag
 }
 
-/// `vui_parameters` (E.2.1) carrying only what was asked for: the colour
+/// `vui_parameters` (E.2.1): the frame rate on every stream, the colour
 /// description and the chroma siting when the caller gave them, and the
-/// frame rate the removal times are counted in plus the HRD when a buffer
-/// was declared.
+/// HRD when a buffer was declared.
 ///
-/// Everything else is absent by its own flag. A VUI is optional and this
-/// encoder had none until the buffer model needed one, so the only reason
-/// any of it is here is that a removal schedule without a frame rate is not
-/// a schedule — and, later, that a BT.2020 PQ picture with no colour
-/// description is shown as BT.709. Each part is present only under its own
-/// condition, so a stream with a buffer and no colour is byte-identical to
-/// one from before colour existed. The inverse of `hevc::sps::parse_vui`.
+/// Everything else is absent by its own flag. The clock is here whatever
+/// else is, because a raw Annex-B stream carries its frame rate nowhere
+/// else and a player that finds none guesses (ffmpeg: 25 pictures a
+/// second); the rest because a removal schedule without a frame rate is
+/// not a schedule, and a BT.2020 PQ picture with no colour description is
+/// shown as BT.709. Each other part is present only under its own
+/// condition. The inverse of `hevc::sps::parse_vui`.
 fn write_vui(
     w: &mut BitWriter,
     colour: Option<&ColourDescription>,
@@ -385,18 +384,19 @@ fn write_vui(
     w.flag(false); // field_seq_flag
     w.flag(false); // frame_field_info_present_flag
     w.flag(false); // default_display_window_flag
+    // The clock, on every stream (as the H.264 side says): one tick per
+    // picture, the frame rate in lowest terms — 29.97 is 1001 over 30000,
+    // 30 is 1 over 30.
+    w.flag(true); // vui_timing_info_present_flag
+    w.bits(32, fps_den); // vui_num_units_in_tick
+    w.bits(32, fps_num); // vui_time_scale — ticks per second
+    w.flag(false); // vui_poc_proportional_to_timing_flag
     match cpb {
         Some(cpb) => {
-            w.flag(true); // vui_timing_info_present_flag
-            // One tick per picture, the frame rate in lowest terms: 29.97
-            // is 1001 over 30000, 30 is 1 over 30 as it always was.
-            w.bits(32, fps_den); // vui_num_units_in_tick
-            w.bits(32, fps_num); // vui_time_scale — ticks per second
-            w.flag(false); // vui_poc_proportional_to_timing_flag
             w.flag(true); // vui_hrd_parameters_present_flag
             write_hrd(w, cpb, fps_num);
         }
-        None => w.flag(false), // vui_timing_info_present_flag
+        None => w.flag(false), // vui_hrd_parameters_present_flag
     }
     w.flag(false); // bitstream_restriction_flag
 }
@@ -533,12 +533,8 @@ pub fn write_sps(cfg: &Config, g: &Geometry, log2_max_poc_lsb: u32, cpb: Option<
     w.flag(false); // long_term_ref_pics_present_flag
     w.flag(false); // sps_temporal_mvp_enabled_flag
     w.flag(false); // strong_intra_smoothing_enabled_flag
-    if cpb.is_some() || cfg.colour.is_some() || cfg.chroma_loc.is_some() {
-        w.flag(true); // vui_parameters_present_flag
-        write_vui(&mut w, cfg.colour.as_ref(), cfg.chroma_loc, cpb, cfg.frame_rate());
-    } else {
-        w.flag(false); // vui_parameters_present_flag
-    }
+    w.flag(true); // vui_parameters_present_flag
+    write_vui(&mut w, cfg.colour.as_ref(), cfg.chroma_loc, cpb, cfg.frame_rate());
     w.flag(false); // sps_extension_present_flag
     w.rbsp_trailing_bits();
     w.into_nal()
@@ -976,14 +972,16 @@ mod tests {
         }
     }
 
-    /// A stream that declares no buffer must carry no VUI at all — the
-    /// bytes before this feature existed, unchanged.
+    /// A stream that declares no buffer carries a VUI with the clock and
+    /// nothing else: the rate a raw stream would otherwise not have.
     #[test]
-    fn declaring_no_buffer_writes_no_vui() {
+    fn declaring_no_buffer_writes_the_clock_alone() {
         use crate::hevc::sps::Sps;
         let (cfg, g) = geom(64, 64, ChromaFormat::Yuv420);
         let sps = Sps::parse(&crate::nal::unescape_rbsp(&write_sps(&cfg, &g, 8, None))).expect("SPS");
-        assert!(sps.vui.is_none(), "an SPS with no buffer declared should carry no VUI");
+        let vui = sps.vui.expect("a VUI on every stream");
+        assert_eq!(vui.timing, Some((1, 30)), "the clock, one tick a picture");
+        assert!(vui.hrd.is_none() && vui.colour_description.is_none(), "no buffer declared, no HRD");
     }
 
     /// The colour description round-trips through the decoder's own SPS
@@ -1013,7 +1011,7 @@ mod tests {
             assert_eq!(m, c.matrix, "{c:?}: matrix");
             assert_eq!(vui.full_range, c.full_range, "{c:?}: range");
             assert_eq!(vui.chroma_loc, None, "{c:?}: no siting asked for, none written");
-            assert_eq!(vui.timing, None, "{c:?}: no buffer, no clock");
+            assert_eq!(vui.timing, Some((1, 30)), "{c:?}: the clock on every stream");
             assert!(vui.hrd.is_none(), "{c:?}: no buffer, no HRD");
         }
         let cpb = Cpb::new(64_000, 125).expect("representable");

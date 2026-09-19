@@ -639,7 +639,9 @@ mod tests {
 
     /// A stream with no VUI, or a VUI with no HRD, is not a stream that
     /// failed the buffer — it is one that declared no buffer, and saying so
-    /// is different from saying it conformed. Both codecs.
+    /// is different from saying it conformed. Both codecs. Every stream
+    /// these encoders write carries a VUI with its clock, so one that
+    /// declares no buffer is the second kind: a clock and no HRD.
     #[test]
     fn a_stream_that_declares_no_buffer_is_refused_rather_than_passed() {
         use crate::encode::h265_syntax::{Geometry, write_sps};
@@ -647,9 +649,9 @@ mod tests {
         let cfg = Config { width: 64, height: 64, ..Config::default() };
         let g = Geometry::new(&cfg);
         let sps = crate::encode::h265_syntax::annexb(33, &write_sps(&cfg, &g, 8, None));
-        let err = verify(&sps).expect_err("no VUI means no verdict");
+        let err = verify(&sps).expect_err("no HRD means no verdict");
         let s = format!("{err}");
-        assert!(s.contains("no VUI") || s.contains("no buffer"), "{s}");
+        assert!(s.contains("no hypothetical reference decoder"), "{s}");
 
         let g = crate::encode::h264_syntax::Geometry::new(&cfg);
         let sps = crate::encode::h264_syntax::annexb(
@@ -658,9 +660,9 @@ mod tests {
             &crate::encode::h264_syntax::write_sps(&cfg, &g, 16, 16, None),
         );
         assert!(is_h264(&sps));
-        let err = verify(&sps).expect_err("H.264: no VUI means no verdict");
+        let err = verify(&sps).expect_err("H.264: no HRD means no verdict");
         let s = format!("{err}");
-        assert!(s.contains("no VUI") || s.contains("no buffer"), "{s}");
+        assert!(s.contains("no hypothetical reference decoder"), "{s}");
     }
 
     /// Every frame rate a caller can name round-trips through both
@@ -704,6 +706,34 @@ mod tests {
         }
         let zero = Config { width: 64, height: 64, fps_den: 0, ..Config::default() };
         assert!(zero.validate().unwrap_err().to_string().contains("fps_den"));
+    }
+
+    /// Every stream carries its clock, buffer or none — a raw stream has
+    /// its rate nowhere else — and H.264's `fixed_frame_rate_flag` says so
+    /// exactly where it is true: a progressive stream, and not an
+    /// interlaced one, whose field pictures claim nothing.
+    #[test]
+    fn every_stream_carries_its_clock() {
+        use crate::encode::{Config, FieldOrder};
+        for (fps, fps_den) in [(30, 1), (25, 1), (30000, 1001), (60000, 1001)] {
+            let cfg = Config { width: 64, height: 64, fps, fps_den, ..Config::default() };
+            let (num, den) = cfg.frame_rate();
+            let g4 = crate::encode::h264_syntax::Geometry::new(&cfg);
+            let sps4 = crate::encode::h264_syntax::write_sps(&cfg, &g4, 16, 16, None);
+            let vui4 = crate::h264::Sps::parse(&crate::nal::unescape_rbsp(&sps4)).unwrap().vui.expect("an H.264 VUI");
+            assert_eq!((vui4.timing, vui4.fixed_frame_rate), (Some((den, 2 * num)), true), "H.264 {fps}/{fps_den}");
+            assert!(vui4.nal_hrd.is_none(), "H.264 {fps}/{fps_den}: no buffer, no HRD");
+            let g5 = crate::encode::h265_syntax::Geometry::new(&cfg);
+            let sps5 = crate::encode::h265_syntax::write_sps(&cfg, &g5, 8, None);
+            let vui5 = Sps::parse(&crate::nal::unescape_rbsp(&sps5)).unwrap().vui.expect("an H.265 VUI");
+            assert_eq!(vui5.timing, Some((den, num)), "H.265 {fps}/{fps_den}");
+            assert!(vui5.hrd.is_none(), "H.265 {fps}/{fps_den}: no buffer, no HRD");
+        }
+        let cfg = Config { width: 64, height: 64, interlace: Some(FieldOrder::TopFirst), ..Config::default() };
+        let g = crate::encode::h264_syntax::Geometry::new(&cfg);
+        let sps = crate::encode::h264_syntax::write_sps(&cfg, &g, 16, 16, None);
+        let vui = crate::h264::Sps::parse(&crate::nal::unescape_rbsp(&sps)).unwrap().vui.expect("a VUI");
+        assert_eq!((vui.timing, vui.fixed_frame_rate), (Some((1, 60)), false), "interlaced: the clock, no fixed-rate claim");
     }
 
     /// At 29.97 H.264's clock tick is 1501.5 of the 90 kHz ones — 3003/2,

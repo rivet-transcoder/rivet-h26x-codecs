@@ -35,13 +35,23 @@
 #                   one already in force (tools/psrep_mask.py) — with
 #                   identical reconstructions: for the change that writes
 #                   them at IDRs only.
+#   MASK=vui        likewise VUI-ONLY: the second stream's SPS adds the VUI
+#                   frame clock and nothing else (tools/vui_mask.py: the
+#                   flag that turns it on and the bits it inserts), every
+#                   other NAL unit byte-identical, reconstructions too — for
+#                   the change that writes the clock on every stream.
+#   MASK=psrep+vui  both at once: the repeats are taken out first and what
+#                   differs then is held to the clock mask. A cell is
+#                   PSREPEAT-ONLY, VUI-ONLY or PSREPEAT+VUI-ONLY by which
+#                   of the two it needed.
 # Resolved before the cd below, which would otherwise turn a relative
 # script path into nothing.
 VERIFY=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/verify_encode.sh
 LEVEL_MASK=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/level_mask.py
 PSREP_MASK=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/psrep_mask.py
+VUI_MASK=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/vui_mask.py
 MASK=${MASK:-}
-case "$MASK" in ""|level|psrep) ;; *) echo "MASK=$MASK: only MASK=level and MASK=psrep are known" >&2; exit 2 ;; esac
+case "$MASK" in ""|level|psrep|vui|psrep+vui) ;; *) echo "MASK=$MASK: only MASK=level, psrep, vui and psrep+vui are known" >&2; exit 2 ;; esac
 cd "${H26X_WORK:-$(dirname "$0")}"
 ENC=${1:-../release/examples/h26xenc.exe}
 [ -f "$ENC" ] || ENC=${ENC%.exe}
@@ -97,11 +107,16 @@ one() {
   if ! cmp -s "$a" "$b"; then
     if [ -n "$MASK" ]; then
       codec=h264; case "$flags" in *"--codec h265"*) codec=h265 ;; esac
-      # The level mask prints what moved; the others print their own
-      # label (the first word) and then what moved.
-      case "$MASK" in level) script=$LEVEL_MASK ;; *) script=$PSREP_MASK ;; esac
-      if m=$(python "$script" "$codec" "$a" "$b"); then
-        case "$MASK" in level) label=LEVEL-ONLY ;; *) label=${m%% *}; m=${m#* } ;; esac
+      # The level and clock masks print what moved; the repeat mask prints
+      # its own label first (which of the changes the cell needed).
+      case "$MASK" in
+        level) mask=("$LEVEL_MASK") label=LEVEL-ONLY ;;
+        vui) mask=("$VUI_MASK") label=VUI-ONLY ;;
+        psrep) mask=("$PSREP_MASK") label= ;;
+        psrep+vui) mask=("$PSREP_MASK" --vui) label= ;;
+      esac
+      if m=$(python "${mask[@]}" "$codec" "$a" "$b"); then
+        [ -n "$label" ] || { label=${m%% *}; m=${m#* }; }
         if cmp -s "$a.yuv" "$b.yuv"; then
           printf '%-11s %s (%s)\n' "$label" "$tag" "$m"; return 0
         fi
@@ -117,7 +132,7 @@ one() {
   echo "SAME        $tag ($(stat -c %s "$a") bytes)"
 }
 export -f one
-export ENC ENC_B OUT ENV_A ENV_B MASK LEVEL_MASK PSREP_MASK
+export ENC ENC_B OUT ENV_A ENV_B MASK LEVEL_MASK PSREP_MASK VUI_MASK
 
 echo "== encode identity: [$ENV_A] $(basename "$ENC") vs [${ENV_B:-as shipped}] $(basename "$ENC_B")${MASK:+ (MASK=$MASK)} =="
 results="$OUT/results.txt"

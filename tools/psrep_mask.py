@@ -21,13 +21,21 @@ with its parameter sets, so an IDR slice always lands in its own access
 unit's group, and a parameter set, which follows a slice or begins the
 stream, always opens the group of the access unit it belongs to.
 
-    python psrep_mask.py h264|h265 A B
+With --vui (identity_encode.sh's MASK=psrep+vui, for the two changes
+landing together) a sequence parameter set left differing after that is
+held to tools/vui_mask.py's rule instead of refused: the second adds the
+VUI frame clock and nothing else.
 
-Exit 0 when the streams are equal under the mask, printing PSREPEAT-ONLY
-and what was dropped (`12 SPS + 12 PPS repeats, 168 bytes`) or `identical`;
-1 otherwise, printing the first difference.
+    python psrep_mask.py [--vui] h264|h265 A B
+
+Exit 0 when the streams are equal under the mask, printing a label for
+what it took — PSREPEAT-ONLY, VUI-ONLY or PSREPEAT+VUI-ONLY — and then
+what that was (`12 SPS + 12 PPS repeats, 168 bytes; SPS VUI +clock 1/60
+fixed`), or `identical`; 1 otherwise, printing the first difference.
 """
 import sys
+
+import vui_mask
 
 
 def nal_units(data):
@@ -87,12 +95,16 @@ def drop_repeats(nals):
 
 
 def main():
-    if len(sys.argv) != 4 or sys.argv[1] not in ("h264", "h265"):
-        sys.exit("usage: psrep_mask.py h264|h265 A B")
-    codec = sys.argv[1]
-    a = nal_units(open(sys.argv[2], "rb").read())
-    b = nal_units(open(sys.argv[3], "rb").read())
-    note = "identical"
+    args = sys.argv[1:]
+    vui = args[:1] == ["--vui"]
+    if vui:
+        args = args[1:]
+    if len(args) != 3 or args[0] not in ("h264", "h265"):
+        sys.exit("usage: psrep_mask.py [--vui] h264|h265 A B")
+    codec = args[0]
+    a = nal_units(open(args[1], "rb").read())
+    b = nal_units(open(args[2], "rb").read())
+    labels, notes = [], []
     if codec == "h264":
         a, sps, pps, gone = drop_repeats(a)
         b, bsps, bpps, _ = drop_repeats(b)
@@ -100,15 +112,27 @@ def main():
             print(f"MOVED: the second stream repeats parameter sets ({bsps} SPS, {bpps} PPS)")
             return 1
         if sps or pps:
-            note = f"PSREPEAT-ONLY {sps} SPS + {pps} PPS repeats, {gone} bytes"
+            labels.append("PSREPEAT")
+            notes.append(f"{sps} SPS + {pps} PPS repeats, {gone} bytes")
     if len(a) != len(b):
         print(f"MOVED: {len(a)} NAL units against {len(b)} after the repeats")
         return 1
+    sps_type = vui_mask.CODECS[codec][0]
+    clocks = set()
     for k, (x, y) in enumerate(zip(a, b)):
-        if x != y:
-            print(f"MOVED: NAL unit {k} (first byte {x[0]:02x}) differs")
-            return 1
-    print(note)
+        if x == y:
+            continue
+        if vui and vui_mask.nal_type(codec, x) == sps_type == vui_mask.nal_type(codec, y):
+            added = vui_mask.added_clock(codec, x, y)
+            if added is not None:
+                clocks.add(added)
+                continue
+        print(f"MOVED: NAL unit {k} (first byte {x[0]:02x}) differs")
+        return 1
+    if clocks:
+        labels.append("VUI")
+        notes.append("; ".join(sorted(clocks)))
+    print(f"{'+'.join(labels)}-ONLY {'; '.join(notes)}" if labels else "identical")
     return 0
 
 
