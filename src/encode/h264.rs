@@ -2626,25 +2626,35 @@ mod tests {
     /// encoder's list: a GOP of one mini-GOP (gop = bframes + 2) at any
     /// reference count, and at three references most GOP lengths (bframes 1
     /// at gop 4 and 5, 2 at 5 and 7, 3 at 6 and 9). No single-GOP test
-    /// could see it. Here bframes 1 to 3 run over gop = bframes + 1 — the
+    /// could see it. A P picture never took a stale reference: its nearest
+    /// earlier picture is its own GOP's previous one, which a stale entry
+    /// can only equal in POC, and that search keeps the later of equals —
+    /// but a P-only stream at two and three references, which kept the
+    /// previous GOP's pictures longest, is held here all the same. So
+    /// bframes 0 to 3 run over gop = bframes + 1 — for bframes above 0 the
     /// IDR releases the held pictures as P, so no B picture is coded: the
     /// control — to bframes + 4 and one longer GOP, at one and three
-    /// references and 8 and 10 bits, over three GOPs and a part, each
-    /// picture decoded (SELF, in process) and held to the encoder's own.
+    /// references with B pictures and two and three without, at 8 and 10
+    /// bits, over three GOPs and a part, each picture decoded (SELF, in
+    /// process) and held to the encoder's own.
     #[test]
     fn every_gop_predicts_from_what_the_decoder_holds() {
-        for bframes in 1u32..=3 {
+        for bframes in 0u32..=3 {
             let mut gops = vec![bframes + 1, bframes + 2, bframes + 3, bframes + 4, 2 * bframes + 3];
+            gops.retain(|&g| g > 1);
+            gops.sort_unstable();
             gops.dedup();
+            let refs: &[u32] = if bframes == 0 { &[2, 3] } else { &[1, 3] };
             for gop in gops {
-                for (max_refs, bit_depth) in [(1u32, 8u32), (3, 8), (1, 10), (3, 10)] {
+                for (&max_refs, bit_depth) in refs.iter().flat_map(|r| [(r, 8u32), (r, 10)]) {
                     let tag = format!("gop {gop} bframes {bframes} refs {max_refs} {bit_depth}-bit");
                     let frames = woven_frames(64, 64, ChromaFormat::Yuv420, bit_depth, 3 * gop as usize + 2, 0);
                     let config = Config { gop, bframes, max_refs, ..cfg(64, 64, ChromaFormat::Yuv420, bit_depth) };
                     let (units, census) = encode_and_self_check(&tag, config, &frames);
                     assert!(units.iter().filter(|u| u.keyframe).count() >= 3, "{tag}: fewer than three GOPs");
-                    if gop == bframes + 1 {
-                        assert_eq!(census.pictures[2], 0, "{tag}: a B picture in a GOP the IDR ends first: {census:?}");
+                    assert!(census.pictures[1] > 0, "{tag}: no P picture was coded: {census:?}");
+                    if bframes == 0 || gop == bframes + 1 {
+                        assert_eq!(census.pictures[2], 0, "{tag}: a B picture where none can be: {census:?}");
                     } else {
                         assert!(census.pictures[2] > 0, "{tag}: no B picture was coded: {census:?}");
                     }
