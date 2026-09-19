@@ -553,7 +553,9 @@ EXCLUSIVE_TOKENS="ilace fdeep wsine"
 # the deep path, @cut the whole-CTB units of --cu-depth 0 and @fade the
 # weighted, three-reference combination. h26xenc's `shapes` census counts
 # 2nxn / nx2n per picture kind, so a green cell can be told from one whose
-# pictures took no shape.
+# pictures took no shape: the static clip, odd and the smooth grad take
+# none, and none is taken anywhere at QP 40, where a second unit's syntax
+# never pays — which is why the AQ and SAO row runs at QP 32.
 CONFIGS=${CONFIGS:-"
 lossless-intra|--codec h264 --lossless --gop 0
 cqp-intra|--codec h264 --qp 26 --gop 0
@@ -627,7 +629,7 @@ hevc-refs2-wp-ip@fade|--codec h265 --qp 26 --gop 8 --refs 2 --wpred
 hevc10-refs2-ip@p10|--codec h265 --qp 26 --gop 8 --refs 2
 hevc-parts-ip|--codec h265 --qp 26 --gop 8 --parts sym
 hevc-parts-ipb|--codec h265 --qp 26 --gop 8 --bframes 2 --parts sym
-hevc-parts-aq40-sao-ipb|--codec h265 --qp 40 --gop 8 --bframes 2 --aq 1.0 --sao --parts sym
+hevc-parts-aq32-sao-ipb|--codec h265 --qp 32 --gop 8 --bframes 2 --aq 1.0 --sao --parts sym
 hevc-parts-ipb@big|--codec h265 --qp 26 --gop 8 --bframes 2 --parts sym
 hevc-parts-ipb@edge|--codec h265 --qp 26 --gop 8 --bframes 2 --parts sym
 hevc10-parts-ipb@p10|--codec h265 --qp 26 --gop 8 --bframes 2 --parts sym

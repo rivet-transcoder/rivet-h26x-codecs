@@ -394,6 +394,11 @@ pub struct PuPick {
     pub cost: f32,
 }
 
+/// A partitioned shape's decision, [`InterPicture::pick_parts`]'s answer:
+/// the shape, its two units in the reader's order, and its cost in SATD
+/// plus bits, comparable with a 2Nx2N unit's [`PuPick::cost`].
+type PartsPick = (PartMode, [PuPick; 2], f32);
+
 impl Default for PuPick {
     fn default() -> Self {
         PuPick { merge_idx: None, idc: 0, mvd: [Mv::ZERO; 2], mvp_flag: [0; 2], mv: [Mv::ZERO; 2], ref_idx: [0, -1], satd: 0, cost: 0.0 }
@@ -622,7 +627,7 @@ pub struct InterPicture<S: Sample> {
     /// partitioned shape, if one was offered. `tree_leaf` codes the loser
     /// too when the two are close, and keeps the cheaper in SSD plus
     /// lambda times the bits of the whole CU.
-    alts: Option<(PuPick, Option<(PartMode, [PuPick; 2], f32)>)>,
+    alts: Option<(PuPick, Option<PartsPick>)>,
     /// The picture descriptor the intra decision's availability and MPM
     /// mirrors read, built once from the SPS.
     geo: Geo,
@@ -1389,7 +1394,7 @@ impl<S: Sample> InterPicture<S> {
         y_stride: usize,
         rate: &Rate,
         lam: f32,
-    ) -> Option<(PartMode, [PuPick; 2], f32)> {
+    ) -> Option<PartsPick> {
         let shapes: &[PartMode] = match self.parts {
             InterParts::None => return None,
             InterParts::Symmetric => &[PartMode::P2NxN, PartMode::PNx2N],
@@ -1399,7 +1404,7 @@ impl<S: Sample> InterPicture<S> {
         let motion = save4(&self.recon.motion, self.recon.w4, x0, y0, n);
         let pred_mode = save4(&self.info.pred_mode, w4, x0, y0, n);
         PicInfo::fill4(&mut self.info.pred_mode, w4, x0, y0, n, n, 0);
-        let mut best: Option<(PartMode, [PuPick; 2], f32)> = None;
+        let mut best: Option<PartsPick> = None;
         for &part in shapes {
             let mut picks = [PuPick::default(); 2];
             let mut cost = lam * rate.parts(part);
