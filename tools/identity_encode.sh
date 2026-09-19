@@ -29,12 +29,19 @@
 #                   MOVED — for a change to how the level is chosen, which
 #                   moves that one field in nearly every stream and nothing
 #                   else. Every other difference is still MOVED.
+#   MASK=psrep      likewise PSREPEAT-ONLY: the H.264 streams are equal once
+#                   the parameter-set repeats are taken out of both — an SPS
+#                   or PPS outside an IDR access unit, byte-identical to the
+#                   one already in force (tools/psrep_mask.py) — with
+#                   identical reconstructions: for the change that writes
+#                   them at IDRs only.
 # Resolved before the cd below, which would otherwise turn a relative
 # script path into nothing.
 VERIFY=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/verify_encode.sh
 LEVEL_MASK=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/level_mask.py
+PSREP_MASK=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/psrep_mask.py
 MASK=${MASK:-}
-case "$MASK" in ""|level) ;; *) echo "MASK=$MASK: only MASK=level is known" >&2; exit 2 ;; esac
+case "$MASK" in ""|level|psrep) ;; *) echo "MASK=$MASK: only MASK=level and MASK=psrep are known" >&2; exit 2 ;; esac
 cd "${H26X_WORK:-$(dirname "$0")}"
 ENC=${1:-../release/examples/h26xenc.exe}
 [ -f "$ENC" ] || ENC=${ENC%.exe}
@@ -88,15 +95,19 @@ one() {
     echo "ENCODE-FAIL $tag (B): $(tail -1 "$b.log" | head -c 100)"; return 1
   fi
   if ! cmp -s "$a" "$b"; then
-    if [ "$MASK" = level ]; then
+    if [ -n "$MASK" ]; then
       codec=h264; case "$flags" in *"--codec h265"*) codec=h265 ;; esac
-      if m=$(python "$LEVEL_MASK" "$codec" "$a" "$b"); then
+      # The level mask prints what moved; the others print their own
+      # label (the first word) and then what moved.
+      case "$MASK" in level) script=$LEVEL_MASK ;; *) script=$PSREP_MASK ;; esac
+      if m=$(python "$script" "$codec" "$a" "$b"); then
+        case "$MASK" in level) label=LEVEL-ONLY ;; *) label=${m%% *}; m=${m#* } ;; esac
         if cmp -s "$a.yuv" "$b.yuv"; then
-          echo "LEVEL-ONLY  $tag ($m)"; return 0
+          printf '%-11s %s (%s)\n' "$label" "$tag" "$m"; return 0
         fi
-        echo "MOVED       $tag: reconstructions differ (bitstreams differ only in the level: $m)"; return 1
+        echo "MOVED       $tag: reconstructions differ (bitstreams differ only under MASK=$MASK: $m)"; return 1
       fi
-      echo "MOVED       $tag: bitstreams differ beyond the level ($m)"; return 1
+      echo "MOVED       $tag: bitstreams differ beyond MASK=$MASK ($m)"; return 1
     fi
     echo "MOVED       $tag: bitstreams differ ($(stat -c %s "$a") vs $(stat -c %s "$b") bytes)"; return 1
   fi
@@ -106,7 +117,7 @@ one() {
   echo "SAME        $tag ($(stat -c %s "$a") bytes)"
 }
 export -f one
-export ENC ENC_B OUT ENV_A ENV_B MASK LEVEL_MASK
+export ENC ENC_B OUT ENV_A ENV_B MASK LEVEL_MASK PSREP_MASK
 
 echo "== encode identity: [$ENV_A] $(basename "$ENC") vs [${ENV_B:-as shipped}] $(basename "$ENC_B")${MASK:+ (MASK=$MASK)} =="
 results="$OUT/results.txt"
@@ -132,10 +143,10 @@ for src in $SOURCES; do
 done | xargs -P "$JOBS" -I{} bash -c 'IFS="|" read -r s n f <<< "{}"; one "$s" "$n" "$f"' | sort | tee "$results"
 
 same=$(grep -c '^SAME' "$results")
-masked=$(grep -c '^LEVEL-ONLY' "$results")
+masked=$(grep -cE '^[A-Z+]+-ONLY' "$results")
 bad=$(grep -cE '^(MOVED|ENCODE-FAIL)' "$results")
 echo
-echo "identity: $same identical, ${MASK:+$masked level-only, }$bad moved"
+echo "identity: $same identical, ${MASK:+$masked $MASK-only, }$bad moved"
 # Zero cells is not a pass: it is the configuration list failing to parse
 # or the corpus missing, and a green line over nothing is the vacuity this
 # whole gate exists to refuse.
