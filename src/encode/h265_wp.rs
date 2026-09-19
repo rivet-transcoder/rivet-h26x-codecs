@@ -117,6 +117,15 @@ impl PlaneFit {
         self.used() && (self.sad_weighted as f64) < self.sad_plain as f64 * 0.7
     }
 
+    /// Whether the fit is used and removes at least 10% of the plain SAD —
+    /// short of [`PlaneFit::strong`], but more than the drift of a coarse
+    /// reconstruction mostly buys. H.264's P pictures price such a fit
+    /// against the defaults and write the defaults for a fit that does not
+    /// reach it (see `encode::h264`'s `p_weights`).
+    pub(crate) fn worth_pricing(&self) -> bool {
+        self.used() && (self.sad_weighted as f64) < self.sad_plain as f64 * 0.9
+    }
+
     /// The identity: default weighting, never [`PlaneFit::used`].
     pub(crate) fn identity(sad_plain: u64) -> Self {
         PlaneFit { weight: 1 << LOG2_DENOM, offset: 0, sad_plain, sad_weighted: sad_plain, log2_denom: LOG2_DENOM }
