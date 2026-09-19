@@ -278,6 +278,9 @@ fn main() {
         if enc.recodes() != 0 {
             eprintln!("rate: {} extra codings to fit the declared buffer", enc.recodes());
         }
+        if enc.seed_recodes() != 0 {
+            eprintln!("rate: {} extra codings of pictures planned from a seed alone", enc.seed_recodes());
+        }
         // The controller's model check: how far, in quantiser steps of
         // its law, the pictures landed from where they were planned.
         if let Some(err) = enc.plan_error() {
