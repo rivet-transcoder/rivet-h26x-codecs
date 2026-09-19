@@ -23,13 +23,17 @@
 //! table says so in one flag bit. A fit that helps nothing costs the
 //! table's bits and biases the motion search for no return.
 //!
-//! The fit is H.264's too (`encode::h264`'s explicit weighting for P
+//! The fit is H.264's too (`encode::h264`'s explicit weighting for P and B
 //! slices): H.264's table carries the weight itself where H.265's carries a
 //! delta around the identity, so [`fit_samples`] takes the range the
 //! caller's syntax can hold, and the reference as a plain sample layout
 //! ([`RefSamples`]) rather than either decoder's plane type. The weighted
 //! arithmetic the check applies is the same in both standards: H.264's
-//! 8.4.2.3.2 uni-directional formula at `logWD >= 1` is H.265's.
+//! 8.4.2.3.2 uni-directional formula at `logWD >= 1` is H.265's, and at
+//! `logWD` 0 it drops the rounding shift, as `weighted_sad` does. H.264
+//! also bounds the sum of a bi-predicted pair's two weights, which a B
+//! slice's fits can break at [`LOG2_DENOM`]; [`fit_samples_at`] quantises
+//! the same sums ([`plane_sums`]) at a coarser denominator for it.
 //!
 //! What this is not: a per-block decision. The table is per slice and
 //! per reference, so a picture whose left half fades and whose right
@@ -80,7 +84,7 @@ const MIN_GAIN: f64 = 0.02;
 /// One component's fitted weighting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlaneFit {
-    /// The weight, in units of `1 << LOG2_DENOM`. `1 << LOG2_DENOM` is
+    /// The weight, in units of `1 << log2_denom`. `1 << log2_denom` is
     /// the identity.
     pub weight: i32,
     /// The offset in 8-bit sample units (what the table carries; the
@@ -90,18 +94,32 @@ pub(crate) struct PlaneFit {
     pub sad_plain: u64,
     /// The same against the weighted reference.
     pub sad_weighted: u64,
+    /// The denominator the weight is in: [`LOG2_DENOM`], except where an
+    /// H.264 B picture's pair of fits needs a coarser one
+    /// ([`fit_samples_at`]).
+    pub log2_denom: u32,
 }
 
 impl PlaneFit {
     /// Whether the fit is worth carrying: it is not the identity and it
     /// removes more than [`MIN_GAIN`] of the plain SAD.
     pub fn used(&self) -> bool {
-        (self.weight != 1 << LOG2_DENOM || self.offset != 0) && (self.sad_weighted as f64) < self.sad_plain as f64 * (1.0 - MIN_GAIN)
+        (self.weight != 1 << self.log2_denom || self.offset != 0) && (self.sad_weighted as f64) < self.sad_plain as f64 * (1.0 - MIN_GAIN)
+    }
+
+    /// Whether the fit is used and removes at least 30% of the plain SAD —
+    /// what a real change of brightness does and a reconstruction merely
+    /// drifting in level from its source does not (such fits remove 2 to
+    /// 21% on the pans, zooms and cut measured). H.264's P pictures keep
+    /// a strong fit without pricing it against the defaults (see
+    /// `encode::h264`'s `code_attempt`).
+    pub(crate) fn strong(&self) -> bool {
+        self.used() && (self.sad_weighted as f64) < self.sad_plain as f64 * 0.7
     }
 
     /// The identity: default weighting, never [`PlaneFit::used`].
     pub(crate) fn identity(sad_plain: u64) -> Self {
-        PlaneFit { weight: 1 << LOG2_DENOM, offset: 0, sad_plain, sad_weighted: sad_plain }
+        PlaneFit { weight: 1 << LOG2_DENOM, offset: 0, sad_plain, sad_weighted: sad_plain, log2_denom: LOG2_DENOM }
     }
 }
 
@@ -139,8 +157,27 @@ pub(crate) const H264_WEIGHTS: (i32, i32) = (-128, 127);
 /// `weights` — the range the caller's table syntax carries.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fit_samples<S: Sample>(cur: &[S], cur_stride: usize, refp: RefSamples<'_, S>, w: usize, h: usize, bit_depth: u32, weights: (i32, i32)) -> PlaneFit {
+    fit_samples_at(&plane_sums(cur, cur_stride, refp, w, h), cur, cur_stride, refp, w, h, bit_depth, weights, LOG2_DENOM)
+}
+
+/// What a fit is computed from: the sample count, the sums of the
+/// reference, the source, the reference squared and their product, and
+/// the zero-motion SAD of the source against the plain reference — one
+/// pass over the plane, which [`fit_samples_at`] quantises at whichever
+/// denominator its caller settles on.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PlaneSums {
+    n: f64,
+    sr: f64,
+    sc: f64,
+    srr: f64,
+    src: f64,
+    sad_plain: u64,
+}
+
+/// [`PlaneSums`] of `cur` against the display area of `refp`.
+pub(crate) fn plane_sums<S: Sample>(cur: &[S], cur_stride: usize, refp: RefSamples<'_, S>, w: usize, h: usize) -> PlaneSums {
     let o = refp.origin;
-    let n = (w * h) as f64;
     let (mut sr, mut sc, mut srr, mut src) = (0f64, 0f64, 0f64, 0f64);
     let mut sad_plain = 0u64;
     for y in 0..h {
@@ -156,42 +193,66 @@ pub(crate) fn fit_samples<S: Sample>(cur: &[S], cur_stride: usize, refp: RefSamp
             sad_plain += u64::from(rrow[x].to_i32().abs_diff(crow[x].to_i32()));
         }
     }
+    PlaneSums { n: (w * h) as f64, sr, sc, srr, src, sad_plain }
+}
+
+/// The fit `sums` make with the weight in units of `1 << log2_denom` —
+/// [`LOG2_DENOM`] for every table but an H.264 B slice's, whose two lists'
+/// weights must also sum inside the bound 8.4.2.3 sets a bi-predicted pair
+/// (see `encode::h264`). The offset is refitted to the weight the
+/// denominator quantises to, and the check runs at that weight, so a
+/// coarser denominator is judged on what it can actually carry.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fit_samples_at<S: Sample>(
+    sums: &PlaneSums,
+    cur: &[S],
+    cur_stride: usize,
+    refp: RefSamples<'_, S>,
+    w: usize,
+    h: usize,
+    bit_depth: u32,
+    weights: (i32, i32),
+    log2_denom: u32,
+) -> PlaneFit {
+    let PlaneSums { n, sr, sc, srr, src, sad_plain } = *sums;
     let var = srr / n - (sr / n) * (sr / n);
     if var <= 0.0 {
         // A flat reference has no gain to fit; an offset alone is the
         // mean difference, which a flat block's residual codes for
         // nothing anyway.
-        return PlaneFit::identity(sad_plain);
+        return PlaneFit { weight: 1 << log2_denom, log2_denom, ..PlaneFit::identity(sad_plain) };
     }
     let gain = (src / n - (sr / n) * (sc / n)) / var;
-    let unit = f64::from(1u32 << LOG2_DENOM);
+    let unit = f64::from(1u32 << log2_denom);
     // The weight is held to what the caller's syntax carries, and the
     // offset to the -128..=127 eight-bit units both standards' tables do.
     let weight = (gain * unit).round().clamp(f64::from(weights.0), f64::from(weights.1)) as i32;
     let scale = f64::from(1u32 << (bit_depth - 8));
     let offset_samples = sc / n - f64::from(weight) / unit * (sr / n);
     let offset = (offset_samples / scale).round().clamp(-128.0, 127.0) as i32;
-    let fit = PlaneFit { weight, offset, sad_plain, sad_weighted: 0 };
-    let sad_weighted = weighted_sad(cur, cur_stride, refp, w, h, bit_depth, weight, offset);
+    let fit = PlaneFit { weight, offset, sad_plain, sad_weighted: 0, log2_denom };
+    let sad_weighted = weighted_sad(cur, cur_stride, refp, w, h, bit_depth, weight, offset, log2_denom);
     PlaneFit { sad_weighted, ..fit }
 }
 
 /// Zero-motion SAD of `cur` against `refp` weighted by `(weight,
-/// offset)` — the decoder's `weighted_uni` arithmetic at a whole-sample
-/// vector: `Clip(((r * w + round) >> denom) + (o << (bitDepth - 8)))`.
+/// offset)` at `log2_denom` — the decoder's `weighted_uni` arithmetic at a
+/// whole-sample vector: `Clip(((r * w + round) >> denom) + (o <<
+/// (bitDepth - 8)))`, and without the rounding shift at a denominator of
+/// zero, as H.264's 8.4.2.3.2 has it.
 #[allow(clippy::too_many_arguments)]
-fn weighted_sad<S: Sample>(cur: &[S], cur_stride: usize, refp: RefSamples<'_, S>, w: usize, h: usize, bit_depth: u32, weight: i32, offset: i32) -> u64 {
+fn weighted_sad<S: Sample>(cur: &[S], cur_stride: usize, refp: RefSamples<'_, S>, w: usize, h: usize, bit_depth: u32, weight: i32, offset: i32, log2_denom: u32) -> u64 {
     let o = refp.origin;
     let max = (1i32 << bit_depth) - 1;
-    let round = 1i32 << (LOG2_DENOM - 1);
     let off = offset << (bit_depth - 8);
     let mut sad = 0u64;
     for y in 0..h {
         let rrow = &refp.data[o + y * refp.stride..];
         let crow = &cur[y * cur_stride..];
         for x in 0..w {
-            let p = (((rrow[x].to_i32() * weight + round) >> LOG2_DENOM) + off).clamp(0, max);
-            sad += u64::from(p.abs_diff(crow[x].to_i32()));
+            let v = rrow[x].to_i32() * weight;
+            let p = if log2_denom >= 1 { ((v + (1 << (log2_denom - 1))) >> log2_denom) + off } else { v + off };
+            sad += u64::from(p.clamp(0, max).abs_diff(crow[x].to_i32()));
         }
     }
     sad

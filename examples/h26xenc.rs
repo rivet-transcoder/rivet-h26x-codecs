@@ -17,7 +17,8 @@
 
 use h26x::ChromaFormat;
 use h26x::encode::{
-    ColourDescription, Config, ContentLightLevel, Entropy, FieldCoding, FieldOrder, MasteringDisplay, RateControl,
+    BWeighting, ColourDescription, Config, ContentLightLevel, Entropy, FieldCoding, FieldOrder, MasteringDisplay,
+    RateControl,
 };
 
 /// `G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)` — x265's `master-display`
@@ -57,7 +58,7 @@ fn die(msg: &str) -> ! {
          \x20      [--recon F] [--codec h264|h265] [--qp N | --lossless | --bitrate BPS]\n\
          \x20      [--fps N] [--cpb-ms N]\n\
          \x20      [--gop N] [--bframes N] [--cavlc] [--t8x8] [--subparts] [--sao]\n\
-         \x20      [--aq STRENGTH] [--lookahead N] [--wpred] [--refs N] [--cu-depth N] [--depth N] [--threads N]\n\
+         \x20      [--aq STRENGTH] [--lookahead N] [--wpred] [--bweight default|implicit|explicit] [--refs N] [--cu-depth N] [--depth N] [--threads N]\n\
          \x20      [--interlace tff|bff [--field-coding field|paff|mbaff]] (H.264)\n\
          \x20      [--color PRIMARIES:TRANSFER:MATRIX (H.273 codes, e.g. 9:16:9 for HDR10)]\n\
          \x20      [--full-range] [--chroma-loc N (H.273 chroma_sample_loc_type 0..=5)]\n\
@@ -131,8 +132,19 @@ fn main() {
             // let the rate controller see them. H.264 refuses it by name.
             "--lookahead" => cfg.lookahead = val(&mut i, &args, "--lookahead").parse().unwrap_or_else(|_| die("--lookahead")),
             // Both codecs: weighted prediction, a fitted gain and offset per
-            // reference in every P slice.
+            // reference in every P and B slice.
             "--wpred" => cfg.weighted_pred = true,
+            // H.264: how B slices weight their predictions — default
+            // (the plain average), implicit (by distance) or explicit (a
+            // fitted table, beside --wpred). Absent, the encoder's choice.
+            "--bweight" => {
+                cfg.b_weighting = Some(match val(&mut i, &args, "--bweight").as_str() {
+                    "default" => BWeighting::Default,
+                    "implicit" => BWeighting::Implicit,
+                    "explicit" => BWeighting::Explicit,
+                    _ => die("--bweight wants default, implicit or explicit"),
+                })
+            }
             // How many past pictures a P slice may choose between. 1 is
             // the default and every stream written with it is
             // byte-identical to before multiple references existed.
@@ -406,13 +418,19 @@ fn main() {
     }
     // The weighting census, when weighted prediction was asked for: how
     // many P pictures chose a weighting, and whether it lowered the luma
-    // residual at the vectors the search chose, macroblock by macroblock.
+    // residual at the vectors the search chose, macroblock by macroblock —
+    // and the same for the B pictures, when there are any.
     if wpred {
         let c = enc.shape_census();
-        eprintln!(
-            "wp P: {} of {} pictures weighted, {} macroblocks won, {} lost",
-            c.wp_on[1], c.pictures[1], c.wp_won[1], c.wp_lost[1]
-        );
+        for (pic, name) in [(1usize, "P"), (2, "B")] {
+            if pic == 2 && c.pictures[2] == 0 {
+                continue;
+            }
+            eprintln!(
+                "wp {name}: {} of {} pictures weighted, {} macroblocks won, {} lost; {} priced against the defaults, {} kept them",
+                c.wp_on[pic], c.pictures[pic], c.wp_won[pic], c.wp_lost[pic], c.wp_priced[pic], c.wp_rd_default[pic]
+            );
+        }
     }
     // The interlace census, when interlaced coding was asked for: how many
     // field pictures the frames were coded as.

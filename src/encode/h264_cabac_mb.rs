@@ -429,6 +429,7 @@ pub fn write_b_picture_cabac<S: Sample>(
     rec: &mut [Recon<S>],
     refs: [&[Recon<S>]; 2],
     col: &Colocated,
+    weights: crate::encode::h264_me::BWeights<'_>,
 ) -> PicMotion {
     let mbw = g.mbs_wide as usize;
     let total = mbw * g.mbs_high as usize;
@@ -438,7 +439,7 @@ pub fn write_b_picture_cabac<S: Sample>(
     let mut st = CabacState::new(SliceType::B, 0, qp as i32);
     let mut e = CabacEncoder::new(w);
     let mut coded: Vec<Coded> = Vec::with_capacity(total);
-    let fmbs = code_b_picture(g, tools, qp, planes, rec, refs, col, |mb_x, mb_y, mb| {
+    let fmbs = code_b_picture(g, tools, qp, planes, rec, refs, col, weights, |mb_x, mb_y, mb| {
         let idx = coded.len();
         let left = (mb_x > 0).then(|| &coded[idx - 1]);
         let above = (mb_y > 0).then(|| &coded[idx - mbw]);

@@ -220,6 +220,25 @@ pub enum FieldCoding {
     Mbaff,
 }
 
+/// How an H.264 B slice weights its predictions (8.4.2.3) — the PPS's
+/// `weighted_bipred_idc` — see [`Config::b_weighting`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BWeighting {
+    /// `weighted_bipred_idc` 0: a one-list prediction as it is, a two-list
+    /// one the plain average of the two.
+    Default,
+    /// `weighted_bipred_idc` 2: a two-list prediction weighted by the
+    /// picture's distances in display order to its two references
+    /// (8.4.2.3.1) — two thirds and one third for a B picture a third of
+    /// the way between its anchors — a one-list one as it is. Nothing is
+    /// written per slice: the weights follow from the picture order counts.
+    Implicit,
+    /// `weighted_bipred_idc` 1: a fitted `pred_weight_table` in every B
+    /// slice, priced against a table of defaults — what
+    /// [`Config::weighted_pred`] gives B slices, and only beside it.
+    Explicit,
+}
+
 /// Everything the encoder needs that is not a picture.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -362,12 +381,15 @@ pub struct Config {
     /// change a reference's brightness, so without this every block of a
     /// fading picture carries the level change as residual.
     ///
-    /// H.265 weights B slices too when the GOP has B pictures: the PPS
-    /// sets `weighted_bipred_flag` and every B slice's table carries an
-    /// entry for each list's reference, fitted the same way, which the
-    /// one-list and the bi predictions both apply (8.5.3.3.4.3). H.264's B
-    /// slices keep default weighting (`weighted_bipred_idc` 0). A lossless
-    /// H.264 stream refuses it, its inter pictures being exact copies.
+    /// Both codecs weight B slices too when the GOP has B pictures: the
+    /// PPS sets H.265's `weighted_bipred_flag` or H.264's
+    /// `weighted_bipred_idc` 1, and every B slice's table carries an entry
+    /// for each list's reference, fitted the same way, which the one-list
+    /// and the bi predictions both apply (8.5.3.3.4.3, 8.4.2.3). Each
+    /// codec prices a B picture's fitted table against a table of defaults
+    /// and keeps the cheaper, and H.264 a P picture's where no fit in it is
+    /// strong (`encode::h264`'s `code_attempt`). A lossless H.264 stream
+    /// refuses it, its inter pictures being exact copies.
     /// Off, the stream is byte-identical to one from an encoder that never
     /// had it.
     pub weighted_pred: bool,
@@ -436,6 +458,31 @@ pub struct Config {
     /// H.264, with [`Config::interlace`]: field pictures, picture-adaptive
     /// or macroblock-adaptive frame/field coding. Ignored without it.
     pub field_coding: FieldCoding,
+    /// H.264: how B slices weight their predictions, or `None` for the
+    /// encoder's choice — [`BWeighting::Explicit`] under
+    /// [`Config::weighted_pred`], [`BWeighting::Default`] otherwise.
+    ///
+    /// `Some(Explicit)` needs `weighted_pred` (the explicit table is its
+    /// fit); `Some(Default)` beside `weighted_pred` weights P slices and
+    /// leaves B slices to the plain average; `Some(Implicit)` weights B
+    /// slices by distance whether or not P slices are weighted. Interlaced
+    /// and lossless streams code default-weighted B pictures and refuse
+    /// `Some(Implicit)` by name. H.265 has no implicit mode: it takes
+    /// `None`, or `Some` of what it does anyway (explicit B under
+    /// `weighted_pred`, default without), and refuses the rest by name.
+    ///
+    /// Implicit weighting is asked for, not chosen, because it is not a
+    /// gain everywhere. Against default weighting over every clip of the
+    /// corpus and rivet's 640x360 set, at one to three B pictures and QP
+    /// 22..40, it gains where the picture changes between its anchors — a
+    /// fade -2.4 to -16.8% BD-rate, a gradient -1.4 to -3.4%, motion -0.3 to
+    /// -1.2% — and loses where it does not: detail +0.1 to +0.4%, testsrc2
+    /// +0.1 to +0.2%, combed interlaced frames coded progressive +0.5 to
+    /// +0.8%, with 48 of 504 cells both larger and worse. Two equally good
+    /// anchors average their noise best at equal weights. With one B
+    /// picture it is the default weighting: halfway, the weights are 32
+    /// and 32.
+    pub b_weighting: Option<BWeighting>,
 }
 
 impl Default for Config {
@@ -466,6 +513,7 @@ impl Default for Config {
             max_cu_depth: None,
             interlace: None,
             field_coding: FieldCoding::Paff,
+            b_weighting: None,
         }
     }
 }

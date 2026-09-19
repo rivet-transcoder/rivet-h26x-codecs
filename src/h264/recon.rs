@@ -158,22 +158,6 @@ impl<'a, S: Sample> SliceRefs<'a, S> {
         Weighting::Default
     }
 
-    /// One implicit weight pair (8.4.2.3.1) from POC distances.
-    fn implicit_pair(cur_poc: i32, poc0: i32, poc1: i32, long0: bool, long1: bool) -> (i32, i32) {
-        let tb = (cur_poc - poc0).clamp(-128, 127);
-        let td = (poc1 - poc0).clamp(-128, 127);
-        if td == 0 || long0 || long1 {
-            return (32, 32);
-        }
-        let tx = (16384 + (td / 2).abs()) / td;
-        let dsf = ((tb * tx + 32) >> 6).clamp(-1024, 1023);
-        let w1 = dsf >> 2;
-        if !(-64..=128).contains(&w1) {
-            return (32, 32);
-        }
-        (64 - w1, w1)
-    }
-
     /// Implicit weights for a field macroblock of an MBAFF frame: the
     /// current field's POC against the referenced fields' (8.4.2.3.1 —
     /// currPicOrField, pic0, pic1 are fields then).
@@ -183,7 +167,7 @@ impl<'a, S: Sample> SliceRefs<'a, S> {
         let (i1, p1) = self.resolve(1, r1, true, mb_parity);
         let poc0 = self.frames[0][i0].field_poc[p0 as usize];
         let poc1 = self.frames[1][i1].field_poc[p1 as usize];
-        Self::implicit_pair(
+        implicit_pair(
             cur,
             poc0,
             poc1,
@@ -199,7 +183,7 @@ impl<'a, S: Sample> SliceRefs<'a, S> {
         let mut t = vec![vec![(32i32, 32i32); n1]; n0];
         for i in 0..n0 {
             for j in 0..n1 {
-                t[i][j] = Self::implicit_pair(
+                t[i][j] = implicit_pair(
                     self.cur_poc,
                     self.pocs[0][i],
                     self.pocs[1][j],
@@ -210,6 +194,27 @@ impl<'a, S: Sample> SliceRefs<'a, S> {
         }
         self.implicit = Some(t);
     }
+}
+
+/// One implicit weight pair (8.4.2.3.1) from POC distances: `(w0, w1)` at
+/// `logWD` 5 for a block bi-predicted from pictures at `poc0` (list 0) and
+/// `poc1` (list 1) in the picture at `cur_poc`, `(32, 32)` where either is
+/// long-term, the two coincide, or the distance ratio leaves the range.
+/// A free function, as [`explicit_weighting`] is, so the H.264 encoder
+/// weights its implicit B pictures by the decoder's own derivation.
+pub(crate) fn implicit_pair(cur_poc: i32, poc0: i32, poc1: i32, long0: bool, long1: bool) -> (i32, i32) {
+    let tb = (cur_poc - poc0).clamp(-128, 127);
+    let td = (poc1 - poc0).clamp(-128, 127);
+    if td == 0 || long0 || long1 {
+        return (32, 32);
+    }
+    let tx = (16384 + (td / 2).abs()) / td;
+    let dsf = ((tb * tx + 32) >> 6).clamp(-1024, 1023);
+    let w1 = dsf >> 2;
+    if !(-64..=128).contains(&w1) {
+        return (32, 32);
+    }
+    (64 - w1, w1)
 }
 
 /// The explicit weighting (8.4.2.3.2) of a block predicted from list-0
