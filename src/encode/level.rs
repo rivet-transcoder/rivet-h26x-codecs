@@ -621,9 +621,9 @@ impl H265Stream {
         let (width, height) = (u64::from(g.coded_width), u64::from(g.coded_height));
         let fps = u64::from(cfg.fps.max(1));
         let (buffering_minus1, _) = h265_syntax::dpb(cfg);
-        // A slice's reference set lists what the picture predicts from,
-        // every entry used by it: a P picture's list 0, a B picture's two
-        // anchors.
+        // NumPicTotalCurr counts a set's used entries: a P picture's list
+        // 0, a B picture's two anchors (kept pictures are listed unused and
+        // do not count).
         let total_curr = u64::from(if cfg.bframes > 0 { cfg.max_refs.max(2) } else { cfg.max_refs.max(1) });
         let profile = h265_profile(cfg, g);
         let (mut rate, mut cpb, mut au_bytes) = match (declared_cpb(cfg), cfg.rate) {
