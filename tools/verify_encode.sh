@@ -612,6 +612,21 @@ EXCLUSIVE_TOKENS="ilace fdeep wsine"
 # pictures took no shape: the static clip, odd and the smooth grad take
 # none, and none is taken anywhere at QP 40, where a second unit's syntax
 # never pays — which is why the AQ and SAO row runs at QP 32.
+# The *-gNbM rows are short GOPs with B pictures, several GOPs per clip. An
+# H.264 IDR empties the decoder's reference lists and restarts POC, but the
+# encoder kept the previous GOP's references: where one of its anchors
+# survived the IDR at the POC of the new GOP's, the first B picture after
+# the IDR predicted from it and the decoder, which no longer had it, did
+# not — every B picture from there differed from the encoder's
+# reconstruction. That happened in a GOP of one mini-GOP (`--gop` =
+# `--bframes` + 2) at any reference count, and with three references at
+# most GOP lengths, while every row here ran --gop 8 or longer with at most
+# two. Under that fault SELF was red on 29 of the 34 H.264 cells here (from
+# display index 4 at --gop 3 --bframes 1), all but the static clip, whose
+# anchors do not differ, and the six-picture odd clip where the second GOP
+# holds no B picture; CROSS stayed green, as libavcodec decodes the stream
+# exactly as we do. The H.265 rows are the same GOPs, which H.265 always
+# coded correctly (it drops its references at an IDR), held there.
 CONFIGS=${CONFIGS:-"
 lossless-intra|--codec h264 --lossless --gop 0
 cqp-intra|--codec h264 --qp 26 --gop 0
@@ -702,6 +717,14 @@ hevc-refs3-ipb@cut|--codec h265 --qp 26 --gop 250 --bframes 2 --refs 3
 hevc-refs4-b3@motion|--codec h265 --qp 26 --gop 250 --bframes 3 --refs 4
 hevc-refs4-b3@fade|--codec h265 --qp 26 --gop 250 --bframes 3 --refs 4
 hevc-refs4-b3@cut|--codec h265 --qp 26 --gop 250 --bframes 3 --refs 4
+h264-ipb-g3b1|--codec h264 --qp 26 --gop 3 --bframes 1
+h264-ipb-g4b2|--codec h264 --qp 26 --gop 4 --bframes 2
+h264-refs3-ipb-g5b1|--codec h264 --qp 26 --gop 5 --bframes 1 --refs 3
+h264-10-ipb-g3b1@p10|--codec h264 --qp 26 --gop 3 --bframes 1
+hevc-ipb-g3b1|--codec h265 --qp 26 --gop 3 --bframes 1
+hevc-ipb-g4b2|--codec h265 --qp 26 --gop 4 --bframes 2
+hevc-refs3-ipb-g5b1|--codec h265 --qp 26 --gop 5 --bframes 1 --refs 3
+hevc10-ipb-g3b1@p10|--codec h265 --qp 26 --gop 3 --bframes 1
 abr-64k-cpb@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8
 abr-64k-cpb-ntsc@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8 --fps 30000/1001
 abr-64k-cavlc-cpb@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8 --cavlc

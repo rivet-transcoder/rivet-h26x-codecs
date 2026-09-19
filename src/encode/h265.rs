@@ -4202,6 +4202,58 @@ mod tests {
         }
     }
 
+    /// H.265's side of H.264's `every_gop_predicts_from_what_the_decoder_holds`:
+    /// the same GOP grid — bframes 1 to 3 over gop = bframes + 1 to
+    /// bframes + 4 and one longer GOP, at one and three references, over
+    /// three GOPs and a part — decoded whole, with nothing concealed, and
+    /// matched to the reconstructions by display index, because POC
+    /// restarts at every IDR. H.265 drops its references at an IDR
+    /// (`Attempt::clears_refs`) and never showed the H.264 fault; this
+    /// holds it there.
+    #[test]
+    fn every_gop_predicts_from_what_the_decoder_holds() {
+        for bframes in 1u32..=3 {
+            let mut gops = vec![bframes + 1, bframes + 2, bframes + 3, bframes + 4, 2 * bframes + 3];
+            gops.dedup();
+            for gop in gops {
+                for max_refs in [1u32, 3] {
+                    let tag = format!("gop {gop} bframes {bframes} refs {max_refs}");
+                    let frames = moving_frames_n(64, 64, ChromaFormat::Yuv420, 3 * gop as usize + 2);
+                    let mut e = H265Encoder::new(Config { gop, bframes, max_refs, ..cfg(64, 64, ChromaFormat::Yuv420) })
+                        .unwrap_or_else(|err| panic!("{tag}: {err}"));
+                    let mut units = Vec::new();
+                    for f in &frames {
+                        units.extend(e.push(f).unwrap_or_else(|err| panic!("{tag}: {err}")));
+                    }
+                    units.extend(e.flush().unwrap_or_else(|err| panic!("{tag}: {err}")));
+                    assert_eq!(units.len(), frames.len(), "{tag}: one access unit per picture");
+                    assert!(units.iter().filter(|u| u.keyframe).count() >= 3, "{tag}: fewer than three GOPs");
+                    let bs = e.census().by_kind[2].cus;
+                    if gop == bframes + 1 {
+                        assert_eq!(bs, 0, "{tag}: a B picture in a GOP the IDR ends first");
+                    } else {
+                        assert!(bs > 0, "{tag}: no B picture was coded");
+                    }
+                    let mut dec = crate::hevc::HevcDecoder::new();
+                    for u in &units {
+                        dec.push_annexb(&u.data).unwrap_or_else(|err| panic!("{tag}: decoder rejected the stream: {err}"));
+                    }
+                    dec.flush().unwrap_or_else(|err| panic!("{tag}: decoder failed to flush: {err}"));
+                    assert_eq!(dec.warnings(), 0, "{tag}: the decoder concealed something in the stream");
+                    let mut by_display = vec![None; units.len()];
+                    for u in &units {
+                        by_display[u.display as usize] = Some(u.encode_index as usize);
+                    }
+                    for (i, coded) in by_display.iter().enumerate() {
+                        let want = &e.reconstructions()[coded.unwrap_or_else(|| panic!("{tag}: display index {i} never coded"))];
+                        let got = dec.next_picture().unwrap_or_else(|| panic!("{tag}: picture {i} missing"));
+                        assert!(got.into_packed() == *want, "{tag}: picture {i} decoded differently than the encoder reconstructed it");
+                    }
+                }
+            }
+        }
+    }
+
     /// Three pictures of detailed content, each translated a little
     /// further, in the packed layout the encoder takes. Real motion plus
     /// real detail is what makes a P picture carry residual rather than
