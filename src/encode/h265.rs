@@ -601,7 +601,7 @@ impl<S: Sample> Core<S> {
             // was declared, so the two cannot disagree by the rounding.
             RateControl::Bitrate { bps } => {
                 let bps = cpb.map_or(bps, |c| c.bit_rate as u32);
-                Some(RateController::with_cpb(bps, cfg.fps, cfg.width, cfg.height, cfg.gop, cfg.bframes, cpb.map(|c| c.size)))
+                Some(RateController::with_cpb(bps, cfg.frame_rate_f64(), cfg.width, cfg.height, cfg.gop, cfg.bframes, cpb.map(|c| c.size)))
             }
             _ => None,
         };
@@ -641,7 +641,7 @@ impl<S: Sample> Core<S> {
             RateControl::Bitrate { bps } => bps as f64,
             _ => return None,
         };
-        Some((rc.achieved_bps(self.cfg.fps), target))
+        Some((rc.achieved_bps(self.cfg.frame_rate_f64()), target))
     }
 
     /// See [`H265Encoder::push`].

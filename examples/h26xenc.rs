@@ -51,12 +51,29 @@ fn parse_mastering_display(s: &str) -> Option<MasteringDisplay> {
     })
 }
 
+/// A frame rate as `(numerator, denominator)`: `30`, `30000/1001`, or a
+/// decimal such as `12.5`, taken exactly.
+fn parse_rate(s: &str) -> Option<(u32, u32)> {
+    if let Some((n, d)) = s.split_once('/') {
+        return Some((n.trim().parse().ok()?, d.trim().parse().ok()?));
+    }
+    match s.split_once('.') {
+        Some((whole, frac)) if !frac.is_empty() && frac.len() <= 6 && frac.bytes().all(|b| b.is_ascii_digit()) => {
+            let den = 10u32.pow(frac.len() as u32);
+            let whole: u32 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
+            Some((whole.checked_mul(den)?.checked_add(frac.parse().ok()?)?, den))
+        }
+        Some(_) => None,
+        None => Some((s.parse().ok()?, 1)),
+    }
+}
+
 fn die(msg: &str) -> ! {
     eprintln!("h26xenc: {msg}");
     eprintln!(
         "usage: h26xenc --input F --size WxH [--format 400|420|422|444] --output F\n\
          \x20      [--recon F] [--codec h264|h265] [--qp N | --lossless | --bitrate BPS]\n\
-         \x20      [--fps N] [--cpb-ms N]\n\
+         \x20      [--fps N | N/D | decimal] [--cpb-ms N]\n\
          \x20      [--gop N] [--bframes N] [--cavlc] [--t8x8] [--subparts] [--sao]\n\
          \x20      [--aq STRENGTH] [--lookahead N] [--wpred] [--bweight default|implicit|explicit] [--refs N] [--cu-depth N] [--depth N] [--threads N]\n\
          \x20      [--interlace tff|bff [--field-coding field|paff|mbaff]] (H.264)\n\
@@ -105,7 +122,13 @@ fn main() {
                 let b: u32 = val(&mut i, &args, "--bitrate").parse().unwrap_or_else(|_| die("--bitrate"));
                 cfg.rate = RateControl::Bitrate { bps: b };
             }
-            "--fps" => cfg.fps = val(&mut i, &args, "--fps").parse().unwrap_or_else(|_| die("--fps")),
+            // Frames per second: a whole number, N/D (30000/1001 for
+            // 29.97), or a decimal taken exactly (12.5 is 25/2; 29.97 is
+            // 2997/100 — the NTSC rate is 30000/1001).
+            "--fps" => {
+                let s = val(&mut i, &args, "--fps");
+                (cfg.fps, cfg.fps_den) = parse_rate(&s).unwrap_or_else(|| die("--fps wants N, N/D or a decimal"));
+            }
             "--cpb-ms" => cfg.cpb_ms = val(&mut i, &args, "--cpb-ms").parse().unwrap_or_else(|_| die("--cpb-ms")),
             "--gop" => cfg.gop = val(&mut i, &args, "--gop").parse().unwrap_or_else(|_| die("--gop")),
             "--bframes" => {

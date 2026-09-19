@@ -26,10 +26,11 @@
 //!   that is whole macroblocks (`MaxFS`, and each dimension within
 //!   `Sqrt(MaxFS * 8)`). For H.265 it is `PicSizeInSamplesY` (`MaxLumaPs`,
 //!   the same square-root rule).
-//! - **Picture rate**, `Config::fps`: macroblocks (H.264 `MaxMBPS`) or luma
-//!   samples (H.265 `MaxLumaSr`) per second, and the absolute ceiling `fR`
-//!   puts on pictures per second — 172 below H.264 level 6, 300 at 6 and
-//!   above and throughout H.265.
+//! - **Picture rate**, `Config::fps / Config::fps_den` exactly — 29.97 is
+//!   30000/1001, not 30: macroblocks (H.264 `MaxMBPS`) or luma samples
+//!   (H.265 `MaxLumaSr`) per second, and the absolute ceiling `fR` puts on
+//!   pictures per second — 172 below H.264 level 6, 300 at 6 and above and
+//!   throughout H.265.
 //! - **The decoded picture buffer the stream needs.** H.264: the
 //!   `max_num_ref_frames` the SPS writes. The B pictures are not
 //!   references, and the output-order DPB (C.4.5.2) outputs one directly
@@ -152,6 +153,11 @@ pub struct Level {
     pub name: &'static str,
 }
 
+/// A frame rate in lowest terms as a person reads it: `30`, or `30000/1001`.
+fn rate_name(num: u64, den: u64) -> String {
+    if den == 1 { num.to_string() } else { format!("{num}/{den}") }
+}
+
 /// The buffer a configuration declares — the one the encoders build, by
 /// the same rule, so that what the level is checked against and what the
 /// stream carries are the same numbers. `None` where the encoders refuse
@@ -238,7 +244,11 @@ struct H264Stream {
     /// The largest coded picture, in macroblocks: the frame, or the field
     /// where every picture is one. Slice limit A.3.3(k) counts this.
     pic_mbs: u64,
-    fps: u64,
+    /// The frame rate, `fps_num / fps_den` frames per second in lowest
+    /// terms (`Config::frame_rate`): every limit per second is compared
+    /// cross-multiplied, so 29.97 is 29.97 and not 30.
+    fps_num: u64,
+    fps_den: u64,
     profile_idc: u8,
     interlaced: bool,
     /// Frame buffers the stream needs.
@@ -257,7 +267,8 @@ impl H264Stream {
         // The SPS geometry is the frame's; a field geometry is half of it.
         let high = u64::from(if g.field_pic { g.mbs_high * 2 } else { g.mbs_high });
         let frame_mbs = wide * high;
-        let fps = u64::from(cfg.fps.max(1));
+        let (fps_num, fps_den) = cfg.frame_rate();
+        let (fps_num, fps_den) = (u64::from(fps_num), u64::from(fps_den));
         let profile_idc = h264_syntax::profile_idc(g);
         let refs = u64::from(cfg.max_refs);
         let cpb = declared_cpb(cfg);
@@ -278,12 +289,12 @@ impl H264Stream {
             let depth = u64::from(g.bit_depth);
             let raw_mb_bits = 256 * depth + 2 * u64::from(cw * ch) * depth;
             let bytes = frame_mbs * (raw_mb_bits / 8 + 3) + 256;
-            rate = Some(bytes * 8 * fps);
+            rate = Some((bytes * 8 * fps_num).div_ceil(fps_den));
             buffer = Some(bytes * 8);
             au_bytes = Some(bytes);
         }
         let pic_mbs = if g.interlaced && cfg.field_coding == FieldCoding::Field { frame_mbs / 2 } else { frame_mbs };
-        H264Stream { wide, high, pic_mbs, fps, profile_idc, interlaced: g.interlaced, dpb, rate, cpb: buffer, au_bytes }
+        H264Stream { wide, high, pic_mbs, fps_num, fps_den, profile_idc, interlaced: g.interlaced, dpb, rate, cpb: buffer, au_bytes }
     }
 
     /// Every limit of `row` this stream exceeds, in words — empty when the
@@ -293,12 +304,13 @@ impl H264Stream {
         let frame_mbs = self.wide * self.high;
         // fR (A.3): the least interval between pictures, whatever their size.
         let max_fps = if row.idc >= 60 { 300 } else { 172 };
-        if self.fps > max_fps {
-            why.push(format!("{} frames/s is above the {max_fps} fR allows", self.fps));
+        let (num, den) = (self.fps_num, self.fps_den);
+        if num > max_fps * den {
+            why.push(format!("{} frames/s is above the {max_fps} fR allows", rate_name(num, den)));
         }
-        // A.3.2(a): a picture of PicSizeInMbs every 1/fps seconds.
-        if frame_mbs * self.fps > row.max_mbps {
-            why.push(format!("{} macroblocks/s is above MaxMBPS {}", frame_mbs * self.fps, row.max_mbps));
+        // A.3.2(a): a picture of PicSizeInMbs every den/num seconds.
+        if frame_mbs * num > row.max_mbps * den {
+            why.push(format!("{} macroblocks/s is above MaxMBPS {}", (frame_mbs * num).div_ceil(den), row.max_mbps));
         }
         // A.3.2(c) to (e).
         if frame_mbs > row.max_fs {
@@ -322,9 +334,9 @@ impl H264Stream {
         }
         // A.3.3(j), the High profile only: an access unit is at most
         // 384 * MaxMBPS * (tr(n) - tr(n - 1)) / MinCR bytes.
-        let min_cr_limit = |b: &u64| self.profile_idc == 100 && b * self.fps * row.min_cr > 384 * row.max_mbps;
+        let min_cr_limit = |b: &u64| self.profile_idc == 100 && b * num * row.min_cr > 384 * row.max_mbps * den;
         if let Some(b) = self.au_bytes.filter(min_cr_limit) {
-            why.push(format!("a {b}-byte picture is above 384 * MaxMBPS / MinCR {} per picture", 384 * row.max_mbps / row.min_cr / self.fps));
+            why.push(format!("a {b}-byte picture is above 384 * MaxMBPS / MinCR {} per picture", 384 * row.max_mbps * den / row.min_cr / num));
         }
         // A.3.3(d) and Table A-4: frame_mbs_only_flag at 1..=2 and 4.2 up.
         if self.interlaced && (row.idc <= 20 || row.idc >= 42) {
@@ -602,7 +614,9 @@ struct H265Stream {
     /// `pic_width_in_luma_samples` and `pic_height_in_luma_samples`.
     width: u64,
     height: u64,
-    fps: u64,
+    /// The frame rate in lowest terms, as for H.264.
+    fps_num: u64,
+    fps_den: u64,
     /// `CtbSizeY`.
     ctb: u64,
     /// `sps_max_dec_pic_buffering_minus1 + 1`.
@@ -619,11 +633,12 @@ struct H265Stream {
 impl H265Stream {
     fn new(cfg: &Config, g: &h265_syntax::Geometry) -> Self {
         let (width, height) = (u64::from(g.coded_width), u64::from(g.coded_height));
-        let fps = u64::from(cfg.fps.max(1));
+        let (fps_num, fps_den) = cfg.frame_rate();
+        let (fps_num, fps_den) = (u64::from(fps_num), u64::from(fps_den));
         let (buffering_minus1, _) = h265_syntax::dpb(cfg);
-        // A slice's reference set lists what the picture predicts from,
-        // every entry used by it: a P picture's list 0, a B picture's two
-        // anchors.
+        // NumPicTotalCurr counts a set's used entries: a P picture's list
+        // 0, a B picture's two anchors (kept pictures are listed unused and
+        // do not count).
         let total_curr = u64::from(if cfg.bframes > 0 { cfg.max_refs.max(2) } else { cfg.max_refs.max(1) });
         let profile = h265_profile(cfg, g);
         let (mut rate, mut cpb, mut au_bytes) = match (declared_cpb(cfg), cfg.rate) {
@@ -638,14 +653,15 @@ impl H265Stream {
             let (sw, sh) = g.chroma.subsampling();
             let chroma = if g.chroma == ChromaFormat::Monochrome { 0 } else { 2 * (width / u64::from(sw)) * (height / u64::from(sh)) };
             let bits = (width * height + chroma) * u64::from(g.bit_depth);
-            rate = Some(bits * fps);
+            rate = Some((bits * fps_num).div_ceil(fps_den));
             cpb = Some(bits);
             au_bytes = Some(bits / 8);
         }
         H265Stream {
             width,
             height,
-            fps,
+            fps_num,
+            fps_den,
             ctb: 1 << g.log2_ctb,
             dpb: u64::from(buffering_minus1) + 1,
             total_curr,
@@ -666,13 +682,14 @@ impl H265Stream {
         }
         let pic = self.width * self.height;
         // fR (A.4.2) is 1/300 at every level offered here.
-        if self.fps > 300 {
-            why.push(format!("{} pictures/s is above the 300 fR allows", self.fps));
+        let (num, den) = (self.fps_num, self.fps_den);
+        if num > 300 * den {
+            why.push(format!("{} pictures/s is above the 300 fR allows", rate_name(num, den)));
         }
         why.extend(row.picture_exceeds(self.width, self.height));
         // A.4.2(a).
-        if pic * self.fps > row.max_luma_sr {
-            why.push(format!("{} luma samples/s is above MaxLumaSr {}", pic * self.fps, row.max_luma_sr));
+        if pic * num > row.max_luma_sr * den {
+            why.push(format!("{} luma samples/s is above MaxLumaSr {}", (pic * num).div_ceil(den), row.max_luma_sr));
         }
         // A.4.1(d).
         if row.idc >= H265_CTB_32_FROM && self.ctb < 32 {
@@ -710,8 +727,8 @@ impl H265Stream {
         // MaxLumaSr * (tr(n) - tr(n - 1)) / MinCr bytes, MinCr being
         // MinCrBase * MinCrScaleFactor / HbrFactor.
         if let Some(b) = self.au_bytes {
-            let lhs = u128::from(b) * u128::from(self.fps) * u128::from(row.min_cr_base[t]) * u128::from(p.min_cr_scale_tenths) * 1_000;
-            let rhs = u128::from(p.fcf_milli) * u128::from(row.max_luma_sr) * 10 * u128::from(p.hbr_factor());
+            let lhs = u128::from(b) * u128::from(num) * u128::from(row.min_cr_base[t]) * u128::from(p.min_cr_scale_tenths) * 1_000;
+            let rhs = u128::from(p.fcf_milli) * u128::from(row.max_luma_sr) * 10 * u128::from(p.hbr_factor()) * u128::from(den);
             if lhs > rhs {
                 why.push(format!("a {b}-byte picture is above FormatCapabilityFactor * MaxLumaSr / MinCr per picture"));
             }
@@ -828,6 +845,28 @@ mod tests {
         ] {
             assert_eq!(h264_name(&cfg(w, h, fps)), want, "{w}x{h}@{fps}");
         }
+    }
+
+    /// The level reads the exact frame rate. 1600x656 is 4100 macroblocks:
+    /// at 60 a second that is 246000, past level 4's MaxMBPS of 245760,
+    /// and at 59.94 it is 245754, inside it. 2624x1600 does the same at
+    /// level 5.1's 983040, and 1056x1056 at H.265 level 4's MaxLumaSr —
+    /// 66,908,160 samples a second at 60, 66,841,252 at 59.94, against
+    /// 66,846,720. And fR's 172 pictures a second, below level 6, is a
+    /// ceiling 172.5 is above.
+    #[test]
+    fn levels_read_the_exact_frame_rate() {
+        let at = |w, h, fps, fps_den| Config { fps_den, ..cfg(w, h, fps) };
+        for (w, h, whole, ntsc) in [(1600, 656, "4.2", "4"), (2624, 1600, "5.2", "5.1"), (1920, 1080, "4.2", "4.2")] {
+            assert_eq!(h264_name(&at(w, h, 60, 1)), whole, "H.264 {w}x{h}@60");
+            assert_eq!(h264_name(&at(w, h, 60000, 1001)), ntsc, "H.264 {w}x{h}@59.94");
+        }
+        assert_eq!(h264_name(&at(1920, 1080, 30000, 1001)), "4", "1080p29.97 is 4, as 1080p30");
+        assert_eq!(h265_name(&at(1056, 1056, 60, 1)), "4.1");
+        assert_eq!(h265_name(&at(1056, 1056, 60000, 1001)), "4");
+        assert_eq!(h264_name(&at(176, 144, 172, 1)), "2.1");
+        assert_eq!(h264_name(&at(176, 144, 345, 2)), "6", "172.5 pictures a second is above fR below level 6");
+        assert_eq!(h264_name(&at(176, 144, 25, 2)), "1", "12.5 pictures a second");
     }
 
     /// Past level 6.2 H.264 has nothing to claim, and the encoder says why

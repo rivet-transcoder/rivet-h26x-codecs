@@ -373,7 +373,7 @@ fn write_vui(
     colour: Option<&ColourDescription>,
     chroma_loc: Option<u8>,
     cpb: Option<&Cpb>,
-    fps: u32,
+    (fps_num, fps_den): (u32, u32),
 ) {
     w.flag(false); // aspect_ratio_info_present_flag
     w.flag(false); // overscan_info_present_flag
@@ -388,11 +388,13 @@ fn write_vui(
     match cpb {
         Some(cpb) => {
             w.flag(true); // vui_timing_info_present_flag
-            w.bits(32, 1); // vui_num_units_in_tick
-            w.bits(32, fps.max(1)); // vui_time_scale — ticks per second
+            // One tick per picture, the frame rate in lowest terms: 29.97
+            // is 1001 over 30000, 30 is 1 over 30 as it always was.
+            w.bits(32, fps_den); // vui_num_units_in_tick
+            w.bits(32, fps_num); // vui_time_scale — ticks per second
             w.flag(false); // vui_poc_proportional_to_timing_flag
             w.flag(true); // vui_hrd_parameters_present_flag
-            write_hrd(w, cpb, fps);
+            write_hrd(w, cpb, fps_num);
         }
         None => w.flag(false), // vui_timing_info_present_flag
     }
@@ -533,7 +535,7 @@ pub fn write_sps(cfg: &Config, g: &Geometry, log2_max_poc_lsb: u32, cpb: Option<
     w.flag(false); // strong_intra_smoothing_enabled_flag
     if cpb.is_some() || cfg.colour.is_some() || cfg.chroma_loc.is_some() {
         w.flag(true); // vui_parameters_present_flag
-        write_vui(&mut w, cfg.colour.as_ref(), cfg.chroma_loc, cpb, cfg.fps);
+        write_vui(&mut w, cfg.colour.as_ref(), cfg.chroma_loc, cpb, cfg.frame_rate());
     } else {
         w.flag(false); // vui_parameters_present_flag
     }

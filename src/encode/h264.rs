@@ -832,9 +832,9 @@ impl<S: Sample> Core<S> {
             // was declared, so the two cannot disagree by the rounding.
             RateControl::Bitrate { bps } => Some(match cpb {
                 Some(c) => RateController::with_cpb(
-                    c.bit_rate as u32, cfg.fps, cfg.width, cfg.height, cfg.gop, cfg.bframes, Some(c.size),
+                    c.bit_rate as u32, cfg.frame_rate_f64(), cfg.width, cfg.height, cfg.gop, cfg.bframes, Some(c.size),
                 ),
-                None => RateController::new(bps, cfg.fps, cfg.width, cfg.height, cfg.gop, cfg.bframes),
+                None => RateController::new(bps, cfg.frame_rate_f64(), cfg.width, cfg.height, cfg.gop, cfg.bframes),
             }),
             _ => None,
         };
@@ -2222,7 +2222,7 @@ impl<S: Sample> Core<S> {
             RateControl::Bitrate { bps } => bps as f64,
             _ => return None,
         };
-        Some((rc.achieved_bps(self.cfg.fps), target))
+        Some((rc.achieved_bps(self.cfg.frame_rate_f64()), target))
     }
 
     /// See [`H264Encoder::picture_qp`].

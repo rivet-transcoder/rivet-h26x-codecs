@@ -52,7 +52,11 @@
 //!   for the constant-rate case.
 //!
 //! Everything is integer: bits and 90 kHz ticks, no floating point
-//! anywhere, so the verdict is reproducible rather than nearly so.
+//! anywhere, so the verdict is reproducible rather than nearly so. A
+//! frame rate that is not a whole number of 90 kHz ticks — 29.97 in
+//! H.264's field clock is 1501.5 of them — is kept as the exact fraction
+//! (`Schedule::tick_den`), and the removal times are counted in the
+//! fraction's own units, so a long stream does not drift by the rounding.
 
 use crate::hevc::sps::Sps;
 use crate::{Error, Result};
@@ -97,8 +101,13 @@ pub struct Schedule {
     /// `cbr_flag`.
     pub cbr: bool,
     /// Removal interval, in 90 kHz ticks — `90_000 * num_units_in_tick /
-    /// time_scale` for a fixed picture rate.
+    /// time_scale` for a fixed picture rate — over [`Schedule::tick_den`].
     pub tick_90k: u64,
+    /// Denominator of the removal interval: `tick_90k / tick_den` 90 kHz
+    /// ticks, in lowest terms. 1 for a clock that divides 90 kHz — every
+    /// whole-number frame rate this encoder writes — and 2 for 29.97 in
+    /// H.264's field clock (3003/2 ticks).
+    pub tick_den: u64,
     /// `initial_cpb_removal_delay`, in 90 kHz ticks.
     pub initial_delay_90k: u64,
 }
@@ -113,24 +122,28 @@ pub struct Schedule {
 /// is indistinguishable from one that cannot.
 pub fn simulate(sizes: &[u64], s: &Schedule) -> Report {
     let removal: Vec<u64> =
-        (0..sizes.len()).map(|n| s.initial_delay_90k + (n as u64) * s.tick_90k).collect();
+        (0..sizes.len()).map(|n| s.initial_delay_90k * s.tick_den + (n as u64) * s.tick_90k).collect();
     simulate_at(sizes, &removal, s)
 }
 
-/// [`simulate`] with each unit's removal time given outright, in 90 kHz
-/// ticks — how an H.264 stream is walked, whose removal times come from
-/// the `cpb_removal_delay` of each picture's own timing SEI rather than
-/// from a fixed-rate inference.
+/// [`simulate`] with each unit's removal time given outright, in units of
+/// `1 / (90 000 * tick_den)` seconds — 90 kHz ticks when `tick_den` is 1
+/// — how an H.264 stream is walked, whose removal times come from the
+/// `cpb_removal_delay` of each picture's own timing SEI rather than from a
+/// fixed-rate inference.
 pub fn simulate_at(sizes: &[u64], removal_90k: &[u64], s: &Schedule) -> Report {
     debug_assert_eq!(sizes.len(), removal_90k.len());
     let mut occupancy = Vec::with_capacity(sizes.len());
     let mut underflow: Option<(usize, u64)> = None;
     let mut overflow: Option<(usize, u64)> = None;
 
-    // Everything in 90 kHz ticks and bits. Bits arriving in `d` ticks is
-    // `bit_rate * d / 90_000`, done as one product before the divide so the
-    // truncation happens once rather than compounding per picture.
-    let arrived = |ticks: u64| -> u64 { s.bit_rate.saturating_mul(ticks) / 90_000 };
+    // Everything in bits and fractions of a 90 kHz tick. Bits arriving in
+    // `d` of them is `bit_rate * d / (90_000 * tick_den)`, done as one
+    // product before the divide so the truncation happens once rather than
+    // compounding per picture — and in 128 bits, which the product of a
+    // rate and a time counted that finely needs.
+    let per_second = 90_000u128 * u128::from(s.tick_den.max(1));
+    let arrived = |ticks: u64| -> u64 { (u128::from(s.bit_rate) * u128::from(ticks) / per_second).min(u128::from(u64::MAX)) as u64 };
 
     for (n, &size) in sizes.iter().enumerate() {
         // Bits that have arrived by this removal time, and bits already
@@ -221,6 +234,18 @@ fn access_unit_bits(annexb: &[u8]) -> Vec<u64> {
     out
 }
 
+/// One clock tick, `num_units_in_tick / time_scale` seconds, in 90 kHz
+/// ticks as a fraction in lowest terms: `(90 000 * num_units_in_tick,
+/// time_scale)` over their common divisor.
+fn removal_interval(num_units: u32, time_scale: u32) -> (u64, u64) {
+    let (num, den) = (90_000u64 * u64::from(num_units), u64::from(time_scale));
+    let (mut a, mut b) = (num, den);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    (num / a.max(1), den / a.max(1))
+}
+
 /// Read the schedule out of the stream itself: the HRD from the SPS's VUI,
 /// and the initial removal delay from the first buffering period SEI.
 fn schedule_from_stream(annexb: &[u8]) -> Result<Schedule> {
@@ -256,13 +281,8 @@ fn schedule_from_stream(annexb: &[u8]) -> Result<Schedule> {
     }
     let initial_delay_90k =
         initial_delay.ok_or_else(|| Error::bitstream("HRD: no buffering period SEI, so the initial removal delay is unknown"))?;
-    Ok(Schedule {
-        bit_rate: hrd.bit_rate,
-        cpb_size: hrd.cpb_size,
-        cbr: hrd.cbr,
-        tick_90k: 90_000u64 * num_units as u64 / time_scale as u64,
-        initial_delay_90k,
-    })
+    let (tick_90k, tick_den) = removal_interval(num_units, time_scale);
+    Ok(Schedule { bit_rate: hrd.bit_rate, cpb_size: hrd.cpb_size, cbr: hrd.cbr, tick_90k, tick_den, initial_delay_90k })
 }
 
 /// `initial_cpb_removal_delay[0]` out of a `buffering_period` SEI payload.
@@ -402,13 +422,14 @@ fn h264_units(annexb: &[u8]) -> Result<(Vec<u64>, Vec<u64>, Schedule)> {
     let mut cur_sei = H264Sei::default();
     let mut in_slices = false;
     // Removal time of the last buffering-period unit, the base every
-    // `cpb_removal_delay` counts from.
+    // `cpb_removal_delay` counts from — like every removal time here, in
+    // `1 / (90 000 * tick_den)` seconds.
     let mut base_90k: Option<u64> = None;
     let mut close = |bytes: u64, sei: &H264Sei, schedule: &Schedule, sizes: &mut Vec<u64>, removal: &mut Vec<u64>| -> Result<()> {
         let n = sizes.len();
         let t = match (base_90k, sei.buffering_period, sei.pic_timing) {
-            (None, Some(initial), Some((delay, _))) => initial + delay * schedule.tick_90k,
-            (None, Some(initial), None) if n == 0 => initial,
+            (None, Some(initial), Some((delay, _))) => initial * schedule.tick_den + delay * schedule.tick_90k,
+            (None, Some(initial), None) if n == 0 => initial * schedule.tick_den,
             (None, None, _) => {
                 return Err(Error::bitstream(
                     "HRD: the first access unit carries no buffering period SEI, so the initial removal delay is unknown",
@@ -475,11 +496,13 @@ fn h264_units(annexb: &[u8]) -> Result<(Vec<u64>, Vec<u64>, Schedule)> {
                 if time_scale == 0 {
                     return Err(Error::bitstream("HRD: time_scale is zero"));
                 }
+                let (tick_90k, tick_den) = removal_interval(num_units, time_scale);
                 schedule = Some(Schedule {
                     bit_rate: hrd.bit_rate,
                     cpb_size: hrd.cpb_size,
                     cbr: hrd.cbr,
-                    tick_90k: 90_000u64 * num_units as u64 / time_scale as u64,
+                    tick_90k,
+                    tick_den,
                     initial_delay_90k: 0,
                 });
                 sps = Some(parsed);
@@ -541,7 +564,7 @@ mod tests {
     /// second at 90 000 ticks a second is one bit per tick, and 30 pictures
     /// a second is 3000 ticks and therefore 3000 bits between removals.
     fn sched(cpb: u64, cbr: bool) -> Schedule {
-        Schedule { bit_rate: 90_000, cpb_size: cpb, cbr, tick_90k: 3_000, initial_delay_90k: cpb }
+        Schedule { bit_rate: 90_000, cpb_size: cpb, cbr, tick_90k: 3_000, tick_den: 1, initial_delay_90k: cpb }
     }
 
     /// A stream that spends exactly what arrives never moves the buffer.
@@ -638,6 +661,122 @@ mod tests {
         let err = verify(&sps).expect_err("H.264: no VUI means no verdict");
         let s = format!("{err}");
         assert!(s.contains("no VUI") || s.contains("no buffer"), "{s}");
+    }
+
+    /// Every frame rate a caller can name round-trips through both
+    /// parameter sets' VUI exactly, in lowest terms: H.264's field clock
+    /// (`num_units_in_tick` the rate's denominator, `time_scale` twice its
+    /// numerator), H.265's picture clock (denominator over numerator). A
+    /// whole-number rate writes what it always did — 30 is 1 over 60 and 1
+    /// over 30 — and 60/2 is written as 30.
+    #[test]
+    fn fractional_frame_rates_round_trip_through_the_vui() {
+        use crate::encode::{Config, RateControl};
+        for (fps, fps_den, num, den) in [
+            (30000, 1001, 30000, 1001),
+            (24000, 1001, 24000, 1001),
+            (60000, 1001, 60000, 1001),
+            (25, 1, 25, 1),
+            (30, 1, 30, 1),
+            (25, 2, 25, 2),
+            (60, 2, 30, 1),
+        ] {
+            let tag = format!("{fps}/{fps_den}");
+            let cfg = Config {
+                width: 64,
+                height: 64,
+                fps,
+                fps_den,
+                rate: RateControl::Bitrate { bps: 1_000_000 },
+                cpb_ms: 500,
+                ..Config::default()
+            };
+            assert_eq!(cfg.frame_rate(), (num, den), "{tag}");
+            let cpb = crate::encode::h265_syntax::Cpb::new(1_000_000, 500).unwrap();
+            let g4 = crate::encode::h264_syntax::Geometry::new(&cfg);
+            let sps4 = crate::encode::h264_syntax::write_sps(&cfg, &g4, 16, 16, Some(&cpb));
+            let sps4 = crate::h264::Sps::parse(&crate::nal::unescape_rbsp(&sps4)).unwrap();
+            assert_eq!(sps4.vui.as_ref().and_then(|v| v.timing), Some((den, 2 * num)), "{tag}: H.264 (num_units_in_tick, time_scale)");
+            let g5 = crate::encode::h265_syntax::Geometry::new(&cfg);
+            let sps5 = crate::encode::h265_syntax::write_sps(&cfg, &g5, 8, Some(&cpb));
+            let sps5 = Sps::parse(&crate::nal::unescape_rbsp(&sps5)).unwrap();
+            assert_eq!(sps5.vui.as_ref().and_then(|v| v.timing), Some((den, num)), "{tag}: H.265 (num_units_in_tick, time_scale)");
+        }
+        let zero = Config { width: 64, height: 64, fps_den: 0, ..Config::default() };
+        assert!(zero.validate().unwrap_err().to_string().contains("fps_den"));
+    }
+
+    /// At 29.97 H.264's clock tick is 1501.5 of the 90 kHz ones — 3003/2,
+    /// kept exactly — so the thousandth picture of a stream is removed at
+    /// exactly 1000 * 1001 / 30000 seconds after the first, not 250
+    /// ticks early as the rounded tick would have it. H.265's picture
+    /// tick at 29.97 is a whole 3003.
+    #[test]
+    fn a_fractional_clock_is_kept_exact() {
+        assert_eq!(removal_interval(1001, 60_000), (3003, 2));
+        assert_eq!(removal_interval(1001, 30_000), (3003, 1));
+        assert_eq!(removal_interval(1, 60), (1500, 1));
+        assert_eq!(removal_interval(2, 50), (3600, 1), "12.5 pictures a second: 7200 a tick pair");
+        let s = Schedule { bit_rate: 90_000, cpb_size: 1 << 30, cbr: false, tick_90k: 3003, tick_den: 2, initial_delay_90k: 9000 };
+        // A frame is two ticks: unit n of a fixed-rate walk is removed
+        // `n` ticks after the first, which for H.264 is half a frame; the
+        // H.264 walk counts two per frame through cpb_removal_delay.
+        let sizes = vec![1u64; 2001];
+        let r = simulate(&sizes, &s);
+        assert!(r.conforms());
+        // After 2000 ticks (1000 frames) at 90 000 bits a second, exactly
+        // 90 000 * (0.1 + 1000 * 1001 / 30000) bits have arrived.
+        let arrived = 9_000 + 1000 * 3003;
+        assert_eq!(r.occupancy[2000], arrived - 2001, "the buffer after the last removal, to the bit");
+    }
+
+    /// Streams coded at 29.97 by both encoders, against a declared
+    /// buffer, conform to it — read back, walked and judged at the exact
+    /// clock their VUI declares.
+    #[test]
+    fn streams_at_29_97_conform_to_their_buffer() {
+        use crate::encode::{Config, RateControl};
+        let frames: Vec<Vec<u8>> = (0..24)
+            .map(|i| {
+                let mut f = vec![128u8; 64 * 64 * 3 / 2];
+                for y in 0..64 {
+                    for x in 0..64 {
+                        f[y * 64 + x] = (((x + 2 * i) * 5) ^ ((y + i) * 3)) as u8;
+                    }
+                }
+                f
+            })
+            .collect();
+        let cfg = Config {
+            width: 64,
+            height: 64,
+            fps: 30000,
+            fps_den: 1001,
+            gop: 12,
+            rate: RateControl::Bitrate { bps: 96_000 },
+            cpb_ms: 500,
+            ..Config::default()
+        };
+        let mut s264 = Vec::new();
+        let mut e = crate::encode::h264::H264Encoder::new(cfg.clone()).unwrap();
+        for f in &frames {
+            s264.extend(e.push(f).unwrap().into_iter().flat_map(|a| a.data));
+        }
+        s264.extend(e.flush().unwrap().into_iter().flat_map(|a| a.data));
+        let mut s265 = Vec::new();
+        let mut e = crate::encode::h265::H265Encoder::new(Config { max_cu_depth: Some(0), ..cfg }).unwrap();
+        for f in &frames {
+            s265.extend(e.push(f).unwrap().into_iter().flat_map(|a| a.data));
+        }
+        s265.extend(e.flush().unwrap().into_iter().flat_map(|a| a.data));
+        let (_, _, sched) = h264_units(&s264).unwrap();
+        assert_eq!((sched.tick_90k, sched.tick_den), (3003, 2), "H.264 at 29.97: a 1501.5-tick field clock");
+        assert_eq!(schedule_from_stream(&s265).map(|s| (s.tick_90k, s.tick_den)).unwrap(), (3003, 1));
+        for (codec, stream) in [("H.264", &s264), ("H.265", &s265)] {
+            let r = verify(stream).unwrap_or_else(|err| panic!("{codec}: {err}"));
+            assert_eq!(r.units, frames.len(), "{codec}");
+            assert!(r.conforms(), "{codec} at 29.97 breaks its own buffer: {r:?}");
+        }
     }
 
     /// An H.264 stream's schedule is read off its own SEI: the initial
