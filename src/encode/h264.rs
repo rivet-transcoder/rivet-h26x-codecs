@@ -1051,6 +1051,14 @@ impl<S: Sample> Core<S> {
             self.frame_num = 0;
             self.idr_pic_id ^= 1;
             self.last_bp_encode = c.encode;
+            // And the decoder marks every reference it holds unused (8.2.5.1),
+            // so none of them may be predicted from again. Kept, they were
+            // chosen: POC restarts at the IDR, so the previous GOP's anchors
+            // sit at the POCs of this GOP's, and `lists_for` breaks a tie
+            // for the nearest later picture toward the older entry — the
+            // first B picture after the IDR predicted from an anchor the
+            // decoder no longer has.
+            self.refs.clear();
         }
         if c.reference {
             self.frame_num = (self.frame_num + 1) & ((1 << LOG2_MAX_FRAME_NUM) - 1);
@@ -2608,6 +2616,43 @@ mod tests {
             .collect()
     }
 
+    /// The encoder predicts only from what the decoder holds, across every
+    /// GOP boundary. An IDR empties the decoder's reference lists and
+    /// restarts POC; the encoder kept the previous GOP's references, whose
+    /// anchors sat at the POCs of the new GOP's, and took the older of two
+    /// at the same POC as the first B picture's later reference — so from
+    /// that B picture on, the decoder's pictures were not the encoder's. It
+    /// showed wherever the previous GOP's anchor outlived the IDR in the
+    /// encoder's list: a GOP of one mini-GOP (gop = bframes + 2) at any
+    /// reference count, and at three references most GOP lengths (bframes 1
+    /// at gop 4 and 5, 2 at 5 and 7, 3 at 6 and 9). No single-GOP test
+    /// could see it. Here bframes 1 to 3 run over gop = bframes + 1 — the
+    /// IDR releases the held pictures as P, so no B picture is coded: the
+    /// control — to bframes + 4 and one longer GOP, at one and three
+    /// references and 8 and 10 bits, over three GOPs and a part, each
+    /// picture decoded (SELF, in process) and held to the encoder's own.
+    #[test]
+    fn every_gop_predicts_from_what_the_decoder_holds() {
+        for bframes in 1u32..=3 {
+            let mut gops = vec![bframes + 1, bframes + 2, bframes + 3, bframes + 4, 2 * bframes + 3];
+            gops.dedup();
+            for gop in gops {
+                for (max_refs, bit_depth) in [(1u32, 8u32), (3, 8), (1, 10), (3, 10)] {
+                    let tag = format!("gop {gop} bframes {bframes} refs {max_refs} {bit_depth}-bit");
+                    let frames = woven_frames(64, 64, ChromaFormat::Yuv420, bit_depth, 3 * gop as usize + 2, 0);
+                    let config = Config { gop, bframes, max_refs, ..cfg(64, 64, ChromaFormat::Yuv420, bit_depth) };
+                    let (units, census) = encode_and_self_check(&tag, config, &frames);
+                    assert!(units.iter().filter(|u| u.keyframe).count() >= 3, "{tag}: fewer than three GOPs");
+                    if gop == bframes + 1 {
+                        assert_eq!(census.pictures[2], 0, "{tag}: a B picture in a GOP the IDR ends first: {census:?}");
+                    } else {
+                        assert!(census.pictures[2] > 0, "{tag}: no B picture was coded: {census:?}");
+                    }
+                }
+            }
+        }
+    }
+
     /// Encode `frames` under `config` and hold the stream to the encoder's
     /// reconstructions with [`self_check`], returning the access units and
     /// the census.
@@ -2625,19 +2670,27 @@ mod tests {
     }
 
     /// Decode `units` with the production decoder and hold every picture to
-    /// the reconstruction the encoder kept for it (SELF, in process) —
-    /// matched through each access unit's POC, as
-    /// `deep_pictures_round_trip_through_the_decoder` matches them.
+    /// the reconstruction the encoder kept for it (SELF, in process), with
+    /// nothing concealed on the way — matched through each access unit's
+    /// display index, counted from the first unit handed in so that a
+    /// stream cut at a later IDR is checked the same way. Not through its
+    /// POC, as `deep_pictures_round_trip_through_the_decoder` matches a
+    /// single GOP: POC restarts at every IDR, so across GOPs it names a
+    /// place in the GOP, not in the stream, and that is what it is held to
+    /// here for a stream coded at `gop` (0: every picture an IDR).
     fn self_check(tag: &str, gop: u32, units: &[Access], recons: &[Vec<u8>]) {
         let mut dec = crate::h264::H264Decoder::new();
         for u in units {
             dec.push_annexb(&u.data).unwrap_or_else(|err| panic!("{tag}: decoder rejected the stream: {err}"));
         }
         dec.flush().unwrap_or_else(|err| panic!("{tag}: decoder failed to flush: {err}"));
+        assert_eq!(dec.warnings(), 0, "{tag}: the decoder concealed something in the stream");
+        let first = units.iter().map(|u| u.display).min().unwrap_or(0);
         let mut by_display = vec![None; units.len()];
         for u in units {
-            let display = if gop == 0 { u.encode_index as usize } else { (u.poc / 2) as usize };
-            by_display[display] = Some(u.encode_index as usize);
+            let in_gop = if gop == 0 { 0 } else { u.display % u64::from(gop) };
+            assert_eq!(u.poc, 2 * in_gop as i32, "{tag}: display index {} has POC {}", u.display, u.poc);
+            by_display[(u.display - first) as usize] = Some(u.encode_index as usize);
         }
         for (i, coded) in by_display.iter().enumerate() {
             let want = &recons[coded.unwrap_or_else(|| panic!("{tag}: display index {i} never coded"))];
