@@ -584,6 +584,19 @@ EXCLUSIVE_TOKENS="ilace fdeep wsine"
 # red, which is why SELF now also fails on any warning our decoder counts. They visit motion (and, through the tag, its 10-bit twin
 # motion10), fade and cut; --gop 250 because at --gop 8 the GOP ends before
 # --bframes 3 leaves a B picture below an anchor it does not use.
+# The lookahead rows tagged @wpoff, @fdeep10 and @wsine10 put lookahead ABR on
+# the three fades that no lookahead row visited: the gain-and-offset fade at 8
+# and 10 bits and the native 10-bit fade. Everything rc.rs records about
+# fades under lookahead was measured on them by a runner outside this gate:
+# the intra cap dropped on a brightness step (encode::h265
+# PicCost::inter_cost), and the first picture coded again when the seed
+# misses it (rc::RateController::seed_recode, 4x on wsine10). Without these
+# rows neither change had a gate cell on the content it was made for. The
+# la-ipb row on wpoff is the B-picture case, where the fade model was blocked
+# on the chroma of the anchors the B pictures predict from. On develop
+# 1412ebc they end at 1.289 (wpoff la-96k), 1.177 (wpoff la-ipb-64k), 1.229
+# (fdeep10) and 1.101 (wsine10) of target: inside the RATE band, and over
+# target for the reasons rc.rs gives.
 CONFIGS=${CONFIGS:-"
 lossless-intra|--codec h264 --lossless --gop 0
 cqp-intra|--codec h264 --qp 26 --gop 0
@@ -645,6 +658,10 @@ hevc-abr-la-96k|--codec h265 --bitrate 96000 --gop 8 --lookahead 8
 hevc-abr-la-ipb-64k|--codec h265 --bitrate 64000 --gop 8 --bframes 2 --lookahead 4
 hevc-vbv-la-125@src_cut|--codec h265 --bitrate 64000 --cpb-ms 125 --gop 8 --lookahead 8
 hevc10-abr-la-96k@p10|--codec h265 --bitrate 96000 --gop 8 --lookahead 8
+hevc-abr-la-96k@wpoff|--codec h265 --bitrate 96000 --gop 8 --lookahead 8
+hevc-abr-la-ipb-64k@wpoff|--codec h265 --bitrate 64000 --gop 8 --bframes 2 --lookahead 4
+hevc10-abr-la-96k@fdeep10|--codec h265 --bitrate 96000 --gop 8 --lookahead 8
+hevc10-abr-la-96k@wsine10|--codec h265 --bitrate 96000 --gop 8 --lookahead 8
 hevc-wp-ip|--codec h265 --qp 26 --gop 8 --wpred
 hevc-wp-ipb@fade|--codec h265 --qp 26 --gop 8 --bframes 2 --wpred
 hevc-wp40-ip@fade|--codec h265 --qp 40 --gop 8 --wpred
