@@ -677,6 +677,14 @@ impl<S: Sample> Core<S> {
                 "H.264 encode: a coding quadtree depth (max_cu_depth, an H.265 tool; H.264 codes 16x16 macroblocks)",
             ));
         }
+        if cfg.inter_parts != crate::encode::InterParts::None {
+            // H.265's prediction-unit shapes. H.264's own partitions are
+            // its macroblock and sub-macroblock types (`subparts`); a
+            // shape asked for here is refused by name rather than ignored.
+            return Err(Error::unsupported(
+                "H.264 encode: H.265 inter partitions (inter_parts; H.264 partitions macroblocks through subparts)",
+            ));
+        }
         if cfg.sao {
             // Not "in progress": H.264 has no sample adaptive offset at
             // all. Refusing names that rather than silently ignoring a

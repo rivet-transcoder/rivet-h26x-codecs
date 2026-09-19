@@ -63,29 +63,47 @@
 //! no collocated picture), which makes the spatial + zero candidate set
 //! the *complete* derivation for these streams, not a subset.
 //!
+//! # Prediction-unit partitions (2026-09-18)
+//!
+//! Under `Config::inter_parts` a CU may also take the symmetric halves,
+//! `PART_2NxN` and `PART_Nx2N` ([`InterCuKind::Parts`]), at every CU size,
+//! in P and B pictures. Each shape's two units are decided in the reader's
+//! order by the same pickers as a 2Nx2N unit (`InterPicture::pick_pu`,
+//! `InterPicture::pick_pu_b`), each over the decoder's own candidates
+//! for its `PuPos` — the second unit's derived with the first unit's
+//! motion already in the motion grid, which is what the second-unit
+//! exclusions of the merge derivation depend on. An 8x4 or 4x8 unit never
+//! takes AMVP `PRED_BI` (the reader has no spelling for it) and its merge
+//! candidates are made one-list by the derivation itself. The residual
+//! stays one CU-sized TU: this SPS's `max_transform_hierarchy_depth_inter`
+//! is 2, so no transform split is inferred (`interSplitFlag` is 0). A
+//! partitioned CU codes `rqt_root_cbf`, which the reader infers only for a
+//! 2Nx2N merge, and is never a skip.
+//!
+//! The cheapest shape in SATD plus bits (the units' own syntax, then
+//! `part_mode` and the CU syntax around them) meets the 2Nx2N unit, and
+//! when the two come within `PARTS_RD_MARGIN` of each other both are
+//! coded and the cheaper in SSD plus lambda times the CU's bits is kept.
+//! That choice is the CU's unsplit candidate in the coding quadtree, whose
+//! split decision is unchanged. The measurements are on
+//! `PARTS_RD_MARGIN` and `Config::inter_parts`.
+//!
+//! What was priced first (2026-09-13), for the record: measured while the
+//! encoder coded one `PART_2Nx2N` unit per CTB,
+//! `tools/partition_opportunity.py` (integer-sample SAD, ±4, a split must
+//! beat the whole block by 5%) over the seven 8-bit 4:2:0 clips found
+//! 16.2% of blocks would take a symmetric split and 13.3% an AMP shape
+//! beyond it — 7.1% symmetric once the smooth-gradient clip is set aside,
+//! the AMP count mostly the fractal half of the cut clip. The transform
+//! split it expected to cost was a misreading of this SPS, whose inter
+//! transform depth was already 2.
+//!
 //! # Priced, not built (2026-09-13)
 //!
-//! Three of the standard's inter tools were costed against this corpus
+//! Two of the standard's inter tools were costed against this corpus
 //! before deciding not to build them. The numbers are here so the next
 //! reader decides against a bigger corpus rather than re-deriving them.
 //!
-//! - **Prediction-unit partitions, symmetric and AMP.** Measured while the
-//!   encoder coded one `PART_2Nx2N` unit per CTB; the coding quadtree now
-//!   splits CTBs into smaller `PART_2Nx2N` units, which takes part of the
-//!   same opportunity by another road. `tools/partition_opportunity.py`
-//!   (integer-sample SAD, ±4, a split must beat the whole block by 5%)
-//!   over the seven 8-bit 4:2:0 clips: 16.2% of blocks would take a
-//!   symmetric split and 13.3% an AMP shape beyond it — but 7.1% and
-//!   less once the smooth-gradient clip is set aside (an integer search
-//!   approximates a fractional pan with two offsets, which quarter-sample
-//!   refinement does without a split), and the AMP count lives in the
-//!   fractal half of the cut clip, where a 32x8 strip overfits. The
-//!   clips with real uniform motion and the held frame come out at 0.0%.
-//!   Against that: a second vector and `part_mode` on every split unit,
-//!   and under this SPS's `max_transform_hierarchy_depth_inter` an
-//!   inferred transform split (`interSplitFlag`) the inter writer would
-//!   have to learn to spell. The symmetric shapes are the prerequisite
-//!   for AMP, and AMP's own value sits inside the probe's bias.
 //! - **Temporal merge / AMVP candidates (TMVP).** The SPS disables it;
 //!   the decoder's derivation is complete and the motion grid the
 //!   collocated picture would need is already kept in `Frame`. What a
@@ -111,6 +129,7 @@
 //! # Scope (v1) — the same deliberately fixed geometry as the intra module
 //!
 //! - **P slices, one reference** (list 0, `ref_idx` 0), `PART_2Nx2N` CUs
+//!   (and, under `Config::inter_parts`, two-unit ones: see above)
 //!   — a whole CTB, or a quadtree leaf down to 8x8 through
 //!   `InterPicture::code_ctu_tree` — each with one CU-sized TU (no transform
 //!   split — the SPS's
@@ -171,6 +190,13 @@
 //!   `abs_mvd_greater0_flag`, `abs_mvd_greater1_flag`, `abs_mvd_minus2`,
 //!   `mvd_sign_flag` per component), `mvp_l0_flag`; then `rqt_root_cbf`,
 //!   and when set the same unsplit transform tree.
+//! - [`InterCuKind::Parts`]: `cu_skip_flag` 0, `pred_mode_flag` 0,
+//!   `part_mode` (2NxN `01`, Nx2N `00`, context-coded, the inverse of
+//!   `parse_part_mode`'s inter arms: `hevc::ctu::write_part_mode_inter_at`),
+//!   then each unit's `prediction_unit` — `merge_flag`, then `merge_idx` or
+//!   the AMVP syntax, `inter_pred_idc` at the unit's own dimensions in a B
+//!   slice (`write_prediction_unit`) — then `rqt_root_cbf`, coded, and
+//!   when set the same unsplit transform tree.
 //! - [`InterCuKind::UseIntra`]: not an inter CU at all. This decision's
 //!   coefficients are meaningless and the planes are untouched; the
 //!   caller calls [`InterPicture::code_ctu_intra`], which runs the intra
@@ -222,9 +248,10 @@ use crate::encode::h265_intra::{
 use crate::cabac_enc::CabacEncoder;
 use crate::hevc::ctu::{
     PartMode, SplitCuNb, chroma_qp, explicit_weighting, write_cu_skip_flag, write_inter_pred_idc, write_merge_flag,
-    write_merge_idx, write_mvd, write_mvp_flag, write_part_mode_inter, write_pred_mode_flag,
+    write_merge_idx, write_mvd, write_mvp_flag, write_part_mode_inter, write_part_mode_inter_at, write_pred_mode_flag,
     write_ref_idx, write_rqt_root_cbf, write_split_cu_flag,
 };
+use crate::encode::InterParts;
 use crate::hevc::ctx::Contexts;
 use crate::hevc::frame::{Frame, MotionInfo, Mv, Plane16, fill_motion};
 use crate::hevc::inter::{McScratch, Weighting, predict_block};
@@ -251,6 +278,33 @@ pub const MAX_MERGE_CAND: usize = 5;
 /// Kept well inside the frame's `LUMA_PAD` (80) so every full-sample SAD
 /// reads the padded plane directly.
 const SEARCH_RANGE: i32 = 48;
+
+/// How close, in SATD plus bits, the losing candidate of a CU's 2Nx2N unit
+/// and its best partitioned shape must come to the winner for `tree_leaf`
+/// to code it too and choose between the two in SSD plus lambda times the
+/// CU's bits: within this fraction of the winner's cost (1.0: at most
+/// twice it).
+///
+/// The SATD comparison alone misjudges the choice, because it knows
+/// neither the residual each candidate leaves nor that a 2Nx2N merge with
+/// nothing left codes as a skip. Measured 2026-09-18, `--parts sym`
+/// against `--parts none` on one binary, YUV BD-rate at QP 22-40 (the
+/// 1280x720 clips at 22-37), IP / IPB:
+///
+/// ```text
+///   margin              corpus mean (11 clips)   720p testsrc2    720p natural
+///   SATD only           -0.93% / -0.91%          -1.71 / -1.06    -0.10 / -0.18
+///   0.1                 -1.43% / -1.37%
+///   0.3                 -1.58% / -1.67%          -2.47 / -2.44    -1.40 / -1.38
+///   1.0                 -1.59% / -1.91%          -2.69 / -2.38    -1.54 / -1.33
+///   any (always)                                 -2.64 / -2.35    -1.31 / -1.32
+/// ```
+///
+/// On the natural clip SATD alone let B pictures take shapes that cost
+/// more than they saved (its B slices grew 0.6%). The second coding costs
+/// little: CPU against `none` went from x1.50-2.00 with SATD alone to
+/// x1.62-2.18 at 1.0.
+const PARTS_RD_MARGIN: f32 = 1.0;
 
 /// The CU-level choices this module decides between.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -297,12 +351,58 @@ pub enum InterCuKind {
         /// `mvp_l0_flag` / `mvp_l1_flag`.
         mvp_flag: [u8; 2],
     },
+    /// Two prediction units ([`InterCuDecision::part`] says how the CU is
+    /// divided, [`InterCuDecision::pus`] what each carries), each merge or
+    /// AMVP on its own. `rqt_root_cbf` is coded: the reader infers it only
+    /// for a 2Nx2N merge unit, so a partitioned CU whose residual quantised
+    /// away codes a 0 rather than becoming a skip, which is 2Nx2N only.
+    Parts,
     /// Inter lost to the flatness proxy: code this CU with the intra
     /// decision instead. Only `mv` is meaningful (callers feeding motion
     /// state must *not* use it — an intra CU's motion is
     /// `MotionInfo::INTRA`, which `InterPicture::code_ctu` has already
     /// stored in that case).
     UseIntra,
+}
+
+/// One prediction unit's motion decision: which motion it carries, how it
+/// is signalled and what that costs. What `InterPicture::pick_pu` and
+/// `InterPicture::pick_pu_b` return, and, for the two units of a
+/// [`InterCuKind::Parts`] CU, what the writer spells.
+#[derive(Clone, Copy, Debug)]
+pub struct PuPick {
+    /// `merge_idx` when a merge candidate won, `None` for AMVP.
+    pub merge_idx: Option<u8>,
+    /// The AMVP shape's `inter_pred_idc` (0 `PRED_L0`, 1 `PRED_L1`,
+    /// 2 `PRED_BI`); 0 in a P slice.
+    pub idc: u8,
+    /// AMVP's `mvd` per list, wrapping differences from the chosen
+    /// predictors. Only the lists `idc` uses are written.
+    pub mvd: [Mv; 2],
+    /// AMVP's `mvp_lX_flag` per list.
+    pub mvp_flag: [u8; 2],
+    /// The motion as the decoder stores it: a vector and a reference index
+    /// per list, -1 for a list the unit does not use.
+    pub mv: [Mv; 2],
+    /// See `mv`.
+    pub ref_idx: [i8; 2],
+    /// Luma SATD of the winner's prediction.
+    pub satd: u32,
+    /// The winner's SATD plus lambda times the bits it was priced at: a
+    /// whole 2Nx2N CU's own syntax for the CU's single unit, the unit's
+    /// own syntax for one of two.
+    pub cost: f32,
+}
+
+/// A partitioned shape's decision, [`InterPicture::pick_parts`]'s answer:
+/// the shape, its two units in the reader's order, and its cost in SATD
+/// plus bits, comparable with a 2Nx2N unit's [`PuPick::cost`].
+type PartsPick = (PartMode, [PuPick; 2], f32);
+
+impl Default for PuPick {
+    fn default() -> Self {
+        PuPick { merge_idx: None, idc: 0, mvd: [Mv::ZERO; 2], mvp_flag: [0; 2], mv: [Mv::ZERO; 2], ref_idx: [0, -1], satd: 0, cost: 0.0 }
+    }
 }
 
 /// How one P CU was coded, in the form the coding-tree writer needs.
@@ -333,6 +433,13 @@ pub struct InterCuDecision {
     pub qp_y: i32,
     /// The choice, with its signalling payload.
     pub kind: InterCuKind,
+    /// `part_mode`: `PART_2Nx2N` for every kind but [`InterCuKind::Parts`].
+    pub part: PartMode,
+    /// A [`InterCuKind::Parts`] CU's two prediction units, in the reader's
+    /// order (`PartMode::pus`). Unused otherwise; the single unit of the
+    /// other kinds is `kind` plus the motion fields below, which for a
+    /// partitioned CU repeat the first unit's.
+    pub pus: [PuPick; 2],
     /// The chosen motion vector, quarter luma samples, list 0. Filled for
     /// every kind including `Skip` (the writer carries no vector, but
     /// callers and tests want the motion the CU actually has).
@@ -402,6 +509,8 @@ impl Default for InterCuDecision {
             bypass: false,
             qp_y: 26,
             kind: InterCuKind::Skip { merge_idx: 0 },
+            part: PartMode::P2Nx2N,
+            pus: [PuPick::default(); 2],
             mv: Mv::ZERO,
             ref_idx: 0,
             mv_l1: Mv::ZERO,
@@ -509,6 +618,16 @@ pub struct InterPicture<S: Sample> {
     /// desyncs the arithmetic coder. **1**, matching what the picture
     /// writer sets for I slices and what `write_cu_intra_body` spells.
     pub split_depth: u32,
+    /// The prediction-unit shapes an inter CU may take besides 2Nx2N:
+    /// `Config::inter_parts`, set by the caller. [`InterParts::None`]
+    /// until then, which is every CU a single unit.
+    pub parts: InterParts,
+    /// The last CU decision's two candidates, as [`Self::code_cu`] or
+    /// [`Self::code_cu_b`] left them: the 2Nx2N unit and the cheapest
+    /// partitioned shape, if one was offered. `tree_leaf` codes the loser
+    /// too when the two are close, and keeps the cheaper in SSD plus
+    /// lambda times the bits of the whole CU.
+    alts: Option<(PuPick, Option<PartsPick>)>,
     /// The picture descriptor the intra decision's availability and MPM
     /// mirrors read, built once from the SPS.
     geo: Geo,
@@ -590,6 +709,8 @@ impl<S: Sample> InterPicture<S> {
             cat: sps.chroma_array_type(),
             cur_poc,
             split_depth: 1,
+            parts: InterParts::None,
+            alts: None,
             geo: Geo::new(sps.log2_ctb_size, w, h, sps.chroma_array_type()),
             intra_scratch: IntraScratch::default(),
             scratch: McScratch::new(),
@@ -740,7 +861,7 @@ impl<S: Sample> InterPicture<S> {
         c_stride: usize,
     ) -> InterCuDecision {
         let n = 1usize << log2_cu;
-        let mut out = InterCuDecision { log2_cu, bypass: ctx.bypass, qp_y: ctx.qp, ..InterCuDecision::default() };
+        let out = InterCuDecision { log2_cu, bypass: ctx.bypass, qp_y: ctx.qp, ..InterCuDecision::default() };
 
         // Mark the CTB as this (single) slice's, as the decoder does at CTB
         // start: `avail_ctx` reads the current CTB's slice address, and
@@ -750,8 +871,6 @@ impl<S: Sample> InterPicture<S> {
         self.info.ctb_slice[ctb] = 0;
 
         debug_assert!(!refs_l0.is_empty(), "a P CU needs at least one reference");
-        let pocs: Vec<i32> = refs_l0.iter().map(|f| f.poc).collect();
-        let refs = self.ref_ctx(&pocs);
         let pu = PuPos {
             x_cb: x0 as i32,
             y_cb: y0 as i32,
@@ -762,19 +881,42 @@ impl<S: Sample> InterPicture<S> {
             h: n as i32,
             part_idx: 0,
         };
+        let lam = lambda(ctx.qp) * satd_lambda_scale(ctx.bit_depth);
+        let rate = Rate::new_at(ctx.qp, false, log2_cu, depth);
+        let pick = self.pick_pu(ctx, refs_l0, &pu, src_y, y_stride, &rate, lam);
+        let parts = self.pick_parts(ctx, TreeRefs::P(refs_l0), x0, y0, log2_cu, src_y, y_stride, &rate, lam);
+        self.alts = Some((pick, parts));
+        if let Some((part, pus, _)) = parts.filter(|p| p.2 < pick.cost) {
+            return self.code_parts(ctx, TreeRefs::P(refs_l0), out, part, pus, x0, y0, log2_cu, src_y, y_stride, src_cb, src_cr, c_stride);
+        }
+        self.code_whole(ctx, TreeRefs::P(refs_l0), out, pick, x0, y0, log2_cu, src_y, y_stride, src_cb, src_cr, c_stride)
+    }
 
+    /// The motion decision for one prediction unit `pu` of a P CU: the
+    /// cheaper of merge, over the decoder's own candidates, and AMVP, over
+    /// every reference in `refs_l0`, by luma SATD plus `lam` times the bits
+    /// `rate` prices each shape at. The 2Nx2N CU's single PU is `pu` with
+    /// the CU's own rectangle. Reads the decoder-grade state the walk
+    /// maintains and writes none of it.
+    #[allow(clippy::too_many_arguments)]
+    fn pick_pu(&mut self, ctx: &MeCtx<'_, S>, refs_l0: &[&Frame<S>], pu: &PuPos, src_y: &[S], y_stride: usize, rate: &Rate, lam: f32) -> PuPick {
+        let (x0, y0) = (pu.x_pb as usize, pu.y_pb as usize);
+        let wh = (pu.w as usize, pu.h as usize);
+        let whole = pu.w == pu.n_cb && pu.h == pu.n_cb;
+        let nref = refs_l0.len() as u32;
+        let pocs: Vec<i32> = refs_l0.iter().map(|f| f.poc).collect();
+        let refs = self.ref_ctx(&pocs);
         // The decoder's own candidate lists (see the module header). The
         // AMVP predictors depend on the reference index — the derivation
         // scales a neighbour's vector by the POC-distance ratio between
         // its reference and this one — so they are derived per
         // reference by calling `amvp` once for each.
-        let merge: Vec<Cand> = (0..MAX_MERGE_CAND).map(|i| merge_candidate(&self.info, &self.recon, &refs, &pu, i)).collect();
+        let merge: Vec<Cand> = (0..MAX_MERGE_CAND).map(|i| merge_candidate(&self.info, &self.recon, &refs, pu, i)).collect();
         let mvp: Vec<[Mv; 2]> = (0..refs_l0.len())
-            .map(|r| [amvp(&self.info, &self.recon, &refs, &pu, 0, r as i8, 0), amvp(&self.info, &self.recon, &refs, &pu, 0, r as i8, 1)])
+            .map(|r| [amvp(&self.info, &self.recon, &refs, pu, 0, r as i8, 0), amvp(&self.info, &self.recon, &refs, pu, 0, r as i8, 1)])
             .collect();
 
-        let soff = y0 * y_stride + x0;
-        let src = &src_y[soff..];
+        let src = &src_y[y0 * y_stride + x0..];
 
         // One search per reference. Multi-reference is not a wider search
         // of the same picture but a CHOICE between pictures: a block
@@ -801,17 +943,15 @@ impl<S: Sample> InterPicture<S> {
         for (r, rf) in refs_l0.iter().enumerate() {
             let mut seeds: Vec<Mv> = vec![Mv::ZERO, mvp[r][0], mvp[r][1]];
             seeds.extend(merge.iter().filter(|c| c.ref_idx[0] == r as i8).map(|c| c.mv[0]));
-            let full = self.search_full(ctx, &rf.y, x0, y0, n, src, y_stride, &seeds);
+            let full = self.search_full(ctx, &rf.y, x0, y0, wh, src, y_stride, &seeds);
             let wp = self.wp_for(r)[0];
-            per_ref.push(self.refine_subpel(ctx, &rf.y, wp, 0, x0, y0, n, src, y_stride, full));
+            per_ref.push(self.refine_subpel(ctx, &rf.y, wp, 0, x0, y0, wh, src, y_stride, full));
         }
 
         // Cost the shapes. Merge candidates are scored at their exact
         // vectors against the picture they actually name; only the first
         // occurrence of a (vector, reference) matters (a later duplicate
         // signals strictly more bins for the same prediction).
-        let lam = lambda(ctx.qp) * satd_lambda_scale(ctx.bit_depth);
-        let rate = Rate::new_at(ctx.qp, false, log2_cu, depth);
         let mut best_merge: Option<(usize, u32)> = None; // (idx, satd)
         let mut best_merge_cost = f32::INFINITY;
         let mut seen: Vec<(Mv, i8)> = Vec::with_capacity(MAX_MERGE_CAND);
@@ -821,12 +961,18 @@ impl<S: Sample> InterPicture<S> {
                 continue;
             }
             seen.push((cand.mv[0], ri));
-            let satd = self.satd_at(ctx, &refs_l0[ri as usize].y, ri as usize, x0, y0, n, src, y_stride, cand.mv[0]);
+            let satd = self.satd_at(ctx, &refs_l0[ri as usize].y, ri as usize, x0, y0, wh, src, y_stride, cand.mv[0]);
             // cu_skip_flag or merge_flag, plus the TR-coded index.
             // Skip and merge differ in signalling, and a zero-residual
             // candidate becomes a skip, so price each at the shape it
-            // would actually take.
-            let bits = rate.skip(idx as u8).min(rate.merge(idx as u8));
+            // would actually take. One unit of two is never a skip: it
+            // spells merge_flag and the index, and the CU around it is
+            // priced once, by the caller.
+            let bits = if whole {
+                rate.skip(idx as u8).min(rate.merge(idx as u8))
+            } else {
+                rate.pu(&PuPick { merge_idx: Some(idx as u8), ..PuPick::default() }, false, pu, nref)
+            };
             let cost = satd as f32 + lam * bits;
             if cost < best_merge_cost {
                 best_merge_cost = cost;
@@ -839,14 +985,20 @@ impl<S: Sample> InterPicture<S> {
         // it costs to say WHICH picture — `ref_idx` is truncated unary
         // over the active count and absent entirely at one reference,
         // so a single-reference stream prices exactly as it always did.
-        let nref = refs_l0.len() as u32;
         let mut best_amvp: Option<(usize, u8, Mv, u32)> = None; // (ref, flag, mvd, satd)
         let mut amvp_cost = f32::INFINITY;
         for (r, &(mv_r, satd_r)) in per_ref.iter().enumerate() {
             let mvd_for = |p: Mv| Mv::new(mv_r.x.wrapping_sub(p.x), mv_r.y.wrapping_sub(p.y));
             let (d0, d1) = (mvd_for(mvp[r][0]), mvd_for(mvp[r][1]));
-            let c0 = rate.amvp_ref(d0, 0, true, nref, r as u32);
-            let c1 = rate.amvp_ref(d1, 1, true, nref, r as u32);
+            let price = |d: Mv, flag: u8| {
+                if whole {
+                    rate.amvp_ref(d, flag, true, nref, r as u32)
+                } else {
+                    rate.pu(&PuPick { mvd: [d, Mv::ZERO], mvp_flag: [flag, 0], ref_idx: [r as i8, -1], ..PuPick::default() }, false, pu, nref)
+                }
+            };
+            let c0 = price(d0, 0);
+            let c1 = price(d1, 1);
             let (flag, mvd, bits) = if c1 < c0 { (1u8, d1, c1) } else { (0u8, d0, c0) };
             // merge_flag 0, ref_idx, mvp_l0_flag, rqt_root_cbf, plus the
             // mvd bins (cu_skip_flag and pred_mode/part_mode surround
@@ -859,56 +1011,28 @@ impl<S: Sample> InterPicture<S> {
         }
         let (amvp_ref, amvp_flag, mvd, amvp_satd) = best_amvp.expect("at least one reference");
 
-        let merge_wins = best_merge.is_some_and(|_| best_merge_cost <= amvp_cost);
-        let (mv, chosen_ref, inter_satd) = if merge_wins {
-            let (idx, satd) = best_merge.expect("merge_wins implies a candidate");
-            (merge[idx].mv[0], merge[idx].ref_idx[0].max(0) as usize, satd)
-        } else {
-            (per_ref[amvp_ref].0, amvp_ref, amvp_satd)
-        };
-        let refp: &Frame<S> = refs_l0[chosen_ref];
-        out.mv = mv;
-        out.ref_idx = chosen_ref as i8;
-
-        if prefer_intra(ctx, inter_satd, src, y_stride, n) {
-            out.kind = InterCuKind::UseIntra;
-            // An intra CU's motion, stored now so later candidate
-            // derivations see what the decoder will see.
-            fill_motion(&mut self.recon.motion, self.recon.w4, x0, y0, n, n, MotionInfo::INTRA);
-            let w4 = self.info.w4;
-            PicInfo::fill4(&mut self.info.pred_mode, w4, x0, y0, n, n, 1);
-            // `coding_unit` records `cu_skip_flag` for every CU before it
-            // knows the pred mode (ctu.rs:419), and the *next* CU's
-            // `cu_skip_flag` context counts skipped neighbours out of
-            // exactly this array. An intra CU is never skipped.
-            PicInfo::fill4(&mut self.info.skip, w4, x0, y0, n, n, 0);
-            return out;
+        match best_merge {
+            Some((idx, satd)) if best_merge_cost <= amvp_cost => PuPick {
+                merge_idx: Some(idx as u8),
+                idc: 0,
+                mvd: [Mv::ZERO; 2],
+                mvp_flag: [0; 2],
+                mv: [merge[idx].mv[0], Mv::ZERO],
+                ref_idx: [merge[idx].ref_idx[0].max(0), -1],
+                satd,
+                cost: best_merge_cost,
+            },
+            _ => PuPick {
+                merge_idx: None,
+                idc: 0,
+                mvd: [mvd, Mv::ZERO],
+                mvp_flag: [amvp_flag, 0],
+                mv: [per_ref[amvp_ref].0, Mv::ZERO],
+                ref_idx: [amvp_ref as i8, -1],
+                satd: amvp_satd,
+                cost: amvp_cost,
+            },
         }
-
-        // The chosen prediction, through the decoder's own MC, weighted
-        // exactly as the slice header says this reference is.
-        let wp = self.wp_for(chosen_ref);
-        predict_block(ctx.dsp, &mut self.scratch, &mut self.recon, x0, y0, n, n, Some((refp, mv)), None, wp);
-
-        let any = self.code_residual_cu(ctx, x0, y0, log2_cu, src, y_stride, src_cb, src_cr, c_stride, &mut out);
-        out.kind = match (merge_wins, any) {
-            (true, false) => InterCuKind::Skip { merge_idx: best_merge.expect("merge_wins").0 as u8 },
-            (true, true) => InterCuKind::Merge { merge_idx: best_merge.expect("merge_wins").0 as u8 },
-            (false, _) => InterCuKind::Amvp { mvp_flag: amvp_flag, mvd },
-        };
-
-        // Store motion and marks exactly as the decoder's `prediction_unit`
-        // does after parsing ("Store motion", src/hevc/ctu.rs): the next
-        // CUs' candidate lists read them — the reference index included,
-        // which is what makes a neighbour's vector scale by the right
-        // POC distance.
-        let mut mi = MotionInfo { mv: [mv, Mv::ZERO], ref_delta: [0; 2], ref_idx: [chosen_ref as i8, -1], flags: 0, pad: 0 };
-        mi.ref_delta[0] = (self.cur_poc - refp.poc).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-        fill_motion(&mut self.recon.motion, self.recon.w4, x0, y0, n, n, mi);
-        let w4 = self.info.w4;
-        PicInfo::fill4(&mut self.info.pred_mode, w4, x0, y0, n, n, 0);
-        PicInfo::fill4(&mut self.info.skip, w4, x0, y0, n, n, matches!(out.kind, InterCuKind::Skip { .. }) as u8);
-        out
     }
 
     /// Decide and code one CTU as a single 2Nx2N CU of a **B** picture
@@ -978,13 +1102,12 @@ impl<S: Sample> InterPicture<S> {
         c_stride: usize,
     ) -> InterCuDecision {
         let n = 1usize << log2_cu;
-        let mut out = InterCuDecision { log2_cu, bypass: ctx.bypass, qp_y: ctx.qp, ..InterCuDecision::default() };
+        let out = InterCuDecision { log2_cu, bypass: ctx.bypass, qp_y: ctx.qp, ..InterCuDecision::default() };
 
         let ctb = self.info.ctb_of(x0, y0);
         self.info.ctb_slice_addr[ctb] = 0;
         self.info.ctb_slice[ctb] = 0;
 
-        let refs = self.ref_ctx_b(ref0.poc, ref1.poc);
         let pu = PuPos {
             x_cb: x0 as i32,
             y_cb: y0 as i32,
@@ -995,15 +1118,35 @@ impl<S: Sample> InterPicture<S> {
             h: n as i32,
             part_idx: 0,
         };
+        let lam = lambda(ctx.qp) * satd_lambda_scale(ctx.bit_depth);
+        let rate = Rate::new_at(ctx.qp, true, log2_cu, depth);
+        let pick = self.pick_pu_b(ctx, ref0, ref1, &pu, src_y, y_stride, &rate, lam);
+        let parts = self.pick_parts(ctx, TreeRefs::B(ref0, ref1), x0, y0, log2_cu, src_y, y_stride, &rate, lam);
+        self.alts = Some((pick, parts));
+        if let Some((part, pus, _)) = parts.filter(|p| p.2 < pick.cost) {
+            return self.code_parts(ctx, TreeRefs::B(ref0, ref1), out, part, pus, x0, y0, log2_cu, src_y, y_stride, src_cb, src_cr, c_stride);
+        }
+        self.code_whole(ctx, TreeRefs::B(ref0, ref1), out, pick, x0, y0, log2_cu, src_y, y_stride, src_cb, src_cr, c_stride)
+    }
 
-        let merge: Vec<Cand> = (0..MAX_MERGE_CAND).map(|i| merge_candidate(&self.info, &self.recon, &refs, &pu, i)).collect();
+    /// [`Self::pick_pu`] for one prediction unit of a B CU: merge over the
+    /// decoder's own candidates (both lists, the combined bi pairs and the
+    /// bi zero candidates a B slice adds) against AMVP in list 0, list 1 or
+    /// both, each list searched on its own and the bi trial scored at the
+    /// two winners. Writes no decoder-grade state either.
+    #[allow(clippy::too_many_arguments)]
+    fn pick_pu_b(&mut self, ctx: &MeCtx<'_, S>, ref0: &Frame<S>, ref1: &Frame<S>, pu: &PuPos, src_y: &[S], y_stride: usize, rate: &Rate, lam: f32) -> PuPick {
+        let (x0, y0) = (pu.x_pb as usize, pu.y_pb as usize);
+        let wh = (pu.w as usize, pu.h as usize);
+        let whole = pu.w == pu.n_cb && pu.h == pu.n_cb;
+        let refs = self.ref_ctx_b(ref0.poc, ref1.poc);
+        let merge: Vec<Cand> = (0..MAX_MERGE_CAND).map(|i| merge_candidate(&self.info, &self.recon, &refs, pu, i)).collect();
         let mvp: [[Mv; 2]; 2] = [
-            [amvp(&self.info, &self.recon, &refs, &pu, 0, 0, 0), amvp(&self.info, &self.recon, &refs, &pu, 0, 0, 1)],
-            [amvp(&self.info, &self.recon, &refs, &pu, 1, 0, 0), amvp(&self.info, &self.recon, &refs, &pu, 1, 0, 1)],
+            [amvp(&self.info, &self.recon, &refs, pu, 0, 0, 0), amvp(&self.info, &self.recon, &refs, pu, 0, 0, 1)],
+            [amvp(&self.info, &self.recon, &refs, pu, 1, 0, 0), amvp(&self.info, &self.recon, &refs, pu, 1, 0, 1)],
         ];
 
-        let soff = y0 * y_stride + x0;
-        let src = &src_y[soff..];
+        let src = &src_y[y0 * y_stride + x0..];
 
         // Per-list search. Each list is seeded from the zero vector, its
         // own two AMVP predictors, and every merge candidate that uses it.
@@ -1015,16 +1158,14 @@ impl<S: Sample> InterPicture<S> {
             // Whole samples are searched on the weighted reference where the
             // list is weighted (`search_b`), the sub-sample rings below on
             // the reference itself under the weighted scoring.
-            let full = self.search_full(ctx, self.search_b[list].as_ref().unwrap_or(plane), x0, y0, n, src, y_stride, &seeds);
+            let full = self.search_full(ctx, self.search_b[list].as_ref().unwrap_or(plane), x0, y0, wh, src, y_stride, &seeds);
             // Scored under the weighting a one-list prediction from this
             // list carries, so the vector is chosen for the prediction
             // that will be made.
             let wp = self.wp_b[list][0];
-            uni[list] = self.refine_subpel(ctx, plane, wp, list, x0, y0, n, src, y_stride, full);
+            uni[list] = self.refine_subpel(ctx, plane, wp, list, x0, y0, wh, src, y_stride, full);
         }
 
-        let lam = lambda(ctx.qp) * satd_lambda_scale(ctx.bit_depth);
-        let rate = Rate::new_at(ctx.qp, true, log2_cu, depth);
 
         // The three AMVP shapes. `inter_pred_idc` costs two bins for a uni
         // shape and one for BI (the reader stops after a set first bin),
@@ -1032,6 +1173,14 @@ impl<S: Sample> InterPicture<S> {
         // — the same approximate-bin-count placeholder policy as the rest
         // of this module.
         let mvd_for = |mv: Mv, p: Mv| Mv::new(mv.x.wrapping_sub(p.x), mv.y.wrapping_sub(p.y));
+        // A whole CU's AMVP syntax, or one unit's of two.
+        let amvp_bits = |idc: u8, mvd: [Mv; 2], fl: [u8; 2]| {
+            if whole {
+                rate.amvp_b(idc, mvd, fl, true)
+            } else {
+                rate.pu(&PuPick { idc, mvd, mvp_flag: fl, ..PuPick::default() }, true, pu, 1)
+            }
+        };
         let mut best_mvd = [Mv::ZERO; 2];
         let mut best_flag = [0u8; 2];
         for list in 0..2usize {
@@ -1043,7 +1192,7 @@ impl<S: Sample> InterPicture<S> {
                 mvd[list] = m;
                 let mut fl = [0u8; 2];
                 fl[list] = f;
-                rate.amvp_b(idc_for(list), mvd, fl, true)
+                amvp_bits(idc_for(list), mvd, fl)
             };
             let pick1 = one(b, 1) < one(a, 0);
             best_flag[list] = u8::from(pick1);
@@ -1057,17 +1206,20 @@ impl<S: Sample> InterPicture<S> {
             mvd[list] = best_mvd[list];
             let mut fl = [0u8; 2];
             fl[list] = best_flag[list];
-            let bits = rate.amvp_b(list as u8, mvd, fl, true);
+            let bits = amvp_bits(list as u8, mvd, fl);
             let cost = u.1 as f32 + lam * bits;
             if cost < best_cost {
                 best_cost = cost;
                 best = Some((list as u8, u.1));
             }
         }
-        // idc 2: the bi trial at the two winners.
-        let bi_satd = self.satd_bi_at(ctx, &ref0.y, &ref1.y, x0, y0, n, src, y_stride, uni[0].0, uni[1].0, self.wp_b[2][0]);
-        {
-            let bits = rate.amvp_b(2, best_mvd, best_flag, true);
+        // idc 2: the bi trial at the two winners — not for an 8x4 or 4x8
+        // unit, which the reader gives no PRED_BI spelling (its
+        // `inter_pred_idc` codes one bin, L0 or L1, where `w + h == 12`).
+        let bi_ok = pu.w + pu.h != 12;
+        let bi_satd = if bi_ok { self.satd_bi_at(ctx, &ref0.y, &ref1.y, x0, y0, wh, src, y_stride, uni[0].0, uni[1].0, self.wp_b[2][0]) } else { u32::MAX };
+        if bi_ok {
+            let bits = amvp_bits(2, best_mvd, best_flag);
             let cost = bi_satd as f32 + lam * bits;
             if cost < best_cost {
                 best_cost = cost;
@@ -1088,12 +1240,16 @@ impl<S: Sample> InterPicture<S> {
             }
             seen.push(key);
             let satd = match (cand.ref_idx[0] >= 0, cand.ref_idx[1] >= 0) {
-                (true, true) => self.satd_bi_at(ctx, &ref0.y, &ref1.y, x0, y0, n, src, y_stride, cand.mv[0], cand.mv[1], self.wp_b[2][0]),
-                (true, false) => self.satd_at_weighted(ctx, &ref0.y, x0, y0, n, src, y_stride, cand.mv[0], self.wp_b[0][0], 0),
-                (false, true) => self.satd_at_weighted(ctx, &ref1.y, x0, y0, n, src, y_stride, cand.mv[1], self.wp_b[1][0], 1),
+                (true, true) => self.satd_bi_at(ctx, &ref0.y, &ref1.y, x0, y0, wh, src, y_stride, cand.mv[0], cand.mv[1], self.wp_b[2][0]),
+                (true, false) => self.satd_at_weighted(ctx, &ref0.y, x0, y0, wh, src, y_stride, cand.mv[0], self.wp_b[0][0], 0),
+                (false, true) => self.satd_at_weighted(ctx, &ref1.y, x0, y0, wh, src, y_stride, cand.mv[1], self.wp_b[1][0], 1),
                 (false, false) => unreachable!("filtered above"),
             };
-            let bits = rate.skip(idx as u8).min(rate.merge(idx as u8));
+            let bits = if whole {
+                rate.skip(idx as u8).min(rate.merge(idx as u8))
+            } else {
+                rate.pu(&PuPick { merge_idx: Some(idx as u8), ..PuPick::default() }, true, pu, 1)
+            };
             let cost = satd as f32 + lam * bits;
             if cost < best_merge_cost {
                 best_merge_cost = cost;
@@ -1101,70 +1257,269 @@ impl<S: Sample> InterPicture<S> {
             }
         }
 
-        let merge_wins = best_merge.is_some_and(|_| best_merge_cost <= best_cost);
-        // The motion the winner carries, as `ref_idx` pairs the decoder
-        // would store.
-        let (mv_pair, ref_pair, inter_satd) = if merge_wins {
-            let (idx, satd) = best_merge.expect("merge_wins implies a candidate");
-            (merge[idx].mv, merge[idx].ref_idx, satd)
-        } else {
-            let mv = [uni[0].0, uni[1].0];
-            let r: [i8; 2] = match best_idc {
-                0 => [0, -1],
-                1 => [-1, 0],
-                _ => [0, 0],
-            };
-            (
-                [if r[0] >= 0 { mv[0] } else { Mv::ZERO }, if r[1] >= 0 { mv[1] } else { Mv::ZERO }],
-                r,
-                amvp_satd,
-            )
-        };
-        out.mv = mv_pair[0];
-        out.ref_idx = ref_pair[0];
-        out.mv_l1 = mv_pair[1];
-        out.ref_idx_l1 = ref_pair[1];
+        match best_merge {
+            Some((idx, satd)) if best_merge_cost <= best_cost => PuPick {
+                merge_idx: Some(idx as u8),
+                idc: 0,
+                mvd: [Mv::ZERO; 2],
+                mvp_flag: [0; 2],
+                mv: merge[idx].mv,
+                ref_idx: merge[idx].ref_idx,
+                satd,
+                cost: best_merge_cost,
+            },
+            _ => {
+                // The motion the winner carries, as `ref_idx` pairs the
+                // decoder would store.
+                let r: [i8; 2] = match best_idc {
+                    0 => [0, -1],
+                    1 => [-1, 0],
+                    _ => [0, 0],
+                };
+                PuPick {
+                    merge_idx: None,
+                    idc: best_idc,
+                    mvd: best_mvd,
+                    mvp_flag: best_flag,
+                    mv: [if r[0] >= 0 { uni[0].0 } else { Mv::ZERO }, if r[1] >= 0 { uni[1].0 } else { Mv::ZERO }],
+                    ref_idx: r,
+                    satd: amvp_satd,
+                    cost: best_cost,
+                }
+            }
+        }
+    }
 
-        if prefer_intra(ctx, inter_satd, src, y_stride, n) {
+    /// Code the CU of `1 << log2_cu` at `(x0, y0)` as one 2Nx2N prediction
+    /// unit carrying `pick`: the flatness proxy, the prediction through the
+    /// decoder's own MC — one list or both, weighted exactly as the slice
+    /// header says those lists are, and per-format chroma for free — the
+    /// residual, the kind the residual leaves (a merge with nothing left
+    /// is a skip), and the motion and marks stored exactly as the
+    /// decoder's `prediction_unit` stores them after parsing ("Store
+    /// motion", src/hevc/ctu.rs): the next CUs' candidate lists read them —
+    /// the reference index included, which is what makes a neighbour's
+    /// vector scale by the right POC distance.
+    #[allow(clippy::too_many_arguments)]
+    fn code_whole(
+        &mut self,
+        ctx: &MeCtx<'_, S>,
+        refs: TreeRefs<'_, S>,
+        mut out: InterCuDecision,
+        pick: PuPick,
+        x0: usize,
+        y0: usize,
+        log2_cu: u32,
+        src_y: &[S],
+        y_stride: usize,
+        src_cb: &[S],
+        src_cr: &[S],
+        c_stride: usize,
+    ) -> InterCuDecision {
+        let n = 1usize << log2_cu;
+        let src = &src_y[y0 * y_stride + x0..];
+        let w4 = self.info.w4;
+        out.mv = pick.mv[0];
+        out.ref_idx = pick.ref_idx[0];
+        out.mv_l1 = pick.mv[1];
+        out.ref_idx_l1 = pick.ref_idx[1];
+
+        if prefer_intra(ctx, pick.satd, src, y_stride, n) {
             out.kind = InterCuKind::UseIntra;
+            // An intra CU's motion, stored now so later candidate
+            // derivations see what the decoder will see.
             fill_motion(&mut self.recon.motion, self.recon.w4, x0, y0, n, n, MotionInfo::INTRA);
-            let w4 = self.info.w4;
             PicInfo::fill4(&mut self.info.pred_mode, w4, x0, y0, n, n, 1);
-            // Never skipped — and under the quadtree the area may still
-            // hold a skip mark from a trial that lost, which the P walk's
-            // identical fill already clears.
+            // `coding_unit` records `cu_skip_flag` for every CU before it
+            // knows the pred mode (ctu.rs:419), and the *next* CU's
+            // `cu_skip_flag` context counts skipped neighbours out of
+            // exactly this array. An intra CU is never skipped — and under
+            // the quadtree the area may still hold a skip mark from a
+            // trial that lost.
             PicInfo::fill4(&mut self.info.skip, w4, x0, y0, n, n, 0);
             return out;
         }
 
-        // The chosen prediction, through the decoder's own MC — uni or bi
-        // by which lists the winner uses, and per-format chroma for free —
-        // weighted exactly as the slice header says those lists are.
-        let r0 = (ref_pair[0] >= 0).then_some((ref0, mv_pair[0]));
-        let r1 = (ref_pair[1] >= 0).then_some((ref1, mv_pair[1]));
-        let wp = self.wp_b_for(ref_pair);
-        predict_block(ctx.dsp, &mut self.scratch, &mut self.recon, x0, y0, n, n, r0, r1, wp);
+        match refs {
+            TreeRefs::P(l0) => {
+                let r = pick.ref_idx[0] as usize;
+                let wp = self.wp_for(r);
+                predict_block(ctx.dsp, &mut self.scratch, &mut self.recon, x0, y0, n, n, Some((l0[r], pick.mv[0])), None, wp);
+            }
+            TreeRefs::B(r0, r1) => {
+                let a = (pick.ref_idx[0] >= 0).then_some((r0, pick.mv[0]));
+                let b = (pick.ref_idx[1] >= 0).then_some((r1, pick.mv[1]));
+                let wp = self.wp_b_for(pick.ref_idx);
+                predict_block(ctx.dsp, &mut self.scratch, &mut self.recon, x0, y0, n, n, a, b, wp);
+            }
+        }
 
         let any = self.code_residual_cu(ctx, x0, y0, log2_cu, src, y_stride, src_cb, src_cr, c_stride, &mut out);
-        out.kind = match (merge_wins, any) {
-            (true, false) => InterCuKind::Skip { merge_idx: best_merge.expect("merge_wins").0 as u8 },
-            (true, true) => InterCuKind::Merge { merge_idx: best_merge.expect("merge_wins").0 as u8 },
-            (false, _) => InterCuKind::BAmvp { idc: best_idc, mvd: best_mvd, mvp_flag: best_flag },
+        out.kind = match (pick.merge_idx, any, refs) {
+            (Some(merge_idx), false, _) => InterCuKind::Skip { merge_idx },
+            (Some(merge_idx), true, _) => InterCuKind::Merge { merge_idx },
+            (None, _, TreeRefs::P(_)) => InterCuKind::Amvp { mvp_flag: pick.mvp_flag[0], mvd: pick.mvd[0] },
+            (None, _, TreeRefs::B(..)) => InterCuKind::BAmvp { idc: pick.idc, mvd: pick.mvd, mvp_flag: pick.mvp_flag },
         };
 
-        // Store motion and marks exactly as `prediction_unit` does after
-        // parsing ("Store motion", src/hevc/ctu.rs), both lists this time.
-        let mut mi = MotionInfo { mv: mv_pair, ref_idx: ref_pair, ref_delta: [0; 2], flags: 0, pad: 0 };
+        let mi = self.motion_info(&pick, refs);
+        fill_motion(&mut self.recon.motion, self.recon.w4, x0, y0, n, n, mi);
+        PicInfo::fill4(&mut self.info.pred_mode, w4, x0, y0, n, n, 0);
+        PicInfo::fill4(&mut self.info.skip, w4, x0, y0, n, n, matches!(out.kind, InterCuKind::Skip { .. }) as u8);
+        out
+    }
+
+    /// The cheapest partitioned alternative for the CU of `1 << log2_cu` at
+    /// `(x0, y0)`, among the shapes [`Self::parts`] offers, or `None` when it
+    /// offers none. Each shape's two units are picked in the reader's
+    /// order, and before the second unit's candidates are derived the CU
+    /// is marked inter and the first unit's motion is in the motion grid —
+    /// what `coding_unit` and `prediction_unit` have left there for the
+    /// reader by then, and what makes the second unit's candidate list the
+    /// one the reader builds (the first unit is a neighbour of the second,
+    /// and the standard's second-unit exclusions depend on it). The grid
+    /// and the marks are put back afterwards; the caller stores the
+    /// winner's. A shape's cost is its two units' ([`PuPick::cost`]) plus
+    /// the CU syntax around them ([`Rate::parts`]), comparable with a
+    /// 2Nx2N unit's cost, which prices the whole CU's syntax.
+    #[allow(clippy::too_many_arguments)]
+    fn pick_parts(
+        &mut self,
+        ctx: &MeCtx<'_, S>,
+        refs: TreeRefs<'_, S>,
+        x0: usize,
+        y0: usize,
+        log2_cu: u32,
+        src_y: &[S],
+        y_stride: usize,
+        rate: &Rate,
+        lam: f32,
+    ) -> Option<PartsPick> {
+        let shapes: &[PartMode] = match self.parts {
+            InterParts::None => return None,
+            InterParts::Symmetric => &[PartMode::P2NxN, PartMode::PNx2N],
+        };
+        let n = 1usize << log2_cu;
+        let w4 = self.info.w4;
+        let motion = save4(&self.recon.motion, self.recon.w4, x0, y0, n);
+        let pred_mode = save4(&self.info.pred_mode, w4, x0, y0, n);
+        PicInfo::fill4(&mut self.info.pred_mode, w4, x0, y0, n, n, 0);
+        let mut best: Option<PartsPick> = None;
+        for &part in shapes {
+            let mut picks = [PuPick::default(); 2];
+            let mut cost = lam * rate.parts(part);
+            for (i, &(px, py, pw, ph)) in part.pus(n as i32).iter().enumerate() {
+                let pu = PuPos { x_cb: x0 as i32, y_cb: y0 as i32, n_cb: n as i32, x_pb: x0 as i32 + px, y_pb: y0 as i32 + py, w: pw, h: ph, part_idx: i as u32 };
+                let pick = match refs {
+                    TreeRefs::P(l0) => self.pick_pu(ctx, l0, &pu, src_y, y_stride, rate, lam),
+                    TreeRefs::B(r0, r1) => self.pick_pu_b(ctx, r0, r1, &pu, src_y, y_stride, rate, lam),
+                };
+                cost += pick.cost;
+                picks[i] = pick;
+                if i == 0 {
+                    let mi = self.motion_info(&pick, refs);
+                    fill_motion(&mut self.recon.motion, self.recon.w4, pu.x_pb as usize, pu.y_pb as usize, pw as usize, ph as usize, mi);
+                }
+            }
+            restore4(&mut self.recon.motion, self.recon.w4, x0, y0, n, &motion);
+            if best.as_ref().is_none_or(|b| cost < b.2) {
+                best = Some((part, picks, cost));
+            }
+        }
+        restore4(&mut self.info.pred_mode, w4, x0, y0, n, &pred_mode);
+        best
+    }
+
+    /// The motion `prediction_unit` stores for a unit carrying `pick`: its
+    /// vectors and reference indices, and the POC distance of each list it
+    /// uses — which is what makes a neighbour's vector scale right in a
+    /// later unit's candidate derivation.
+    fn motion_info(&self, pick: &PuPick, refs: TreeRefs<'_, S>) -> MotionInfo {
+        let mut mi = MotionInfo { mv: pick.mv, ref_delta: [0; 2], ref_idx: pick.ref_idx, flags: 0, pad: 0 };
         for list in 0..2usize {
-            if ref_pair[list] >= 0 {
-                let poc = if list == 0 { ref0.poc } else { ref1.poc };
+            if pick.ref_idx[list] >= 0 {
+                let poc = match refs {
+                    TreeRefs::P(l0) => l0[pick.ref_idx[0] as usize].poc,
+                    TreeRefs::B(r0, r1) => {
+                        if list == 0 {
+                            r0.poc
+                        } else {
+                            r1.poc
+                        }
+                    }
+                };
                 mi.ref_delta[list] = (self.cur_poc - poc).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
             }
         }
-        fill_motion(&mut self.recon.motion, self.recon.w4, x0, y0, n, n, mi);
+        mi
+    }
+
+    /// Code the CU of `1 << log2_cu` at `(x0, y0)` as the partitioned shape
+    /// `part` whose two units carry `pus` ([`Self::pick_parts`]'s winner):
+    /// the flatness proxy against the units' summed SATD, then each unit
+    /// predicted through the decoder's own MC, one residual over the whole
+    /// CU (one CU-sized transform unit — the SPS's
+    /// `max_transform_hierarchy_depth_inter` of 2 infers no split), and the
+    /// motion and marks stored per unit as `prediction_unit` stores them.
+    #[allow(clippy::too_many_arguments)]
+    fn code_parts(
+        &mut self,
+        ctx: &MeCtx<'_, S>,
+        refs: TreeRefs<'_, S>,
+        mut out: InterCuDecision,
+        part: PartMode,
+        pus: [PuPick; 2],
+        x0: usize,
+        y0: usize,
+        log2_cu: u32,
+        src_y: &[S],
+        y_stride: usize,
+        src_cb: &[S],
+        src_cr: &[S],
+        c_stride: usize,
+    ) -> InterCuDecision {
+        let n = 1usize << log2_cu;
+        let src = &src_y[y0 * y_stride + x0..];
         let w4 = self.info.w4;
+        out.part = part;
+        out.pus = pus;
+        out.mv = pus[0].mv[0];
+        out.ref_idx = pus[0].ref_idx[0];
+        out.mv_l1 = pus[0].mv[1];
+        out.ref_idx_l1 = pus[0].ref_idx[1];
+        if prefer_intra(ctx, pus[0].satd.saturating_add(pus[1].satd), src, y_stride, n) {
+            out.kind = InterCuKind::UseIntra;
+            out.part = PartMode::P2Nx2N;
+            fill_motion(&mut self.recon.motion, self.recon.w4, x0, y0, n, n, MotionInfo::INTRA);
+            PicInfo::fill4(&mut self.info.pred_mode, w4, x0, y0, n, n, 1);
+            PicInfo::fill4(&mut self.info.skip, w4, x0, y0, n, n, 0);
+            return out;
+        }
+        let rects = part.pus(n as i32);
+        for (pk, &(px, py, pw, ph)) in pus.iter().zip(rects.iter()) {
+            let (x, y) = (x0 + px as usize, y0 + py as usize);
+            match refs {
+                TreeRefs::P(l0) => {
+                    let r = pk.ref_idx[0] as usize;
+                    let wp = self.wp_for(r);
+                    predict_block(ctx.dsp, &mut self.scratch, &mut self.recon, x, y, pw as usize, ph as usize, Some((l0[r], pk.mv[0])), None, wp);
+                }
+                TreeRefs::B(r0, r1) => {
+                    let a = (pk.ref_idx[0] >= 0).then_some((r0, pk.mv[0]));
+                    let b = (pk.ref_idx[1] >= 0).then_some((r1, pk.mv[1]));
+                    let wp = self.wp_b_for(pk.ref_idx);
+                    predict_block(ctx.dsp, &mut self.scratch, &mut self.recon, x, y, pw as usize, ph as usize, a, b, wp);
+                }
+            }
+        }
+        self.code_residual_cu(ctx, x0, y0, log2_cu, src, y_stride, src_cb, src_cr, c_stride, &mut out);
+        out.kind = InterCuKind::Parts;
+        for (pk, &(px, py, pw, ph)) in pus.iter().zip(rects.iter()) {
+            let mi = self.motion_info(pk, refs);
+            fill_motion(&mut self.recon.motion, self.recon.w4, x0 + px as usize, y0 + py as usize, pw as usize, ph as usize, mi);
+        }
         PicInfo::fill4(&mut self.info.pred_mode, w4, x0, y0, n, n, 0);
-        PicInfo::fill4(&mut self.info.skip, w4, x0, y0, n, n, matches!(out.kind, InterCuKind::Skip { .. }) as u8);
+        PicInfo::fill4(&mut self.info.skip, w4, x0, y0, n, n, 0);
         out
     }
 
@@ -1446,6 +1801,33 @@ impl<S: Sample> InterPicture<S> {
         let n = 1usize << log2;
         let ssd = cu_ssd(ctx, &self.recon, self.cat, x0, y0, n, src);
         let bits = crate::encode::h265::p_cu_bits(&coded, self.cat, ctx.qp, ctx.bypass, is_b, nref, depth);
+        // A 2Nx2N unit and a partitioned shape were chosen between in SATD
+        // plus bits (`code_cu`); when the loser came close, code it too and
+        // keep the cheaper in SSD plus lambda times the CU's bits, the
+        // loser's state put back from a copy. See `PARTS_RD_MARGIN`.
+        if let (Some((whole, Some((part, pus, parts_cost)))), PCuDecision::Inter(d)) = (self.alts.take(), &coded) {
+            let chose_parts = d.kind == InterCuKind::Parts;
+            let (mine, other) = if chose_parts { (parts_cost, whole.cost) } else { (whole.cost, parts_cost) };
+            if other <= mine * (1.0 + PARTS_RD_MARGIN) {
+                let saved = TrialSave::take(self, x0, y0, n);
+                let out = InterCuDecision { log2_cu: log2, bypass: ctx.bypass, qp_y: ctx.qp, ..InterCuDecision::default() };
+                let alt = if chose_parts {
+                    self.code_whole(ctx, refs, out, whole, x0, y0, log2, src.y, src.y_stride, src.cb, src.cr, src.c_stride)
+                } else {
+                    self.code_parts(ctx, refs, out, part, pus, x0, y0, log2, src.y, src.y_stride, src.cb, src.cr, src.c_stride)
+                };
+                if alt.kind != InterCuKind::UseIntra {
+                    let alt = PCuDecision::Inter(alt);
+                    let ssd_a = cu_ssd(ctx, &self.recon, self.cat, x0, y0, n, src);
+                    let bits_a = crate::encode::h265::p_cu_bits(&alt, self.cat, ctx.qp, ctx.bypass, is_b, nref, depth);
+                    let lam = ssd_lambda(ctx.qp, ctx.bit_depth);
+                    if (ssd_a as f64) + lam * f64::from(bits_a) < (ssd as f64) + lam * f64::from(bits) {
+                        return (alt, ssd_a, bits_a);
+                    }
+                }
+                saved.put(self, x0, y0, n);
+            }
+        }
         // An intra unit at the minimum coding block has a second shape, as
         // in an I picture: code `PART_NxN` too and keep the cheaper, the
         // loser's state put back from a copy.
@@ -1488,16 +1870,16 @@ impl<S: Sample> InterPicture<S> {
     /// decoder's `>> 2` addresses them), returning the best vector in
     /// quarter units.
     #[allow(clippy::too_many_arguments)]
-    fn search_full(&self, ctx: &MeCtx<'_, S>, refp: &Plane16<S>, x: usize, y: usize, n: usize, src: &[S], src_stride: usize, seeds: &[Mv]) -> Mv {
+    fn search_full(&self, ctx: &MeCtx<'_, S>, refp: &Plane16<S>, x: usize, y: usize, (w, h): (usize, usize), src: &[S], src_stride: usize, seeds: &[Mv]) -> Mv {
         let clamp_pos = |fx: i32, fy: i32| -> (i32, i32) {
             let pad = refp.pad as i32;
-            let xi = (x as i32 + fx).clamp(-pad, refp.width as i32 + pad - n as i32);
-            let yi = (y as i32 + fy).clamp(-pad, refp.height as i32 + pad - n as i32);
+            let xi = (x as i32 + fx).clamp(-pad, refp.width as i32 + pad - w as i32);
+            let yi = (y as i32 + fy).clamp(-pad, refp.height as i32 + pad - h as i32);
             (xi - x as i32, yi - y as i32)
         };
         let sad_of = |fx: i32, fy: i32| -> u32 {
             let off = refp.offset((x as i32 + fx) as isize, (y as i32 + fy) as isize);
-            (ctx.dist.sad)(src, src_stride, &refp.data[off..], refp.stride, n, n)
+            (ctx.dist.sad)(src, src_stride, &refp.data[off..], refp.stride, w, h)
         };
         let mut best = (0i32, 0i32);
         let mut best_sad = u32::MAX;
@@ -1541,9 +1923,9 @@ impl<S: Sample> InterPicture<S> {
     /// under `wp`, the luma weighting a one-list prediction from `list`
     /// carries (see [`Self::satd_at_weighted`]).
     #[allow(clippy::too_many_arguments)]
-    fn refine_subpel(&mut self, ctx: &MeCtx<'_, S>, refp: &Plane16<S>, wp: Weighting, list: usize, x: usize, y: usize, n: usize, src: &[S], src_stride: usize, start: Mv) -> (Mv, u32) {
+    fn refine_subpel(&mut self, ctx: &MeCtx<'_, S>, refp: &Plane16<S>, wp: Weighting, list: usize, x: usize, y: usize, wh: (usize, usize), src: &[S], src_stride: usize, start: Mv) -> (Mv, u32) {
         let mut best = start;
-        let mut best_satd = self.satd_at_weighted(ctx, refp, x, y, n, src, src_stride, start, wp, list);
+        let mut best_satd = self.satd_at_weighted(ctx, refp, x, y, wh, src, src_stride, start, wp, list);
         for step in [2i16, 1] {
             let centre = best;
             for dy in [-step, 0, step] {
@@ -1552,7 +1934,7 @@ impl<S: Sample> InterPicture<S> {
                         continue;
                     }
                     let mv = Mv::new(centre.x.wrapping_add(dx), centre.y.wrapping_add(dy));
-                    let satd = self.satd_at_weighted(ctx, refp, x, y, n, src, src_stride, mv, wp, list);
+                    let satd = self.satd_at_weighted(ctx, refp, x, y, wh, src, src_stride, mv, wp, list);
                     if satd < best_satd {
                         best_satd = satd;
                         best = mv;
@@ -1568,9 +1950,9 @@ impl<S: Sample> InterPicture<S> {
     /// `source` in `src/hevc/inter.rs`, and the sample-domain stage is the
     /// default uni-prediction the decoder applies.
     #[allow(clippy::too_many_arguments)]
-    fn satd_at(&mut self, ctx: &MeCtx<'_, S>, refp: &Plane16<S>, r: usize, x: usize, y: usize, n: usize, src: &[S], src_stride: usize, mv: Mv) -> u32 {
+    fn satd_at(&mut self, ctx: &MeCtx<'_, S>, refp: &Plane16<S>, r: usize, x: usize, y: usize, wh: (usize, usize), src: &[S], src_stride: usize, mv: Mv) -> u32 {
         let wp = self.wp_for(r)[0];
-        self.satd_at_weighted(ctx, refp, x, y, n, src, src_stride, mv, wp, 0)
+        self.satd_at_weighted(ctx, refp, x, y, wh, src, src_stride, mv, wp, 0)
     }
 
     /// [`Self::satd_at`] under a given luma weighting: the default
@@ -1579,16 +1961,16 @@ impl<S: Sample> InterPicture<S> {
     /// `predict_block` takes for a one-list prediction from that list, and
     /// the same kernel it will commit the winner through.
     #[allow(clippy::too_many_arguments)]
-    fn satd_at_weighted(&mut self, ctx: &MeCtx<'_, S>, refp: &Plane16<S>, x: usize, y: usize, n: usize, src: &[S], src_stride: usize, mv: Mv, wp: Weighting, list: usize) -> u32 {
+    fn satd_at_weighted(&mut self, ctx: &MeCtx<'_, S>, refp: &Plane16<S>, x: usize, y: usize, (w, h): (usize, usize), src: &[S], src_stride: usize, mv: Mv, wp: Weighting, list: usize) -> u32 {
         let InterPicture { swin, stmp, spred14, spred, .. } = self;
-        predict14(ctx, refp, x, y, n, mv, swin, stmp, spred14);
+        predict14(ctx, refp, x, y, (w, h), mv, swin, stmp, spred14);
         let bd = ctx.bit_depth;
         let max = (1i32 << bd) - 1;
         match wp {
-            Weighting::Default => (ctx.dsp.uni)(spred, n, spred14, n, n, 14 - bd as i32, max),
-            Weighting::Explicit { log2_wd, w, o } => (ctx.dsp.weighted_uni)(spred, n, spred14, n, n, log2_wd, w[list], o[list], max),
+            Weighting::Default => (ctx.dsp.uni)(spred, w, spred14, w, h, 14 - bd as i32, max),
+            Weighting::Explicit { log2_wd, w: wt, o } => (ctx.dsp.weighted_uni)(spred, w, spred14, w, h, log2_wd, wt[list], o[list], max),
         }
-        (ctx.dist.satd)(src, src_stride, spred, n, n, n)
+        (ctx.dist.satd)(src, src_stride, spred, w, w, h)
     }
 
     /// The model check for weighted prediction: the luma SATD of the CU
@@ -1600,8 +1982,8 @@ impl<S: Sample> InterPicture<S> {
         let n = 1usize << log2_cu;
         let src = &src_y[y0 * y_stride + x0..];
         let wp = self.wp_for(r)[0];
-        let plain = self.satd_at_weighted(ctx, &refp.y, x0, y0, n, src, y_stride, mv, Weighting::Default, 0);
-        let weighted = self.satd_at_weighted(ctx, &refp.y, x0, y0, n, src, y_stride, mv, wp, 0);
+        let plain = self.satd_at_weighted(ctx, &refp.y, x0, y0, (n, n), src, y_stride, mv, Weighting::Default, 0);
+        let weighted = self.satd_at_weighted(ctx, &refp.y, x0, y0, (n, n), src, y_stride, mv, wp, 0);
         (plain, weighted)
     }
 
@@ -1628,13 +2010,13 @@ impl<S: Sample> InterPicture<S> {
         let wp = self.wp_b_for(ref_idx)[0];
         match (ref_idx[0] >= 0, ref_idx[1] >= 0) {
             (true, true) => {
-                let plain = self.satd_bi_at(ctx, &ref0.y, &ref1.y, x0, y0, n, src, y_stride, mv[0], mv[1], Weighting::Default);
-                (plain, self.satd_bi_at(ctx, &ref0.y, &ref1.y, x0, y0, n, src, y_stride, mv[0], mv[1], wp))
+                let plain = self.satd_bi_at(ctx, &ref0.y, &ref1.y, x0, y0, (n, n), src, y_stride, mv[0], mv[1], Weighting::Default);
+                (plain, self.satd_bi_at(ctx, &ref0.y, &ref1.y, x0, y0, (n, n), src, y_stride, mv[0], mv[1], wp))
             }
             (one0, _) => {
                 let (refp, list) = if one0 { (&ref0.y, 0) } else { (&ref1.y, 1) };
-                let plain = self.satd_at_weighted(ctx, refp, x0, y0, n, src, y_stride, mv[list], Weighting::Default, list);
-                (plain, self.satd_at_weighted(ctx, refp, x0, y0, n, src, y_stride, mv[list], wp, list))
+                let plain = self.satd_at_weighted(ctx, refp, x0, y0, (n, n), src, y_stride, mv[list], Weighting::Default, list);
+                (plain, self.satd_at_weighted(ctx, refp, x0, y0, (n, n), src, y_stride, mv[list], wp, list))
             }
         }
     }
@@ -1656,7 +2038,7 @@ impl<S: Sample> InterPicture<S> {
         ref1: &Plane16<S>,
         x: usize,
         y: usize,
-        n: usize,
+        (w, h): (usize, usize),
         src: &[S],
         src_stride: usize,
         mv0: Mv,
@@ -1664,15 +2046,15 @@ impl<S: Sample> InterPicture<S> {
         wp: Weighting,
     ) -> u32 {
         let InterPicture { swin, stmp, spred14, spred14_b, spred, .. } = self;
-        predict14(ctx, ref0, x, y, n, mv0, swin, stmp, spred14);
-        predict14(ctx, ref1, x, y, n, mv1, swin, stmp, spred14_b);
+        predict14(ctx, ref0, x, y, (w, h), mv0, swin, stmp, spred14);
+        predict14(ctx, ref1, x, y, (w, h), mv1, swin, stmp, spred14_b);
         let bd = ctx.bit_depth;
         let max = (1i32 << bd) - 1;
         match wp {
-            Weighting::Default => (ctx.dsp.bi)(spred, n, spred14, spred14_b, n, n, 15 - bd as i32, max),
-            Weighting::Explicit { log2_wd, w, o } => (ctx.dsp.weighted_bi)(spred, n, spred14, spred14_b, n, n, log2_wd, w[0], w[1], o[0], o[1], max),
+            Weighting::Default => (ctx.dsp.bi)(spred, w, spred14, spred14_b, w, h, 15 - bd as i32, max),
+            Weighting::Explicit { log2_wd, w: wt, o } => (ctx.dsp.weighted_bi)(spred, w, spred14, spred14_b, w, h, log2_wd, wt[0], wt[1], o[0], o[1], max),
         }
-        (ctx.dist.satd)(src, src_stride, spred, n, n, n)
+        (ctx.dist.satd)(src, src_stride, spred, w, w, h)
     }
 }
 
@@ -1745,8 +2127,8 @@ impl<S: Sample> TrialSave<S> {
     }
 }
 
-/// One list's 14-bit luma prediction of the `n x n` block at `(x, y)` for
-/// vector `mv`, into `out`. The window gathering and the kernel choice are
+/// One list's 14-bit luma prediction of the `w x h` block at `(x, y)` for
+/// vector `mv`, into `out` (stride `w`). The window gathering and the kernel choice are
 /// `hevc::inter`'s `source` and `interp` (3 taps before the sample, 4
 /// after; `qpel_copy` / `_h` / `_v` / `_h`+`_v2` by fraction), which is
 /// what keeps a scored candidate identical to what `predict_block` will
@@ -1761,7 +2143,7 @@ fn predict14<S: Sample>(
     refp: &Plane16<S>,
     x: usize,
     y: usize,
-    n: usize,
+    (w, h): (usize, usize),
     mv: Mv,
     swin: &mut [S],
     stmp: &mut [i16],
@@ -1776,7 +2158,7 @@ fn predict14<S: Sample>(
     // The filter window (3 samples before, 4 after), gathered with
     // clamping when it leaves the padded plane — `source`'s rule.
     let (x0, y0) = (xi - 3, yi - 3);
-    let (ww, hh) = (n + 7, n + 7);
+    let (ww, hh) = (w + 7, h + 7);
     let pad = refp.pad as i32;
     let inside = x0 >= -pad && y0 >= -pad && x0 + ww as i32 <= refp.width as i32 + pad && y0 + hh as i32 <= refp.height as i32 + pad;
     let (win, stride) = if inside {
@@ -1791,12 +2173,12 @@ fn predict14<S: Sample>(
     };
     let at_block = 3 * stride + 3;
     match (fx, fy) {
-        (0, 0) => (ctx.dsp.qpel_copy)(out, &win[at_block..], stride, n, n, shift3),
-        (_, 0) => (ctx.dsp.qpel_h)(out, &win[3 * stride..], stride, n, n, fx, shift1),
-        (0, _) => (ctx.dsp.qpel_v)(out, &win[3..], stride, n, n, fy, shift1),
+        (0, 0) => (ctx.dsp.qpel_copy)(out, &win[at_block..], stride, w, h, shift3),
+        (_, 0) => (ctx.dsp.qpel_h)(out, &win[3 * stride..], stride, w, h, fx, shift1),
+        (0, _) => (ctx.dsp.qpel_v)(out, &win[3..], stride, w, h, fy, shift1),
         _ => {
-            (ctx.dsp.qpel_h)(stmp, win, stride, n, n + 7, fx, shift1);
-            (ctx.dsp.qpel_v2)(out, stmp, n, n, n, fy);
+            (ctx.dsp.qpel_h)(stmp, win, stride, w, h + 7, fx, shift1);
+            (ctx.dsp.qpel_v2)(out, stmp, w, w, h, fy);
         }
     }
 }
@@ -1949,6 +2331,27 @@ impl Rate {
         })
     }
 
+    /// What a partitioned CU spells around its two prediction units:
+    /// `split_cu_flag` and `cu_skip_flag` 0 (the prefix), `pred_mode_flag`,
+    /// `part_mode` and `rqt_root_cbf` 1. The units' own syntax is
+    /// [`Rate::pu`], so a shape is priced as this plus its two units.
+    pub(crate) fn parts(&self, part: PartMode) -> f32 {
+        self.count(|e, cx| {
+            self.prefix(e, cx, false);
+            write_pred_mode_flag(e, cx, false);
+            write_part_mode_inter_at(e, cx, part, self.log2_cu, MIN_CB_LOG2, false);
+            write_rqt_root_cbf(e, cx, true);
+        })
+    }
+
+    /// One prediction unit of a partitioned CU: `merge_flag`, then its
+    /// `merge_idx` or its AMVP syntax, exactly as `write_prediction_unit`
+    /// spells it for the unit `pu`, in a B slice or a P slice of `nref`
+    /// active list-0 references.
+    pub(crate) fn pu(&self, sig: &PuPick, is_b: bool, pu: &PuPos, nref: u32) -> f32 {
+        self.count(|e, cx| write_prediction_unit(e, cx, sig, is_b, pu.w, pu.h, self.depth, nref))
+    }
+
     /// B-slice AMVP: `inter_pred_idc`, then per list — interleaved as
     /// `prediction_unit` reads them — the `mvd` and `mvp_lX_flag` of each
     /// list the shape uses.
@@ -1974,6 +2377,44 @@ impl Rate {
             }
             write_rqt_root_cbf(e, cx, root_cbf);
         })
+    }
+}
+
+/// Spell one prediction unit of a partitioned CU in `prediction_unit`'s
+/// order: `merge_flag`; then `merge_idx`, or `inter_pred_idc` (B slices
+/// only, for the `w` by `h` unit at coding-tree depth `depth`) and, for each
+/// list the unit uses, `ref_idx` (only where the list has more than one
+/// active reference, which here is list 0 of a P slice with `nref` above
+/// one), `mvd` and `mvp_lX_flag`. A 2Nx2N CU's single unit is spelled by the
+/// CU writer, whose shapes (skip, and the inferred `rqt_root_cbf` of a
+/// merge) exist only there.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_prediction_unit(e: &mut CabacEncoder, cx: &mut Contexts, pu: &PuPick, is_b: bool, w: i32, h: i32, depth: u32, nref: u32) {
+    if let Some(idx) = pu.merge_idx {
+        write_merge_flag(e, cx, true);
+        write_merge_idx(e, cx, MAX_MERGE_CAND as u32, u32::from(idx));
+        return;
+    }
+    write_merge_flag(e, cx, false);
+    debug_assert!(is_b || pu.idc == 0, "a P unit predicts from list 0");
+    debug_assert!(pu.idc != 2 || w + h != 12, "an 8x4 or 4x8 unit has no PRED_BI");
+    if is_b {
+        write_inter_pred_idc(e, cx, w, h, depth, u32::from(pu.idc));
+    }
+    for list in 0..2usize {
+        let uses = match pu.idc {
+            0 => list == 0,
+            1 => list == 1,
+            _ => true,
+        };
+        if !uses {
+            continue;
+        }
+        if list == 0 && !is_b && nref > 1 {
+            write_ref_idx(e, cx, nref, u32::from(pu.ref_idx[0].max(0) as u8));
+        }
+        write_mvd(e, cx, pu.mvd[list]);
+        write_mvp_flag(e, cx, pu.mvp_flag[list] != 0);
     }
 }
 
@@ -2319,7 +2760,9 @@ mod tests {
                     // would desync — such a CU must have been Skip.
                     assert!(d.rqt_root_cbf, "cu {i}: a zero-residual merge CU escaped becoming Skip")
                 }
-                InterCuKind::Amvp { .. } | InterCuKind::BAmvp { .. } | InterCuKind::UseIntra => {}
+                // A partitioned CU codes rqt_root_cbf, so either value is
+                // spellable.
+                InterCuKind::Amvp { .. } | InterCuKind::BAmvp { .. } | InterCuKind::Parts | InterCuKind::UseIntra => {}
             }
         }
     }
@@ -2745,6 +3188,7 @@ mod tests {
                     (mv, r)
                 }
                 InterCuKind::Amvp { .. } => unreachable!("the B walk never produces the P shape"),
+                InterCuKind::Parts => unreachable!("this replay codes whole units: the walk it drives leaves partitions off"),
                 InterCuKind::UseIntra => {
                     fill_motion(&mut frame.motion, frame.w4, x0, y0, n, n, MotionInfo::INTRA);
                     PicInfo::fill4(&mut info.pred_mode, w4, x0, y0, n, n, 1);
@@ -2934,6 +3378,7 @@ mod tests {
                     Mv::new(mvp.x.wrapping_add(mvd.x), mvp.y.wrapping_add(mvd.y))
                 }
                 InterCuKind::BAmvp { .. } => unreachable!("this replay drives the P walk, which never produces a B shape"),
+                InterCuKind::Parts => unreachable!("this replay codes whole units: the walk it drives leaves partitions off"),
                 InterCuKind::UseIntra => {
                     fill_motion(&mut frame.motion, frame.w4, x0, y0, n, n, MotionInfo::INTRA);
                     PicInfo::fill4(&mut info.pred_mode, w4, x0, y0, n, n, 1);
