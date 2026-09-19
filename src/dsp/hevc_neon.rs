@@ -16,6 +16,10 @@ use crate::hevc::tables::{EPEL_FILTERS, QPEL_FILTERS, TRANSFORM32};
 /// Replace the scalar entries of `d` with the NEON kernels.
 pub fn install(d: &mut HevcDsp<u16>) {
     d.idct = [idct_neon::<4>, idct_neon::<8>, idct_neon::<16>, idct_neon::<32>];
+    d.idst4 = idst4_neon;
+    d.intra_planar = intra_planar_neon::<u16>;
+    d.intra_dc = intra_dc_neon::<u16>;
+    d.intra_angular = intra_angular_neon::<u16>;
     d.add_residual = add_residual_neon;
     d.qpel_copy = copy_neon;
     d.qpel_h = qpel_h_neon;
@@ -29,6 +33,11 @@ pub fn install(d: &mut HevcDsp<u16>) {
     d.bi = bi_neon;
     d.weighted_uni = weighted_uni_neon;
     d.weighted_bi = weighted_bi_neon;
+    d.qpel_uni = qpel_uni_neon;
+    d.epel_uni = epel_uni_neon;
+    d.qpel_bi = qpel_bi_neon;
+    d.epel_bi = epel_bi_neon;
+    d.fused_mc = true;
     d.sao_band = sao_band_neon;
     d.sao_edge = sao_edge_neon;
     d.deblock_luma_v = deblock_luma_v_neon;
@@ -118,6 +127,65 @@ unsafe fn clip_u16(v: int16x8_t, maxv: int16x8_t) -> uint16x8_t {
     unsafe { vreinterpretq_u16_s16(vminq_s16(vmaxq_s16(v, vdupq_n_s16(0)), maxv)) }
 }
 
+/// What a FIR stage produces: 14-bit predictions (the two-pass path and
+/// the first stage of hv) ...
+const MODE_I16: u8 = 0;
+/// ... default-weighted uni-prediction samples ...
+const MODE_UNI: u8 = 1;
+/// ... or default-weighted bi-prediction samples.
+const MODE_BI: u8 = 2;
+
+/// Where a FIR stage writes, by `MODE_*`, and the depth-dependent shift and
+/// clip of the sample modes (as in `super::hevc_x86_128`'s `Out16`).
+#[derive(Clone, Copy)]
+struct Out16 {
+    /// `MODE_I16`: 14-bit predictions, stride `w`.
+    i16: *mut i16,
+    /// `MODE_UNI` / `MODE_BI`: samples, stride `stride`.
+    dst: *mut u16,
+    /// Sample stride.
+    stride: usize,
+    /// `MODE_BI`: the other list's 14-bit prediction, stride `w`.
+    other: *const i16,
+    /// Block width (the stride of `i16` and `other`).
+    w: usize,
+    /// `14 - BitDepth` (uni) or `15 - BitDepth` (bi).
+    shift: i32,
+    /// `(1 << BitDepth) - 1`.
+    max: i32,
+}
+
+impl Out16 {
+    /// 14-bit predictions into `dst`, stride `w`.
+    fn i16(dst: *mut i16, w: usize) -> Self {
+        Out16 { i16: dst, dst: std::ptr::null_mut(), stride: 0, other: std::ptr::null(), w, shift: 0, max: 0 }
+    }
+}
+
+/// Emit 8 lanes of a stage's output (`v`, 14-bit) at (`row`, `x`), the
+/// first `n`: stored as they are, or finished as [`uni_neon`] /
+/// [`bi_neon`] finish a stored prediction, lane for lane.
+#[inline(always)]
+unsafe fn emit16<const MODE: u8>(out: &Out16, row: usize, x: usize, v: int16x8_t, n: usize) {
+    unsafe {
+        let maxv = vdupq_n_s16(out.max as i16);
+        match MODE {
+            MODE_I16 => store_n(out.i16.add(row * out.w + x), v, n),
+            MODE_UNI => {
+                let r = vshlq_s16(vqaddq_s16(v, vdupq_n_s16(1 << (out.shift - 1))), vdupq_n_s16(-(out.shift as i16)));
+                store_n_u16(out.dst.add(row * out.stride + x), clip_u16(r, maxv), n);
+            }
+            _ => {
+                let o = load_n(out.other.add(row * out.w + x), n);
+                let round = vdupq_n_s32(1 << (out.shift - 1));
+                let lo = vaddq_s32(vaddl_s16(vget_low_s16(o), vget_low_s16(v)), round);
+                let hi = vaddq_s32(vaddl_high_s16(o, v), round);
+                store_n_u16(out.dst.add(row * out.stride + x), clip_u16(narrow_shift(lo, hi, out.shift), maxv), n);
+            }
+        }
+    }
+}
+
 // ----------------------------------------------------------------------
 // Interpolation
 // ----------------------------------------------------------------------
@@ -141,7 +209,7 @@ fn copy_neon(dst: &mut [i16], src: &[u16], src_stride: usize, w: usize, h: usize
 
 /// Horizontal FIR over u16 samples: `src` at the first tap.
 #[inline(always)]
-unsafe fn fir_h<const TAPS: usize>(dst: *mut i16, src: *const u16, src_stride: usize, w: usize, h: usize, taps: &[i8], shift: i32) {
+unsafe fn fir_h<const TAPS: usize, const MODE: u8>(out: &Out16, src: *const u16, src_stride: usize, w: usize, h: usize, taps: &[i8], shift: i32) {
     unsafe {
         let mut c = [0i16; 8];
         for k in 0..TAPS {
@@ -149,7 +217,6 @@ unsafe fn fir_h<const TAPS: usize>(dst: *mut i16, src: *const u16, src_stride: u
         }
         for y in 0..h {
             let s = src.add(y * src_stride);
-            let d = dst.add(y * w);
             let mut x = 0;
             while x < w {
                 let mut lo = vdupq_n_s32(0);
@@ -159,23 +226,22 @@ unsafe fn fir_h<const TAPS: usize>(dst: *mut i16, src: *const u16, src_stride: u
                     lo = vmlal_n_s16(lo, vget_low_s16(v), c[k]);
                     hi = vmlal_high_n_s16(hi, v, c[k]);
                 }
-                store_n(d.add(x), narrow_shift(lo, hi, shift), (w - x).min(8));
+                emit16::<MODE>(out, y, x, narrow_shift(lo, hi, shift), (w - x).min(8));
                 x += 8;
             }
         }
     }
 }
 
-/// Vertical FIR over u16 (`T = u16`) or i16 (`T = i16`) rows.
+/// Vertical FIR over u16 (reinterpreted, samples below 2^15) or i16 rows.
 #[inline(always)]
-unsafe fn fir_v<const TAPS: usize>(dst: *mut i16, src: *const i16, src_stride: usize, w: usize, h: usize, taps: &[i8], shift: i32) {
+unsafe fn fir_v<const TAPS: usize, const MODE: u8>(out: &Out16, src: *const i16, src_stride: usize, w: usize, h: usize, taps: &[i8], shift: i32) {
     unsafe {
         let mut c = [0i16; 8];
         for k in 0..TAPS {
             c[k] = taps[k] as i16;
         }
         for y in 0..h {
-            let d = dst.add(y * w);
             let mut x = 0;
             while x < w {
                 let mut lo = vdupq_n_s32(0);
@@ -185,7 +251,7 @@ unsafe fn fir_v<const TAPS: usize>(dst: *mut i16, src: *const i16, src_stride: u
                     lo = vmlal_n_s16(lo, vget_low_s16(v), c[k]);
                     hi = vmlal_high_n_s16(hi, v, c[k]);
                 }
-                store_n(d.add(x), narrow_shift(lo, hi, shift), (w - x).min(8));
+                emit16::<MODE>(out, y, x, narrow_shift(lo, hi, shift), (w - x).min(8));
                 x += 8;
             }
         }
@@ -196,7 +262,7 @@ fn qpel_h_neon(dst: &mut [i16], src: &[u16], src_stride: usize, w: usize, h: usi
     if !fits(src.len(), src_stride, h, w, 8) {
         return (HevcDsp::<u16>::SCALAR.qpel_h)(dst, src, src_stride, w, h, frac, shift);
     }
-    unsafe { fir_h::<8>(dst.as_mut_ptr(), src.as_ptr(), src_stride, w, h, &QPEL_FILTERS[frac][..8], shift) }
+    unsafe { fir_h::<8, MODE_I16>(&Out16::i16(dst.as_mut_ptr(), w), src.as_ptr(), src_stride, w, h, &QPEL_FILTERS[frac][..8], shift) }
 }
 
 fn qpel_v_neon(dst: &mut [i16], src: &[u16], src_stride: usize, w: usize, h: usize, frac: usize, shift: i32) {
@@ -204,35 +270,131 @@ fn qpel_v_neon(dst: &mut [i16], src: &[u16], src_stride: usize, w: usize, h: usi
         return (HevcDsp::<u16>::SCALAR.qpel_v)(dst, src, src_stride, w, h, frac, shift);
     }
     // Samples < 2^15: reinterpreting the u16 plane as i16 is exact.
-    unsafe { fir_v::<8>(dst.as_mut_ptr(), src.as_ptr() as *const i16, src_stride, w, h, &QPEL_FILTERS[frac][..8], shift) }
+    unsafe { fir_v::<8, MODE_I16>(&Out16::i16(dst.as_mut_ptr(), w), src.as_ptr() as *const i16, src_stride, w, h, &QPEL_FILTERS[frac][..8], shift) }
 }
 
 pub(super) fn qpel_v2_neon(dst: &mut [i16], src: &[i16], src_stride: usize, w: usize, h: usize, frac: usize) {
     if !fits(src.len(), src_stride, h + 7, w, 0) {
         return (HevcDsp::<u16>::SCALAR.qpel_v2)(dst, src, src_stride, w, h, frac);
     }
-    unsafe { fir_v::<8>(dst.as_mut_ptr(), src.as_ptr(), src_stride, w, h, &QPEL_FILTERS[frac][..8], 6) }
+    unsafe { fir_v::<8, MODE_I16>(&Out16::i16(dst.as_mut_ptr(), w), src.as_ptr(), src_stride, w, h, &QPEL_FILTERS[frac][..8], 6) }
 }
 
 fn epel_h_neon(dst: &mut [i16], src: &[u16], src_stride: usize, w: usize, h: usize, frac: usize, shift: i32) {
     if !fits(src.len(), src_stride, h, w, 4) {
         return (HevcDsp::<u16>::SCALAR.epel_h)(dst, src, src_stride, w, h, frac, shift);
     }
-    unsafe { fir_h::<4>(dst.as_mut_ptr(), src.as_ptr(), src_stride, w, h, &EPEL_FILTERS[frac], shift) }
+    unsafe { fir_h::<4, MODE_I16>(&Out16::i16(dst.as_mut_ptr(), w), src.as_ptr(), src_stride, w, h, &EPEL_FILTERS[frac], shift) }
 }
 
 fn epel_v_neon(dst: &mut [i16], src: &[u16], src_stride: usize, w: usize, h: usize, frac: usize, shift: i32) {
     if !fits(src.len(), src_stride, h + 3, w, 0) {
         return (HevcDsp::<u16>::SCALAR.epel_v)(dst, src, src_stride, w, h, frac, shift);
     }
-    unsafe { fir_v::<4>(dst.as_mut_ptr(), src.as_ptr() as *const i16, src_stride, w, h, &EPEL_FILTERS[frac], shift) }
+    unsafe { fir_v::<4, MODE_I16>(&Out16::i16(dst.as_mut_ptr(), w), src.as_ptr() as *const i16, src_stride, w, h, &EPEL_FILTERS[frac], shift) }
 }
 
 pub(super) fn epel_v2_neon(dst: &mut [i16], src: &[i16], src_stride: usize, w: usize, h: usize, frac: usize) {
     if !fits(src.len(), src_stride, h + 3, w, 0) {
         return (HevcDsp::<u16>::SCALAR.epel_v2)(dst, src, src_stride, w, h, frac);
     }
-    unsafe { fir_v::<4>(dst.as_mut_ptr(), src.as_ptr(), src_stride, w, h, &EPEL_FILTERS[frac], 6) }
+    unsafe { fir_v::<4, MODE_I16>(&Out16::i16(dst.as_mut_ptr(), w), src.as_ptr(), src_stride, w, h, &EPEL_FILTERS[frac], 6) }
+}
+
+// ----------------------------------------------------------------------
+// Fused interpolation + prediction
+// ----------------------------------------------------------------------
+
+/// The whole-sample position: each sample shifted into the 14-bit domain as
+/// [`copy_neon`] does, then finished by `MODE`.
+#[inline(always)]
+unsafe fn fir_copy<const MODE: u8>(out: &Out16, src: *const u16, src_stride: usize, w: usize, h: usize, shift: i32) {
+    unsafe {
+        let sh = vdupq_n_s16(shift as i16);
+        for y in 0..h {
+            let mut x = 0;
+            while x < w {
+                let v = vreinterpretq_s16_u16(vld1q_u16(src.add(y * src_stride + x)));
+                emit16::<MODE>(out, y, x, vshlq_s16(v, sh), (w - x).min(8));
+                x += 8;
+            }
+        }
+    }
+}
+
+/// The fused kernels at 16 bits: `TAPS` (8 luma / 4 chroma), `MODE_UNI` or
+/// `MODE_BI` — `super::hevc_x86_128`'s `fused16` on NEON. Bit depths 8 to
+/// 12; anything else, or a window that does not fit, is the reference's.
+#[allow(clippy::too_many_arguments)]
+fn fused16<const TAPS: usize, const MODE: u8>(dst: &mut [u16], dst_stride: usize, src: &[u16], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], other: &[i16], bit_depth: u32) {
+    let reach = TAPS / 2 - 1;
+    let at_block = reach * src_stride + reach;
+    let hh = h + TAPS - 1;
+    let ok = (8..=12).contains(&bit_depth)
+        && w >= 2
+        && h >= 1
+        && (h - 1) * dst_stride + w <= dst.len()
+        && (MODE != MODE_BI || other.len() >= w * h)
+        && tmp.len() >= super::hevc::MC_TMP_LEN
+        && match (fx, fy) {
+            (0, 0) => src.len() > at_block && fits(src.len() - at_block, src_stride, h, w, 0),
+            (_, 0) => src.len() > reach * src_stride && fits(src.len() - reach * src_stride, src_stride, h, w, TAPS),
+            (0, _) => src.len() > reach && fits(src.len() - reach, src_stride, hh, w, 0),
+            _ => fits(src.len(), src_stride, hh, w, TAPS) && fits(super::hevc::MC_TMP_LEN, w, hh, w, 0),
+        };
+    if !ok {
+        let s = HevcDsp::<u16>::SCALAR;
+        return match (TAPS, MODE) {
+            (8, MODE_UNI) => (s.qpel_uni)(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, bit_depth),
+            (8, _) => (s.qpel_bi)(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, other, bit_depth),
+            (_, MODE_UNI) => (s.epel_uni)(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, bit_depth),
+            _ => (s.epel_bi)(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, other, bit_depth),
+        };
+    }
+    let bd = bit_depth as i32;
+    let shift1 = bd.min(12) - 8;
+    let (tx, ty): (&[i8], &[i8]) = if TAPS == 8 { (&QPEL_FILTERS[fx][..8], &QPEL_FILTERS[fy][..8]) } else { (&EPEL_FILTERS[fx], &EPEL_FILTERS[fy]) };
+    let out = Out16 {
+        i16: std::ptr::null_mut(),
+        dst: dst.as_mut_ptr(),
+        stride: dst_stride,
+        other: other.as_ptr(),
+        w,
+        shift: if MODE == MODE_UNI { 14 - bd } else { 15 - bd },
+        max: (1 << bd) - 1,
+    };
+    unsafe {
+        match (fx, fy) {
+            (0, 0) => fir_copy::<MODE>(&out, src.as_ptr().add(at_block), src_stride, w, h, 14 - bd),
+            (_, 0) => fir_h::<TAPS, MODE>(&out, src.as_ptr().add(reach * src_stride), src_stride, w, h, tx, shift1),
+            // Samples < 2^15: reinterpreting the u16 plane as i16 is exact.
+            (0, _) => fir_v::<TAPS, MODE>(&out, src.as_ptr().add(reach) as *const i16, src_stride, w, h, ty, shift1),
+            _ => {
+                fir_h::<TAPS, MODE_I16>(&Out16::i16(tmp.as_mut_ptr(), w), src.as_ptr(), src_stride, w, hh, tx, shift1);
+                fir_v::<TAPS, MODE>(&out, tmp.as_ptr(), w, w, h, ty, 6);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qpel_uni_neon(dst: &mut [u16], dst_stride: usize, src: &[u16], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], bit_depth: u32) {
+    fused16::<8, MODE_UNI>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, &[], bit_depth)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn epel_uni_neon(dst: &mut [u16], dst_stride: usize, src: &[u16], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], bit_depth: u32) {
+    fused16::<4, MODE_UNI>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, &[], bit_depth)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qpel_bi_neon(dst: &mut [u16], dst_stride: usize, src: &[u16], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], other: &[i16], bit_depth: u32) {
+    fused16::<8, MODE_BI>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, other, bit_depth)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn epel_bi_neon(dst: &mut [u16], dst_stride: usize, src: &[u16], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], other: &[i16], bit_depth: u32) {
+    fused16::<4, MODE_BI>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, other, bit_depth)
 }
 
 // ----------------------------------------------------------------------
@@ -367,6 +529,228 @@ const fn build_t16() -> [[i16; 32]; 32] {
 
 static T16: [[i16; 32]; 32] = build_t16();
 
+// ----------------------------------------------------------------------
+// Intra prediction
+// ----------------------------------------------------------------------
+//
+// `hevc_x86_128.rs`'s intra kernels on NEON, generic over the sample type
+// (both tables' references are u16; only the store differs). NEON widens
+// unsigned: `umull` / `umlal` by scalar into u32 and `rshrn` / `ushl` back,
+// so, unlike the x86 and wasm kernels, these are exact for any u16 and
+// need no range test.
+
+/// Store the first `n` (≤ 8) lanes of `v` (values in sample range) as
+/// samples of `S`.
+#[inline(always)]
+unsafe fn put<S: crate::hevc::frame::Sample>(dst: *mut S, v: uint16x8_t, n: usize) {
+    unsafe {
+        if S::BYTES == 2 {
+            return store_n_u16(dst as *mut u16, v, n);
+        }
+        let b = vmovn_u16(v);
+        match n {
+            8 => vst1_u8(dst as *mut u8, b),
+            4 => std::ptr::write_unaligned(dst as *mut u32, vget_lane_u32::<0>(vreinterpret_u32_u8(b))),
+            _ => {
+                let mut t = [0u8; 8];
+                vst1_u8(t.as_mut_ptr(), b);
+                std::ptr::copy_nonoverlapping(t.as_ptr(), dst as *mut u8, n);
+            }
+        }
+    }
+}
+
+/// Transpose eight 8-lane u16 rows: `trn` at 16, 32 and 64 bits.
+#[inline(always)]
+unsafe fn transpose8_u16(r: &mut [uint16x8_t; 8]) {
+    unsafe {
+        let t16 = |a: uint16x8_t, b: uint16x8_t| (vtrn1q_u16(a, b), vtrn2q_u16(a, b));
+        let (a0, a1) = t16(r[0], r[1]);
+        let (a2, a3) = t16(r[2], r[3]);
+        let (a4, a5) = t16(r[4], r[5]);
+        let (a6, a7) = t16(r[6], r[7]);
+        let w = |v: uint16x8_t| vreinterpretq_u32_u16(v);
+        let t32 = |a: uint16x8_t, b: uint16x8_t| (vtrn1q_u32(w(a), w(b)), vtrn2q_u32(w(a), w(b)));
+        let (b0, b2) = t32(a0, a2);
+        let (b1, b3) = t32(a1, a3);
+        let (b4, b6) = t32(a4, a6);
+        let (b5, b7) = t32(a5, a7);
+        let q = |v: uint32x4_t| vreinterpretq_u64_u32(v);
+        let t64 = |a: uint32x4_t, b: uint32x4_t| (vreinterpretq_u16_u64(vtrn1q_u64(q(a), q(b))), vreinterpretq_u16_u64(vtrn2q_u64(q(a), q(b))));
+        (r[0], r[4]) = t64(b0, b4);
+        (r[1], r[5]) = t64(b1, b5);
+        (r[2], r[6]) = t64(b2, b6);
+        (r[3], r[7]) = t64(b3, b7);
+    }
+}
+
+pub(super) fn intra_planar_neon<S: crate::hevc::frame::Sample>(dst: &mut [S], stride: usize, left: &[u16], top: &[u16], n: usize) {
+    let fits = left.len() > n && top.len() >= n.max(8) && (n - 1) * stride + n <= dst.len();
+    if !fits || !(4..=32).contains(&n) {
+        return (HevcDsp::<S>::scalar().intra_planar)(dst, stride, left, top, n);
+    }
+    unsafe {
+        let d = dst.as_mut_ptr();
+        let sh = vdupq_n_s32(-(n.trailing_zeros() as i32 + 1));
+        let (ln, tn) = (left[n], top[n]);
+        let idx: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+        let lanes = vld1q_u16(idx.as_ptr());
+        for (y, &ly) in left[..n].iter().enumerate() {
+            let ry = (n - 1 - y) as u16;
+            let mut x = 0;
+            while x < n {
+                let xs = vaddq_u16(lanes, vdupq_n_u16(x as u16));
+                let wl = vsubq_u16(vdupq_n_u16((n - 1) as u16), xs); // n-1-x
+                let wr = vaddq_u16(xs, vdupq_n_u16(1)); // x+1
+                let t = vld1q_u16(top.as_ptr().add(x));
+                let base = vdupq_n_u32((y as u32 + 1) * ln as u32 + n as u32);
+                let lo = vmlal_n_u16(vmlal_n_u16(vmlal_n_u16(base, vget_low_u16(wl), ly), vget_low_u16(wr), tn), vget_low_u16(t), ry);
+                let hi = vmlal_high_n_u16(vmlal_high_n_u16(vmlal_high_n_u16(base, wl, ly), wr, tn), t, ry);
+                let v = vcombine_u16(vmovn_u32(vshlq_u32(lo, sh)), vmovn_u32(vshlq_u32(hi, sh)));
+                put(d.add(y * stride + x), v, (n - x).min(8));
+                x += 8;
+            }
+        }
+    }
+}
+
+pub(super) fn intra_dc_neon<S: crate::hevc::frame::Sample>(dst: &mut [S], stride: usize, left: &[u16], top: &[u16], n: usize, edge: bool) {
+    if left.len() < n || top.len() < n || !(4..=32).contains(&n) || (n - 1) * stride + n > dst.len() {
+        return (HevcDsp::<S>::scalar().intra_dc)(dst, stride, left, top, n, edge);
+    }
+    let log2n = n.trailing_zeros();
+    let sum = n as i32 + top[..n].iter().chain(&left[..n]).map(|&v| v as i32).sum::<i32>();
+    let dc = sum >> (log2n + 1);
+    unsafe {
+        let d = dst.as_mut_ptr();
+        let v = vdupq_n_u16(dc as u16);
+        for y in 0..n {
+            let mut x = 0;
+            while x < n {
+                put(d.add(y * stride + x), v, (n - x).min(8));
+                x += 8;
+            }
+        }
+    }
+    if edge {
+        dst[0] = S::from_i32((left[0] as i32 + 2 * dc + top[0] as i32 + 2) >> 2);
+        for x in 1..n {
+            dst[x] = S::from_i32((top[x] as i32 + 3 * dc + 2) >> 2);
+        }
+        for (y, &l) in left[..n].iter().enumerate().skip(1) {
+            dst[y * stride] = S::from_i32((l as i32 + 3 * dc + 2) >> 2);
+        }
+    }
+}
+
+pub(super) fn intra_angular_neon<S: crate::hevc::frame::Sample>(dst: &mut [S], stride: usize, refs: &[u16], n: usize, angle: i32, transposed: bool) {
+    // Every load of the last vector of a row, from `ref[-n]` up.
+    if refs.len() < 3 * n + 2 + 8 || !(4..=32).contains(&n) || (n - 1) * stride + n > dst.len() {
+        return (HevcDsp::<S>::scalar().intra_angular)(dst, stride, refs, n, angle, transposed);
+    }
+    unsafe {
+        let d = dst.as_mut_ptr();
+        // Written before it is read, tile by tile, so not cleared.
+        let mut tmp = [std::mem::MaybeUninit::<u16>::uninit(); 32 * 32];
+        for y in 0..n {
+            let pos = (y as i32 + 1) * angle;
+            let (i, f) = (pos >> 5, (pos & 31) as u16);
+            let p = refs.as_ptr().offset(n as isize + i as isize + 1);
+            let mut x = 0;
+            while x < n {
+                let a = vld1q_u16(p.add(x));
+                let v = if f == 0 {
+                    a
+                } else {
+                    // ((32 - f) * a + f * b + 16) >> 5, widened: `rshrn` is the +16 >> 5.
+                    let b = vld1q_u16(p.add(x + 1));
+                    let lo = vmlal_n_u16(vmull_n_u16(vget_low_u16(a), 32 - f), vget_low_u16(b), f);
+                    let hi = vmlal_high_n_u16(vmull_high_n_u16(a, 32 - f), b, f);
+                    vcombine_u16(vrshrn_n_u32::<5>(lo), vrshrn_n_u32::<5>(hi))
+                };
+                if transposed {
+                    store_n_u16(tmp.as_mut_ptr().add(y * n + x) as *mut u16, v, (n - x).min(8));
+                } else {
+                    put(d.add(y * stride + x), v, (n - x).min(8));
+                }
+                x += 8;
+            }
+        }
+        if !transposed {
+            return;
+        }
+        let t = tmp.as_ptr() as *const u16;
+        if n == 4 {
+            let rows: [int16x4_t; 4] = std::array::from_fn(|j| vld1_s16(t.add(4 * j) as *const i16));
+            let c = transpose4x4_s16(rows);
+            for (j, v) in c.iter().enumerate() {
+                put(d.add(j * stride), vreinterpretq_u16_s16(vcombine_s16(*v, *v)), 4);
+            }
+            return;
+        }
+        for by in (0..n).step_by(8) {
+            for bx in (0..n).step_by(8) {
+                let mut r: [uint16x8_t; 8] = std::array::from_fn(|j| vld1q_u16(t.add((by + j) * n + bx)));
+                transpose8_u16(&mut r);
+                for (j, v) in r.iter().enumerate() {
+                    put(d.add((bx + j) * stride + by), *v, 8);
+                }
+            }
+        }
+    }
+}
+
+/// The 4x4 DCT basis, `TRANSFORM32` at every eighth row.
+const DCT4: [[i16; 4]; 4] = [[64, 64, 64, 64], [83, 36, -36, -83], [64, -64, -64, 64], [36, -83, 83, -36]];
+/// The 4x4 DST basis (8.6.4.2, `trType == 1`).
+const DST4: [[i16; 4]; 4] = [[29, 55, 74, 84], [74, 74, 0, -74], [84, -29, -74, 55], [55, -84, 74, -29]];
+
+/// The 4x4 inverse DST (intra luma 4x4), for both sample tables.
+pub(super) fn idst4_neon(coeffs: &mut [i16], bd_shift: i32, _max_x: usize, _max_y: usize) {
+    assert!(coeffs.len() >= 16 && (1..=31).contains(&bd_shift));
+    unsafe { inv4(coeffs.as_mut_ptr(), bd_shift, &DST4) }
+}
+
+/// Transpose a 4x4 block of i16, one row a vector: `trn` at 16 and then 32
+/// bits.
+#[inline(always)]
+unsafe fn transpose4x4_s16(r: [int16x4_t; 4]) -> [int16x4_t; 4] {
+    unsafe {
+        let a = vtrn_s16(r[0], r[1]);
+        let b = vtrn_s16(r[2], r[3]);
+        let c = vtrn_s32(vreinterpret_s32_s16(a.0), vreinterpret_s32_s16(b.0));
+        let d = vtrn_s32(vreinterpret_s32_s16(a.1), vreinterpret_s32_s16(b.1));
+        [vreinterpret_s16_s32(c.0), vreinterpret_s16_s32(d.0), vreinterpret_s16_s32(c.1), vreinterpret_s16_s32(d.1)]
+    }
+}
+
+/// Both stages of the 4x4 inverse transform with basis `m` (8.6.4.2):
+/// output `i` of four lines at once is `sum_j m[j][i] * r[j]` by widening
+/// multiply-accumulate (`smlal` by scalar), the rounding term the
+/// accumulator's start, the shift an arithmetic `sshl` by a negative count
+/// and the 16-bit clip `sqxtn`. The second stage runs on the transposed
+/// intermediate, and one more transpose puts the result in raster order.
+unsafe fn inv4(c: *mut i16, bd_shift: i32, m: &[[i16; 4]; 4]) {
+    unsafe {
+        let stage = |r: [int16x4_t; 4], round: i32, shift: i32| -> [int16x4_t; 4] {
+            std::array::from_fn(|i| {
+                let mut acc = vdupq_n_s32(round);
+                for (j, rj) in r.iter().enumerate() {
+                    acc = vmlal_n_s16(acc, *rj, m[j][i]);
+                }
+                vqmovn_s32(vshlq_s32(acc, vdupq_n_s32(-shift)))
+            })
+        };
+        let rows = [vld1_s16(c), vld1_s16(c.add(4)), vld1_s16(c.add(8)), vld1_s16(c.add(12))];
+        let t = stage(rows, 64, 7);
+        let o = stage(transpose4x4_s16(t), 1 << (bd_shift - 1), bd_shift);
+        let r = transpose4x4_s16(o);
+        for (i, v) in r.iter().enumerate() {
+            vst1_s16(c.add(4 * i), *v);
+        }
+    }
+}
+
 pub(super) fn idct_neon<const N: usize>(coeffs: &mut [i16], bd_shift: i32, max_x: usize, max_y: usize) {
     if max_x == 0 && max_y == 0 {
         let round2 = 1i32 << (bd_shift - 1);
@@ -376,7 +760,8 @@ pub(super) fn idct_neon<const N: usize>(coeffs: &mut [i16], bd_shift: i32, max_x
         return;
     }
     if N == 4 {
-        return (HevcDsp::<u16>::SCALAR.idct[0])(coeffs, bd_shift, max_x, max_y);
+        assert!(coeffs.len() >= 16 && (1..=31).contains(&bd_shift));
+        return unsafe { inv4(coeffs.as_mut_ptr(), bd_shift, &DCT4) };
     }
     unsafe {
         let mut tmp = [0i16; 32 * 32];
@@ -788,6 +1173,51 @@ mod tests {
         d
     }
 
+    /// The fused kernels at every depth they serve, every shape and
+    /// fraction, samples uniform or on the rails.
+    #[test]
+    fn fused_matches_scalar() {
+        let d = neon();
+        assert!(d.fused_mc, "no fused kernels at 16 bits");
+        let s = HevcDsp::<u16>::SCALAR;
+        let mut seed = 0xf05e_u64;
+        let stride = 96;
+        let mut ta = vec![0i16; crate::dsp::hevc::MC_TMP_LEN];
+        let mut tb = vec![0i16; crate::dsp::hevc::MC_TMP_LEN];
+        for bd in 8..=12u32 {
+            let max = (1u32 << bd) - 1;
+            for rails in [false, true] {
+                let src: Vec<u16> = (0..stride * 96)
+                    .map(|_| if rails { if lcg(&mut seed).is_multiple_of(2) { 0 } else { max as u16 } } else { (lcg(&mut seed) % (max + 1)) as u16 })
+                    .collect();
+                for &(w, h) in &[(2usize, 4usize), (4, 4), (6, 8), (8, 8), (12, 16), (16, 16), (32, 8), (64, 16)] {
+                    let other: Vec<i16> = (0..w * h).map(|_| (lcg(&mut seed) % 24000) as i16 - 2500).collect();
+                    let ds = w + 9;
+                    let mut a = vec![0u16; ds * h];
+                    let mut b = vec![0u16; ds * h];
+                    for fx in 0..8 {
+                        for fy in 0..8 {
+                            if fx < 4 && fy < 4 {
+                                (s.qpel_uni)(&mut a, ds, &src, stride, w, h, fx, fy, &mut ta, bd);
+                                (d.qpel_uni)(&mut b, ds, &src, stride, w, h, fx, fy, &mut tb, bd);
+                                assert_eq!(a, b, "qpel_uni {w}x{h} ({fx},{fy}) {bd} bits");
+                                (s.qpel_bi)(&mut a, ds, &src, stride, w, h, fx, fy, &mut ta, &other, bd);
+                                (d.qpel_bi)(&mut b, ds, &src, stride, w, h, fx, fy, &mut tb, &other, bd);
+                                assert_eq!(a, b, "qpel_bi {w}x{h} ({fx},{fy}) {bd} bits");
+                            }
+                            (s.epel_uni)(&mut a, ds, &src, stride, w, h, fx, fy, &mut ta, bd);
+                            (d.epel_uni)(&mut b, ds, &src, stride, w, h, fx, fy, &mut tb, bd);
+                            assert_eq!(a, b, "epel_uni {w}x{h} ({fx},{fy}) {bd} bits");
+                            (s.epel_bi)(&mut a, ds, &src, stride, w, h, fx, fy, &mut ta, &other, bd);
+                            (d.epel_bi)(&mut b, ds, &src, stride, w, h, fx, fy, &mut tb, &other, bd);
+                            assert_eq!(a, b, "epel_bi {w}x{h} ({fx},{fy}) {bd} bits");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn interp_matches_scalar() {
         let d = neon();
@@ -889,6 +1319,13 @@ mod tests {
                 (s.idct[(log2 - 2) as usize])(&mut a, bd_shift, mx, my);
                 (d.idct[(log2 - 2) as usize])(&mut b, bd_shift, mx, my);
                 assert_eq!(a, b, "idct n={n} trial={trial}");
+                if n == 4 {
+                    let mut a = c.clone();
+                    let mut b = c.clone();
+                    (s.idst4)(&mut a, bd_shift, 3, 3);
+                    (d.idst4)(&mut b, bd_shift, 3, 3);
+                    assert_eq!(a, b, "idst4 trial={trial}");
+                }
             }
         }
         let stride = 80;

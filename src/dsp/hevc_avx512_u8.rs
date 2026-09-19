@@ -73,7 +73,7 @@ pub fn install(d: &mut HevcDsp<u8>) {
 
 /// The low `n` (≤ 32) lanes.
 #[inline(always)]
-fn mask32(n: usize) -> __mmask32 {
+pub(super) fn mask32(n: usize) -> __mmask32 {
     (((1u64 << n) - 1) as u32) as __mmask32
 }
 
@@ -90,7 +90,7 @@ unsafe fn pack32(v: __m512i) -> __m256i {
 /// Store the first `n` (≤ 32) 16-bit lanes.
 #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
 #[inline]
-unsafe fn store_i16(dst: *mut i16, v: __m512i, n: usize) {
+pub(super) unsafe fn store_i16(dst: *mut i16, v: __m512i, n: usize) {
     unsafe {
         if n >= 32 {
             _mm512_storeu_si512(dst as *mut __m512i, v);
@@ -103,7 +103,7 @@ unsafe fn store_i16(dst: *mut i16, v: __m512i, n: usize) {
 /// Load the first `n` (≤ 32) 16-bit lanes, zero elsewhere.
 #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
 #[inline]
-unsafe fn load_i16(src: *const i16, n: usize) -> __m512i {
+pub(super) unsafe fn load_i16(src: *const i16, n: usize) -> __m512i {
     unsafe {
         if n >= 32 {
             _mm512_loadu_si512(src as *const __m512i)
@@ -216,7 +216,7 @@ fn fits_bytes(len: usize, stride: usize, rows: usize, w: usize, extra: usize) ->
 /// so the last load reaches past the last row — into the buffer, never past
 /// its end, which is what this checks.
 #[inline(always)]
-fn fits_i16(len: usize, w: usize, rows: usize) -> bool {
+pub(super) fn fits_i16(len: usize, w: usize, rows: usize) -> bool {
     let last_x = if w >= 32 { (w - 1) / 32 * 32 } else { 0 };
     (rows - 1) * w + last_x + 32 <= len
 }
@@ -379,7 +379,7 @@ fn qpel_v_avx512(dst: &mut [i16], src: &[u8], src_stride: usize, w: usize, h: us
     unsafe { fir_v::<8, MODE_I16>(&out, src.as_ptr(), src_stride, w, h, &QPEL_FILTERS[frac][..8], shift) }
 }
 
-fn qpel_v2_avx512(dst: &mut [i16], src: &[i16], src_stride: usize, w: usize, h: usize, frac: usize) {
+pub(super) fn qpel_v2_avx512(dst: &mut [i16], src: &[i16], src_stride: usize, w: usize, h: usize, frac: usize) {
     if src_stride != w || w < 2 || dst.len() < w * h || !fits_i16(src.len(), w, h + 7) {
         return super::hevc_avx2::qpel_v2_avx2(dst, src, src_stride, w, h, frac);
     }
@@ -387,7 +387,7 @@ fn qpel_v2_avx512(dst: &mut [i16], src: &[i16], src_stride: usize, w: usize, h: 
     unsafe { fir_v2::<8, MODE_I16>(&out, src.as_ptr(), w, h, &QPEL_FILTERS[frac][..8]) }
 }
 
-fn epel_v2_avx512(dst: &mut [i16], src: &[i16], src_stride: usize, w: usize, h: usize, frac: usize) {
+pub(super) fn epel_v2_avx512(dst: &mut [i16], src: &[i16], src_stride: usize, w: usize, h: usize, frac: usize) {
     if src_stride != w || w < 2 || dst.len() < w * h || !fits_i16(src.len(), w, h + 3) {
         return super::hevc_avx2::epel_v2_avx2(dst, src, src_stride, w, h, frac);
     }

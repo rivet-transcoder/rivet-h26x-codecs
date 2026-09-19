@@ -48,7 +48,11 @@ pub(crate) mod distortion_x86;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod distortion_x86_u16;
 #[cfg(target_arch = "x86_64")]
+pub(crate) mod h264_enc_x86;
+#[cfg(target_arch = "x86_64")]
 pub(crate) mod hevc_enc_x86;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod sao_x86;
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod distortion_neon;
 #[cfg(target_arch = "aarch64")]
@@ -82,11 +86,15 @@ pub(crate) mod neon_dotprod;
 // The encode-only tiers beyond x86: the same kernels as `distortion_x86`
 // and `hevc_enc_x86`, on NEON and on wasm `simd128`.
 #[cfg(target_arch = "aarch64")]
+pub(crate) mod h264_enc_neon;
+#[cfg(target_arch = "aarch64")]
 pub(crate) mod hevc_enc_neon;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod distortion_wasm128;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod distortion_wasm128_u16;
+#[cfg(target_arch = "wasm32")]
+pub(crate) mod h264_enc_wasm128;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod hevc_enc_wasm128;
 

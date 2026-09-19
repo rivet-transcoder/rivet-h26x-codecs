@@ -265,6 +265,7 @@ macro_rules! kernels_u16 {
         /// Every 16-bit-sample kernel — the bottom rung, and the top one.
         pub(crate) fn install_all_u16(d: &mut HevcDsp<u16>) {
             d.idct = [idct::<4>, idct::<8>, idct::<16>, idct::<32>];
+            d.idst4 = idst4;
             d.add_residual = add_residual;
             d.qpel_copy = copy_u16;
             d.qpel_h = qpel_h;
@@ -278,6 +279,14 @@ macro_rules! kernels_u16 {
             d.bi = bi;
             d.weighted_uni = weighted_uni;
             d.weighted_bi = weighted_bi;
+            d.qpel_uni = qpel_uni16;
+            d.epel_uni = epel_uni16;
+            d.qpel_bi = qpel_bi16;
+            d.epel_bi = epel_bi16;
+            d.fused_mc = true;
+            d.intra_planar = intra_planar::<u16>;
+            d.intra_dc = intra_dc::<u16>;
+            d.intra_angular = intra_angular::<u16>;
             install_sao_u16(d);
             install_deblock_u16(d);
         }
@@ -370,6 +379,73 @@ macro_rules! kernels_u16 {
             _mm_min_epi16(_mm_max_epi16(v, _mm_setzero_si128()), maxv)
         }
 
+        /// What a FIR stage produces: 14-bit predictions (the two-pass path
+        /// and the first stage of hv) ...
+        const MODE_I16: u8 = 0;
+        /// ... default-weighted uni-prediction samples ...
+        const MODE_UNI: u8 = 1;
+        /// ... or default-weighted bi-prediction samples.
+        const MODE_BI: u8 = 2;
+
+        /// Where a 16-bit-sample FIR stage writes, by `MODE_*`. The u8
+        /// kernels bake the 8-bit shifts into their output stage; here the
+        /// shift and the clip depend on the bit depth, so they travel with
+        /// the destination.
+        #[derive(Clone, Copy)]
+        struct Out16 {
+            /// `MODE_I16`: 14-bit predictions, stride `w`.
+            i16: *mut i16,
+            /// `MODE_UNI` / `MODE_BI`: samples, stride `stride`.
+            dst: *mut u16,
+            /// Sample stride.
+            stride: usize,
+            /// `MODE_BI`: the other list's 14-bit prediction, stride `w`.
+            other: *const i16,
+            /// Block width (the stride of `i16` and `other`).
+            w: usize,
+            /// `14 - BitDepth` (uni) or `15 - BitDepth` (bi).
+            shift: i32,
+            /// `(1 << BitDepth) - 1`.
+            max: i32,
+        }
+
+        impl Out16 {
+            /// 14-bit predictions into `dst`, stride `w`.
+            fn i16(dst: *mut i16, w: usize) -> Self {
+                Out16 { i16: dst, dst: std::ptr::null_mut(), stride: 0, other: std::ptr::null(), w, shift: 0, max: 0 }
+            }
+        }
+
+        /// Emit 8 lanes of a stage's output (`v`, 14-bit) at (`row`, `x`),
+        /// the first `n` lanes: stored as they are, or finished the way
+        /// [`uni`] / [`bi`] finish a stored prediction, lane for lane.
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn emit16<const MODE: u8>(out: &Out16, row: usize, x: usize, v: __m128i, n: usize) {
+            unsafe {
+                let sh = _mm_cvtsi32_si128(out.shift);
+                let maxv = _mm_set1_epi16(out.max as i16);
+                match MODE {
+                    MODE_I16 => store_n(out.i16.add(row * out.w + x), v, n),
+                    MODE_UNI => {
+                        // 14-bit + round fits i16 (< 16384 + 8192).
+                        let r = _mm_sra_epi16(_mm_adds_epi16(v, _mm_set1_epi16(1 << (out.shift - 1))), sh);
+                        store_n_u16(out.dst.add(row * out.stride + x), clip_u16(r, maxv), n);
+                    }
+                    _ => {
+                        // The sum can pass i16: `pmaddwd` against (1, 1) is it
+                        // in 32 bits.
+                        let o = load_n(out.other.add(row * out.w + x), n);
+                        let ones = _mm_set1_epi32(pair16(1, 1));
+                        let round = _mm_set1_epi32(1 << (out.shift - 1));
+                        let q = |u: __m128i| _mm_sra_epi32(_mm_add_epi32(_mm_madd_epi16(u, ones), round), sh);
+                        let p = _mm_packs_epi32(q(_mm_unpacklo_epi16(o, v)), q(_mm_unpackhi_epi16(o, v)));
+                        store_n_u16(out.dst.add(row * out.stride + x), clip_u16(p, maxv), n);
+                    }
+                }
+            }
+        }
+
         // ------------------------------------------------------------------
         // Interpolation
         // ------------------------------------------------------------------
@@ -401,7 +477,7 @@ macro_rules! kernels_u16 {
         /// Horizontal FIR with `TAPS` taps over u16 samples.
         #[target_feature(enable = $feat)]
         #[inline]
-        unsafe fn fir_h<const TAPS: usize>(dst: *mut i16, src: *const u16, src_stride: usize, w: usize, h: usize, taps: &[i8], shift: i32) {
+        unsafe fn fir_h<const TAPS: usize, const MODE: u8>(out: &Out16, src: *const u16, src_stride: usize, w: usize, h: usize, taps: &[i8], shift: i32) {
             unsafe {
                 let mut c = [_mm_setzero_si128(); 4];
                 for k in 0..TAPS / 2 {
@@ -410,7 +486,6 @@ macro_rules! kernels_u16 {
                 let sh = _mm_cvtsi32_si128(shift);
                 for y in 0..h {
                     let s = src.add(y * src_stride);
-                    let d = dst.add(y * w);
                     let mut x = 0;
                     while x < w {
                         let mut lo = _mm_setzero_si128();
@@ -422,7 +497,7 @@ macro_rules! kernels_u16 {
                             hi = _mm_add_epi32(hi, _mm_madd_epi16(_mm_unpackhi_epi16(a, b), c[k]));
                         }
                         let r = _mm_packs_epi32(_mm_sra_epi32(lo, sh), _mm_sra_epi32(hi, sh));
-                        store_n(d.add(x), r, (w - x).min(8));
+                        emit16::<MODE>(out, y, x, r, (w - x).min(8));
                         x += 8;
                     }
                 }
@@ -432,7 +507,7 @@ macro_rules! kernels_u16 {
         /// Vertical FIR with `TAPS` taps over u16 or i16 rows (`T` = 2-byte lanes).
         #[target_feature(enable = $feat)]
         #[inline]
-        unsafe fn fir_v<const TAPS: usize, T>(dst: *mut i16, src: *const T, src_stride: usize, w: usize, h: usize, taps: &[i8], shift: i32) {
+        unsafe fn fir_v<const TAPS: usize, T, const MODE: u8>(out: &Out16, src: *const T, src_stride: usize, w: usize, h: usize, taps: &[i8], shift: i32) {
             unsafe {
                 let mut c = [_mm_setzero_si128(); 4];
                 for k in 0..TAPS / 2 {
@@ -440,7 +515,6 @@ macro_rules! kernels_u16 {
                 }
                 let sh = _mm_cvtsi32_si128(shift);
                 for y in 0..h {
-                    let d = dst.add(y * w);
                     let mut x = 0;
                     while x < w {
                         let mut lo = _mm_setzero_si128();
@@ -452,7 +526,7 @@ macro_rules! kernels_u16 {
                             hi = _mm_add_epi32(hi, _mm_madd_epi16(_mm_unpackhi_epi16(a, b), c[k]));
                         }
                         let r = _mm_packs_epi32(_mm_sra_epi32(lo, sh), _mm_sra_epi32(hi, sh));
-                        store_n(d.add(x), r, (w - x).min(8));
+                        emit16::<MODE>(out, y, x, r, (w - x).min(8));
                         x += 8;
                     }
                 }
@@ -463,42 +537,353 @@ macro_rules! kernels_u16 {
             if !fits(src.len(), src_stride, h, w, 8) {
                 return (HevcDsp::<u16>::SCALAR.qpel_h)(dst, src, src_stride, w, h, frac, shift);
             }
-            unsafe { fir_h::<8>(dst.as_mut_ptr(), src.as_ptr(), src_stride, w, h, &QPEL_FILTERS[frac][..8], shift) }
+            unsafe { fir_h::<8, MODE_I16>(&Out16::i16(dst.as_mut_ptr(), w), src.as_ptr(), src_stride, w, h, &QPEL_FILTERS[frac][..8], shift) }
         }
 
         fn qpel_v(dst: &mut [i16], src: &[u16], src_stride: usize, w: usize, h: usize, frac: usize, shift: i32) {
             if !fits(src.len(), src_stride, h + 7, w, 0) {
                 return (HevcDsp::<u16>::SCALAR.qpel_v)(dst, src, src_stride, w, h, frac, shift);
             }
-            unsafe { fir_v::<8, u16>(dst.as_mut_ptr(), src.as_ptr(), src_stride, w, h, &QPEL_FILTERS[frac][..8], shift) }
+            unsafe { fir_v::<8, u16, MODE_I16>(&Out16::i16(dst.as_mut_ptr(), w), src.as_ptr(), src_stride, w, h, &QPEL_FILTERS[frac][..8], shift) }
         }
 
         pub(super) fn qpel_v2(dst: &mut [i16], src: &[i16], src_stride: usize, w: usize, h: usize, frac: usize) {
             if !fits(src.len(), src_stride, h + 7, w, 0) {
                 return (HevcDsp::<u16>::SCALAR.qpel_v2)(dst, src, src_stride, w, h, frac);
             }
-            unsafe { fir_v::<8, i16>(dst.as_mut_ptr(), src.as_ptr(), src_stride, w, h, &QPEL_FILTERS[frac][..8], 6) }
+            unsafe { fir_v::<8, i16, MODE_I16>(&Out16::i16(dst.as_mut_ptr(), w), src.as_ptr(), src_stride, w, h, &QPEL_FILTERS[frac][..8], 6) }
         }
 
         fn epel_h(dst: &mut [i16], src: &[u16], src_stride: usize, w: usize, h: usize, frac: usize, shift: i32) {
             if !fits(src.len(), src_stride, h, w, 4) {
                 return (HevcDsp::<u16>::SCALAR.epel_h)(dst, src, src_stride, w, h, frac, shift);
             }
-            unsafe { fir_h::<4>(dst.as_mut_ptr(), src.as_ptr(), src_stride, w, h, &EPEL_FILTERS[frac], shift) }
+            unsafe { fir_h::<4, MODE_I16>(&Out16::i16(dst.as_mut_ptr(), w), src.as_ptr(), src_stride, w, h, &EPEL_FILTERS[frac], shift) }
         }
 
         fn epel_v(dst: &mut [i16], src: &[u16], src_stride: usize, w: usize, h: usize, frac: usize, shift: i32) {
             if !fits(src.len(), src_stride, h + 3, w, 0) {
                 return (HevcDsp::<u16>::SCALAR.epel_v)(dst, src, src_stride, w, h, frac, shift);
             }
-            unsafe { fir_v::<4, u16>(dst.as_mut_ptr(), src.as_ptr(), src_stride, w, h, &EPEL_FILTERS[frac], shift) }
+            unsafe { fir_v::<4, u16, MODE_I16>(&Out16::i16(dst.as_mut_ptr(), w), src.as_ptr(), src_stride, w, h, &EPEL_FILTERS[frac], shift) }
         }
 
         pub(super) fn epel_v2(dst: &mut [i16], src: &[i16], src_stride: usize, w: usize, h: usize, frac: usize) {
             if !fits(src.len(), src_stride, h + 3, w, 0) {
                 return (HevcDsp::<u16>::SCALAR.epel_v2)(dst, src, src_stride, w, h, frac);
             }
-            unsafe { fir_v::<4, i16>(dst.as_mut_ptr(), src.as_ptr(), src_stride, w, h, &EPEL_FILTERS[frac], 6) }
+            unsafe { fir_v::<4, i16, MODE_I16>(&Out16::i16(dst.as_mut_ptr(), w), src.as_ptr(), src_stride, w, h, &EPEL_FILTERS[frac], 6) }
+        }
+
+        // ------------------------------------------------------------------
+        // Fused interpolation + prediction
+        // ------------------------------------------------------------------
+
+        /// The whole-sample position: each sample shifted into the 14-bit
+        /// domain as [`copy_u16`] does, then finished by `MODE`.
+        #[target_feature(enable = $feat)]
+        unsafe fn fir_copy<const MODE: u8>(out: &Out16, src: *const u16, src_stride: usize, w: usize, h: usize, shift: i32) {
+            unsafe {
+                let sh = _mm_cvtsi32_si128(shift);
+                for y in 0..h {
+                    let s = src.add(y * src_stride);
+                    let mut x = 0;
+                    while x < w {
+                        let v = _mm_sll_epi16(_mm_loadu_si128(s.add(x) as *const __m128i), sh);
+                        emit16::<MODE>(out, y, x, v, (w - x).min(8));
+                        x += 8;
+                    }
+                }
+            }
+        }
+
+        /// The fused kernels at 16 bits: `TAPS` (8 luma / 4 chroma),
+        /// `MODE_UNI` or `MODE_BI`. The stages are the two-pass kernels'
+        /// own, and the last one finishes its output where [`uni`] / [`bi`]
+        /// would have read it back, so the 14-bit prediction is never
+        /// stored. Bit depths 8 to 12, the ones whose intermediates are
+        /// i16; the scalar reference takes anything else.
+        #[allow(clippy::too_many_arguments)]
+        fn fused16<const TAPS: usize, const MODE: u8>(dst: &mut [u16], dst_stride: usize, src: &[u16], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], other: &[i16], bit_depth: u32) {
+            let reach = TAPS / 2 - 1;
+            let at_block = reach * src_stride + reach;
+            let hh = h + TAPS - 1;
+            let ok = (8..=12).contains(&bit_depth)
+                && w >= 2
+                && h >= 1
+                && (h - 1) * dst_stride + w <= dst.len()
+                && (MODE != MODE_BI || other.len() >= w * h)
+                && tmp.len() >= crate::dsp::hevc::MC_TMP_LEN
+                && match (fx, fy) {
+                    (0, 0) => src.len() > at_block && fits(src.len() - at_block, src_stride, h, w, 0),
+                    (_, 0) => src.len() > reach * src_stride && fits(src.len() - reach * src_stride, src_stride, h, w, TAPS),
+                    (0, _) => src.len() > reach && fits(src.len() - reach, src_stride, hh, w, 0),
+                    _ => fits(src.len(), src_stride, hh, w, TAPS) && fits(crate::dsp::hevc::MC_TMP_LEN, w, hh, w, 0),
+                };
+            if !ok {
+                let s = HevcDsp::<u16>::SCALAR;
+                return match (TAPS, MODE) {
+                    (8, MODE_UNI) => (s.qpel_uni)(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, bit_depth),
+                    (8, _) => (s.qpel_bi)(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, other, bit_depth),
+                    (_, MODE_UNI) => (s.epel_uni)(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, bit_depth),
+                    _ => (s.epel_bi)(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, other, bit_depth),
+                };
+            }
+            let bd = bit_depth as i32;
+            let shift1 = bd.min(12) - 8;
+            let (tx, ty): (&[i8], &[i8]) = if TAPS == 8 { (&QPEL_FILTERS[fx][..8], &QPEL_FILTERS[fy][..8]) } else { (&EPEL_FILTERS[fx], &EPEL_FILTERS[fy]) };
+            let out = Out16 {
+                i16: std::ptr::null_mut(),
+                dst: dst.as_mut_ptr(),
+                stride: dst_stride,
+                other: other.as_ptr(),
+                w,
+                shift: if MODE == MODE_UNI { 14 - bd } else { 15 - bd },
+                max: (1 << bd) - 1,
+            };
+            unsafe {
+                match (fx, fy) {
+                    (0, 0) => fir_copy::<MODE>(&out, src.as_ptr().add(at_block), src_stride, w, h, 14 - bd),
+                    (_, 0) => fir_h::<TAPS, MODE>(&out, src.as_ptr().add(reach * src_stride), src_stride, w, h, tx, shift1),
+                    (0, _) => fir_v::<TAPS, u16, MODE>(&out, src.as_ptr().add(reach), src_stride, w, h, ty, shift1),
+                    _ => {
+                        fir_h::<TAPS, MODE_I16>(&Out16::i16(tmp.as_mut_ptr(), w), src.as_ptr(), src_stride, w, hh, tx, shift1);
+                        fir_v::<TAPS, i16, MODE>(&out, tmp.as_ptr(), w, w, h, ty, 6);
+                    }
+                }
+            }
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn qpel_uni16(dst: &mut [u16], dst_stride: usize, src: &[u16], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], bit_depth: u32) {
+            fused16::<8, MODE_UNI>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, &[], bit_depth)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn epel_uni16(dst: &mut [u16], dst_stride: usize, src: &[u16], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], bit_depth: u32) {
+            fused16::<4, MODE_UNI>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, &[], bit_depth)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn qpel_bi16(dst: &mut [u16], dst_stride: usize, src: &[u16], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], other: &[i16], bit_depth: u32) {
+            fused16::<8, MODE_BI>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, other, bit_depth)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn epel_bi16(dst: &mut [u16], dst_stride: usize, src: &[u16], src_stride: usize, w: usize, h: usize, fx: usize, fy: usize, tmp: &mut [i16], other: &[i16], bit_depth: u32) {
+            fused16::<4, MODE_BI>(dst, dst_stride, src, src_stride, w, h, fx, fy, tmp, other, bit_depth)
+        }
+
+        // ------------------------------------------------------------------
+        // Intra prediction
+        // ------------------------------------------------------------------
+        //
+        // Generic over the sample type: the reference samples are u16 for
+        // both tables, the arithmetic is the same i16 / i32 lanes, and only
+        // the store differs (`put`). `pmaddwd` reads the references as i16,
+        // so a reference above 32767 (a 16-bit stream) goes to the scalar
+        // kernel; no u8 reference can be.
+
+        /// Store the first `n` (≤ 8) lanes of `v` (values in sample range)
+        /// as samples of `S`.
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn put<S: crate::hevc::frame::Sample>(dst: *mut S, v: __m128i, n: usize) {
+            unsafe {
+                if S::BYTES == 2 {
+                    return store_n_u16(dst as *mut u16, v, n);
+                }
+                let b = _mm_packus_epi16(v, v);
+                match n {
+                    8 => _mm_storel_epi64(dst as *mut __m128i, b),
+                    4 => std::ptr::write_unaligned(dst as *mut u32, _mm_cvtsi128_si32(b) as u32),
+                    _ => {
+                        let mut t = [0u8; 16];
+                        _mm_storeu_si128(t.as_mut_ptr() as *mut __m128i, b);
+                        std::ptr::copy_nonoverlapping(t.as_ptr(), dst as *mut u8, n);
+                    }
+                }
+            }
+        }
+
+        /// Whether any of `r` is above 32767 — past what `pmaddwd` reads as
+        /// a positive i16. Never true of a u8 table's references.
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn over_i16<S: crate::hevc::frame::Sample>(r: &[u16]) -> bool {
+            unsafe {
+                if S::BYTES == 1 {
+                    return false;
+                }
+                let mut acc = _mm_setzero_si128();
+                let mut i = 0;
+                while i + 8 <= r.len() {
+                    acc = _mm_or_si128(acc, _mm_loadu_si128(r.as_ptr().add(i) as *const __m128i));
+                    i += 8;
+                }
+                _mm_movemask_epi8(acc) & 0xAAAA != 0 || r[i..].iter().any(|&v| v > 32767)
+            }
+        }
+
+        fn intra_planar<S: crate::hevc::frame::Sample>(dst: &mut [S], stride: usize, left: &[u16], top: &[u16], n: usize) {
+            let fits = left.len() > n && top.len() >= n.max(8) && (n - 1) * stride + n <= dst.len();
+            if !fits || !(4..=32).contains(&n) || unsafe { over_i16::<S>(&left[..=n]) || over_i16::<S>(&top[..=n]) } {
+                return (HevcDsp::<S>::scalar().intra_planar)(dst, stride, left, top, n);
+            }
+            unsafe { intra_planar_impl(dst.as_mut_ptr(), stride, left, top, n) }
+        }
+
+        /// Planar, eight columns a vector: `(n-1-x)·p[-1][y] + (x+1)·p[n][-1]`
+        /// is one `pmaddwd` of the per-column weight pairs against the
+        /// broadcast pair `(left[y], top[n])`, and `(n-1-y)·p[x][-1] +
+        /// (y+1)·p[-1][n]` another of the row's broadcast weights against
+        /// `(top[x], left[n])` interleaved.
+        #[target_feature(enable = $feat)]
+        unsafe fn intra_planar_impl<S: crate::hevc::frame::Sample>(dst: *mut S, stride: usize, left: &[u16], top: &[u16], n: usize) {
+            unsafe {
+                let sh = _mm_cvtsi32_si128(n.trailing_zeros() as i32 + 1);
+                let round = _mm_set1_epi32(n as i32);
+                let ln = _mm_set1_epi16(left[n] as i16);
+                let chunks = n.div_ceil(8);
+                let mut w = [(_mm_setzero_si128(), _mm_setzero_si128()); 4];
+                let mut t = [(_mm_setzero_si128(), _mm_setzero_si128()); 4];
+                for c in 0..chunks {
+                    let wx = |x: usize| pair16((n as i32 - 1 - x as i32) as i16, (x + 1) as i16);
+                    let x0 = 8 * c;
+                    w[c] = (
+                        _mm_setr_epi32(wx(x0), wx(x0 + 1), wx(x0 + 2), wx(x0 + 3)),
+                        _mm_setr_epi32(wx(x0 + 4), wx(x0 + 5), wx(x0 + 6), wx(x0 + 7)),
+                    );
+                    let tx = _mm_loadu_si128(top.as_ptr().add(x0) as *const __m128i);
+                    t[c] = (_mm_unpacklo_epi16(tx, ln), _mm_unpackhi_epi16(tx, ln));
+                }
+                for y in 0..n {
+                    let a = _mm_set1_epi32(pair16(left[y] as i16, top[n] as i16));
+                    let b = _mm_set1_epi32(pair16((n - 1 - y) as i16, (y + 1) as i16));
+                    for c in 0..chunks {
+                        let lo = _mm_add_epi32(_mm_add_epi32(_mm_madd_epi16(w[c].0, a), _mm_madd_epi16(t[c].0, b)), round);
+                        let hi = _mm_add_epi32(_mm_add_epi32(_mm_madd_epi16(w[c].1, a), _mm_madd_epi16(t[c].1, b)), round);
+                        let v = _mm_packs_epi32(_mm_sra_epi32(lo, sh), _mm_sra_epi32(hi, sh));
+                        put(dst.add(y * stride + 8 * c), v, (n - 8 * c).min(8));
+                    }
+                }
+            }
+        }
+
+        fn intra_dc<S: crate::hevc::frame::Sample>(dst: &mut [S], stride: usize, left: &[u16], top: &[u16], n: usize, edge: bool) {
+            if left.len() < n || top.len() < n || !(4..=32).contains(&n) || (n - 1) * stride + n > dst.len() {
+                return (HevcDsp::<S>::scalar().intra_dc)(dst, stride, left, top, n, edge);
+            }
+            let log2n = n.trailing_zeros();
+            let sum = n as i32 + top[..n].iter().chain(&left[..n]).map(|&v| v as i32).sum::<i32>();
+            let dc = sum >> (log2n + 1);
+            unsafe { intra_fill(dst.as_mut_ptr(), stride, n, dc) };
+            if edge {
+                dst[0] = S::from_i32((left[0] as i32 + 2 * dc + top[0] as i32 + 2) >> 2);
+                for x in 1..n {
+                    dst[x] = S::from_i32((top[x] as i32 + 3 * dc + 2) >> 2);
+                }
+                for y in 1..n {
+                    dst[y * stride] = S::from_i32((left[y] as i32 + 3 * dc + 2) >> 2);
+                }
+            }
+        }
+
+        /// Fill an `n x n` block with `v` (a sample value).
+        #[target_feature(enable = $feat)]
+        unsafe fn intra_fill<S: crate::hevc::frame::Sample>(dst: *mut S, stride: usize, n: usize, v: i32) {
+            unsafe {
+                let vv = _mm_set1_epi16(v as i16);
+                for y in 0..n {
+                    let mut x = 0;
+                    while x < n {
+                        put(dst.add(y * stride + x), vv, (n - x).min(8));
+                        x += 8;
+                    }
+                }
+            }
+        }
+
+        fn intra_angular<S: crate::hevc::frame::Sample>(dst: &mut [S], stride: usize, refs: &[u16], n: usize, angle: i32, transposed: bool) {
+            // Every load of the last vector of a row, from `ref[-n]` up.
+            let reach = 3 * n + 2 + 8;
+            if refs.len() < reach || !(4..=32).contains(&n) || (n - 1) * stride + n > dst.len() || unsafe { over_i16::<S>(&refs[..3 * n + 2]) } {
+                return (HevcDsp::<S>::scalar().intra_angular)(dst, stride, refs, n, angle, transposed);
+            }
+            unsafe { intra_angular_impl(dst.as_mut_ptr(), stride, refs.as_ptr(), n, angle, transposed) }
+        }
+
+        /// One row of the angular interpolation, eight samples at `p`
+        /// (`ref[x + iIdx + 1]`) with fraction `f`: `pmaddwd` of the
+        /// interleaved neighbours against `(32 - f, f)`.
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn angular8(p: *const u16, k: __m128i, f: i32) -> __m128i {
+            unsafe {
+                let a = _mm_loadu_si128(p as *const __m128i);
+                if f == 0 {
+                    return a;
+                }
+                let b = _mm_loadu_si128(p.add(1) as *const __m128i);
+                let r = _mm_set1_epi32(16);
+                let lo = _mm_srai_epi32(_mm_add_epi32(_mm_madd_epi16(_mm_unpacklo_epi16(a, b), k), r), 5);
+                let hi = _mm_srai_epi32(_mm_add_epi32(_mm_madd_epi16(_mm_unpackhi_epi16(a, b), k), r), 5);
+                _mm_packs_epi32(lo, hi)
+            }
+        }
+
+        /// Angular prediction. The vertical modes write their rows straight
+        /// into the block; the horizontal ones predict the transposed block
+        /// row by row into a scratch block, and an 8x8 (or 4x4) transpose
+        /// per tile writes it into place.
+        #[target_feature(enable = $feat)]
+        unsafe fn intra_angular_impl<S: crate::hevc::frame::Sample>(dst: *mut S, stride: usize, refs: *const u16, n: usize, angle: i32, transposed: bool) {
+            unsafe {
+                // Written before it is read, tile by tile, so not cleared:
+                // clearing 2 KB a call was a visible share of the kernel.
+                let mut tmp = [std::mem::MaybeUninit::<u16>::uninit(); 32 * 32];
+                for y in 0..n {
+                    let pos = (y as i32 + 1) * angle;
+                    let (i, f) = (pos >> 5, pos & 31);
+                    let k = _mm_set1_epi32(pair16((32 - f) as i16, f as i16));
+                    let p = refs.offset(n as isize + i as isize + 1);
+                    let mut x = 0;
+                    while x < n {
+                        let v = angular8(p.add(x), k, f);
+                        if transposed {
+                            store_n(tmp.as_mut_ptr().add(y * n + x) as *mut i16, v, (n - x).min(8));
+                        } else {
+                            put(dst.add(y * stride + x), v, (n - x).min(8));
+                        }
+                        x += 8;
+                    }
+                }
+                if !transposed {
+                    return;
+                }
+                let t = tmp.as_ptr() as *const u16;
+                if n == 4 {
+                    let r = |j: usize| _mm_loadl_epi64(t.add(4 * j) as *const __m128i);
+                    let a = _mm_unpacklo_epi16(r(0), r(1));
+                    let b = _mm_unpacklo_epi16(r(2), r(3));
+                    let c01 = _mm_unpacklo_epi32(a, b);
+                    let c23 = _mm_unpackhi_epi32(a, b);
+                    put(dst, c01, 4);
+                    put(dst.add(stride), _mm_srli_si128(c01, 8), 4);
+                    put(dst.add(2 * stride), c23, 4);
+                    put(dst.add(3 * stride), _mm_srli_si128(c23, 8), 4);
+                    return;
+                }
+                for by in (0..n).step_by(8) {
+                    for bx in (0..n).step_by(8) {
+                        let mut r: [__m128i; 8] = std::array::from_fn(|j| _mm_loadu_si128(t.add((by + j) * n + bx) as *const __m128i));
+                        transpose8_u16(&mut r);
+                        for (j, v) in r.iter().enumerate() {
+                            put(dst.add((bx + j) * stride + by), *v, 8);
+                        }
+                    }
+                }
+            }
         }
 
         // ------------------------------------------------------------------
@@ -684,10 +1069,76 @@ macro_rules! kernels_u16 {
                 return;
             }
             if N == 4 {
-                // Not worth a vector: the scalar butterfly is 4 lines.
-                return (HevcDsp::<u16>::SCALAR.idct[0])(coeffs, bd_shift, max_x, max_y);
+                return idct4(coeffs, bd_shift, max_x, max_y);
             }
             unsafe { idct_impl::<N>(coeffs, bd_shift, max_x, max_y) }
+        }
+
+        /// The 4x4 DCT basis, `TRANSFORM32` at every eighth row.
+        const DCT4: [[i16; 4]; 4] = [[64, 64, 64, 64], [83, 36, -36, -83], [64, -64, -64, 64], [36, -83, 83, -36]];
+        /// The 4x4 DST basis (8.6.4.2, `trType == 1`).
+        const DST4: [[i16; 4]; 4] = [[29, 55, 74, 84], [74, 74, 0, -74], [84, -29, -74, 55], [55, -84, 74, -29]];
+
+        /// The 4x4 inverse DCT, all sixteen coefficients whatever `max_x` /
+        /// `max_y` say (the rest are zero, and cost nothing here). The DC
+        /// shortcut is `idct`'s. Shared with the AVX2 table, whose own
+        /// kernel has nothing to widen at this size.
+        pub(crate) fn idct4(coeffs: &mut [i16], bd_shift: i32, _max_x: usize, _max_y: usize) {
+            assert!(coeffs.len() >= 16 && (1..=31).contains(&bd_shift));
+            unsafe { inv4_impl(coeffs.as_mut_ptr(), bd_shift, &DCT4) }
+        }
+
+        /// The 4x4 inverse DST (intra luma 4x4).
+        pub(crate) fn idst4(coeffs: &mut [i16], bd_shift: i32, _max_x: usize, _max_y: usize) {
+            assert!(coeffs.len() >= 16 && (1..=31).contains(&bd_shift));
+            unsafe { inv4_impl(coeffs.as_mut_ptr(), bd_shift, &DST4) }
+        }
+
+        /// One stage of a 4-point inverse transform over four vectors of
+        /// four i16 (`r[j]`, coefficient `j` of four lines): output `i` of
+        /// each line is `sum_j m[j][i] * r[j]` — two `pmaddwd` over the
+        /// interleaved pairs `(r0, r1)` and `(r2, r3)` — then rounded,
+        /// shifted and saturated to i16, which is the reference's clip.
+        /// Returns outputs `[0 | 1]` and `[2 | 3]`.
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn inv4_stage(r: [__m128i; 4], m: &[[i16; 4]; 4], round: __m128i, sh: __m128i) -> (__m128i, __m128i) {
+            let p01 = _mm_unpacklo_epi16(r[0], r[1]);
+            let p23 = _mm_unpacklo_epi16(r[2], r[3]);
+            let out = |i: usize| {
+                let a = _mm_madd_epi16(p01, _mm_set1_epi32(pair16(m[0][i], m[1][i])));
+                let b = _mm_madd_epi16(p23, _mm_set1_epi32(pair16(m[2][i], m[3][i])));
+                _mm_sra_epi32(_mm_add_epi32(_mm_add_epi32(a, b), round), sh)
+            };
+            (_mm_packs_epi32(out(0), out(1)), _mm_packs_epi32(out(2), out(3)))
+        }
+
+        /// Transpose the 4x4 i16 block `[row0 | row1]`, `[row2 | row3]`
+        /// into its columns, one each in the low half of a vector.
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn columns4(a: __m128i, b: __m128i) -> [__m128i; 4] {
+            let u = _mm_unpacklo_epi16(a, b);
+            let v = _mm_unpackhi_epi16(a, b);
+            let c01 = _mm_unpacklo_epi16(u, v);
+            let c23 = _mm_unpackhi_epi16(u, v);
+            [c01, _mm_srli_si128(c01, 8), c23, _mm_srli_si128(c23, 8)]
+        }
+
+        /// Both stages of the 4x4 inverse transform with basis `m` (8.6.4.2):
+        /// columns, the 16-bit clip, rows. The second stage runs on the
+        /// transposed intermediate, so its output is the block's columns
+        /// and one more transpose puts it back in raster order.
+        #[target_feature(enable = $feat)]
+        unsafe fn inv4_impl(c: *mut i16, bd_shift: i32, m: &[[i16; 4]; 4]) {
+            unsafe {
+                let row = |j: usize| _mm_loadl_epi64(c.add(4 * j) as *const __m128i);
+                let (a, b) = inv4_stage([row(0), row(1), row(2), row(3)], m, _mm_set1_epi32(64), _mm_cvtsi32_si128(7));
+                let (a, b) = inv4_stage(columns4(a, b), m, _mm_set1_epi32(1 << (bd_shift - 1)), _mm_cvtsi32_si128(bd_shift));
+                let r = columns4(a, b);
+                _mm_storeu_si128(c as *mut __m128i, _mm_unpacklo_epi64(r[0], r[1]));
+                _mm_storeu_si128(c.add(8) as *mut __m128i, _mm_unpacklo_epi64(r[2], r[3]));
+            }
         }
 
         #[target_feature(enable = $feat)]
@@ -1186,6 +1637,10 @@ macro_rules! kernels_u8 {
         /// Every 8-bit-sample kernel — the bottom rung, and the top one.
         pub(crate) fn install_all_u8(d: &mut HevcDsp<u8>) {
             d.idct = [idct::<4>, idct::<8>, idct::<16>, idct::<32>];
+            d.idst4 = idst4;
+            d.intra_planar = intra_planar::<u8>;
+            d.intra_dc = intra_dc::<u8>;
+            d.intra_angular = intra_angular::<u8>;
             d.qpel_v2 = qpel_v2;
             d.epel_v2 = epel_v2;
             d.uni = uni_u8;
@@ -1367,13 +1822,6 @@ macro_rules! kernels_u8 {
             /// Block width (the stride of `i16` and `other`).
             w: usize,
         }
-
-        /// 14-bit predictions (the two-pass path and the first stage of hv).
-        const MODE_I16: u8 = 0;
-        /// Default-weighted uni-prediction samples: `(v + 32) >> 6`.
-        const MODE_UNI: u8 = 1;
-        /// Default-weighted bi-prediction samples: `(v + other + 64) >> 7`.
-        const MODE_BI: u8 = 2;
 
         /// Emit 8 lanes of a stage's output (`v`, 14-bit) at (`row`, `x`), the
         /// first `n` lanes.
@@ -2317,6 +2765,73 @@ mod tests {
         }
     }
 
+    /// The fused kernels at 16 bits, every rung the host has (AVX2 and
+    /// AVX-512 tables included), at every depth they serve: samples uniform
+    /// over the depth or on its rails, the other list's prediction over the
+    /// 14-bit range a real one has, every block shape and fraction, both
+    /// directions of the clip reached.
+    #[test]
+    fn fused_matches_scalar_u16() {
+        let mut cpus = rungs();
+        let top = Cpu::detect();
+        if top.avx2 {
+            cpus.push(("avx2", Cpu { avx512: false, avx512vnni: false, ..top }));
+        }
+        if top.avx512 {
+            cpus.push(("avx512", top));
+        }
+        let s = HevcDsp::<u16>::SCALAR;
+        let mut seed = 0xf05e_u64;
+        let stride = 96;
+        let mut ta = vec![0i16; MC_TMP_LEN];
+        let mut tb = vec![0i16; MC_TMP_LEN];
+        let mut n = 0;
+        for (name, cpu) in cpus {
+            let d = HevcDsp::<u16>::new(cpu);
+            assert!(d.fused_mc, "{name}: no fused kernels at 16 bits");
+            for bd in 8..=12u32 {
+                let max = (1u32 << bd) - 1;
+                for rails in [false, true] {
+                    let src: Vec<u16> = (0..stride * 96)
+                        .map(|_| if rails { if lcg(&mut seed).is_multiple_of(2) { 0 } else { max as u16 } } else { (lcg(&mut seed) % (max + 1)) as u16 })
+                        .collect();
+                    for &(w, h) in &SIZES {
+                        // A prediction, within what an interpolation of this
+                        // depth produces.
+                        let other: Vec<i16> = (0..w * h).map(|_| (lcg(&mut seed) % 24000) as i16 - 2500).collect();
+                        let ds = w + 9;
+                        let mut a = vec![0u16; ds * h];
+                        let mut b = vec![0u16; ds * h];
+                        let what = |k: &str, fx: usize, fy: usize| format!("{name} {k} {w}x{h} ({fx},{fy}) {bd} bits rails {rails}");
+                        for fx in 0..4 {
+                            for fy in 0..4 {
+                                (s.qpel_uni)(&mut a, ds, &src, stride, w, h, fx, fy, &mut ta, bd);
+                                (d.qpel_uni)(&mut b, ds, &src, stride, w, h, fx, fy, &mut tb, bd);
+                                assert_eq!(a, b, "{}", what("qpel_uni", fx, fy));
+                                (s.qpel_bi)(&mut a, ds, &src, stride, w, h, fx, fy, &mut ta, &other, bd);
+                                (d.qpel_bi)(&mut b, ds, &src, stride, w, h, fx, fy, &mut tb, &other, bd);
+                                assert_eq!(a, b, "{}", what("qpel_bi", fx, fy));
+                                n += 2;
+                            }
+                        }
+                        for fx in 0..8 {
+                            for fy in 0..8 {
+                                (s.epel_uni)(&mut a, ds, &src, stride, w, h, fx, fy, &mut ta, bd);
+                                (d.epel_uni)(&mut b, ds, &src, stride, w, h, fx, fy, &mut tb, bd);
+                                assert_eq!(a, b, "{}", what("epel_uni", fx, fy));
+                                (s.epel_bi)(&mut a, ds, &src, stride, w, h, fx, fy, &mut ta, &other, bd);
+                                (d.epel_bi)(&mut b, ds, &src, stride, w, h, fx, fy, &mut tb, &other, bd);
+                                assert_eq!(a, b, "{}", what("epel_bi", fx, fy));
+                                n += 2;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(n > 0);
+    }
+
     #[test]
     fn combine_matches_scalar_u16() {
         let s = HevcDsp::<u16>::SCALAR;
@@ -2344,6 +2859,102 @@ mod tests {
                         assert_eq!(a, b, "{name} wbi {w}x{h} {lwd} {wt} {o} max {max}");
                     }
                 }
+            }
+        }
+    }
+
+    /// The 4x4 inverse DCT and DST at every rung the host has, AVX2 and
+    /// AVX-512 included (they take this module's kernels at 4x4), in both
+    /// tables: coefficients across the whole of i16, so both stages' clips
+    /// are reached, dense and within a random bounding box, at the shifts of
+    /// 8, 10 and 12 bits.
+    #[test]
+    fn transforms4_match_scalar_at_every_rung() {
+        let mut cpus = rungs();
+        let top = Cpu::detect();
+        if top.avx2 {
+            cpus.push(("avx2", Cpu { avx512: false, avx512vnni: false, ..top }));
+        }
+        if top.avx512 {
+            cpus.push(("avx512", top));
+        }
+        let s = HevcDsp::<u16>::SCALAR;
+        let mut seed = 0x4d57_u64;
+        let mut n = 0;
+        for (name, cpu) in cpus {
+            let d16 = HevcDsp::<u16>::new(cpu);
+            let d8 = HevcDsp::<u8>::new(cpu);
+            for trial in 0..3000 {
+                let (mx, my) = if trial % 3 == 0 { (3, 3) } else { ((lcg(&mut seed) % 4) as usize, (lcg(&mut seed) % 4) as usize) };
+                let mut c = [0i16; 16];
+                for y in 0..=my {
+                    for x in 0..=mx {
+                        c[y * 4 + x] = match lcg(&mut seed) % 6 {
+                            0 => 32767,
+                            1 => -32768,
+                            2 => 0,
+                            _ => lcg(&mut seed) as i16,
+                        };
+                    }
+                }
+                let bd_shift = 12 - (trial % 3) * 2;
+                let mut want = c;
+                (s.idct[0])(&mut want, bd_shift, mx, my);
+                let mut want_dst = c;
+                (s.idst4)(&mut want_dst, bd_shift, 3, 3);
+                for (table, idct, idst) in [("u16", d16.idct[0], d16.idst4), ("u8", d8.idct[0], d8.idst4)] {
+                    let mut got = c;
+                    idct(&mut got, bd_shift, mx, my);
+                    assert_eq!(got, want, "{name} {table} idct4 trial {trial} max {mx},{my} shift {bd_shift} {c:?}");
+                    let mut got = c;
+                    idst(&mut got, bd_shift, 3, 3);
+                    assert_eq!(got, want_dst, "{name} {table} idst4 trial {trial} shift {bd_shift} {c:?}");
+                    n += 2;
+                }
+            }
+        }
+        assert!(n > 0);
+    }
+
+    /// ns per call of the 4x4 inverse DCT and DST, scalar against every
+    /// rung (AVX2 and AVX-512 take the AVX kernel), median of seven paired
+    /// rounds; the two scalar rows are the same-table control. `cargo test
+    /// --release --lib hevc_x86_128 -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn transforms4_bench() {
+        use std::time::Instant;
+        let mut seed = 0xb4d7_u64;
+        let blocks: Vec<[i16; 16]> = (0..64).map(|_| std::array::from_fn(|_| (lcg(&mut seed) % 2001) as i16 - 1000)).collect();
+        let s = HevcDsp::<u16>::SCALAR;
+        let mut tabs = vec![("scalar", s), ("scalar-again", s)];
+        tabs.extend(tables_u16());
+        const ROUNDS: usize = 7;
+        const PER: usize = 200_000;
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.total_cmp(b));
+            v[v.len() / 2]
+        };
+        for (label, dst) in [("idct4", false), ("idst4", true)] {
+            // `ns[round][table]`: every table back to back within a round.
+            let mut ns = vec![vec![0f64; tabs.len()]; ROUNDS];
+            let mut sink = 0i64;
+            for round in ns.iter_mut() {
+                for (slot, (_, d)) in round.iter_mut().zip(&tabs) {
+                    let f = if dst { d.idst4 } else { d.idct[0] };
+                    let start = Instant::now();
+                    for i in 0..PER {
+                        let mut c = blocks[i & 63];
+                        f(std::hint::black_box(&mut c), 12, 3, 3);
+                        sink = sink.wrapping_add(c[5] as i64);
+                    }
+                    *slot = start.elapsed().as_nanos() as f64 / PER as f64;
+                }
+            }
+            for (t, (name, _)) in tabs.iter().enumerate() {
+                let own = median(ns.iter().map(|r| r[t]).collect());
+                let ratio = median(ns.iter().map(|r| r[0] / r[t]).collect());
+                println!("{label} {name:13} {own:7.1} ns/call  {ratio:5.2}x scalar [{}]", sink & 1);
             }
         }
     }

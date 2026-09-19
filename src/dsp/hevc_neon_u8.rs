@@ -24,6 +24,10 @@ use crate::hevc::tables::{EPEL_FILTERS, QPEL_FILTERS};
 /// Replace the scalar entries of `d` with the NEON kernels.
 pub fn install(d: &mut HevcDsp<u8>) {
     d.idct = [w16::idct_neon::<4>, w16::idct_neon::<8>, w16::idct_neon::<16>, w16::idct_neon::<32>];
+    d.idst4 = w16::idst4_neon;
+    d.intra_planar = w16::intra_planar_neon::<u8>;
+    d.intra_dc = w16::intra_dc_neon::<u8>;
+    d.intra_angular = w16::intra_angular_neon::<u8>;
     d.add_residual = add_residual_neon;
     d.qpel_copy = copy_neon;
     d.qpel_h = qpel_h_neon;

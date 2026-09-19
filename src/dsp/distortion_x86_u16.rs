@@ -556,6 +556,21 @@ pub(crate) mod avx2 {
         unsafe {
             let mut acc = _mm256_setzero_si256();
             let mut y = 0;
+            if w == 8 {
+                // The four tiles of an 8x8 block: rows 0..4 in the low
+                // lane, 4..8 in the high one.
+                while y < h {
+                    let rows = |p: *const u16, s: usize| {
+                        std::array::from_fn(|r| {
+                            let lo = _mm_loadu_si128(p.add((y + r) * s) as *const __m128i);
+                            let hi = _mm_loadu_si128(p.add((y + r + 4) * s) as *const __m128i);
+                            _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(lo), hi)
+                        })
+                    };
+                    acc = _mm256_add_epi32(acc, quad(rows(a, sa), rows(b, sb)));
+                    y += 8;
+                }
+            }
             while y < h {
                 let ra = a.add(y * sa);
                 let rb = b.add(y * sb);
@@ -574,7 +589,9 @@ pub(crate) mod avx2 {
     }
 
     fn satd(a: &[u16], a_stride: usize, b: &[u16], b_stride: usize, w: usize, h: usize) -> u32 {
-        if w % 16 != 0 || h % 4 != 0 || h == 0 {
+        // Sixteen or more wide, or eight wide in whole 8x8 blocks.
+        let ours = if w == 8 { h.is_multiple_of(8) } else { w.is_multiple_of(16) && h.is_multiple_of(4) };
+        if !ours || h == 0 {
             return super::avx::satd(a, a_stride, b, b_stride, w, h);
         }
         assert!(a.len() >= (h - 1) * a_stride + w && b.len() >= (h - 1) * b_stride + w, "block out of range");

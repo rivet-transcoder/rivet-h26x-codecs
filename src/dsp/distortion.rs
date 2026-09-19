@@ -37,6 +37,31 @@ pub type SatdFn<S> = fn(a: &[S], a_stride: usize, b: &[S], b_stride: usize, w: u
 /// others because at 12 bits a 64x64 block overflows 32 bits.
 pub type SsdFn<S> = fn(a: &[S], a_stride: usize, b: &[S], b_stride: usize, w: usize, h: usize) -> u64;
 
+/// The encoder's SAO edge-offset statistics (its side of 8.7.3) over a `w
+/// x h` region of `rec` starting at index `origin`, row stride `stride`,
+/// every sample's two neighbours — at offsets `na` and `nb` — usable: each
+/// sample's category `e = 2 + sign(r - a) + sign(r - b)` and its error
+/// `src - r`, counted and summed per category into `tally[e] = [count,
+/// sum]`. `src` starts at the region's first sample, stride `src_stride`.
+/// A sample within `reach` of 0 or of `max` is also pushed onto `near` as
+/// `(e, r, err)`: the SAO model treats those apart, since a clip at the
+/// rail moves them by less than the offset.
+pub type SaoEdgeStatsFn<S> = fn(
+    rec: &[S],
+    origin: usize,
+    stride: usize,
+    src: &[S],
+    src_stride: usize,
+    w: usize,
+    h: usize,
+    na: isize,
+    nb: isize,
+    max: i32,
+    reach: i32,
+    tally: &mut [[i64; 2]; 5],
+    near: &mut Vec<(u8, u16, i32)>,
+);
+
 /// The distortion kernels, filled at run time from what the CPU has.
 #[derive(Clone)]
 pub struct DistortionDsp<S: Sample = u8> {
@@ -48,6 +73,8 @@ pub struct DistortionDsp<S: Sample = u8> {
     pub satd: SatdFn<S>,
     /// Sum of squared differences.
     pub ssd: SsdFn<S>,
+    /// SAO edge-offset statistics.
+    pub sao_edge_stats: SaoEdgeStatsFn<S>,
 }
 
 impl<S: Sample> DistortionDsp<S> {
@@ -59,6 +86,7 @@ impl<S: Sample> DistortionDsp<S> {
             sad: sad_scalar::<S>,
             satd: satd_scalar::<S>,
             ssd: ssd_scalar::<S>,
+            sao_edge_stats: sao_edge_stats_scalar::<S>,
         }
     }
 
@@ -84,6 +112,8 @@ fn install_simd<S: Sample>(d: &mut DistortionDsp<S>, cpu: Cpu) {
     if super::enc_simd_disabled("distortion") {
         return;
     }
+    #[cfg(target_arch = "x86_64")]
+    super::sao_x86::install(d, cpu);
     let d = d as &mut dyn Any;
     if let Some(d) = d.downcast_mut::<DistortionDsp<u8>>() {
         #[cfg(target_arch = "x86_64")]
@@ -121,6 +151,39 @@ pub(crate) fn sad_scalar<S: Sample>(a: &[S], a_stride: usize, b: &[S], b_stride:
         }
     }
     sum
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sao_edge_stats_scalar<S: Sample>(
+    rec: &[S],
+    origin: usize,
+    stride: usize,
+    src: &[S],
+    src_stride: usize,
+    w: usize,
+    h: usize,
+    na: isize,
+    nb: isize,
+    max: i32,
+    reach: i32,
+    tally: &mut [[i64; 2]; 5],
+    near: &mut Vec<(u8, u16, i32)>,
+) {
+    for y in 0..h {
+        for x in 0..w {
+            let i = origin + y * stride + x;
+            let r = rec[i].to_i32();
+            let a = rec[(i as isize + na) as usize].to_i32();
+            let b = rec[(i as isize + nb) as usize].to_i32();
+            let e = (2 + (r - a).signum() + (r - b).signum()) as usize;
+            let err = src[y * src_stride + x].to_i32() - r;
+            tally[e][0] += 1;
+            tally[e][1] += err as i64;
+            if r < reach || max - r < reach {
+                near.push((e as u8, r as u16, err));
+            }
+        }
+    }
 }
 
 pub(crate) fn ssd_scalar<S: Sample>(a: &[S], a_stride: usize, b: &[S], b_stride: usize, w: usize, h: usize) -> u64 {

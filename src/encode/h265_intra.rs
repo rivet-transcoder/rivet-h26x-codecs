@@ -87,7 +87,7 @@ use crate::dsp::hevc::HevcDsp;
 use crate::dsp::hevc_enc::{HevcEncDsp, qbits, quant_offset, quant_scale};
 use crate::hevc::ctu::chroma_qp;
 use crate::hevc::frame::{Frame, Plane16};
-use crate::hevc::intra::{IntraScratch, RefAvail, predict};
+use crate::hevc::intra::{IntraScratch, RefAvail, predict, predict_prepared, prepare};
 use crate::hevc::pic::PicInfo;
 use crate::hevc::residual::{ScalingSource, scale_coefficients};
 use crate::picture::ChromaFormat;
@@ -1577,13 +1577,16 @@ fn search_luma_mode<S: Sample>(
     let n = 1usize << log2;
     let off = plane.offset(x as isize, y as isize);
     fill_ref_avail(geo, &mut sc.avail, x, y, n, 1, 1);
+    // The references are gathered once for all 35 trials (and smoothed
+    // once, by the first mode that wants them smoothed).
+    prepare(plane, sc, x, y, n, ctx.bit_depth);
     let rate_scale = satd_lambda_scale(ctx.bit_depth);
     let mut best = (f32::MAX, 1u8);
     for mode in 0..35u8 {
         // The decoder's flags for a luma block under this SPS: reference
         // smoothing on (predict itself skips DC and 4x4), boundary filter
         // on (no implicit RDPCM to suspend it).
-        predict(plane, sc, x, y, n, mode as u32, 0, true, true, ctx.bit_depth, ctx.strong_smoothing);
+        predict_prepared(ctx.dsp, plane, sc, x, y, n, mode as u32, 0, true, true, ctx.bit_depth, ctx.strong_smoothing);
         let satd = (ctx.dist.satd)(src, src_stride, &plane.data[off..], plane.stride, n, n);
         let signal = match cands.iter().position(|&c| c == mode as u32) {
             Some(i) => ModeSignal::LumaMpm(i as u8),
@@ -1622,7 +1625,7 @@ fn code_luma_tb<S: Sample>(
 ) -> u32 {
     let n = 1usize << log2;
     fill_ref_avail(geo, &mut sc.avail, x, y, n, 1, 1);
-    predict(plane, sc, x, y, n, mode as u32, 0, true, true, ctx.bit_depth, ctx.strong_smoothing);
+    predict(ctx.dsp, plane, sc, x, y, n, mode as u32, 0, true, true, ctx.bit_depth, ctx.strong_smoothing);
     let qp = ctx.qp + 6 * (ctx.bit_depth as i32 - 8);
     code_residual(ctx, plane, x, y, log2, 0, qp, src, src_stride, levels, geo.cat, mode)
 }
@@ -1904,6 +1907,38 @@ fn search_chroma_mode<S: Sample>(
     let (sw, sh) = sub_wh(geo.cat);
     let rate_scale = satd_lambda_scale(ctx.bit_depth);
     let mut best = (f32::MAX, 4u8);
+    let score = |syntax: u8, satd: u32, best: &mut (f32, u8)| {
+        let signal = if syntax == 4 { ModeSignal::ChromaDerived } else { ModeSignal::ChromaExplicit };
+        let cost = satd as f32 + mode_signalling_cost(ctx.qp, signal) * rate_scale;
+        if cost < best.0 {
+            *best = (cost, syntax);
+        }
+    };
+    if ntb == 1 {
+        // One transform block: each plane's references are gathered once
+        // for all five trials, which then run plane by plane. Nothing a
+        // trial writes is another trial's reference, so this is the
+        // interleaved loop below reordered; with two blocks (4:2:2) the
+        // second predicts from the first's trial, and the order matters.
+        let (ax, ay) = tbs[0];
+        let (cx, cy) = (ax / sw, ay / sh);
+        let soff = (cy - yl / sh) * c_stride + (cx - xl / sw);
+        fill_ref_avail(geo, &mut sc.avail, ax, ay, nc, sw, sh);
+        let mut satd = [0u32; 5];
+        for (plane, src) in [(&mut *cb, src_cb), (&mut *cr, src_cr)] {
+            prepare(plane, sc, cx, cy, nc, ctx.bit_depth);
+            let off = plane.offset(cx as isize, cy as isize);
+            for syntax in 0..5u8 {
+                let mode = chroma_mode_for(geo.cat, syntax, luma0) as u32;
+                predict_prepared(ctx.dsp, plane, sc, cx, cy, nc, mode, 1, geo.cat == 3, false, ctx.bit_depth, ctx.strong_smoothing);
+                satd[syntax as usize] += (ctx.dist.satd)(&src[soff..], c_stride, &plane.data[off..], plane.stride, nc, nc);
+            }
+        }
+        for syntax in 0..5u8 {
+            score(syntax, satd[syntax as usize], &mut best);
+        }
+        return (best.1, chroma_mode_for(geo.cat, best.1, luma0));
+    }
     for syntax in 0..5u8 {
         let mode = chroma_mode_for(geo.cat, syntax, luma0) as u32;
         let mut satd = 0u32;
@@ -1915,16 +1950,12 @@ fn search_chroma_mode<S: Sample>(
                 // The decoder's flags for a subsampled chroma block: no
                 // reference smoothing (that is 4:4:4's privilege), no
                 // boundary filter (luma's alone).
-                predict(plane, sc, cx, cy, nc, mode, 1, geo.cat == 3, false, ctx.bit_depth, ctx.strong_smoothing);
+                predict(ctx.dsp, plane, sc, cx, cy, nc, mode, 1, geo.cat == 3, false, ctx.bit_depth, ctx.strong_smoothing);
                 let off = plane.offset(cx as isize, cy as isize);
                 satd += (ctx.dist.satd)(&src[soff..], c_stride, &plane.data[off..], plane.stride, nc, nc);
             }
         }
-        let signal = if syntax == 4 { ModeSignal::ChromaDerived } else { ModeSignal::ChromaExplicit };
-        let cost = satd as f32 + mode_signalling_cost(ctx.qp, signal) * rate_scale;
-        if cost < best.0 {
-            best = (cost, syntax);
-        }
+        score(syntax, satd, &mut best);
     }
     (best.1, chroma_mode_for(geo.cat, best.1, luma0))
 }
@@ -1956,7 +1987,7 @@ fn code_chroma_tb<S: Sample>(
     let (sw, sh) = sub_wh(geo.cat);
     let (cx, cy) = (xl / sw, yl / sh);
     fill_ref_avail(geo, &mut sc.avail, xl, yl, nc, sw, sh);
-    predict(plane, sc, cx, cy, nc, mode as u32, c_idx, geo.cat == 3, false, ctx.bit_depth, ctx.strong_smoothing);
+    predict(ctx.dsp, plane, sc, cx, cy, nc, mode as u32, c_idx, geo.cat == 3, false, ctx.bit_depth, ctx.strong_smoothing);
     // QP for chroma as the decoder derives it: the bit-depth offset comes
     // off, the `chroma_array_type`-aware mapping applies (Table 8-10 for
     // 4:2:0, a plain clamp to 51 otherwise), and it goes back on. No PPS
@@ -2670,7 +2701,7 @@ mod tests {
             let IntraPicture { recon, scratch, .. } = &mut probe;
             fill_ref_avail(geo, &mut scratch.avail, 0, 0, n, 1, 1);
             for mode in 0..35u32 {
-                predict(&mut recon.y, scratch, 0, 0, n, mode, 0, true, true, 8, false);
+                predict(&HevcDsp::<u8>::SCALAR, &mut recon.y, scratch, 0, 0, n, mode, 0, true, true, 8, false);
                 let off = recon.y.origin();
                 for yy in 0..n {
                     for xx in 0..n {
@@ -3648,7 +3679,7 @@ mod tests {
                         let mode = mode_from_syntax(d.luma_syntax[pb], cands);
                         assert_eq!(mode, d.luma_modes[pb] as u32, "syntax and mode disagree at ({px},{py})");
                         fill_ref_avail(geo, &mut scratch.avail, px, py, 4, 1, 1);
-                        predict(&mut recon.y, scratch, px, py, 4, mode, 0, true, true, ctx.bit_depth, ctx.strong_smoothing);
+                        predict(ctx.dsp, &mut recon.y, scratch, px, py, 4, mode, 0, true, true, ctx.bit_depth, ctx.strong_smoothing);
                         add_tu(ctx, &mut recon.y, px, py, 2, 0, qp_y, d.bypass, &d.luma[pb * 16..pb * 16 + 16]);
                         PicInfo::fill4(modes, geo.w4, px, py, 4, 4, mode as u8);
                     }
@@ -3663,7 +3694,7 @@ mod tests {
                     PicInfo::fill4(modes, geo.w4, x0, y0, n, n, mode as u8);
                     if !d.split_tu {
                         fill_ref_avail(geo, &mut scratch.avail, x0, y0, n, 1, 1);
-                        predict(&mut recon.y, scratch, x0, y0, n, mode, 0, true, true, ctx.bit_depth, ctx.strong_smoothing);
+                        predict(ctx.dsp, &mut recon.y, scratch, x0, y0, n, mode, 0, true, true, ctx.bit_depth, ctx.strong_smoothing);
                         add_tu(ctx, &mut recon.y, x0, y0, log2_cu, 0, qp_y, d.bypass, &d.luma[..n * n]);
                     } else {
                         // The tree walk, leaf by leaf in z-order, each TB
@@ -3673,7 +3704,7 @@ mod tests {
                             let (tx, ty) = (x0 + (i & 1) * half, y0 + (i >> 1) * half);
                             if !d.split_child[i] {
                                 fill_ref_avail(geo, &mut scratch.avail, tx, ty, half, 1, 1);
-                                predict(&mut recon.y, scratch, tx, ty, half, mode, 0, true, true, ctx.bit_depth, ctx.strong_smoothing);
+                                predict(ctx.dsp, &mut recon.y, scratch, tx, ty, half, mode, 0, true, true, ctx.bit_depth, ctx.strong_smoothing);
                                 add_tu(ctx, &mut recon.y, tx, ty, log2_cu - 1, 0, qp_y, d.bypass, &d.luma[i * q..(i + 1) * q]);
                             } else {
                                 let hh = half / 2;
@@ -3682,7 +3713,7 @@ mod tests {
                                     let (lx, ly) = (tx + (j & 1) * hh, ty + (j >> 1) * hh);
                                     let base = i * q + j * qq;
                                     fill_ref_avail(geo, &mut scratch.avail, lx, ly, hh, 1, 1);
-                                    predict(&mut recon.y, scratch, lx, ly, hh, mode, 0, true, true, ctx.bit_depth, ctx.strong_smoothing);
+                                    predict(ctx.dsp, &mut recon.y, scratch, lx, ly, hh, mode, 0, true, true, ctx.bit_depth, ctx.strong_smoothing);
                                     add_tu(ctx, &mut recon.y, lx, ly, log2_cu - 2, 0, qp_y, d.bypass, &d.luma[base..base + qq]);
                                 }
                             }
@@ -3702,7 +3733,7 @@ mod tests {
                         assert_eq!(mode, d.chroma_mode_nxn[pb], "4:4:4 NxN chroma syntax and mode disagree at ({px},{py})");
                         for (comp, plane) in [&mut recon.cb, &mut recon.cr].into_iter().enumerate() {
                             fill_ref_avail(geo, &mut scratch.avail, px, py, 4, 1, 1);
-                            predict(plane, scratch, px, py, 4, mode as u32, 1 + comp, true, false, ctx.bit_depth, ctx.strong_smoothing);
+                            predict(ctx.dsp, plane, scratch, px, py, 4, mode as u32, 1 + comp, true, false, ctx.bit_depth, ctx.strong_smoothing);
                             add_tu(ctx, plane, px, py, 2, 1 + comp, qp_c, d.bypass, &d.chroma[comp][pb * 16..pb * 16 + 16]);
                         }
                     }
@@ -3743,7 +3774,7 @@ mod tests {
                         for (k, &(ax, ay)) in tbs[..ntb].iter().enumerate() {
                             let base = lbase + k * qtb;
                             fill_ref_avail(geo, &mut scratch.avail, ax, ay, 1 << log2c, sw, sh);
-                            predict(plane, scratch, ax / sw, ay / sh, 1 << log2c, mode as u32, 1 + comp, geo.cat == 3, false, ctx.bit_depth, ctx.strong_smoothing);
+                            predict(ctx.dsp, plane, scratch, ax / sw, ay / sh, 1 << log2c, mode as u32, 1 + comp, geo.cat == 3, false, ctx.bit_depth, ctx.strong_smoothing);
                             add_tu(ctx, plane, ax / sw, ay / sh, log2c, 1 + comp, qp_c, d.bypass, &d.chroma[comp][base..base + qtb]);
                         }
                     }
