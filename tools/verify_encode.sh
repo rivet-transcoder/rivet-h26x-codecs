@@ -537,8 +537,8 @@ EXCLUSIVE_TOKENS="ilace fdeep wsine"
 # it listed only the two it uses, the older anchors were marked unused, and
 # libavcodec refused the next P picture that named one ("Could not find ref
 # with POC 0"). Our decoder generates a stand-in for a missing reference and
-# counts a warning (h26xdec prints the count), so SELF passed and only CROSS
-# was red. They visit motion (and, through the tag, its 10-bit twin
+# counts a warning (h26xdec prints the count); SELF passed and only CROSS was
+# red, which is why SELF now also fails on any warning our decoder counts. They visit motion (and, through the tag, its 10-bit twin
 # motion10), fade and cut; --gop 250 because at --gop 8 the GOP ends before
 # --bframes 3 leaves a B picture below an anchor it does not use.
 CONFIGS=${CONFIGS:-"
@@ -800,6 +800,21 @@ one() {
   fi
   if ! cmp -s "$rec" "$ours"; then
     echo "SELF-FAIL   $tag: decoded output differs from the encoder's own reconstruction"
+    return 1
+  fi
+  # Our decoder conceals what a stream gets wrong — a missing reference gets a
+  # generated stand-in, an out-of-range syntax element a clamp — and counts
+  # each time it did ("N frames, W warnings" on stderr). A stream from our own
+  # encoder has nothing to conceal, so any warning is a defect even when the
+  # pictures still match the reconstruction: the RPS that dropped a later P
+  # picture's anchor passed the two checks above and was caught only by CROSS.
+  selfwarn=$(sed -nE 's/^[0-9]+ frames, ([0-9]+) warnings$/\1/p' "$OUT/$base.$name.dec.log" | tail -n 1)
+  if [ -z "$selfwarn" ]; then
+    echo "SELF-FAIL   $tag: our decoder printed no frame/warning count"
+    return 1
+  elif [ "$selfwarn" -ne 0 ]; then
+    detail=$(grep -vE '^[0-9]+ frames, ' "$OUT/$base.$name.dec.log" | head -1 | head -c 80)
+    echo "SELF-FAIL   $tag: our decoder concealed $selfwarn problem(s) in our bitstream${detail:+: $detail}"
     return 1
   fi
 
