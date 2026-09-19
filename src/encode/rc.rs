@@ -979,15 +979,17 @@ impl RateController {
     /// over a `width` by `height` picture, with `gop` pictures between IDRs
     /// (0 meaning every picture is one) and `bframes` consecutive B
     /// pictures between references.
-    pub fn new(bps: u32, fps: u32, width: u32, height: u32, gop: u32, bframes: u32) -> Self {
+    pub fn new(bps: u32, fps: impl Into<f64>, width: u32, height: u32, gop: u32, bframes: u32) -> Self {
         Self::with_cpb(bps, fps, width, height, gop, bframes, None)
     }
 
     /// [`RateController::new`] against a declared coded picture buffer of
     /// `cpb_bits`, which each picture's target is capped to fit.
     #[allow(clippy::too_many_arguments)]
-    pub fn with_cpb(bps: u32, fps: u32, width: u32, height: u32, gop: u32, bframes: u32, cpb_bits: Option<u64>) -> Self {
-        let fps = fps.max(1) as f64;
+    pub fn with_cpb(bps: u32, fps: impl Into<f64>, width: u32, height: u32, gop: u32, bframes: u32, cpb_bits: Option<u64>) -> Self {
+        // Frames per second, a fraction for the NTSC family: the budget
+        // of each picture is `bps / fps` exactly (`Config::frame_rate_f64`).
+        let fps = fps.into().max(1.0);
         let per_picture = (bps as f64 / fps).max(1.0);
         // With `gop` pictures per keyframe, one carries INTRA_WEIGHT and
         // the rest split between P and B in the ratio the scheduler will
@@ -1361,11 +1363,11 @@ impl RateController {
 
     /// The achieved rate in bits per second, given the frame rate the
     /// controller was built with — for reporting, never for deciding.
-    pub fn achieved_bps(&self, fps: u32) -> f64 {
+    pub fn achieved_bps(&self, fps: impl Into<f64>) -> f64 {
         if self.pictures == 0 {
             return 0.0;
         }
-        self.bits_spent as f64 * fps.max(1) as f64 / self.pictures as f64
+        self.bits_spent as f64 * fps.into().max(1.0) / self.pictures as f64
     }
 }
 
@@ -1399,6 +1401,16 @@ mod tests {
     const K_INTRA: f64 = 1.17e6;
     /// See [`K_INTRA`].
     const K_INTER: f64 = 2.93e5;
+
+    /// Each picture's budget is the target over the exact frame rate: 30
+    /// kbit/s at 30000/1001 is 1001 bits a picture, not the 1000 of 30.
+    #[test]
+    fn the_budget_per_picture_reads_the_exact_frame_rate() {
+        let at = |fps: f64| RateController::new(30_000, fps, 64, 64, 8, 0).per_picture;
+        assert!((at(30_000.0 / 1_001.0) - 1_001.0).abs() < 1e-9, "{}", at(30_000.0 / 1_001.0));
+        assert_eq!(at(30.0), 1_000.0);
+        assert_eq!(RateController::new(30_000, 30, 64, 64, 8, 0).per_picture, 1_000.0, "a whole number still reads");
+    }
 
     /// The ledger is the one exact property here: whatever bytes are
     /// handed to `account`, `bits_spent` is eight times their sum. Trivial

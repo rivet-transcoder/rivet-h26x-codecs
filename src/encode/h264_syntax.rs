@@ -46,11 +46,13 @@ pub const NAL_PPS: u8 = 8;
 const OUTPUT_DELAY_LENGTH: u32 = 24;
 
 /// The clock ticks one frame lasts. `time_scale` is written as twice the
-/// frame rate with `fixed_frame_rate_flag` set, because that flag's
-/// definition counts a *frame* as `DeltaTfiDivisor` ticks and the divisor
-/// is 2 for a frame picture without `pic_struct` (E.2.1) — the field-rate
-/// clock every H.264 encoder writes, so that `cpb_removal_delay` steps by
-/// two per frame.
+/// frame rate's numerator, and `num_units_in_tick` as its denominator,
+/// with `fixed_frame_rate_flag` set, because that flag's definition counts
+/// a *frame* as `DeltaTfiDivisor` ticks and the divisor is 2 for a frame
+/// picture without `pic_struct` (E.2.1) — the field-rate clock every H.264
+/// encoder writes, so that `cpb_removal_delay` steps by two per frame.
+/// 29.97 is `num_units_in_tick` 1001 over `time_scale` 60000; 30 is 1 over
+/// 60, as it always was.
 pub const TICKS_PER_FRAME: u32 = 2;
 
 /// `hrd_parameters()` (E.1.2) — one CPB, NAL HRD only. The inverse of
@@ -89,7 +91,7 @@ fn write_vui(
     colour: Option<&ColourDescription>,
     chroma_loc: Option<u8>,
     cpb: Option<&Cpb>,
-    fps: u32,
+    (fps_num, fps_den): (u32, u32),
 ) {
     w.flag(false); // aspect_ratio_info_present_flag
     w.flag(false); // overscan_info_present_flag
@@ -98,8 +100,8 @@ fn write_vui(
     match cpb {
         Some(cpb) => {
             w.flag(true); // timing_info_present_flag
-            w.bits(32, 1); // num_units_in_tick
-            w.bits(32, TICKS_PER_FRAME * fps.max(1)); // time_scale
+            w.bits(32, fps_den); // num_units_in_tick
+            w.bits(32, TICKS_PER_FRAME * fps_num); // time_scale
             w.flag(true); // fixed_frame_rate_flag
             w.flag(true); // nal_hrd_parameters_present_flag
             write_hrd(w, cpb);
@@ -469,7 +471,7 @@ pub fn write_sps(
     }
     if cpb.is_some() || cfg.colour.is_some() || cfg.chroma_loc.is_some() {
         w.flag(true); // vui_parameters_present_flag
-        write_vui(&mut w, cfg.colour.as_ref(), cfg.chroma_loc, cpb, cfg.fps);
+        write_vui(&mut w, cfg.colour.as_ref(), cfg.chroma_loc, cpb, cfg.frame_rate());
     } else {
         w.flag(false); // vui_parameters_present_flag
     }

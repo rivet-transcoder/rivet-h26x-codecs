@@ -271,15 +271,26 @@ pub struct Config {
     /// constraint on a rate, and there is no rate to constrain at a fixed
     /// quantiser. Asking for one anyway refuses by name.
     pub cpb_ms: u32,
-    /// Frames per second. A target in bits per *second* is meaningless
-    /// without it, and so is a level: the level each stream claims is
-    /// chosen from its macroblocks or samples per second, among other
-    /// things (`encode::level`), so a caller who leaves the default 30
-    /// under a faster stream gets a level too low for it. The rate itself
-    /// reaches the bitstream only as the frame clock of a declared buffer's
-    /// VUI. It is declared rather than assumed so that a caller who cares
-    /// can set it.
+    /// Frames per second, or with [`Config::fps_den`] the numerator of
+    /// the frame rate: the rate is `fps / fps_den`. A target in bits per
+    /// *second* is meaningless without it, and so is a level: the level
+    /// each stream claims is chosen from its macroblocks or samples per
+    /// second, among other things (`encode::level`), so a caller who
+    /// leaves the default 30 under a faster stream gets a level too low
+    /// for it. The rate itself reaches the bitstream only as the frame
+    /// clock of a declared buffer's VUI. It is declared rather than
+    /// assumed so that a caller who cares can set it.
     pub fps: u32,
+    /// The denominator of the frame rate, `fps / fps_den` frames per
+    /// second: 1, the default, for a whole number of them, and 1001 for
+    /// the NTSC family — 30000/1001 is 29.97, 24000/1001 23.976,
+    /// 60000/1001 59.94 — or 2 for 25/2, 12.5. Everything that reads the
+    /// rate reads it exactly: the VUI clock (`num_units_in_tick` and
+    /// `time_scale`, H.264 E.2.1 / H.265 E.3.1), the rate controller's
+    /// per-picture budget and the level (`encode::level`). A whole-number
+    /// caller that never sets it writes exactly the stream it always did.
+    /// Zero is refused.
+    pub fps_den: u32,
     /// Sample adaptive offset, the second in-loop filter (H.265 only).
     ///
     /// Off by default and a switch rather than something always applied,
@@ -455,6 +466,7 @@ impl Default for Config {
             threads: 0,
             sao: false,
             fps: 30,
+            fps_den: 1,
             cpb_ms: 0,
             aq_strength: 0.0,
             lookahead: 0,
@@ -471,6 +483,27 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The frame rate `fps / fps_den` in lowest terms, `(numerator,
+    /// denominator)` — 30000/1001 stays 30000/1001, 60/2 becomes 30/1 —
+    /// with a zero `fps` read as one frame a second, as every reader of
+    /// the rate always has. The exact value, for the VUI clock and the
+    /// level; [`Config::frame_rate_f64`] is the same number for the rate
+    /// controller.
+    pub fn frame_rate(&self) -> (u32, u32) {
+        let (num, den) = (self.fps.max(1), self.fps_den.max(1));
+        let (mut a, mut b) = (num, den);
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        (num / a, den / a)
+    }
+
+    /// [`Config::frame_rate`] as frames per second.
+    pub fn frame_rate_f64(&self) -> f64 {
+        let (num, den) = self.frame_rate();
+        f64::from(num) / f64::from(den)
+    }
+
     /// Reject what the encoder cannot legally or sensibly produce, before it
     /// has written a byte. An encoder that fails late has usually already
     /// emitted a header describing something it then cannot deliver.
@@ -483,6 +516,14 @@ impl Config {
         }
         if self.max_refs == 0 {
             return Err(crate::Error::unsupported("encode: max_refs must be at least 1"));
+        }
+        if self.fps_den == 0 {
+            return Err(crate::Error::unsupported("encode: fps_den is zero (the frame rate is fps / fps_den)"));
+        }
+        if self.frame_rate().0 > i32::MAX as u32 {
+            return Err(crate::Error::unsupported(
+                "encode: a frame rate numerator above 2^31 - 1 in lowest terms (H.264's field clock doubles it into a 32-bit time_scale)",
+            ));
         }
         if !(self.aq_strength >= 0.0) || self.aq_strength > 4.0 {
             return Err(crate::Error::unsupported("encode: aq_strength outside 0.0..=4.0"));

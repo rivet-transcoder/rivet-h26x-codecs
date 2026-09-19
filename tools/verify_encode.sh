@@ -115,6 +115,13 @@
 #               fill-and-drain cycle and both branches are vacuous - which
 #               is why the row is restricted to src_cut below.
 #
+#               The two `-ntsc` rows declare the buffer at 29.97 pictures a
+#               second (--fps 30000/1001): the VUI clock is 1001 over 60000
+#               (H.264's field clock) or over 30000 (H.265), and h26xhrd
+#               walks it exactly - H.264's tick is 1501.5 of the 90 kHz
+#               ones, which a rounded tick would drift from by half a tick a
+#               picture.
+#
 #               Its mutation: make the controller ignore the buffer it was
 #               given, and the row must go red. So does forbidding the
 #               encoder to code a picture twice - at this buffer size the
@@ -577,6 +584,7 @@ hevc-abr-96k|--codec h265 --bitrate 96000 --gop 8
 abr-64k|--codec h264 --bitrate 64000 --gop 8
 abr-128k|--codec h264 --bitrate 128000 --gop 8
 hevc-vbv-125@src_cut|--codec h265 --bitrate 64000 --cpb-ms 125 --gop 8
+hevc-vbv-125-ntsc@src_cut|--codec h265 --bitrate 64000 --cpb-ms 125 --gop 8 --fps 30000/1001
 hevc10-cqp-intra@p10|--codec h265 --qp 26 --gop 0
 hevc10-cqp-ip@p10|--codec h265 --qp 26 --gop 8
 hevc10-cqp-ipb@p10|--codec h265 --qp 26 --gop 8 --bframes 2
@@ -619,6 +627,7 @@ hevc-refs4-b3@motion|--codec h265 --qp 26 --gop 250 --bframes 3 --refs 4
 hevc-refs4-b3@fade|--codec h265 --qp 26 --gop 250 --bframes 3 --refs 4
 hevc-refs4-b3@cut|--codec h265 --qp 26 --gop 250 --bframes 3 --refs 4
 abr-64k-cpb@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8
+abr-64k-cpb-ntsc@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8 --fps 30000/1001
 abr-64k-cavlc-cpb@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8 --cavlc
 h264-10-lossless-intra@p10|--codec h264 --lossless --gop 0
 h264-10-lossless-cavlc-intra@p10|--codec h264 --lossless --gop 0 --cavlc
