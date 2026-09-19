@@ -207,7 +207,9 @@
 //!   pixel seed: it takes the keyframe's observed `k` and its own cost.
 //!   Before any observation at all the seed is [`SEED_BITS_PER_COST`],
 //!   a calibration, clamped through the same [`SEED_QP_MIN`] and
-//!   [`SEED_QP_MAX`] a past-only seed is.
+//!   [`SEED_QP_MAX`] a past-only seed is. A picture planned from a seed
+//!   alone that misses by far is coded again once (*The seeded first
+//!   pictures* below).
 //!
 //! What lookahead does **not** change: the ledger, the bucket, the buffer
 //! cap, and every check above. A cost of one and an empty window is the
@@ -494,7 +496,8 @@
 //! wsine10's 1.003 was two errors cancelling: keyframes at 0.25 and 0.24
 //! of plan against capped end pictures overspending (display 11 at
 //! 2.19x). Anything that fixes the end pictures moves it off 1.0 until the
-//! keyframe seed is fixed, which is a separate problem.
+//! keyframe seed is fixed. *The seeded first pictures* below fixes the
+//! first keyframe and takes wsine10 to 1.101x.
 //!
 //! **Where the evidence is.** The measurements are on the machine they
 //! were taken on, under `D:/rivet-rcfix3` and `D:/rivet-rcfix4`:
@@ -511,6 +514,101 @@
 //! - The cap: `capb/capb.txt` (under `--wpred`), `capwp/capwp.txt` (as
 //!   implemented) and `latrace_b16/` (its per-picture trace).
 //! - la-ipb: `ipb_psnr.out` and `ipb_variants_psnr.out`.
+//!
+//! ## The seeded first pictures, coded again when they miss
+//!
+//! Under lookahead the stream's first picture is planned from
+//! [`SEED_BITS_PER_COST`] and nothing else. That calibration was taken
+//! before the coding quadtree became the default, and it now misses:
+//!
+//! - **The gate's lookahead cells.** Over its 36 lookahead cells, first
+//!   keyframes spent a median 0.82 of plan: 21 under 0.84, 15 under 0.71,
+//!   and 2 over 1.19. The observed `k` had median 3.32 (quartiles 2.55 and
+//!   4.02) against the seed's 4.2. Later keyframes, planned from a
+//!   measurement, spent a median 0.97, so only the seeded pick misses.
+//! - **The grad clip.** Its keyframes sat on [`SEED_QP_MIN`] at 0.11 to
+//!   0.20 of plan.
+//! - **A 720p natural clip** at 2 Mb/s. The seed asked for more than
+//!   [`SEED_QP_MAX`], the keyframe was coded at 45 on 0.28 of plan (28.5 dB
+//!   luma), and the first P spent 5.07 times its plan repairing it.
+//!
+//! **What is implemented** ([`RateController::seed_recode`]):
+//!
+//! - **The first picture.** A picture planned from a seed alone that lands
+//!   more than [`SEED_RECODE_STEPS`] from its plan is coded again once, at
+//!   the quantiser its own bits imply. That quantiser may be below the
+//!   seed's floor, because it is a measurement, and it is bounded by
+//!   [`MAX_FIRST_STEP`].
+//! - **The first P after it.** When the keyframe was coded again, the
+//!   first P borrows a measured `k` rather than the calibration, so the
+//!   seed's clamp no longer holds it. It may be coded again once the same
+//!   way.
+//! - **Nothing else.** At most two extra codings per stream, and none
+//!   without a lookahead.
+//!
+//! Scored on the 125 rate cells of develop f74b437 against its own
+//! binary (`D:/rivet-rcfix4/kfclean/clean.txt`), the mean `|ratio - 1|`
+//! over the 36 lookahead cells goes from 0.0795 to 0.0523:
+//!
+//! - **What moves.** 15 cells move, all with luma up 0.65 to 10.37 dB.
+//!   12 end closer to target. The motion clip at 64 kbps goes from 1.035
+//!   to 1.037, with luma up 2.71 dB. The two that end further by more than
+//!   0.01 are below. No plane falls more than 0.30 dB, nothing is larger
+//!   and worse, and no cell outside the lookahead rows moves.
+//! - **The fade clip at 96 kbps: 1.019 to 1.077**, with luma up 2.14 dB.
+//!   Its P pictures alternate as the fade section above records, now
+//!   0.53 to 1.57 of plan against 0.46 to 1.47. Over the clip the P
+//!   pictures spend 1.06 of their plan where they spent 0.95, because
+//!   the under-spent keyframe that absorbed the misses no longer does.
+//! - **The odd clip at 96 kbps: 0.904 to 0.870**, but on 2089 bytes
+//!   against 2169 and with luma up 10.37 dB. It is strictly better.
+//! - **The native 10-bit fade** (no gate lookahead row) goes from 0.995 to
+//!   1.101: the two errors above, with the keyframe's now gone.
+//! - **The 720p natural clip** codes its keyframe again at 34 (35.8 dB,
+//!   0.89 of plan) and ends at 1.009x with luma up 0.51 dB. Its plan error
+//!   goes from 6.02 to 5.29 steps, and its worst picture from 28.5 to 35.5
+//!   dB.
+//!
+//!   Its first P misses the other way. At 31 it spent 1.78 times its plan;
+//!   coded again at 36 it spent 0.11. Near its skip threshold a P picture's
+//!   bits fall far faster than six steps per doubling, and one re-code by
+//!   the law cannot see that.
+//!
+//! **What it costs.** Two re-codes on a 2-frame 720p stream take 0.30 s,
+//! about one extra keyframe. That is 14.5% of a 12-frame stream (2.05 s),
+//! 1.3% of 120 frames (23.7 s) and 0.28% of 600 frames (108.6 s): best of
+//! 3 to 9 on a loaded machine. A caller that builds an encoder per segment
+//! pays it per segment.
+//!
+//! **What was tried and not kept** (36 cells, mean 0.0803 on the base
+//! then; `D:/rivet-rcfix4/kf`, `kf2`):
+//!
+//! ```text
+//!     variant                                            mean    >0.01 further   planes < -0.30
+//!     re-code the keyframe at 3 steps, nothing else     0.0824        6                0
+//!     the same at 1.5 steps                              0.0846        9                3
+//!     recalibrate the seed to 3.3                        0.0971       19                0
+//!     recalibrate and re-code at 3                       0.0973       22                0
+//!     re-code, first P unclamped (not re-coded)          0.0712        4                0
+//!     re-code the first picture of every kind            0.0748        9               12
+//!     a second, secant re-code of the keyframe           0.0820        8                0
+//!     first P seeded at 2.7 x the keyframe's k           0.0650        3                0
+//!     implemented: re-code, first P unclamped and
+//!       re-coded once                                    0.0531        2                0
+//! ```
+//!
+//! - **The recalibrated seed** makes every first keyframe spend more. That
+//!   uncovers the overspend the under-spent keyframes were hiding, all at
+//!   once, and it moves detail10-444 the wrong way: that keyframe was
+//!   already over its plan, and the cell goes from 1.098 to 1.117.
+//! - **The unclamped first P without its own re-code** borrows an intra
+//!   `k` that is 2 to 4 times too low for a P at a low quantiser. It spent
+//!   3.35 to 4.45 times its plan on the odd and static clips.
+//! - **The secant re-code** lands keyframes near plan: 0.84 to 1.04, and
+//!   grad 0.42 to 0.73 at the step bound. A single re-code by the law
+//!   lands short (0.29 to 0.82), because six steps per doubling is too
+//!   steep below about 30. But landing on plan only makes the clips
+//!   overshoot more.
 
 /// The largest quantiser change between consecutive pictures. Rate control
 /// that lurches is worse to watch than rate control that misses: a picture
@@ -746,6 +844,25 @@ const SEED_QP_MAX: f64 = 45.0;
 /// kept the placeholder from being worse than a seed.
 const SEED_BITS_PER_COST: f64 = 4.2;
 
+/// How far, in quantiser steps of the law, a picture planned from a seed
+/// alone may land from its plan before it is coded again — once, at the
+/// quantiser its own bits ask for ([`RateController::seed_recode`]).
+///
+/// Two pictures are planned that way under lookahead. The stream's first,
+/// from [`SEED_BITS_PER_COST`], and the first P after it, from the
+/// keyframe's bits per cost. The seed is a calibration taken before the
+/// coding quadtree became the default. On the lookahead cells of the gate
+/// it now misses the first keyframe by a median 0.82 of plan: 21 of 36 are
+/// under 0.84 and the grad clip sits at [`SEED_QP_MIN`] on 0.11 of its
+/// plan. On a 720p natural clip at 2 Mb/s it asks for more than
+/// [`SEED_QP_MAX`] and codes the keyframe at 45 on 0.28 of plan. The first
+/// P then spends five times its plan repairing it. See the module docs,
+/// *The seeded first pictures*, for the measurement.
+///
+/// Three steps, a factor of 1.41 either way. At 1.5 the re-code moved 23
+/// of the 36 cells, not 15, and three planes lost more than 0.30 dB.
+const SEED_RECODE_STEPS: f64 = 3.0;
+
 /// Which complexity estimate a picture draws on, and what share of the
 /// budget it is given.
 ///
@@ -954,6 +1071,16 @@ pub struct RateController {
     /// so [`RateController::account`] can pin the model against the
     /// quantiser and cost that actually produced the bits.
     pending: Option<(PicKind, u8, f64)>,
+    /// Whether the pending pick was planned from a seed and nothing else —
+    /// the stream's first under lookahead, or the first P after a keyframe
+    /// that was coded again — so [`RateController::seed_recode`] may ask
+    /// for it to be coded again too.
+    pending_seeded: bool,
+    /// Whether the stream's first picture was coded again by
+    /// [`RateController::seed_recode`]. From then on its bits per cost is a
+    /// measurement at a quantiser the picture shipped at, and a kind that
+    /// borrows it is no longer held to the seed's clamp.
+    keyframe_recoded: bool,
     /// The lookahead cost of the last picture *picked* for each kind, so
     /// the step limit can be widened by a measured change in content
     /// rather than throttle it. `None` until a kind has been picked with
@@ -979,15 +1106,17 @@ impl RateController {
     /// over a `width` by `height` picture, with `gop` pictures between IDRs
     /// (0 meaning every picture is one) and `bframes` consecutive B
     /// pictures between references.
-    pub fn new(bps: u32, fps: u32, width: u32, height: u32, gop: u32, bframes: u32) -> Self {
+    pub fn new(bps: u32, fps: impl Into<f64>, width: u32, height: u32, gop: u32, bframes: u32) -> Self {
         Self::with_cpb(bps, fps, width, height, gop, bframes, None)
     }
 
     /// [`RateController::new`] against a declared coded picture buffer of
     /// `cpb_bits`, which each picture's target is capped to fit.
     #[allow(clippy::too_many_arguments)]
-    pub fn with_cpb(bps: u32, fps: u32, width: u32, height: u32, gop: u32, bframes: u32, cpb_bits: Option<u64>) -> Self {
-        let fps = fps.max(1) as f64;
+    pub fn with_cpb(bps: u32, fps: impl Into<f64>, width: u32, height: u32, gop: u32, bframes: u32, cpb_bits: Option<u64>) -> Self {
+        // Frames per second, a fraction for the NTSC family: the budget
+        // of each picture is `bps / fps` exactly (`Config::frame_rate_f64`).
+        let fps = fps.into().max(1.0);
         let per_picture = (bps as f64 / fps).max(1.0);
         // With `gop` pictures per keyframe, one carries INTRA_WEIGHT and
         // the rest split between P and B in the ratio the scheduler will
@@ -1031,6 +1160,8 @@ impl RateController {
             bits_spent: 0,
             pictures: 0,
             pending: None,
+            pending_seeded: false,
+            keyframe_recoded: false,
             last_cost: [None; 3],
             last_observed: None,
             planned: 0.0,
@@ -1196,6 +1327,16 @@ impl RateController {
         // residual is really the reference's quantisation noise — was
         // planned at quantiser 0 and cost twelve times its keyframe.
         let (k_eff, guess) = if ahead { (self.k_for(kind) * cost, !c.observed) } else { (c.k, false) };
+        // Planned from a seed and nothing else: the stream's first picture,
+        // and the first P after a keyframe that was coded again. Either may
+        // be coded again itself (`seed_recode`).
+        let first_p = kind == PicKind::Inter && self.keyframe_recoded && self.last_observed == Some(PicKind::Intra);
+        let seeded = ahead && guess && (self.last_observed.is_none() || first_p);
+        // A kind borrowing the bits per cost of a keyframe that was coded
+        // again borrows a measurement, not the calibration, so the seed's
+        // clamp does not hold it. Held at `SEED_QP_MIN` it had planned the
+        // grad clip's first P on 0.04 of its plan.
+        let guess = guess && !(self.keyframe_recoded && self.last_observed.is_some());
         let want = 6.0 * (k_eff / target).log2();
         let want = if guess { want.clamp(SEED_QP_MIN, SEED_QP_MAX) } else { want };
         let mut qp = want.round().clamp(QP_MIN as f64, QP_MAX as f64) as i32;
@@ -1260,8 +1401,56 @@ impl RateController {
             self.last_cost[kind as usize] = Some(cost);
         }
         self.pending = Some((kind, qp, cost));
+        self.pending_seeded = seeded;
         self.planned = target;
         qp
+    }
+
+    /// Whether the pending picture, coded once to `bits`, is to be coded
+    /// again, and at what quantiser: `Some` when it was planned from a seed
+    /// and nothing else and landed more than [`SEED_RECODE_STEPS`] from its
+    /// plan. `None` when it landed near enough, and for every other
+    /// picture.
+    ///
+    /// Two pictures of a stream can qualify: its first under lookahead,
+    /// and, if that one was coded again, the first P after it.
+    ///
+    /// The answer is what one observation says: the quantiser moved by the
+    /// miss in steps of the law, `6 * log2(bits / planned)`. It is bounded
+    /// by [`MAX_FIRST_STEP`] like any first measured correction, and not by
+    /// the seed's clamp, because it is no longer a guess. Under a declared
+    /// buffer it may only rise: a picture that fitted must not be coded
+    /// again into one that does not.
+    ///
+    /// A `Some` is also the controller taking that quantiser as the
+    /// pending picture's, in one call so that no caller can re-code without
+    /// telling it. The model is pinned to the coding that ships. The pick
+    /// counts as a measured one, so the kind's next picture moves from it
+    /// by the ordinary step limit rather than from a guess. And it is not
+    /// asked about again.
+    pub fn seed_recode(&mut self, bits: u64) -> Option<u8> {
+        let (kind, qp, cost) = self.pending?;
+        if !self.pending_seeded || bits == 0 || self.planned <= 0.0 {
+            return None;
+        }
+        let miss = 6.0 * (bits as f64 / self.planned).log2();
+        if miss.abs() <= SEED_RECODE_STEPS {
+            return None;
+        }
+        let was = i32::from(qp);
+        let again = ((was as f64 + miss).round() as i32).clamp(was - MAX_FIRST_STEP, was + MAX_FIRST_STEP).clamp(QP_MIN, QP_MAX);
+        if again == was || (self.cpb.is_some() && again < was) {
+            return None;
+        }
+        let again = again as u8;
+        self.pending = Some((kind, again, cost));
+        self.last_informed[kind as usize] = Some(again);
+        self.last_any[kind as usize] = Some(again);
+        self.pending_seeded = false;
+        if kind == PicKind::Intra {
+            self.keyframe_recoded = true;
+        }
+        Some(again)
     }
 
     /// Record what the picture actually cost, in **bytes of the access
@@ -1350,6 +1539,8 @@ impl RateController {
             pictures: self.pictures,
             cpb: self.cpb,
             pending: self.pending,
+            pending_seeded: self.pending_seeded,
+            keyframe_recoded: self.keyframe_recoded,
             last_cost: self.last_cost,
             last_observed: self.last_observed,
             planned: self.planned,
@@ -1361,11 +1552,11 @@ impl RateController {
 
     /// The achieved rate in bits per second, given the frame rate the
     /// controller was built with — for reporting, never for deciding.
-    pub fn achieved_bps(&self, fps: u32) -> f64 {
+    pub fn achieved_bps(&self, fps: impl Into<f64>) -> f64 {
         if self.pictures == 0 {
             return 0.0;
         }
-        self.bits_spent as f64 * fps.max(1) as f64 / self.pictures as f64
+        self.bits_spent as f64 * fps.into().max(1.0) / self.pictures as f64
     }
 }
 
@@ -1399,6 +1590,16 @@ mod tests {
     const K_INTRA: f64 = 1.17e6;
     /// See [`K_INTRA`].
     const K_INTER: f64 = 2.93e5;
+
+    /// Each picture's budget is the target over the exact frame rate: 30
+    /// kbit/s at 30000/1001 is 1001 bits a picture, not the 1000 of 30.
+    #[test]
+    fn the_budget_per_picture_reads_the_exact_frame_rate() {
+        let at = |fps: f64| RateController::new(30_000, fps, 64, 64, 8, 0).per_picture;
+        assert!((at(30_000.0 / 1_001.0) - 1_001.0).abs() < 1e-9, "{}", at(30_000.0 / 1_001.0));
+        assert_eq!(at(30.0), 1_000.0);
+        assert_eq!(RateController::new(30_000, 30, 64, 64, 8, 0).per_picture, 1_000.0, "a whole number still reads");
+    }
 
     /// The ledger is the one exact property here: whatever bytes are
     /// handed to `account`, `bits_spent` is eight times their sum. Trivial
@@ -1866,6 +2067,110 @@ mod tests {
         let mut blind = RateController::new(600_000, 30, W, H, 8, 0);
         let q_blind = blind.pick_qp_ahead(PicKind::Inter, 4e5, &[(PicKind::Inter, 4e5)]);
         assert_ne!(q_blind, q_lo, "the borrowed k made no difference to the first P");
+    }
+
+    /// **A seeded first picture that misses by far is coded again.** The
+    /// stream's first picture under lookahead is planned from the
+    /// calibration alone. Landing within [`SEED_RECODE_STEPS`] of its plan
+    /// it is left alone. Further out, the controller asks for it again at
+    /// the quantiser its own bits imply, below the seed's floor if need be
+    /// and never more than [`MAX_FIRST_STEP`] away. Once coded again it is
+    /// a measured pick:
+    ///
+    /// - the model is pinned to the coding that shipped;
+    /// - the next keyframe moves from it by the ordinary step limit;
+    /// - nothing else is asked about.
+    #[test]
+    fn a_seeded_first_picture_that_misses_by_far_is_coded_again_at_its_own_quantiser() {
+        let cost = 1e-3;
+        let window = |c: f64| vec![(PicKind::Intra, c), (PicKind::Inter, c / 4.0), (PicKind::Inter, c / 4.0)];
+        // A negligible cost puts the seeded pick on the seed's floor.
+        let mut rc = RateController::new(600_000, 30, W, H, 8, 0);
+        let first = rc.pick_qp_ahead(PicKind::Intra, cost, &window(cost));
+        assert_eq!(f64::from(first), SEED_QP_MIN, "the seeded pick of a negligible cost sits on the floor");
+        let plan = rc.planned;
+        let at = |steps: f64| (plan * 2f64.powf(steps / 6.0)) as u64;
+        let ask = |steps: f64| rc.clone_for_test().seed_recode(at(steps));
+        assert_eq!(ask(-2.9), None, "2.9 steps under plan is near enough");
+        assert_eq!(ask(2.9), None, "2.9 steps over plan is near enough");
+        assert_eq!(ask(-4.0), Some(first - 4), "4 steps under plan asks for 4 steps lower");
+        assert_eq!(ask(4.0), Some(first + 4), "4 steps over plan asks for 4 steps higher");
+        assert_eq!(ask(30.0), Some(first + 16), "30 steps over plan is bounded to the first-correction limit");
+
+        let again = rc.seed_recode(at(-12.0)).expect("12 steps under plan is coded again");
+        assert_eq!(again, first - 12, "12 steps under plan asks for 12 steps lower, under the seed's floor");
+        assert_eq!(rc.seed_recode(at(-12.0)), None, "a picture is coded again once, not twice");
+        // Coded again it still lands ten steps under. The model is pinned
+        // to that coding, and the next keyframe, which wants ten lower,
+        // moves by the ordinary limit and not the first correction's.
+        let bytes = (at(-10.0) / 8) as usize;
+        rc.account(bytes);
+        let k = (bytes * 8) as f64 * 2f64.powf(f64::from(again) / 6.0) / cost;
+        let got = rc.complexity[PicKind::Intra as usize].k;
+        assert!((got / k - 1.0).abs() < 1e-9, "the model was pinned to {got}, not to the coding that shipped ({k})");
+        let next = rc.pick_qp_ahead(PicKind::Intra, cost, &window(cost));
+        assert_eq!(i32::from(next), i32::from(again) - MAX_QP_STEP, "the next keyframe did not move from a measured pick");
+        assert_eq!(rc.seed_recode(1), None, "a keyframe planned from a measurement is never asked again");
+
+        // Without a lookahead nothing is seeded from the calibration, and
+        // nothing is ever asked again.
+        let mut past = RateController::new(600_000, 30, W, H, 8, 0);
+        let _ = past.pick_qp(PicKind::Intra);
+        assert_eq!(past.seed_recode(1), None, "the past-only controller asked for a re-code");
+
+        // Under a declared buffer only a rise is asked for.
+        let mut cpb = RateController::with_cpb(600_000, 30, W, H, 8, 0, Some(400_000));
+        let q = cpb.pick_qp_ahead(PicKind::Intra, 1e6, &window(1e6));
+        let plan = cpb.planned;
+        assert_eq!(cpb.clone_for_test().seed_recode((plan * 0.1) as u64), None, "a buffered keyframe under plan was asked to spend more");
+        assert!(cpb.seed_recode((plan * 10.0) as u64).is_some_and(|again| again > q), "a buffered keyframe over plan was not raised");
+    }
+
+    /// **The first P after a re-coded keyframe plans from a measurement.**
+    /// It borrows the keyframe's bits per cost, as every first P does, but
+    /// that is now a measurement at a quantiser a picture shipped at, so
+    /// the seed's floor does not hold it: held there, the grad clip's first
+    /// P was planned on 0.04 of its plan. It may be coded again once
+    /// itself; the second P, and the first B, never are. Without a
+    /// re-coded keyframe the first P is held at the floor as before.
+    #[test]
+    fn the_first_p_after_a_recoded_keyframe_is_not_held_at_the_seed_floor() {
+        let (cost_i, cost_p) = (1e6, 3e4);
+        let window = |kind: PicKind, c: f64| vec![(kind, c), (PicKind::Inter, cost_p), (PicKind::B, cost_p)];
+        // The keyframe lands on plan either way: at the seed's pick, or
+        // coded again 12 steps lower after missing by 12.
+        let keyframe = |recode: bool| {
+            let mut rc = RateController::new(600_000, 30, W, H, 8, 2);
+            let first = rc.pick_qp_ahead(PicKind::Intra, cost_i, &window(PicKind::Intra, cost_i));
+            if recode {
+                let again = rc.seed_recode((rc.planned * 2f64.powf(-12.0 / 6.0)) as u64).expect("the keyframe is coded again");
+                assert_eq!(again, first - 12);
+            } else {
+                assert_eq!(rc.seed_recode(rc.planned as u64), None);
+            }
+            rc.account((rc.planned / 8.0) as usize);
+            rc
+        };
+        let mut rc = keyframe(true);
+        let p1 = rc.pick_qp_ahead(PicKind::Inter, cost_p, &window(PicKind::Inter, cost_p));
+        assert!(f64::from(p1) < SEED_QP_MIN, "the first P after a re-coded keyframe was held at the seed floor: {p1}");
+        let plan = rc.planned;
+        assert_eq!(rc.clone_for_test().seed_recode((plan * 2f64.powf(2.9 / 6.0)) as u64), None, "near enough is left alone");
+        let again = rc.seed_recode((plan * 2f64.powf(9.0 / 6.0)) as u64).expect("the first P over its plan by 9 steps is coded again");
+        assert_eq!(again, p1 + 9);
+        rc.account((plan / 8.0) as usize);
+        let _ = rc.pick_qp_ahead(PicKind::B, cost_p, &window(PicKind::B, cost_p));
+        assert_eq!(rc.seed_recode(1), None, "the first B was asked again");
+        rc.account((rc.planned / 8.0) as usize);
+        let _ = rc.pick_qp_ahead(PicKind::Inter, cost_p, &window(PicKind::Inter, cost_p));
+        assert_eq!(rc.seed_recode(1), None, "the second P was asked again");
+
+        // A first P whose keyframe landed near its plan borrows as before,
+        // held at the floor, and is not asked again.
+        let mut plain = keyframe(false);
+        let p = plain.pick_qp_ahead(PicKind::Inter, cost_p, &window(PicKind::Inter, cost_p));
+        assert_eq!(f64::from(p), SEED_QP_MIN, "without a re-coded keyframe the first P must stay on the seed floor");
+        assert_eq!(plain.seed_recode(1), None, "without a re-coded keyframe the first P was asked again");
     }
 
     /// A measured jump in cost widens the step limit in the direction of

@@ -74,6 +74,8 @@ use crate::encode::h264_intra::{
 };
 use crate::h264::cavlc::sub_block_counts_8x8_scan;
 use crate::h264::inter::Weighting;
+use crate::h264::recon::explicit_weighting;
+use crate::h264::slice::PredWeightTable;
 use crate::encode::h264_syntax::Recon;
 use crate::sample::Sample;
 use crate::h264::frame::{BlockMotion, Frame, Mv, PARITY_FRAME};
@@ -439,6 +441,82 @@ pub struct PRef<'a, S: Sample> {
     pub weighting: Weighting,
 }
 
+/// The two references a B picture predicts from — list 0's past anchor
+/// and list 1's future one — with the weighting its slice's
+/// `pred_weight_table` gives each kind of prediction: [`PRef`]'s two-list
+/// sibling.
+pub struct BRefs<'a, S: Sample> {
+    /// Each list's reconstructed planes, borders replicated
+    /// ([`prepare_reference`]).
+    pub planes: [&'a [Recon<S>]; 2],
+    /// Each list's luma plane the whole-sample search and its refinement
+    /// score against: `planes[l][0]`, or under a luma weighting of that
+    /// list a weighted copy ([`weighted_search_plane`]) — [`PRef::search`]
+    /// per list, on the same terms.
+    pub search: [&'a Recon<S>; 2],
+    /// The weighting of a prediction from list 0 alone, from list 1 alone
+    /// and from both, in that order: what the reader's
+    /// `explicit_weighting` derives for the reference index pairs `(0,
+    /// -1)`, `(-1, 0)` and `(0, 0)` — the only pairs a slice with one
+    /// reference per list has, direct and skip included, whose derived
+    /// indices are these too. `Weighting::Default` throughout without a
+    /// table that weights something.
+    pub weighting: [Weighting; 3],
+}
+
+/// How a B slice weights its predictions: what its PPS's
+/// `weighted_bipred_idc` says, and for an explicit one the slice's table.
+#[derive(Clone, Copy, Debug)]
+pub enum BWeights<'a> {
+    /// idc 0: one list's prediction as it is, two lists' averaged.
+    Default,
+    /// idc 1: the slice's `pred_weight_table`.
+    Explicit(&'a PredWeightTable),
+    /// idc 2: a bi-predicted block weighted by `(w0, w1)` at `logWD` 5 —
+    /// the reader's `implicit_pair` from the picture's POC distances to its
+    /// two references — and a one-list block as it is.
+    Implicit(i32, i32),
+}
+
+impl BWeights<'_> {
+    /// [`BRefs::weighting`] under these weights at `bit_depth`: the
+    /// reader's derivation for each reference pair — `explicit_weighting`
+    /// of the table, or the arm of `SliceRefs::weighting` that implicit
+    /// weighting takes (`logWD` 5, no offsets, default for one list).
+    pub(crate) fn weightings(&self, bit_depth: u32) -> [Weighting; 3] {
+        match *self {
+            BWeights::Default => [Weighting::Default; 3],
+            BWeights::Explicit(t) => b_weightings(Some(t), bit_depth),
+            BWeights::Implicit(w0, w1) => {
+                [Weighting::Default, Weighting::Default, Weighting::Weighted { log_wd: [5; 3], w: [[w0, w1]; 3], o: [[0; 2]; 3] }]
+            }
+        }
+    }
+}
+
+/// [`BRefs::weighting`] for a B slice's `pred_weight_table` `t` at
+/// `bit_depth`: the reader's `explicit_weighting` for each reference pair
+/// a prediction can use, in [`BRefs::weighting`]'s order — or default
+/// weighting throughout without a table.
+pub(crate) fn b_weightings(t: Option<&PredWeightTable>, bit_depth: u32) -> [Weighting; 3] {
+    let wp = |r0: i8, r1: i8| t.map_or(Weighting::Default, |t| explicit_weighting(t, bit_depth, r0, r1, false));
+    [wp(0, -1), wp(-1, 0), wp(0, 0)]
+}
+
+impl<'a, S: Sample> BRefs<'a, S> {
+    /// Default weighting over `planes`: every prediction plain.
+    pub fn plain(planes: [&'a [Recon<S>]; 2]) -> Self {
+        BRefs { planes, search: [&planes[0][0], &planes[1][0]], weighting: [Weighting::Default; 3] }
+    }
+
+    /// The weighting of a prediction from the lists `used` — the reference
+    /// index pair `(0 or -1, 0 or -1)` the decoder weights it by.
+    pub fn weighting_for(&self, used: [bool; 2]) -> Weighting {
+        debug_assert!(used[0] || used[1]);
+        self.weighting[usize::from(used[0]) + 2 * usize::from(used[1]) - 1]
+    }
+}
+
 /// `refp` with an explicit weighting applied to every sample, border
 /// included: 8.4.2.3.2's uni-directional formula at `log_wd`, `weight` and
 /// `offset` (already at the sample depth), clipped to `max` — the plane a
@@ -621,6 +699,12 @@ fn search_rect<S: Sample>(
     let pad = r.pad as i32;
     let (lo_x, hi_x) = (3 - pad - x, r.width as i32 + pad - (w as i32 + 3) - x);
     let (lo_y, hi_y) = (3 - pad - y, r.height as i32 + pad - (h as i32 + 3) - y);
+    // And within the level's vertical vector range (`MaxVmvR`), in this
+    // macroblock's own rows — the search and its refinement both stay
+    // inside it, and every other vector (skip, direct, the predictors) is
+    // a median or copy of searched ones.
+    let vr = ctx.motion.vertical_search(ctx.field);
+    let (lo_y, hi_y) = (lo_y.max(-vr), hi_y.min(vr));
     debug_assert!(lo_x <= hi_x && lo_y <= hi_y, "plane too small to search");
 
     // Seed at the predictor rounded to full samples, clamped legal; the
@@ -779,14 +863,29 @@ fn put_uni<S: Sample>(ctx: &MeCtx<S>, dst: &mut [S], stride: usize, src: &[S], w
     }
 }
 
+/// Combine two one-list predictions `a` and `b` into `dst`: the decoder's
+/// default bi-predictive average (`(a + b + 1) >> 1`, `dsp.avg`) under
+/// default weighting, its `weighted_bi` kernel with component `c`'s two
+/// weights and offsets under an explicit one — the two bi-directional
+/// arms of `predict_partition` (src/h264/inter.rs).
+#[allow(clippy::too_many_arguments)]
+fn put_bi<S: Sample>(ctx: &MeCtx<S>, dst: &mut [S], stride: usize, a: &[S], b: &[S], w: usize, h: usize, weighting: Weighting, c: usize) {
+    match weighting {
+        Weighting::Default => (ctx.dsp.avg)(dst, stride, a, b, w, h),
+        Weighting::Weighted { log_wd, w: wt, o } => {
+            (ctx.dsp.weighted_bi)(dst, stride, a, b, w, h, log_wd[c], wt[c][0], wt[c][1], o[c][0], o[c][1], ctx.max)
+        }
+    }
+}
+
 /// Write one partition's inter prediction for one or two references into
-/// the reconstruction planes, through the decoder's kernels and — when both
-/// lists predict — the decoder's default bi-predictive combine
-/// (`(a + b + 1) >> 1`, the `dsp.avg` kernel `predict_partition` runs for
-/// `Weighting::Default`). A one-list prediction takes `weighting` — a P
-/// slice's explicit table — through [`put_uni`], as `predict_partition`
-/// does. What stands in `rec` afterwards is bit-identical to what a decoder
-/// derives for the same vectors.
+/// the reconstruction planes, through the decoder's kernels: a one-list
+/// prediction through [`put_uni`], a two-list one through [`put_bi`], each
+/// under `weighting` — the default, or what the reader's
+/// `explicit_weighting` derives from the slice's table for the reference
+/// pair the partition uses — as `predict_partition` does. What stands in
+/// `rec` afterwards is bit-identical to what a decoder derives for the
+/// same vectors.
 #[allow(clippy::too_many_arguments)]
 fn predict_inter_rect<S: Sample>(
     ctx: &MeCtx<S>,
@@ -801,10 +900,6 @@ fn predict_inter_rect<S: Sample>(
     weighting: Weighting,
 ) {
     debug_assert!(used[0] || used[1]);
-    debug_assert!(
-        !(used[0] && used[1]) || matches!(weighting, Weighting::Default),
-        "explicit bi-prediction is never written: weighted_bipred_idc is 0"
-    );
     let mut a = [S::default(); 16 * PRED_STRIDE];
     let mut b = [S::default(); 16 * PRED_STRIDE];
     // Luma.
@@ -813,7 +908,7 @@ fn predict_inter_rect<S: Sample>(
     if used[0] && used[1] {
         luma_pred_into(ctx, &refs[0][0], px as i32, py as i32, mv[0], pw, ph, &mut a);
         luma_pred_into(ctx, &refs[1][0], px as i32, py as i32, mv[1], pw, ph, &mut b);
-        (ctx.dsp.avg)(&mut rec[0].data[off..], stride, &a, &b, pw, ph);
+        put_bi(ctx, &mut rec[0].data[off..], stride, &a, &b, pw, ph, weighting, 0);
     } else {
         let l = if used[0] { 0 } else { 1 };
         luma_pred_into(ctx, &refs[l][0], px as i32, py as i32, mv[l], pw, ph, &mut a);
@@ -835,7 +930,7 @@ fn predict_inter_rect<S: Sample>(
             if used[0] && used[1] {
                 luma_pred_into(ctx, &refs[0][comp + 1], px as i32, py as i32, mv[0], pw, ph, &mut a);
                 luma_pred_into(ctx, &refs[1][comp + 1], px as i32, py as i32, mv[1], pw, ph, &mut b);
-                (ctx.dsp.avg)(&mut plane.data[off..], stride, &a, &b, pw, ph);
+                put_bi(ctx, &mut plane.data[off..], stride, &a, &b, pw, ph, weighting, comp + 1);
             } else {
                 let l = if used[0] { 0 } else { 1 };
                 luma_pred_into(ctx, &refs[l][comp + 1], px as i32, py as i32, mv[l], pw, ph, &mut a);
@@ -856,7 +951,7 @@ fn predict_inter_rect<S: Sample>(
         if used[0] && used[1] {
             chroma_pred_into(ctx, &refs[0][comp + 1], cx as i32, cy as i32, mv[0], ctx.chroma_mv_dy[0], cw, crh, h, &mut a);
             chroma_pred_into(ctx, &refs[1][comp + 1], cx as i32, cy as i32, mv[1], ctx.chroma_mv_dy[1], cw, crh, h, &mut b);
-            (ctx.dsp.avg)(&mut plane.data[off..], stride, &a, &b, cw, crh);
+            put_bi(ctx, &mut plane.data[off..], stride, &a, &b, cw, crh, weighting, comp + 1);
         } else {
             let l = if used[0] { 0 } else { 1 };
             chroma_pred_into(ctx, &refs[l][comp + 1], cx as i32, cy as i32, mv[l], ctx.chroma_mv_dy[l], cw, crh, h, &mut a);
@@ -1497,6 +1592,11 @@ fn trial_8x8<S: Sample>(
             SubMbShape::S4x8,
             SubMbShape::S4x4,
         ] {
+            // The level's vector budget (`MotionLimits`): 4x4 is gone from
+            // level 3.1 up; 8x8 is always allowed.
+            if !ctx.motion.allows_sub_8x8(shape.count(), 1) {
+                continue;
+            }
             *st = before;
             let (mut mvs, mut mvds) = (t.mvs, t.mvds);
             let mut satd = 0u32;
@@ -1956,14 +2056,51 @@ pub fn spatial_direct(
 
 /// SATD of the `w` by `h` luma rectangle at picture position `(x, y)`
 /// against its prediction from `used` lists at per-list vectors `mv` —
-/// through the decoder's kernels and, for both lists, its default
-/// bi-predictive average — without touching `rec`. How every B candidate
-/// is priced before one of them is committed. `src` is the source at the
-/// rectangle's own corner.
+/// through the decoder's kernels under the weighting `refs` gives those
+/// lists: for one list a copy or its weighted form, for both the default
+/// bi-predictive average or the weighted pair — without touching `rec`.
+/// How every B candidate is priced before one of them is committed, and so
+/// what the committed prediction will be. `weighting` overrides `refs`'
+/// own (the census scores the plain prediction beside the weighted one).
+/// `src` is the source at the rectangle's own corner.
+#[allow(clippy::too_many_arguments)]
+fn rect_satd_under<S: Sample>(
+    ctx: &MeCtx<S>,
+    refs: &BRefs<S>,
+    x: i32,
+    y: i32,
+    w: usize,
+    h: usize,
+    src: &[S],
+    src_stride: usize,
+    used: [bool; 2],
+    mv: [Mv; 2],
+    weighting: Weighting,
+) -> u32 {
+    let mut a = [S::default(); 16 * PRED_STRIDE];
+    let mut c = [S::default(); 16 * PRED_STRIDE];
+    if used[0] && used[1] {
+        let mut b = [S::default(); 16 * PRED_STRIDE];
+        luma_pred_into(ctx, &refs.planes[0][0], x, y, mv[0], w, h, &mut a);
+        luma_pred_into(ctx, &refs.planes[1][0], x, y, mv[1], w, h, &mut b);
+        put_bi(ctx, &mut c, PRED_STRIDE, &a, &b, w, h, weighting, 0);
+        (ctx.dist.satd)(src, src_stride, &c, PRED_STRIDE, w, h)
+    } else {
+        let l = if used[0] { 0 } else { 1 };
+        luma_pred_into(ctx, &refs.planes[l][0], x, y, mv[l], w, h, &mut a);
+        if matches!(weighting, Weighting::Default) {
+            return (ctx.dist.satd)(src, src_stride, &a, PRED_STRIDE, w, h);
+        }
+        put_uni(ctx, &mut c, PRED_STRIDE, &a, w, h, weighting, 0, l);
+        (ctx.dist.satd)(src, src_stride, &c, PRED_STRIDE, w, h)
+    }
+}
+
+/// [`rect_satd_under`] at the weighting `refs` gives the lists `used`.
 #[allow(clippy::too_many_arguments)]
 fn rect_satd<S: Sample>(
     ctx: &MeCtx<S>,
-    refs: [&[Recon<S>]; 2],
+    refs: &BRefs<S>,
     x: i32,
     y: i32,
     w: usize,
@@ -1973,19 +2110,7 @@ fn rect_satd<S: Sample>(
     used: [bool; 2],
     mv: [Mv; 2],
 ) -> u32 {
-    let mut a = [S::default(); 16 * PRED_STRIDE];
-    if used[0] && used[1] {
-        let mut b = [S::default(); 16 * PRED_STRIDE];
-        let mut c = [S::default(); 16 * PRED_STRIDE];
-        luma_pred_into(ctx, &refs[0][0], x, y, mv[0], w, h, &mut a);
-        luma_pred_into(ctx, &refs[1][0], x, y, mv[1], w, h, &mut b);
-        (ctx.dsp.avg)(&mut c, PRED_STRIDE, &a, &b, w, h);
-        (ctx.dist.satd)(src, src_stride, &c, PRED_STRIDE, w, h)
-    } else {
-        let l = if used[0] { 0 } else { 1 };
-        luma_pred_into(ctx, &refs[l][0], x, y, mv[l], w, h, &mut a);
-        (ctx.dist.satd)(src, src_stride, &a, PRED_STRIDE, w, h)
-    }
+    rect_satd_under(ctx, refs, x, y, w, h, src, src_stride, used, mv, refs.weighting_for(used))
 }
 
 /// SATD of the source against the luma prediction for the given lists
@@ -1998,7 +2123,7 @@ fn rect_satd<S: Sample>(
 #[allow(clippy::too_many_arguments)]
 fn b_luma_satd<S: Sample>(
     ctx: &MeCtx<S>,
-    refs: [&[Recon<S>]; 2],
+    refs: &BRefs<S>,
     px: i32,
     py: i32,
     src: &[S],
@@ -2013,6 +2138,35 @@ fn b_luma_satd<S: Sample>(
         total += rect_satd(ctx, refs, px + ox, py + oy, 8, 8, s, src_stride, used, mv[part]);
     }
     total
+}
+
+/// Luma SATD of one B macroblock's rectangles `rects` (at picture position
+/// `(px, py)`, the lists each uses by `used_of`) against their predictions
+/// at the vectors `motion` holds, plain and under `refs`' weighting, as
+/// `(plain, weighted)` — [`weighting_gain`]'s model check for a B
+/// macroblock, one list's prediction or the pair's.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn weighting_gain_b<S: Sample>(
+    ctx: &MeCtx<S>,
+    refs: &BRefs<S>,
+    px: usize,
+    py: usize,
+    src_luma: &[S],
+    luma_stride: usize,
+    rects: &[(usize, usize, usize, usize)],
+    motion: &MbMotion,
+) -> (u64, u64) {
+    let (mut plain, mut weighted) = (0u64, 0u64);
+    for &(x, y, rw, rh) in rects {
+        let blk = (y / 4) * 4 + x / 4;
+        let used = [motion[0][blk].ref_idx >= 0, motion[1][blk].ref_idx >= 0];
+        let mv = [motion[0][blk].mv, motion[1][blk].mv];
+        let (ax, ay) = (px + x, py + y);
+        let src = &src_luma[ay * luma_stride + ax..];
+        plain += u64::from(rect_satd_under(ctx, refs, ax as i32, ay as i32, rw, rh, src, luma_stride, used, mv, Weighting::Default));
+        weighted += u64::from(rect_satd(ctx, refs, ax as i32, ay as i32, rw, rh, src, luma_stride, used, mv));
+    }
+    (plain, weighted)
 }
 
 /// The direction encoding's three values, in the order ties are broken:
@@ -2092,7 +2246,7 @@ impl BTrial {
 /// take these seven arguments.
 struct BSearch<'a, 'b, S: Sample> {
     ctx: &'b MeCtx<'a, S>,
-    refs: [&'b [Recon<S>]; 2],
+    refs: &'b BRefs<'b, S>,
     px: usize,
     py: usize,
     src_luma: &'b [S],
@@ -2112,7 +2266,7 @@ impl<S: Sample> BSearch<'_, '_, S> {
         let pred = st.predict(list, 0, x, y, w, h);
         let (mv, _) = search_rect(
             self.ctx,
-            &self.refs[list][0],
+            self.refs.search[list],
             (self.px + x) as i32,
             (self.py + y) as i32,
             w,
@@ -2260,6 +2414,13 @@ fn trial_b_8x8<S: Sample>(
             after,
         );
         for shape in [SubMbShape::S8x8, SubMbShape::S8x4, SubMbShape::S4x8, SubMbShape::S4x4] {
+            // The level's vector budget and bi-prediction size
+            // (`MotionLimits`): a shape no direction may take is not
+            // searched, and a direction it rules out not priced.
+            let limits = s.ctx.motion;
+            if !limits.allows_sub_8x8(shape.count(), 1) {
+                continue;
+            }
             // Provisional: both lists searched and committed per
             // sub-rectangle, so the later ones are seeded from something.
             *st = before;
@@ -2274,6 +2435,9 @@ fn trial_b_8x8<S: Sample>(
             // Each direction replayed exactly.
             for dir in B_DIRS {
                 let used = lists_of(dir);
+                if !limits.allows_sub_8x8(shape.count(), used.iter().filter(|&&u| u).count()) {
+                    continue;
+                }
                 *st = before;
                 let mut cand = BTrial::new(BMbKind::B8x8);
                 let mut satd = 0u32;
@@ -2328,10 +2492,14 @@ fn trial_b_8x8<S: Sample>(
 
 /// Decide and code one B macroblock, leaving its reconstruction in `rec`.
 ///
-/// `refs` are the list-0 (past) and list-1 (future) reference pictures'
-/// planes, borders replicated; `st` the motion state gathered from the
-/// picture coded so far; `col` the list-1 reference's motion and `addr`
-/// this macroblock's address in it (see [`spatial_direct`]).
+/// `refs` are the list-0 (past) and list-1 (future) reference pictures
+/// ([`BRefs`]): their planes, borders replicated, the luma each list's
+/// search scores against, and the weighting each kind of prediction takes
+/// — which every candidate is scored under and the winner predicted with,
+/// direct and skip included at the reference pair their derivation gives;
+/// `st` the motion state gathered from the picture coded so far; `col` the
+/// list-1 reference's motion and `addr` this macroblock's address in it
+/// (see [`spatial_direct`]).
 ///
 /// Without `subparts` the candidates are direct, L0, L1 and bi-predictive
 /// 16x16, compared by SATD alone — direct keeps ties, because its syntax
@@ -2355,7 +2523,7 @@ fn trial_b_8x8<S: Sample>(
 pub fn code_macroblock_b<S: Sample>(
     ctx: &MeCtx<S>,
     rec: &mut [Recon<S>],
-    refs: [&[Recon<S>]; 2],
+    refs: &BRefs<S>,
     mb_x: usize,
     mb_y: usize,
     src_luma: &[S],
@@ -2397,8 +2565,8 @@ pub fn code_macroblock_b<S: Sample>(
         // three directions against direct by SATD alone, direct keeping
         // ties.
         let pred = [st.predict(0, 0, 0, 0, 16, 16), st.predict(1, 0, 0, 0, 16, 16)];
-        let (mv0, _) = search_rect(ctx, &refs[0][0], px as i32, py as i32, 16, 16, src, luma_stride, pred[0]);
-        let (mv1, _) = search_rect(ctx, &refs[1][0], px as i32, py as i32, 16, 16, src, luma_stride, pred[1]);
+        let (mv0, _) = search_rect(ctx, refs.search[0], px as i32, py as i32, 16, 16, src, luma_stride, pred[0]);
+        let (mv1, _) = search_rect(ctx, refs.search[1], px as i32, py as i32, 16, 16, src, luma_stride, pred[1]);
         let mut best = dtrial;
         for (dir, mv) in [
             (PRED_L0, [mv0, Mv::ZERO]),
@@ -2462,7 +2630,7 @@ pub fn code_macroblock_b<S: Sample>(
         let used = out.used(part_index_of(x, y));
         let mv = out.mv[(y / 4) * 4 + x / 4];
         st.commit_part(x, y, w, h, [used[0].then_some(mv[0]), used[1].then_some(mv[1])]);
-        predict_inter_rect(ctx, rec, refs, px + x, py + y, w, h, used, mv, Weighting::Default);
+        predict_inter_rect(ctx, rec, refs.planes, px + x, py + y, w, h, used, mv, refs.weighting_for(used));
     }
     // `transform_size_8x8_flag` is absent when any sub-macroblock
     // partition is smaller than 8x8 (a direct one is not, under
@@ -2590,6 +2758,7 @@ mod tests {
                 subparts: false,
                 field: false,
                 chroma_mv_dy: [0; 2],
+                motion: crate::encode::level::MotionLimits::NONE,
             }
         }
     }
@@ -2698,6 +2867,33 @@ mod tests {
             }
         }
         src
+    }
+
+    /// The search keeps the level's vertical vector range (`MaxVmvR`,
+    /// A.3.2(g)) whatever the content asks for: the true motion here is
+    /// ten rows up, found exactly with no limit, and with a range of four
+    /// frame rows every vector lands in `[-4, 4 - 1/4]` — two field rows in
+    /// a field macroblock, whose rows are every other frame row — however
+    /// far the predictor seeds it.
+    #[test]
+    fn the_search_keeps_the_levels_vertical_range() {
+        let t = Tables::new();
+        let refp = grating_plane(48, 48, LUMA_PAD);
+        let truth = Mv::new(0, -40);
+        let src = translated_luma(&refp, truth);
+        let at = |ctx: &MeCtx<u8>, pred: Mv| search_rect(ctx, &refp, 16, 16, 16, 16, &src[16 * 48 + 16..], 48, pred).0;
+        let free = t.ctx(26);
+        assert_eq!(at(&free, truth), truth, "no limit: the search finds the motion");
+        for (field, range) in [(false, 4), (true, 2)] {
+            let ctx = MeCtx { field, motion: crate::encode::level::MotionLimits { max_vmv_r: 4, ..crate::encode::level::MotionLimits::NONE }, ..t.ctx(26) };
+            for pred in [truth, Mv::new(0, -400), Mv::new(8, 400), Mv::ZERO] {
+                let mv = at(&ctx, pred);
+                assert!(
+                    (-4 * range..4 * range).contains(&(mv.y as i32)),
+                    "field {field}: {mv:?} from predictor {pred:?} leaves [-{range}, {range} - 1/4] rows"
+                );
+            }
+        }
     }
 
     /// Fresh (zeroed) reconstruction planes matching [`reference`].
@@ -3117,6 +3313,129 @@ mod tests {
         assert_eq!(mv[2][0], nbmv, "lower-left takes the median prediction");
         assert_eq!(mv[3][0], nbmv, "lower-right likewise");
         assert_ne!(mv[0][0], mv[2][0], "the point of the test is that they differ");
+    }
+
+    /// Under an explicit table, `B_Skip` predicts with the weighting of
+    /// the reference pair spatial direct derives — list 0's entry alone
+    /// when the neighbours use list 0 only, list 1's alone when they use
+    /// list 1 only, both entries' bi-prediction when they use both, and
+    /// both again when no neighbour has motion (8.4.1.2.2's both-negative
+    /// rule) — not the pair of any other case.
+    ///
+    /// Each case's source is its own expected prediction: the references
+    /// at the zero vector the zero-vector neighbours derive, weighted by
+    /// the reader's `explicit_weighting` for the derived pair through the
+    /// scalar kernels — computed here, not through the walk's weightings.
+    /// Direct keeps ties, so it is chosen with nothing left to code, and
+    /// the reconstruction must be that prediction to the sample. The two
+    /// lists' entries differ in every component, and each case's
+    /// prediction differs from the other pairs' and from default
+    /// weighting's, so a macroblock predicted under any other pair's
+    /// weighting cannot match.
+    #[test]
+    fn direct_and_skip_take_the_weighting_of_their_derived_pair() {
+        use crate::h264::slice::WeightEntry;
+        let t = Tables::new();
+        let ctx = t.ctx(26);
+        let ref0 = reference();
+        // A second anchor unlike the first, so a swapped list reads
+        // different samples as well as different weights.
+        let ref1: Vec<Recon<u8>> = ref0
+            .iter()
+            .map(|p| {
+                let mut q = p.clone();
+                for v in q.data.iter_mut() {
+                    *v = 255 - *v / 2;
+                }
+                q
+            })
+            .collect();
+        let entry = |luma: (i32, i32), cb: (i32, i32), cr: (i32, i32)| WeightEntry { luma, chroma: [cb, cr], luma_flag: true, chroma_flag: true };
+        let table = PredWeightTable {
+            luma_log2_denom: 6,
+            chroma_log2_denom: 6,
+            lists: [vec![entry((40, 5), (50, 3), (70, -4))], vec![entry((84, -6), (60, 2), (58, 1))]],
+        };
+        let refs = BRefs {
+            planes: [&ref0, &ref1],
+            search: [&ref0[0], &ref1[0]],
+            weighting: b_weightings(Some(&table), 8),
+        };
+        // The colocated macroblock moves, so colZeroFlag never holds and
+        // direct's vectors are the neighbours' zero medians.
+        let mut col = crate::encode::h264_pic::PicMotion::new(3, 3);
+        let moving = BlockMotion { mv: Mv::new(40, 40), ref_idx: 0, ref_parity: PARITY_FRAME, ref_id: 1 };
+        col.commit(
+            4,
+            crate::h264::mb::MbInfo { kind: DecKind::Inter16x16, decoded: true, slice: 0, ..crate::h264::mb::MbInfo::default() },
+            &[[moving; 16], [BlockMotion::default(); 16]],
+        );
+        let col = Colocated::progressive(&col);
+        let dsp = H264Dsp::<u8>::new(Cpu::SCALAR);
+        let z = Some(Mv::ZERO);
+        let predictions: Vec<(String, Vec<Vec<u8>>)> = [
+            ("list 0 only", [(3, [z, None]), (1, [z, None]), (2, [z, None])], [0i8, -1]),
+            ("list 1 only", [(3, [None, z]), (1, [None, z]), (2, [None, z])], [-1, 0]),
+            ("both lists", [(3, [z, z]), (1, [z, z]), (2, [z, z])], [0, 0]),
+            ("no motion", [(3, [None, None]), (1, [None, None]), (2, [None, None])], [0, 0]),
+        ]
+        .into_iter()
+        .map(|(case, nbs, pair)| {
+            let mut st = state_with_neighbours(&nbs);
+            // The expected prediction, plane by plane: the pair's
+            // weighting from the reader, applied by the scalar kernels to
+            // the zero-vector reads of the references.
+            let wt = explicit_weighting(&table, 8, pair[0], pair[1], false);
+            let Weighting::Weighted { log_wd, w, o } = wt else { unreachable!("a table weights") };
+            let want: Vec<Vec<u8>> = (0..3)
+                .map(|c| {
+                    let (pw, ph) = (ref0[c].width, ref0[c].height);
+                    let mut out = vec![0u8; pw * ph];
+                    for y in 0..ph {
+                        for x in 0..pw {
+                            let (a, b) = ([ref0[c].data[ref0[c].offset(x as isize, y as isize)]], [ref1[c].data[ref1[c].offset(x as isize, y as isize)]]);
+                            let mut d = [0u8];
+                            match pair {
+                                [0, -1] => (dsp.weighted_uni)(&mut d, 1, &a, 1, 1, log_wd[c], w[c][0], o[c][0], 255),
+                                [-1, 0] => (dsp.weighted_uni)(&mut d, 1, &b, 1, 1, log_wd[c], w[c][1], o[c][1], 255),
+                                _ => (dsp.weighted_bi)(&mut d, 1, &a, &b, 1, 1, log_wd[c], w[c][0], w[c][1], o[c][0], o[c][1], 255),
+                            }
+                            out[y * pw + x] = d[0];
+                        }
+                    }
+                    out
+                })
+                .collect();
+            let mut rec = fresh_rec();
+            let dec = code_macroblock_b(&ctx, &mut rec, &refs, 1, 1, &want[0], 48, [&want[1], &want[2]], 24, &mut st, &col, 4, false, PARITY_FRAME);
+            let dir = u8::from(pair[0] >= 0) * PRED_L0 + u8::from(pair[1] >= 0) * PRED_L1;
+            assert_eq!(dec.kind, BMbKind::BSkip, "{case}: direct with nothing to code is B_Skip");
+            assert_eq!(dec.dir, [dir; 4], "{case}: the derived lists");
+            for c in 0..3 {
+                let (x0, y0, n) = if c == 0 { (16, 16, 16) } else { (8, 8, 8) };
+                let pw = ref0[c].width;
+                for y in y0..y0 + n {
+                    for x in x0..x0 + n {
+                        assert_eq!(
+                            rec[c].data[rec[c].offset(x as isize, y as isize)],
+                            want[c][y * pw + x],
+                            "{case}: component {c} at ({x}, {y}) is not the derived pair's weighted prediction"
+                        );
+                    }
+                }
+            }
+            (case.to_string(), want)
+        })
+        .collect();
+        // Each case's prediction is its own: the three pairs weight
+        // differently, and none of them is default weighting.
+        for (i, (a, pa)) in predictions.iter().enumerate().take(3) {
+            for (b, pb) in predictions.iter().take(3).skip(i + 1) {
+                assert_ne!(pa, pb, "{a} and {b} predict the same samples");
+            }
+            let plain = if a == "list 1 only" { &ref1 } else { &ref0 };
+            assert_ne!(pa[0][..48], plain[0].data[plain[0].origin()..plain[0].origin() + 48], "{a}: the weighting changed nothing");
+        }
     }
 
     /// A noisy source over a structured reference: the reconstruction this

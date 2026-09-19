@@ -42,7 +42,9 @@ use super::rc::{Insensitivity, PicKind, RateController};
 use super::h264_syntax as syn;
 use super::h265_wp;
 use crate::h264::slice::{PredWeightTable, WeightEntry};
-use super::{Access, Config, Entropy, FieldCoding, FieldOrder, RateControl};
+use super::h264_me::BWeights;
+use super::{Access, BWeighting, Config, Entropy, FieldCoding, FieldOrder, RateControl};
+use crate::h264::recon::implicit_pair;
 use crate::bitwriter::BitWriter;
 use crate::h264::dpb::{DecodedPic, Dpb, PocState, RefMark};
 use crate::h264::frame::{BlockMotion, Frame, PARITY_FRAME, SharedFrame};
@@ -413,6 +415,17 @@ fn ssd_packed<S: Sample>(src: &[S], rec: &[u8]) -> u64 {
         .sum()
 }
 
+/// Whether an explicitly bi-predicted block may weight its two lists'
+/// predictions by `w0` and `w1` at `log_wd`: 8.4.2.3's constraint on the
+/// pair, `-128 <= w0 + w1 <= (logWD == 7 ? 127 : 128)`, for luma and for
+/// each chroma component. It keeps the weighted sum of two samples inside
+/// what a 16-bit intermediate holds at 8 bits, and a decoder is entitled to
+/// rely on it, so a stream that breaks it is not one a conforming decoder
+/// must reproduce.
+pub(crate) fn bi_pair_legal(w0: i32, w1: i32, log_wd: u32) -> bool {
+    (-128..=if log_wd == 7 { 127 } else { 128 }).contains(&(w0 + w1))
+}
+
 /// Whether a frame's luma is two fields that do not belong together: its
 /// neighbouring rows, which belong to opposite fields, differ more in
 /// total than rows two apart, which share one. Progressive content — even
@@ -452,6 +465,10 @@ struct Attempt<S: Sample> {
     /// An interlaced frame's two fields, when it was coded as field
     /// pictures (`recon` and `motion` are then empty).
     fields: Option<FieldsOut<S>>,
+    /// A P picture's fitted table holds a strong fit
+    /// ([`h265_wp::PlaneFit::strong`]), which `code_attempt` keeps without
+    /// pricing. False for every other attempt.
+    strong_fit: bool,
 }
 
 /// How many macroblocks of each kind the stream's pictures took, per
@@ -480,7 +497,7 @@ pub struct ShapeCensus {
     /// Pictures with at least one non-zero `mb_qp_delta`, per picture type.
     pub qp_delta_pictures: [u64; 3],
     /// Pictures whose `pred_weight_table` weights something — weighted
-    /// prediction chosen, not merely enabled — per picture type (only P
+    /// prediction chosen, not merely enabled — per picture type (P and B
     /// pictures carry a table).
     pub wp_on: [u64; 3],
     /// Under a luma weighting, inter macroblocks whose luma SATD at the
@@ -489,6 +506,12 @@ pub struct ShapeCensus {
     pub wp_won: [u64; 3],
     /// The same, higher weighted than plain: the fit's model check failing.
     pub wp_lost: [u64; 3],
+    /// Pictures whose fitted table was priced against a table of defaults
+    /// — coded twice — per picture type.
+    pub wp_priced: [u64; 3],
+    /// Of those, the pictures whose fitted table lost and which were kept
+    /// coded under the defaults — the fit declined after the fact.
+    pub wp_rd_default: [u64; 3],
     /// Field pictures coded — two per frame of an interlaced stream coded
     /// as fields, and what proves a field row coded fields rather than
     /// declaring an interlaced sequence over frames.
@@ -535,6 +558,8 @@ impl ShapeCensus {
         self.wp_on[pic] += u64::from(weighting.on);
         self.wp_won[pic] += weighting.won;
         self.wp_lost[pic] += weighting.lost;
+        self.wp_priced[pic] += u64::from(weighting.priced);
+        self.wp_rd_default[pic] += u64::from(weighting.rd_default);
     }
 
     /// The kinds that occurred in pictures of type `pic` (0 intra, 1 P,
@@ -720,6 +745,31 @@ impl<S: Sample> Core<S> {
                 ));
             }
         }
+        match cfg.b_weighting {
+            Some(BWeighting::Explicit) if !cfg.weighted_pred => {
+                // The explicit table is the weighted-prediction fit; asked for
+                // alone it would have nothing to fit with.
+                return Err(Error::unsupported(
+                    "H.264 encode: explicit B weighting without weighted prediction (the B table is weighted_pred's fit; ask for weighted_pred)",
+                ));
+            }
+            Some(BWeighting::Implicit) if cfg.interlace.is_some() => {
+                // A field macroblock of an MBAFF frame weights by its own
+                // field's distances (8.4.2.3.1), which the interlaced walks
+                // do not derive.
+                return Err(Error::unsupported(
+                    "H.264 encode: implicit B weighting over interlaced coding (encoder in progress)",
+                ));
+            }
+            Some(BWeighting::Implicit) if cfg.rate == RateControl::Lossless => {
+                // A lossless stream's B pictures are all-skip copies at the
+                // plain average of their anchors, which a weighting would move.
+                return Err(Error::unsupported(
+                    "H.264 encode: implicit B weighting on a lossless stream (its B pictures are plain averages of their anchors)",
+                ));
+            }
+            _ => {}
+        }
         if cfg.weighted_pred && cfg.rate == RateControl::Lossless {
             // A lossless stream's inter pictures are all-skip copies of
             // their reference (PCM has no inter spelling), and a weighting
@@ -781,16 +831,18 @@ impl<S: Sample> Core<S> {
             }
         };
         // The level the SPS will claim: refused here, before any header
-        // exists, when no level admits the stream (`encode::level`).
-        super::level::h264(&cfg, &geom)?;
+        // exists, when no level admits the stream (`encode::level`). The
+        // motion search is then held to what that level allows.
+        let level = super::level::h264(&cfg, &geom)?;
+        let tools = tools.with_motion(super::level::MotionLimits::h264(level.idc));
         let rc = match cfg.rate {
             // The controller aims at the *declared* rate where a buffer
             // was declared, so the two cannot disagree by the rounding.
             RateControl::Bitrate { bps } => Some(match cpb {
                 Some(c) => RateController::with_cpb(
-                    c.bit_rate as u32, cfg.fps, cfg.width, cfg.height, cfg.gop, cfg.bframes, Some(c.size),
+                    c.bit_rate as u32, cfg.frame_rate_f64(), cfg.width, cfg.height, cfg.gop, cfg.bframes, Some(c.size),
                 ),
-                None => RateController::new(bps, cfg.fps, cfg.width, cfg.height, cfg.gop, cfg.bframes),
+                None => RateController::new(bps, cfg.frame_rate_f64(), cfg.width, cfg.height, cfg.gop, cfg.bframes),
             }),
             _ => None,
         };
@@ -1026,12 +1078,82 @@ impl<S: Sample> Core<S> {
         a.access
     }
 
+    /// Code one picture at a given quantiser, keeping nothing — and when
+    /// its fitted `pred_weight_table` weights something, price that table
+    /// rather than trust it.
+    ///
+    /// The fit is a whole-picture line at zero motion. A B picture's is
+    /// judged one list at a time, while a bi-predicted block predicts from
+    /// both weighted anchors at once — and on a fade the default average of
+    /// a brighter and a darker anchor is often already near the picture's
+    /// level. A P picture's is taken wherever it lowers the zero-motion
+    /// residual by two percent, which a coarse reconstruction drifting in
+    /// level from its source does without any fade: on content that pans
+    /// or zooms at QP 40 and above, P pictures took weightings that cost
+    /// bytes and bought nothing (rivet measured up to +0.8% bytes at the
+    /// same quality). Either way a table can cost its bits and steer the
+    /// search for little. So the picture is coded again under a table of
+    /// defaults, and the cheaper of the two is kept: the squared error of
+    /// its displayed reconstruction plus the bits of its access unit, at
+    /// `h264_intra::lambda` scaled to the depth — the Lagrangian
+    /// `code_attempt_paff` prices its two codings by, and H.265's twin of
+    /// this check (`h265::code_attempt`). Both attempts are side-effect
+    /// free, so the one not kept leaves no trace.
+    ///
+    /// The price is the picture's own. A B picture is not a reference, so
+    /// for it that is the whole price. A P picture is, and what its
+    /// weighting does for the pictures predicting from it is not counted —
+    /// which is where the check went wrong when it priced every P table:
+    /// through a fade's near-black end, whose fits are its strongest, it
+    /// kept the defaults picture after picture at QP 40 and 45, each cheaper
+    /// alone, and the stream came out 2 to 3% larger than one weighted
+    /// throughout (rivet's 640x360 fade). So a P picture's table is priced
+    /// only when no fit in it is strong ([`h265_wp::PlaneFit::strong`]: it
+    /// removes at least 30% of the zero-motion SAD) — a fade's fits mostly
+    /// are, the drift a coarse reconstruction takes on pans and zooms is not
+    /// (its fits remove 2 to 21%) — and a strong fit is kept as it stands.
+    /// Where the line sits was measured on that fade and on the pans, zooms
+    /// and cut: at 50% the fade's QP 45 point still came out 2.8% larger;
+    /// at 70% it is within 0.4%, the fade's BD-rate against pricing every
+    /// table improves by 0.2 to 0.7%, and the non-fade cells are where
+    /// pricing every table put them; at 90% the fade gains nothing.
+    ///
+    /// Nor is every weak fit priced. One that removes under a tenth of the
+    /// SAD is written as the defaults outright (`p_weights`): priced, it lost
+    /// nearly every time, and it was most of the second codings on pans and
+    /// zooms at QP 40 and 45 (+31 to 40% CPU on rivet's clips). Against
+    /// pricing every weak fit, over QP 26..45 on rivet's clips and the
+    /// corpus fades, BD-rate moves by at most +0.07% (pan, cut) while the
+    /// P pictures coded twice fall from 53 to 2 on the zoom, 57 to 0 on the
+    /// cut and 92 to 26 on the pan; the fade keeps all 80 of its own.
+    fn code_attempt(&self, c: &Coded, src: &[S], qp: u8) -> Result<Attempt<S>> {
+        let fitted = self.code_attempt_weighted(c, src, qp, true)?;
+        if !fitted.motion.weighting.on || fitted.strong_fit {
+            return Ok(fitted);
+        }
+        let mut plain = self.code_attempt_weighted(c, src, qp, false)?;
+        let scale = f64::from(1u32 << (2 * (self.cfg.bit_depth - 8)));
+        let lam = f64::from(super::h264_intra::lambda(i32::from(qp))) * scale;
+        let cost = |a: &Attempt<S>| ssd_packed(src, &a.rec) as f64 + lam * (a.access.data.len() * 8) as f64;
+        if cost(&plain) < cost(&fitted) {
+            plain.motion.weighting.priced = true;
+            plain.motion.weighting.rd_default = true;
+            return Ok(plain);
+        }
+        let mut fitted = fitted;
+        fitted.motion.weighting.priced = true;
+        Ok(fitted)
+    }
+
     /// Code one picture at a given quantiser, keeping nothing: parameter
     /// sets, the buffer SEI where a buffer is declared, slice header, then
     /// the slice data of whichever path the configuration selects — the
     /// transform writers (either entropy coder), PCM where exactness
-    /// demands it, or the all-skip inter fallback.
-    fn code_attempt(&self, c: &Coded, src: &[S], qp: u8) -> Result<Attempt<S>> {
+    /// demands it, or the all-skip inter fallback. `fit` false codes a
+    /// weighted P or B picture under a table of defaults whatever its fit
+    /// says: the alternative [`Self::code_attempt`] prices a fitted table
+    /// against.
+    fn code_attempt_weighted(&self, c: &Coded, src: &[S], qp: u8, fit: bool) -> Result<Attempt<S>> {
         let g = self.geom;
         let idr = c.kind == Kind::Idr;
         // Reference lists, by picture order count: list0 runs backwards from
@@ -1137,36 +1259,29 @@ impl<S: Sample> Core<S> {
         // is PCM or all-skip, where the zero-colocated assumption of the
         // temporal-direct fallback below still holds.
         let transform_b = !idr && c.kind == Kind::B && lossy;
-        // Weighted prediction, for a P picture under the PPS flag: one entry
-        // for list 0's one reference, each component fitted to the source
-        // against that reference's reconstruction over the display area and
-        // kept only where it lowers the zero-motion residual — the H.265
-        // side's fit (`h265_wp`), held to the weights H.264's table carries.
-        // The table travels in the slice header; the walk predicts with what
-        // the reader derives from it.
-        let wp = (self.cfg.weighted_pred && transform_p).then(|| {
-            let rf = &self.refs[past.expect("checked above")].1;
-            let fits: Vec<h265_wp::PlaneFit> = (0..self.plane_dims.len())
-                .map(|p| {
-                    let (pw, ph) = self.plane_dims[p];
-                    let refs = h265_wp::RefSamples { data: &rf[p].data, origin: rf[p].origin(), stride: rf[p].stride };
-                    h265_wp::fit_samples(planes[p].data, planes[p].stride, refs, pw as usize, ph as usize, g.bit_depth, h265_wp::H264_WEIGHTS)
-                })
-                .collect();
-            let default = (1i32 << h265_wp::LOG2_DENOM, 0i32);
-            let comp = |f: &h265_wp::PlaneFit| if f.used() { (f.weight, f.offset) } else { default };
-            let luma = comp(&fits[0]);
-            let chroma = if fits.len() == 3 { [comp(&fits[1]), comp(&fits[2])] } else { [default; 2] };
-            let entry = WeightEntry { luma, chroma, luma_flag: luma != default, chroma_flag: chroma != [default; 2] };
-            syn::PredWeights {
-                table: PredWeightTable {
-                    luma_log2_denom: h265_wp::LOG2_DENOM,
-                    chroma_log2_denom: h265_wp::LOG2_DENOM,
-                    lists: [vec![entry], Vec::new()],
-                },
-                chroma: g.chroma != crate::ChromaFormat::Monochrome,
+        // Weighted prediction, under the PPS flags: a P picture's table has
+        // an entry for list 0's one reference, a B picture's one for each
+        // list's anchor, each component fitted to the source against that
+        // reference's reconstruction over the display area and kept only
+        // where it lowers the zero-motion residual — the H.265 side's fit
+        // (`h265_wp`), held to the weights H.264's table carries (and a B
+        // pair to the bound on their sum, see `b_weights`). The table
+        // travels in the slice header; the walks predict with what the
+        // reader derives from it.
+        let mut strong_fit = false;
+        let wp = match c.kind {
+            Kind::P if self.cfg.weighted_pred && transform_p => {
+                let (table, strong) = self.p_weights(&planes, &self.refs[past.expect("checked above")].1, fit);
+                strong_fit = strong;
+                Some(table)
             }
-        });
+            Kind::B if transform_b && syn::b_weighting(&self.cfg) == BWeighting::Explicit => Some(self.b_weights(
+                &planes,
+                [&self.refs[past.expect("checked above")].1, &self.refs[future.expect("checked above")].1],
+                fit,
+            )),
+            _ => None,
+        };
         let mut out = Vec::new();
         out.extend_from_slice(&syn::annexb(
             syn::NAL_SPS,
@@ -1351,13 +1466,25 @@ impl<S: Sample> Core<S> {
             let p1 = future.expect("checked above");
             let refs2 = [&self.refs[p0].1[..], &self.refs[p1].1[..]];
             let col = super::h264_pic::Colocated::progressive(&self.refs[p1].2);
+            // How the slice weights its predictions: its table, the pair of
+            // distance weights the reader derives from the three pictures'
+            // order counts (one reference per list, none long-term), or
+            // neither.
+            let weights = match (syn::b_weighting(&self.cfg), wp.as_ref()) {
+                (BWeighting::Explicit, Some(p)) => BWeights::Explicit(&p.table),
+                (BWeighting::Implicit, _) => {
+                    let (w0, w1) = implicit_pair(c.poc, self.refs[p0].0, self.refs[p1].0, false, false);
+                    BWeights::Implicit(w0, w1)
+                }
+                _ => BWeights::Default,
+            };
             if cabac {
                 motion = super::h264_cabac_mb::write_b_picture_cabac(
-                    &mut w, &g, &self.tools, qp, &planes, &mut recon, refs2, &col,
+                    &mut w, &g, &self.tools, qp, &planes, &mut recon, refs2, &col, weights,
                 );
             } else {
                 motion = super::h264_cavlc_mb::write_b_picture(
-                    &mut w, &g, &self.tools, qp, &planes, &mut recon, refs2, &col,
+                    &mut w, &g, &self.tools, qp, &planes, &mut recon, refs2, &col, weights,
                 );
                 w.rbsp_trailing_bits();
             }
@@ -1432,6 +1559,7 @@ impl<S: Sample> Core<S> {
             recon,
             motion,
             fields: None,
+            strong_fit,
         })
     }
 
@@ -1620,9 +1748,9 @@ impl<S: Sample> Core<S> {
                         },
                     };
                     if cabac {
-                        super::h264_cabac_mb::write_b_picture_cabac(&mut w, &gf, &self.tools, qp, &planes, &mut recon, refs2, &col)
+                        super::h264_cabac_mb::write_b_picture_cabac(&mut w, &gf, &self.tools, qp, &planes, &mut recon, refs2, &col, super::h264_me::BWeights::Default)
                     } else {
-                        let m = super::h264_cavlc_mb::write_b_picture(&mut w, &gf, &self.tools, qp, &planes, &mut recon, refs2, &col);
+                        let m = super::h264_cavlc_mb::write_b_picture(&mut w, &gf, &self.tools, qp, &planes, &mut recon, refs2, &col, super::h264_me::BWeights::Default);
                         w.rbsp_trailing_bits();
                         m
                     }
@@ -1659,6 +1787,7 @@ impl<S: Sample> Core<S> {
             recon: Vec::new(),
             motion: super::h264_pic::PicMotion::new(0, 0),
             fields: Some(FieldsOut { model, frame: cur, census, frame_coded: false, pairs: [0; 2] }),
+            strong_fit: false,
         })
     }
 
@@ -1861,9 +1990,9 @@ impl<S: Sample> Core<S> {
                     },
                 };
                 if cabac {
-                    super::h264_cabac_mb::write_b_picture_cabac(&mut w, &g, &self.tools, qp, &planes, &mut recon, refs2, &col)
+                    super::h264_cabac_mb::write_b_picture_cabac(&mut w, &g, &self.tools, qp, &planes, &mut recon, refs2, &col, super::h264_me::BWeights::Default)
                 } else {
-                    let m = super::h264_cavlc_mb::write_b_picture(&mut w, &g, &self.tools, qp, &planes, &mut recon, refs2, &col);
+                    let m = super::h264_cavlc_mb::write_b_picture(&mut w, &g, &self.tools, qp, &planes, &mut recon, refs2, &col, super::h264_me::BWeights::Default);
                     w.rbsp_trailing_bits();
                     m
                 }
@@ -1907,6 +2036,7 @@ impl<S: Sample> Core<S> {
                 frame_coded: true,
                 pairs: motion.pairs,
             }),
+            strong_fit: false,
         })
     }
 
@@ -1947,6 +2077,129 @@ impl<S: Sample> Core<S> {
         Ok(if cost(&field) < cost(&frame) { field } else { frame })
     }
 
+    /// Component `p` of reference `rf` as the fit reads it.
+    fn fit_ref<'r>(rf: &'r [syn::Recon<S>], p: usize) -> h265_wp::RefSamples<'r, S> {
+        h265_wp::RefSamples { data: &rf[p].data, origin: rf[p].origin(), stride: rf[p].stride }
+    }
+
+    /// A P picture's `pred_weight_table`: one entry, for list 0's one
+    /// reference `rf`, each component its own fit at the denominator
+    /// [`h265_wp::LOG2_DENOM`] — the default wherever the fit is not used,
+    /// and everywhere when not `fit` (the table of defaults a fitted one
+    /// is priced against) or when no fit is worth pricing
+    /// ([`h265_wp::PlaneFit::worth_pricing`]) — and whether any of the fits
+    /// is [`h265_wp::PlaneFit::strong`].
+    fn p_weights(&self, planes: &[syn::Plane<'_, S>], rf: &[syn::Recon<S>], fit: bool) -> (syn::PredWeights, bool) {
+        let fits: Vec<h265_wp::PlaneFit> = (0..self.plane_dims.len())
+            .map(|p| {
+                if !fit {
+                    return h265_wp::PlaneFit::identity(0);
+                }
+                let (pw, ph) = self.plane_dims[p];
+                let refs = Self::fit_ref(rf, p);
+                h265_wp::fit_samples(planes[p].data, planes[p].stride, refs, pw as usize, ph as usize, self.cfg.bit_depth, h265_wp::H264_WEIGHTS)
+            })
+            .collect();
+        // A fit that removes under a tenth of the zero-motion SAD is the
+        // drift of a coarse reconstruction, not a change of brightness, and
+        // priced against the defaults it nearly always lost them — 33 of 33
+        // on rivet's zoom at QP 45, 47 of 49 on the cut clip, 55 of 65 on the
+        // pan — for a second coding each time. Such a table is written as the
+        // defaults outright. Fits removing a tenth to under 30% won 40 of 43
+        // on the fade and 12 of 16 on the pan, and are still priced; strong
+        // ones are kept unpriced (`code_attempt`).
+        let strong = fits.iter().any(h265_wp::PlaneFit::strong);
+        let kept = strong || fits.iter().any(h265_wp::PlaneFit::worth_pricing);
+        let fits: Vec<h265_wp::PlaneFit> = if kept { fits } else { vec![h265_wp::PlaneFit::identity(0); fits.len()] };
+        // A component class the fit leaves at the defaults takes
+        // denominator 0, the cheapest to write, as a B table's does.
+        let luma_d = if fits[0].used() { h265_wp::LOG2_DENOM } else { 0 };
+        let chroma_d = if fits[1..].iter().any(h265_wp::PlaneFit::used) { h265_wp::LOG2_DENOM } else { 0 };
+        let comp = |f: &h265_wp::PlaneFit, d: u32| if f.used() { (f.weight, f.offset) } else { (1i32 << d, 0i32) };
+        let luma = comp(&fits[0], luma_d);
+        let chroma = if fits.len() == 3 { [comp(&fits[1], chroma_d), comp(&fits[2], chroma_d)] } else { [(1i32 << chroma_d, 0i32); 2] };
+        let entry = WeightEntry { luma, chroma, luma_flag: luma != (1 << luma_d, 0), chroma_flag: chroma != [(1 << chroma_d, 0); 2] };
+        let table = syn::PredWeights {
+            table: PredWeightTable { luma_log2_denom: luma_d, chroma_log2_denom: chroma_d, lists: [vec![entry], Vec::new()] },
+            chroma: self.cfg.chroma != crate::ChromaFormat::Monochrome,
+        };
+        (table, strong)
+    }
+
+    /// A B picture's `pred_weight_table`: an entry for list 0's past
+    /// anchor and one for list 1's future anchor (`anchors`), each
+    /// component fitted against its own anchor as a P picture's is — on a
+    /// fade the two gains sit either side of the identity.
+    ///
+    /// One thing a P table never meets: a bi-predicted block weights by
+    /// both lists' entries at once, and 8.4.2.3 bounds their sum,
+    /// [`bi_pair_legal`]. At the P table's sixty-fourths a B picture a
+    /// third of the way into a darkening fade already breaks it — gains of
+    /// 15/16 against its brighter past anchor and 15/13 against its darker
+    /// future one are weights 60 and 74. The bound is on the weights, not
+    /// on the gains, so the fit keeps both gains and gives up precision
+    /// instead: each component takes the finest denominator at which the
+    /// pair its two fits make is legal (the fits requantised there, their
+    /// offsets refitted and each checked again), luma on its own and the
+    /// two chroma components together, since they share
+    /// `chroma_log2_weight_denom`. An entry left at the default weights
+    /// by `1 << denom` and counts in the sum like any other. Where no
+    /// denominator makes the pair legal — both gains near the top of what
+    /// the syntax carries — the component keeps the defaults, which every
+    /// denominator allows. Not `fit`: the table of defaults throughout.
+    fn b_weights(&self, planes: &[syn::Plane<'_, S>], anchors: [&[syn::Recon<S>]; 2], fit: bool) -> syn::PredWeights {
+        let bd = self.cfg.bit_depth;
+        let fit_pairs = |comps: &[usize]| -> (u32, Vec<[h265_wp::PlaneFit; 2]>) {
+            if !fit {
+                return (h265_wp::LOG2_DENOM, vec![[h265_wp::PlaneFit::identity(0); 2]; comps.len()]);
+            }
+            let sums: Vec<[h265_wp::PlaneSums; 2]> = comps
+                .iter()
+                .map(|&p| {
+                    let (pw, ph) = self.plane_dims[p];
+                    anchors.map(|rf| h265_wp::plane_sums(planes[p].data, planes[p].stride, Self::fit_ref(rf, p), pw as usize, ph as usize))
+                })
+                .collect();
+            for d in (0..=h265_wp::LOG2_DENOM).rev() {
+                let fits: Vec<[h265_wp::PlaneFit; 2]> = comps
+                    .iter()
+                    .zip(&sums)
+                    .map(|(&p, s)| {
+                        let (pw, ph) = self.plane_dims[p];
+                        [0usize, 1].map(|l| {
+                            let refs = Self::fit_ref(anchors[l], p);
+                            h265_wp::fit_samples_at(&s[l], planes[p].data, planes[p].stride, refs, pw as usize, ph as usize, bd, h265_wp::H264_WEIGHTS, d)
+                        })
+                    })
+                    .collect();
+                let weight = |f: &h265_wp::PlaneFit| if f.used() { f.weight } else { 1 << d };
+                if fits.iter().all(|[f0, f1]| bi_pair_legal(weight(f0), weight(f1), d)) {
+                    return (d, fits);
+                }
+            }
+            (h265_wp::LOG2_DENOM, vec![[h265_wp::PlaneFit::identity(0); 2]; comps.len()])
+        };
+        let (luma_d, luma) = fit_pairs(&[0]);
+        let (chroma_d, chroma) = if planes.len() == 3 { fit_pairs(&[1, 2]) } else { (h265_wp::LOG2_DENOM, Vec::new()) };
+        // A component class whose entries are all the defaults weights
+        // nothing at any denominator — `(1 << d, 0)` is the identity at
+        // every `d`, one list and two — so it takes the one that is
+        // cheapest to write: `ue(0)` is one bit where `ue(6)` is five.
+        let weighted = |fits: &[[h265_wp::PlaneFit; 2]]| fits.iter().flatten().any(h265_wp::PlaneFit::used);
+        let luma_d = if weighted(&luma) { luma_d } else { 0 };
+        let chroma_d = if weighted(&chroma) { chroma_d } else { 0 };
+        let comp = |f: &h265_wp::PlaneFit, d: u32| if f.used() { (f.weight, f.offset) } else { (1i32 << d, 0i32) };
+        let entry = |l: usize| {
+            let y = comp(&luma[0][l], luma_d);
+            let c = if chroma.is_empty() { [(1i32 << chroma_d, 0i32); 2] } else { [comp(&chroma[0][l], chroma_d), comp(&chroma[1][l], chroma_d)] };
+            WeightEntry { luma: y, chroma: c, luma_flag: y != (1 << luma_d, 0), chroma_flag: c != [(1 << chroma_d, 0); 2] }
+        };
+        syn::PredWeights {
+            table: PredWeightTable { luma_log2_denom: luma_d, chroma_log2_denom: chroma_d, lists: [vec![entry(0)], vec![entry(1)]] },
+            chroma: self.cfg.chroma != crate::ChromaFormat::Monochrome,
+        }
+    }
+
     /// Indices into `refs` of the nearest reference before and after `poc`.
     ///
     /// Nearest rather than first: a decoder's default list order is by
@@ -1977,7 +2230,7 @@ impl<S: Sample> Core<S> {
             RateControl::Bitrate { bps } => bps as f64,
             _ => return None,
         };
-        Some((rc.achieved_bps(self.cfg.fps), target))
+        Some((rc.achieved_bps(self.cfg.frame_rate_f64()), target))
     }
 
     /// See [`H264Encoder::picture_qp`].
@@ -2606,13 +2859,14 @@ mod tests {
     }
 
     /// Explicit weighted prediction on a fade: the P pictures choose a
-    /// weighting (census `wp_on`), it holds macroblock by macroblock
-    /// (`wp_won` above `wp_lost`, the model check), the stream is markedly
-    /// smaller than the same encode without it, and it round-trips through
-    /// the production decoder — both entropy coders, every chroma format,
-    /// with B pictures (which stay default-weighted) and sub-partitions and
-    /// the 8x8 transform, at 8, 10 and 12 bits. On a held clip nothing is
-    /// chosen and the table of defaults costs its flags. Lossless refuses.
+    /// weighting (census `wp_on`), and so do the B pictures of the rows
+    /// that have them, it holds macroblock by macroblock (`wp_won` above
+    /// `wp_lost`, the model check), the stream is markedly smaller than the
+    /// same encode without it, and it round-trips through the production
+    /// decoder — both entropy coders, every chroma format, with B pictures
+    /// and sub-partitions and the 8x8 transform, at 8, 10 and 12 bits. On a
+    /// held clip nothing is chosen and the table of defaults costs its
+    /// flags. Lossless refuses.
     #[test]
     fn weighted_prediction_pays_on_a_fade_and_round_trips() {
         for (chroma, bit_depth, bframes, entropy, tools) in [
@@ -2649,7 +2903,10 @@ mod tests {
             let bytes = |u: &[Access]| u.iter().map(|a| a.data.len()).sum::<usize>();
             assert!(census.wp_on[1] > 0, "{tag}: no P picture chose a weighting: {census:?}");
             assert!(census.wp_won[1] > census.wp_lost[1], "{tag}: the fit lost more macroblocks than it won: {census:?}");
-            assert_eq!(census.wp_on[2], 0, "{tag}: a B picture carries no table");
+            if bframes > 0 {
+                assert!(census.wp_on[2] > 0, "{tag}: no B picture chose a weighting: {census:?}");
+                assert!(census.wp_won[2] > census.wp_lost[2], "{tag}: the B fits lost more macroblocks than they won: {census:?}");
+            }
             assert_eq!((plain.wp_on, plain.wp_won, plain.wp_lost), ([0; 3], [0; 3], [0; 3]), "{tag}: the census counts nothing with the switch off");
             assert!(
                 (bytes(&with) as f64) < (bytes(&without) as f64) * 0.9,
@@ -2682,6 +2939,324 @@ mod tests {
             .expect("weighted prediction on a lossless stream must refuse");
         assert!(format!("{err}").contains("weighted prediction"), "{err}");
     }
+    /// The picture-level check between a B picture's fitted table and a
+    /// table of defaults decides both ways on the fade, and the right way
+    /// round. With two B pictures between anchors each sits a third of the
+    /// way along the ramp, where the default average of its anchors is off
+    /// the picture's level and every fitted table is kept at QP 26. With
+    /// one, each sits halfway, where on a linear fade that average is
+    /// already at the picture's level: at QP 40 the table costs more than
+    /// it buys and the defaults are kept. Comparing the two costs the wrong
+    /// way round fails both halves.
+    #[test]
+    fn a_b_pictures_table_is_kept_only_where_it_pays() {
+        let frames = fade_frames(ChromaFormat::Yuv420, 8, 12);
+        let census = |qp: u8, bframes: u32| {
+            let mut e = H264Encoder::new(Config {
+                gop: 12,
+                bframes,
+                weighted_pred: true,
+                rate: RateControl::ConstantQp(qp),
+                ..cfg(64, 64, ChromaFormat::Yuv420, 8)
+            })
+            .unwrap();
+            let mut units = Vec::new();
+            let mut recon = Vec::new();
+            for f in &frames {
+                units.extend(e.push(f).unwrap());
+            }
+            units.extend(e.flush().unwrap());
+            recon.extend(e.reconstructions().iter().cloned());
+            self_check(&format!("QP {qp} bframes {bframes}"), 12, &units, &recon);
+            e.shape_census().clone()
+        };
+        let kept = census(26, 2);
+        assert!(kept.wp_on[2] > 0, "bframes=2 QP 26: no B picture took a fitted table: {kept:?}");
+        assert_eq!(kept.wp_priced[2], kept.wp_on[2], "bframes=2 QP 26: every B table is priced: {kept:?}");
+        assert_eq!(kept.wp_rd_default[2], 0, "bframes=2 QP 26: a fitted table lost to the defaults: {kept:?}");
+        let mid = census(40, 1);
+        assert!(mid.wp_rd_default[2] > 0, "bframes=1 QP 40: every fitted table was kept: {mid:?}");
+    }
+
+    /// A P picture's table follows how much of the zero-motion SAD its fit
+    /// removes: under a tenth, the defaults outright; a tenth to 30%, the
+    /// fit, to be priced; 30% and more, the fit, strong and kept unpriced.
+    /// The fixture is a textured reference and the same picture raised by
+    /// a level `k` under uniform noise of half-width 20, so the plain SAD is
+    /// about `(20^2 + k^2) / 40` a sample and the fitted one 10: k 5, 10
+    /// and 20 remove about 6%, 20% and 50%.
+    #[test]
+    fn a_p_table_follows_how_much_its_fit_removes() {
+        let core = Core::<u8>::new(Config { gop: 8, weighted_pred: true, ..cfg(64, 64, ChromaFormat::Yuv420, 8) }).unwrap();
+        let dims = [(64usize, 64usize), (32, 32), (32, 32)];
+        let reference: Vec<syn::Recon<u8>> = dims
+            .iter()
+            .enumerate()
+            .map(|(c, &(w, h))| {
+                let pad = if c == 0 { crate::h264::frame::LUMA_PAD } else { crate::h264::frame::CHROMA_PAD };
+                let mut p = syn::recon_plane(w as u32, h as u32, pad);
+                for y in 0..h {
+                    for x in 0..w {
+                        let o = p.offset(x as isize, y as isize);
+                        p.data[o] = (60 + (x * 3 + y * 5 + (x * y) / 7) % 120) as u8;
+                    }
+                }
+                p.extend_edges(false);
+                p
+            })
+            .collect();
+        let table = |k: i32| {
+            let mut seed = 0x2545_f491u32;
+            let cur: Vec<Vec<u8>> = dims
+                .iter()
+                .enumerate()
+                .map(|(c, &(w, h))| {
+                    (0..w * h)
+                        .map(|i| {
+                            let r = i32::from(reference[c].data[reference[c].offset((i % w) as isize, (i / w) as isize)]);
+                            if c > 0 {
+                                return r as u8;
+                            }
+                            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                            (r + k + (seed >> 16) as i32 % 41 - 20).clamp(0, 255) as u8
+                        })
+                        .collect()
+                })
+                .collect();
+            let planes: Vec<syn::Plane<'_, u8>> =
+                cur.iter().zip(dims).map(|(s, (w, h))| syn::Plane { data: &s[..], stride: w, width: w as u32, height: h as u32 }).collect();
+            let (t, strong) = core.p_weights(&planes, &reference, true);
+            (t.table.lists[0][0].luma_flag, strong)
+        };
+        assert_eq!(table(5), (false, false), "a fit removing about 6% is written as the defaults");
+        assert_eq!(table(10), (true, false), "a fit removing about 20% is kept, to be priced");
+        assert_eq!(table(20), (true, true), "a fit removing about half is strong");
+    }
+
+    /// A P picture's fitted table is priced against the defaults only when
+    /// no fit in it is strong. The fade's P fits all remove most of the
+    /// zero-motion residual, at QP 26 and over QP 40's coarser keyframe:
+    /// every P picture takes its table, and none is coded twice. A textured
+    /// picture moving three samples a frame does not change brightness,
+    /// but its fit against a reconstruction still lowers the zero-motion
+    /// residual by the few percent that count as used: each such table is
+    /// priced, and the defaults win it. Comparing the costs the wrong way
+    /// round keeps those tables and loses the fade's; pricing strong fits
+    /// too codes the fade's P pictures twice.
+    #[test]
+    fn a_p_pictures_table_is_priced_only_when_its_fits_are_weak() {
+        let census = |frames: &[Vec<u8>], qp: u8| {
+            let mut e = H264Encoder::new(Config {
+                gop: 12,
+                weighted_pred: true,
+                rate: RateControl::ConstantQp(qp),
+                ..cfg(64, 64, ChromaFormat::Yuv420, 8)
+            })
+            .unwrap();
+            let mut units = Vec::new();
+            for f in frames {
+                units.extend(e.push(f).unwrap());
+            }
+            units.extend(e.flush().unwrap());
+            self_check(&format!("QP {qp}"), 12, &units, e.reconstructions());
+            e.shape_census().clone()
+        };
+        let fade = fade_frames(ChromaFormat::Yuv420, 8, 12);
+        for qp in [26u8, 40] {
+            let c = census(&fade, qp);
+            assert!(c.wp_on[1] > 0, "fade QP {qp}: no P picture took its table: {c:?}");
+            assert_eq!(c.wp_priced[1], 0, "fade QP {qp}: a strong fit was priced: {c:?}");
+        }
+        let moving = census(&woven_frames(64, 64, ChromaFormat::Yuv420, 8, 12, 0), 26);
+        assert!(moving.wp_priced[1] > 0, "moving texture: no weak fit was priced: {moving:?}");
+        assert!(moving.wp_rd_default[1] > 0, "moving texture: every weak fit beat the defaults: {moving:?}");
+    }
+
+    /// Implicit B weighting (`weighted_bipred_idc` 2) round-trips through
+    /// the production decoder, whose own derivation (`implicit_pair`, from
+    /// the order counts it reads) weights the same pairs the encoder did:
+    /// both entropy coders, every chroma format, 8 and 10 bits, one to
+    /// three B pictures, beside weighted P pictures, and with the 8x8
+    /// transform and sub-partitions. The weights are by distance — two
+    /// thirds and one third a third of the way between the anchors, a half
+    /// each halfway — and the stream is not the default-weighted one.
+    #[test]
+    fn implicit_b_weighting_round_trips_and_weighs_by_distance() {
+        use crate::encode::BWeighting;
+        assert_eq!(implicit_pair(2, 0, 6, false, false), (43, 21), "a third of the way along");
+        assert_eq!(implicit_pair(4, 0, 6, false, false), (22, 42), "two thirds (the spec rounds DistScaleFactor, not the weights)");
+        assert_eq!(implicit_pair(2, 0, 4, false, false), (32, 32), "halfway");
+        for (chroma, bit_depth, bframes, entropy, tools, wpred) in [
+            (ChromaFormat::Yuv420, 8u32, 2u32, Entropy::Cabac, false, false),
+            (ChromaFormat::Yuv420, 8, 3, Entropy::Cavlc, true, false),
+            (ChromaFormat::Yuv422, 8, 1, Entropy::Cabac, true, false),
+            (ChromaFormat::Yuv444, 8, 2, Entropy::Cavlc, false, true),
+            (ChromaFormat::Monochrome, 8, 2, Entropy::Cabac, false, false),
+            (ChromaFormat::Yuv420, 10, 2, Entropy::Cabac, true, true),
+            (ChromaFormat::Yuv444, 10, 3, Entropy::Cabac, false, false),
+        ] {
+            let tag = format!("{chroma:?} {bit_depth}-bit bframes={bframes} {entropy:?} t8x8+subparts={tools} wpred={wpred}");
+            let frames: Vec<Vec<u8>> = woven_frames(64, 64, chroma, bit_depth, 8, 0)
+                .into_iter()
+                .zip(fade_frames(chroma, bit_depth, 8))
+                .enumerate()
+                .map(|(i, (moving, fading))| if i % 2 == 0 { moving } else { fading })
+                .collect();
+            let run = |b_weighting: Option<BWeighting>| -> (Vec<Access>, Vec<Vec<u8>>) {
+                let mut e = H264Encoder::new(Config {
+                    gop: 8,
+                    bframes,
+                    entropy,
+                    transform_8x8: tools,
+                    subparts: tools,
+                    weighted_pred: wpred,
+                    b_weighting,
+                    ..cfg(64, 64, chroma, bit_depth)
+                })
+                .unwrap_or_else(|err| panic!("{tag}: {err}"));
+                let mut units = Vec::new();
+                for f in &frames {
+                    units.extend(e.push(f).unwrap_or_else(|err| panic!("{tag}: {err}")));
+                }
+                units.extend(e.flush().unwrap_or_else(|err| panic!("{tag}: {err}")));
+                (units, e.reconstructions().to_vec())
+            };
+            let (implicit, recon) = run(Some(BWeighting::Implicit));
+            self_check(&tag, 8, &implicit, &recon);
+            let (default, _) = run(Some(BWeighting::Default));
+            assert_ne!(
+                implicit.iter().map(|a| &a.data).collect::<Vec<_>>(),
+                default.iter().map(|a| &a.data).collect::<Vec<_>>(),
+                "{tag}: implicit weighting coded the default-weighted stream"
+            );
+        }
+    }
+
+    /// B weighting asked for by name is refused where the encoder cannot
+    /// honour it: explicit without weighted prediction (the table is its
+    /// fit), implicit over interlaced coding or on a lossless stream, and
+    /// on H.265 anything but what it does anyway.
+    #[test]
+    fn b_weighting_is_refused_where_it_cannot_be_honoured() {
+        use crate::encode::{BWeighting, FieldOrder};
+        let base = Config { gop: 8, bframes: 2, ..cfg(64, 64, ChromaFormat::Yuv420, 8) };
+        let refuse = |c: Config, what: &str| {
+            let err = H264Encoder::new(c).err().unwrap_or_else(|| panic!("{what}: accepted"));
+            assert!(format!("{err}").contains("B weighting"), "{what}: {err}");
+        };
+        refuse(Config { b_weighting: Some(BWeighting::Explicit), ..base.clone() }, "explicit without weighted prediction");
+        refuse(Config { b_weighting: Some(BWeighting::Implicit), interlace: Some(FieldOrder::TopFirst), ..base.clone() }, "implicit interlaced");
+        refuse(Config { b_weighting: Some(BWeighting::Implicit), rate: RateControl::Lossless, ..base.clone() }, "implicit lossless");
+        for (wp, bw) in [(false, BWeighting::Default), (true, BWeighting::Default), (false, BWeighting::Implicit), (true, BWeighting::Implicit), (true, BWeighting::Explicit)] {
+            H264Encoder::new(Config { weighted_pred: wp, b_weighting: Some(bw), ..base.clone() })
+                .unwrap_or_else(|err| panic!("H.264 weighted_pred {wp} {bw:?}: {err}"));
+        }
+        let h265 = |wp: bool, bw: Option<BWeighting>| crate::encode::h265::H265Encoder::new(Config { weighted_pred: wp, b_weighting: bw, ..base.clone() });
+        for (wp, bw) in [(false, None), (true, None), (true, Some(BWeighting::Explicit)), (false, Some(BWeighting::Default))] {
+            h265(wp, bw).unwrap_or_else(|err| panic!("H.265 weighted_pred {wp} {bw:?}: {err}"));
+        }
+        for (wp, bw) in [(false, BWeighting::Implicit), (true, BWeighting::Implicit), (true, BWeighting::Default), (false, BWeighting::Explicit)] {
+            let err = h265(wp, Some(bw)).err().unwrap_or_else(|| panic!("H.265 weighted_pred {wp} {bw:?}: accepted"));
+            assert!(format!("{err}").contains("B weighting"), "H.265 {bw:?}: {err}");
+        }
+    }
+
+    /// 8.4.2.3's bound on an explicitly bi-predicted pair, at its edges:
+    /// the sum may reach 128 except at a denominator of 7, where 127 is the
+    /// most, and may fall to -128 at every denominator.
+    #[test]
+    fn the_bound_on_a_bi_predicted_pair_is_the_standards() {
+        for d in 0..=6u32 {
+            assert!(bi_pair_legal(64, 64, d) && bi_pair_legal(127, 1, d) && bi_pair_legal(-128, 0, d), "denominator {d}");
+            assert!(!bi_pair_legal(64, 65, d) && !bi_pair_legal(-64, -65, d), "denominator {d}");
+        }
+        assert!(bi_pair_legal(100, 27, 7) && !bi_pair_legal(64, 64, 7) && bi_pair_legal(-100, -28, 7));
+    }
+
+    /// A B picture whose two fits break the bound on a bi-predicted pair
+    /// at the P table's sixty-fourths is given a table that keeps both
+    /// gains at a coarser denominator, legal in luma and in both chroma
+    /// components; a pair no denominator can make legal keeps the defaults.
+    ///
+    /// The fixture is the case that breaks it on the corpus fade: a
+    /// darkening fade a third of the way from its past anchor (full level)
+    /// to its future one (13/16), so the picture is 15/16 of the one and
+    /// 15/13 of the other — weights 60 and 74 at sixty-fourths, summing to
+    /// 134. It is asserted to break the bound at sixty-fourths, so it keeps
+    /// testing what it says.
+    #[test]
+    fn a_b_pair_the_bound_refuses_takes_a_coarser_denominator() {
+        let core = Core::<u8>::new(Config { gop: 8, bframes: 2, weighted_pred: true, ..cfg(64, 64, ChromaFormat::Yuv420, 8) }).unwrap();
+        let tex = |x: usize, y: usize, c: usize| f64::from(60 + ((x * 3 + y * 5 + c * 11 + (x * y) / 7) % 150) as i32);
+        let dims = [(64usize, 64usize), (32, 32), (32, 32)];
+        let samples = |gain: f64, base: &dyn Fn(usize, usize, usize) -> f64| -> Vec<Vec<u8>> {
+            dims.iter()
+                .enumerate()
+                .map(|(c, &(w, h))| (0..w * h).map(|i| (base(i % w, i / w, c) * gain).round().clamp(0.0, 255.0) as u8).collect())
+                .collect()
+        };
+        let anchor = |gain: f64, base: &dyn Fn(usize, usize, usize) -> f64| -> Vec<syn::Recon<u8>> {
+            samples(gain, base)
+                .iter()
+                .zip(dims)
+                .map(|(s, (w, h))| {
+                    let pad = if w == 64 { crate::h264::frame::LUMA_PAD } else { crate::h264::frame::CHROMA_PAD };
+                    let mut p = syn::recon_plane(w as u32, h as u32, pad);
+                    for y in 0..h {
+                        let o = p.offset(0, y as isize);
+                        p.data[o..o + w].copy_from_slice(&s[y * w..(y + 1) * w]);
+                    }
+                    p.extend_edges(false);
+                    p
+                })
+                .collect()
+        };
+        let table_for = |cur: &[Vec<u8>], past: &[syn::Recon<u8>], future: &[syn::Recon<u8>]| {
+            let planes: Vec<syn::Plane<'_, u8>> = cur
+                .iter()
+                .zip(dims)
+                .map(|(s, (w, h))| syn::Plane { data: &s[..], stride: w, width: w as u32, height: h as u32 })
+                .collect();
+            core.b_weights(&planes, [past, future], true).table
+        };
+
+        let (past, future) = (anchor(1.0, &tex), anchor(13.0 / 16.0, &tex));
+        let cur = samples(15.0 / 16.0, &tex);
+        // At sixty-fourths the two fits of every component break the bound.
+        for c in 0..3 {
+            let (w, h) = dims[c];
+            let fit = |rf: &[syn::Recon<u8>]| {
+                h265_wp::fit_samples(&cur[c], w, Core::<u8>::fit_ref(rf, c), w, h, 8, h265_wp::H264_WEIGHTS)
+            };
+            let (f0, f1) = (fit(&past), fit(&future));
+            assert!(f0.used() && f1.used(), "component {c}: {f0:?} {f1:?}");
+            assert!(!bi_pair_legal(f0.weight, f1.weight, 6), "component {c}: the fixture no longer breaks the bound: {} + {}", f0.weight, f1.weight);
+        }
+        let t = table_for(&cur, &past, &future);
+        let (e0, e1) = (t.lists[0][0], t.lists[1][0]);
+        assert!(t.luma_log2_denom < 6 && t.chroma_log2_denom < 6, "{t:?}");
+        assert!(e0.luma_flag && e1.luma_flag && e0.chroma_flag && e1.chroma_flag, "both gains kept in every component: {t:?}");
+        assert!(bi_pair_legal(e0.luma.0, e1.luma.0, t.luma_log2_denom), "luma: {t:?}");
+        for c in 0..2 {
+            assert!(bi_pair_legal(e0.chroma[c].0, e1.chroma[c].0, t.chroma_log2_denom), "chroma {c}: {t:?}");
+        }
+        // The gains are the fade's, to the precision the denominator has.
+        let near = |w: i32, d: u32, gain: f64| (f64::from(w) / f64::from(1u32 << d) - gain).abs() <= 1.0 / f64::from(1u32 << d);
+        assert!(near(e0.luma.0, t.luma_log2_denom, 15.0 / 16.0) && near(e1.luma.0, t.luma_log2_denom, 15.0 / 13.0), "{t:?}");
+
+        // Anchors near black under a picture eighty times brighter: the
+        // gains cannot be carried together at any denominator, so the
+        // pair keeps the defaults, which every denominator allows.
+        let dim = |x: usize, y: usize, _c: usize| f64::from(((x + y) % 3 + 1) as u32);
+        let (past, future) = (anchor(1.0, &dim), anchor(1.0, &dim));
+        let cur = samples(80.0, &dim);
+        let t = table_for(&cur, &past, &future);
+        let (e0, e1) = (t.lists[0][0], t.lists[1][0]);
+        let unit = 1i32 << t.luma_log2_denom;
+        assert!(!e0.luma_flag && !e1.luma_flag && e0.luma == (unit, 0) && e1.luma == (unit, 0), "{t:?}");
+        assert!(bi_pair_legal(e0.luma.0, e1.luma.0, t.luma_log2_denom), "{t:?}");
+    }
+
     /// `count` interlaced frames of `w` by `h` at `bit_depth`, packed as the
     /// encoder takes them: every row of a frame drawn at its own field's
     /// instant — the top field at time `2f`, the bottom at `2f + 1` — from a

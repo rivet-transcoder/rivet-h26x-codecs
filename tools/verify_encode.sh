@@ -115,6 +115,13 @@
 #               fill-and-drain cycle and both branches are vacuous - which
 #               is why the row is restricted to src_cut below.
 #
+#               The two `-ntsc` rows declare the buffer at 29.97 pictures a
+#               second (--fps 30000/1001): the VUI clock is 1001 over 60000
+#               (H.264's field clock) or over 30000 (H.265), and h26xhrd
+#               walks it exactly - H.264's tick is 1501.5 of the 90 kHz
+#               ones, which a rounded tick would drift from by half a tick a
+#               picture.
+#
 #               Its mutation: make the controller ignore the buffer it was
 #               given, and the row must go red. So does forbidding the
 #               encoder to code a picture twice - at this buffer size the
@@ -467,9 +474,13 @@ EXCLUSIVE_TOKENS="ilace fdeep wsine"
 # decline on content that does not fade (h26xenc's `wp` line counts the P
 # pictures that took a weighting: none on detail, motion or static). At QP 40
 # it does not decline: a reconstruction that coarse has drifted in level from
-# its source, the fit takes a weighting to correct it (21 of 84 P pictures on
-# the cut clip at QP 38), and that is the weighted path on content the fade
-# rows never show it — a row at QP 26 alone proved it only on the fade.
+# its source, and the fit takes a weighting to correct it — a weak one, which
+# the picture-level check prices against a table of defaults (23 of the cut
+# clip's 84 P pictures at QP 40, 21 of them going back to the defaults, the
+# `priced` and `kept them` counts of the `wp` line). That is the weighted
+# path, and the check, on content the fade rows never show them — a row at
+# QP 26 alone proved them only on the fade, whose fits are strong and are
+# never priced.
 #
 # The fade is a pure gain, so the offsets its weighting carries round to zero,
 # and a writer that flipped the sign of every weighting offset failed only 11
@@ -516,6 +527,38 @@ EXCLUSIVE_TOKENS="ilace fdeep wsine"
 # same encoder's on its 8-bit twin, on fewer bytes; its B pictures take both
 # outcomes of the table-against-defaults check. Its name carries `wsine`,
 # one of EXCLUSIVE_TOKENS.
+# The H.264 --wpred rows with --bframes are H.264's explicit weighted
+# bi-prediction. The PPS sets weighted_bipred_idc 1 and every B slice carries
+# a table with an entry for each list's anchor; a B picture whose table
+# weights something is priced against a table of defaults, and a component
+# class left at the defaults writes denominator 0. A B pair whose weights
+# would sum past 8.4.2.3's bound at sixty-fourths takes a coarser
+# denominator (on the fade the first B picture of each GOP codes its luma in
+# thirty-seconds). So every H.264 --wpred row with --bframes moved when that
+# landed — `h264-wp-ipb@fade`, `h264-10-wp-cavlc-ipb@p10` and
+# `h264-wpoff-cavlc-ipb@wpoff` included — and with them, since P pictures'
+# weak fits are priced the same way and their default tables got shorter,
+# every H.264 --wpred row. Against the encoder before it (P weighted, B
+# default) at --bframes 2 over QP 22..40: BD-rate -13.5% on the fade, -17.3%
+# on the gain-and-offset fade, -12.4% on fdeep10, -22.9% on wsine10; on the
+# untagged clips the reconstruction is the default-weighted one to the byte
+# and each B slice a table of defaults (about a byte) larger. The rows below
+# `hevc10-wp40-ipb@wsine10` add the B-slice weighting's own cells: QP 40 over
+# every 8-bit clip, where B pictures take and decline tables; the
+# gain-and-offset fade under CABAC (its CAVLC twin was already there); the
+# fade with the 8x8 transform and sub-partitions, and under adaptive
+# quantisation; and both 10-bit fades. h26xenc's `wp B` line counts the B
+# pictures that took a table, were priced, and kept the defaults.
+# The h264-*imp* rows are H.264's implicit B weighting (`--bweight implicit`,
+# `weighted_bipred_idc` 2): no table, every bi-predicted block weighted by
+# the picture's distances to its anchors through the decoder's own
+# `implicit_pair`, so SELF holds the encoder to that derivation and CROSS
+# holds both to libavcodec's. It is opt-in (see `Config::b_weighting` for
+# the measurement: fades and motion gain, detail loses), so no other row
+# moved. One row over every 8-bit clip at two B pictures, one at three with
+# the 8x8 transform and sub-partitions under CAVLC at QP 40, the deep clips,
+# beside explicitly weighted P pictures on the fade, and on the native
+# 10-bit fade, where it gains most.
 # The h264-paff / h264-mbaff rows are H.264 interlaced coding. They visit the
 # two interlaced clips: src_interlace_96x96_420p8 (`@interlace`: fields 20 ms
 # apart, a scrolling half beside a held one, combed so that PAFF has field
@@ -537,8 +580,8 @@ EXCLUSIVE_TOKENS="ilace fdeep wsine"
 # it listed only the two it uses, the older anchors were marked unused, and
 # libavcodec refused the next P picture that named one ("Could not find ref
 # with POC 0"). Our decoder generates a stand-in for a missing reference and
-# counts a warning (h26xdec prints the count), so SELF passed and only CROSS
-# was red. They visit motion (and, through the tag, its 10-bit twin
+# counts a warning (h26xdec prints the count); SELF passed and only CROSS was
+# red, which is why SELF now also fails on any warning our decoder counts. They visit motion (and, through the tag, its 10-bit twin
 # motion10), fade and cut; --gop 250 because at --gop 8 the GOP ends before
 # --bframes 3 leaves a B picture below an anchor it does not use.
 # The hevc*-parts* rows are H.265 inter partitions (--parts sym): a CU may
@@ -592,6 +635,7 @@ hevc-abr-96k|--codec h265 --bitrate 96000 --gop 8
 abr-64k|--codec h264 --bitrate 64000 --gop 8
 abr-128k|--codec h264 --bitrate 128000 --gop 8
 hevc-vbv-125@src_cut|--codec h265 --bitrate 64000 --cpb-ms 125 --gop 8
+hevc-vbv-125-ntsc@src_cut|--codec h265 --bitrate 64000 --cpb-ms 125 --gop 8 --fps 30000/1001
 hevc10-cqp-intra@p10|--codec h265 --qp 26 --gop 0
 hevc10-cqp-ip@p10|--codec h265 --qp 26 --gop 8
 hevc10-cqp-ipb@p10|--codec h265 --qp 26 --gop 8 --bframes 2
@@ -642,6 +686,7 @@ hevc-refs4-b3@motion|--codec h265 --qp 26 --gop 250 --bframes 3 --refs 4
 hevc-refs4-b3@fade|--codec h265 --qp 26 --gop 250 --bframes 3 --refs 4
 hevc-refs4-b3@cut|--codec h265 --qp 26 --gop 250 --bframes 3 --refs 4
 abr-64k-cpb@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8
+abr-64k-cpb-ntsc@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8 --fps 30000/1001
 abr-64k-cavlc-cpb@src_cut|--codec h264 --bitrate 64000 --cpb-ms 125 --gop 8 --cavlc
 h264-10-lossless-intra@p10|--codec h264 --lossless --gop 0
 h264-10-lossless-cavlc-intra@p10|--codec h264 --lossless --gop 0 --cavlc
@@ -764,6 +809,17 @@ h264-verdict-g2-256k@settle|--codec h264 --bitrate 256000 --gop 2
 hevc10-wp-ipb@wsine10|--codec h265 --qp 26 --gop 8 --bframes 2 --wpred
 hevc10-wp-ip@wsine10|--codec h265 --qp 26 --gop 8 --wpred
 hevc10-wp40-ipb@wsine10|--codec h265 --qp 40 --gop 8 --bframes 2 --wpred
+h264-wp40-ipb|--codec h264 --qp 40 --gop 8 --bframes 2 --wpred
+h264-wp-ipb@wpoff|--codec h264 --qp 26 --gop 8 --bframes 2 --wpred
+h264-wp-t8x8-subparts-ipb@fade|--codec h264 --qp 26 --gop 8 --bframes 2 --t8x8 --subparts --wpred
+h264-wp-aq-ipb@fade|--codec h264 --qp 26 --gop 8 --bframes 2 --aq 1.0 --wpred
+h264-10-wp-ipb@wsine10|--codec h264 --qp 26 --gop 8 --bframes 2 --wpred
+h264-10-wp40-ipb@fdeep10|--codec h264 --qp 40 --gop 8 --bframes 2 --wpred
+h264-imp-ipb|--codec h264 --qp 26 --gop 8 --bframes 2 --bweight implicit
+h264-imp40-cavlc-t8x8-subparts-b3|--codec h264 --qp 40 --gop 8 --bframes 3 --cavlc --t8x8 --subparts --bweight implicit
+h264-10-imp-ipb@p10|--codec h264 --qp 26 --gop 8 --bframes 2 --bweight implicit
+h264-imp-wp-ipb@fade|--codec h264 --qp 26 --gop 8 --bframes 2 --wpred --bweight implicit
+h264-10-imp-ipb@wsine10|--codec h264 --qp 26 --gop 8 --bframes 2 --bweight implicit
 "}
 
 # Split a clip's format token into its chroma format and sample depth:
@@ -823,6 +879,21 @@ one() {
   fi
   if ! cmp -s "$rec" "$ours"; then
     echo "SELF-FAIL   $tag: decoded output differs from the encoder's own reconstruction"
+    return 1
+  fi
+  # Our decoder conceals what a stream gets wrong — a missing reference gets a
+  # generated stand-in, an out-of-range syntax element a clamp — and counts
+  # each time it did ("N frames, W warnings" on stderr). A stream from our own
+  # encoder has nothing to conceal, so any warning is a defect even when the
+  # pictures still match the reconstruction: the RPS that dropped a later P
+  # picture's anchor passed the two checks above and was caught only by CROSS.
+  selfwarn=$(sed -nE 's/^[0-9]+ frames, ([0-9]+) warnings$/\1/p' "$OUT/$base.$name.dec.log" | tail -n 1)
+  if [ -z "$selfwarn" ]; then
+    echo "SELF-FAIL   $tag: our decoder printed no frame/warning count"
+    return 1
+  elif [ "$selfwarn" -ne 0 ]; then
+    detail=$(grep -vE '^[0-9]+ frames, ' "$OUT/$base.$name.dec.log" | head -1 | head -c 80)
+    echo "SELF-FAIL   $tag: our decoder concealed $selfwarn problem(s) in our bitstream${detail:+: $detail}"
     return 1
   fi
 

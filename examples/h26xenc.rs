@@ -17,7 +17,8 @@
 
 use h26x::ChromaFormat;
 use h26x::encode::{
-    ColourDescription, Config, ContentLightLevel, Entropy, FieldCoding, FieldOrder, InterParts, MasteringDisplay, RateControl,
+    BWeighting, ColourDescription, Config, ContentLightLevel, Entropy, FieldCoding, FieldOrder, InterParts, MasteringDisplay,
+    RateControl,
 };
 
 /// `G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)` — x265's `master-display`
@@ -50,14 +51,31 @@ fn parse_mastering_display(s: &str) -> Option<MasteringDisplay> {
     })
 }
 
+/// A frame rate as `(numerator, denominator)`: `30`, `30000/1001`, or a
+/// decimal such as `12.5`, taken exactly.
+fn parse_rate(s: &str) -> Option<(u32, u32)> {
+    if let Some((n, d)) = s.split_once('/') {
+        return Some((n.trim().parse().ok()?, d.trim().parse().ok()?));
+    }
+    match s.split_once('.') {
+        Some((whole, frac)) if !frac.is_empty() && frac.len() <= 6 && frac.bytes().all(|b| b.is_ascii_digit()) => {
+            let den = 10u32.pow(frac.len() as u32);
+            let whole: u32 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
+            Some((whole.checked_mul(den)?.checked_add(frac.parse().ok()?)?, den))
+        }
+        Some(_) => None,
+        None => Some((s.parse().ok()?, 1)),
+    }
+}
+
 fn die(msg: &str) -> ! {
     eprintln!("h26xenc: {msg}");
     eprintln!(
         "usage: h26xenc --input F --size WxH [--format 400|420|422|444] --output F\n\
          \x20      [--recon F] [--codec h264|h265] [--qp N | --lossless | --bitrate BPS]\n\
-         \x20      [--fps N] [--cpb-ms N]\n\
+         \x20      [--fps N | N/D | decimal] [--cpb-ms N]\n\
          \x20      [--gop N] [--bframes N] [--cavlc] [--t8x8] [--subparts] [--sao]\n\
-         \x20      [--aq STRENGTH] [--lookahead N] [--wpred] [--refs N] [--cu-depth N] [--depth N] [--threads N]\n\
+         \x20      [--aq STRENGTH] [--lookahead N] [--wpred] [--bweight default|implicit|explicit] [--refs N] [--cu-depth N] [--depth N] [--threads N]\n\
          \x20      [--parts none|sym] (H.265)\n\
          \x20      [--interlace tff|bff [--field-coding field|paff|mbaff]] (H.264)\n\
          \x20      [--color PRIMARIES:TRANSFER:MATRIX (H.273 codes, e.g. 9:16:9 for HDR10)]\n\
@@ -105,7 +123,13 @@ fn main() {
                 let b: u32 = val(&mut i, &args, "--bitrate").parse().unwrap_or_else(|_| die("--bitrate"));
                 cfg.rate = RateControl::Bitrate { bps: b };
             }
-            "--fps" => cfg.fps = val(&mut i, &args, "--fps").parse().unwrap_or_else(|_| die("--fps")),
+            // Frames per second: a whole number, N/D (30000/1001 for
+            // 29.97), or a decimal taken exactly (12.5 is 25/2; 29.97 is
+            // 2997/100 — the NTSC rate is 30000/1001).
+            "--fps" => {
+                let s = val(&mut i, &args, "--fps");
+                (cfg.fps, cfg.fps_den) = parse_rate(&s).unwrap_or_else(|| die("--fps wants N, N/D or a decimal"));
+            }
             "--cpb-ms" => cfg.cpb_ms = val(&mut i, &args, "--cpb-ms").parse().unwrap_or_else(|_| die("--cpb-ms")),
             "--gop" => cfg.gop = val(&mut i, &args, "--gop").parse().unwrap_or_else(|_| die("--gop")),
             "--bframes" => {
@@ -132,8 +156,19 @@ fn main() {
             // let the rate controller see them. H.264 refuses it by name.
             "--lookahead" => cfg.lookahead = val(&mut i, &args, "--lookahead").parse().unwrap_or_else(|_| die("--lookahead")),
             // Both codecs: weighted prediction, a fitted gain and offset per
-            // reference in every P slice.
+            // reference in every P and B slice.
             "--wpred" => cfg.weighted_pred = true,
+            // H.264: how B slices weight their predictions — default
+            // (the plain average), implicit (by distance) or explicit (a
+            // fitted table, beside --wpred). Absent, the encoder's choice.
+            "--bweight" => {
+                cfg.b_weighting = Some(match val(&mut i, &args, "--bweight").as_str() {
+                    "default" => BWeighting::Default,
+                    "implicit" => BWeighting::Implicit,
+                    "explicit" => BWeighting::Explicit,
+                    _ => die("--bweight wants default, implicit or explicit"),
+                })
+            }
             // How many past pictures a P slice may choose between. 1 is
             // the default and every stream written with it is
             // byte-identical to before multiple references existed.
@@ -289,6 +324,9 @@ fn main() {
         if enc.recodes() != 0 {
             eprintln!("rate: {} extra codings to fit the declared buffer", enc.recodes());
         }
+        if enc.seed_recodes() != 0 {
+            eprintln!("rate: {} extra codings of pictures planned from a seed alone", enc.seed_recodes());
+        }
         // The controller's model check: how far, in quantiser steps of
         // its law, the pictures landed from where they were planned.
         if let Some(err) = enc.plan_error() {
@@ -414,13 +452,19 @@ fn main() {
     }
     // The weighting census, when weighted prediction was asked for: how
     // many P pictures chose a weighting, and whether it lowered the luma
-    // residual at the vectors the search chose, macroblock by macroblock.
+    // residual at the vectors the search chose, macroblock by macroblock —
+    // and the same for the B pictures, when there are any.
     if wpred {
         let c = enc.shape_census();
-        eprintln!(
-            "wp P: {} of {} pictures weighted, {} macroblocks won, {} lost",
-            c.wp_on[1], c.pictures[1], c.wp_won[1], c.wp_lost[1]
-        );
+        for (pic, name) in [(1usize, "P"), (2, "B")] {
+            if pic == 2 && c.pictures[2] == 0 {
+                continue;
+            }
+            eprintln!(
+                "wp {name}: {} of {} pictures weighted, {} macroblocks won, {} lost; {} priced against the defaults, {} kept them",
+                c.wp_on[pic], c.pictures[pic], c.wp_won[pic], c.wp_lost[pic], c.wp_priced[pic], c.wp_rd_default[pic]
+            );
+        }
     }
     // The interlace census, when interlaced coding was asked for: how many
     // field pictures the frames were coded as.

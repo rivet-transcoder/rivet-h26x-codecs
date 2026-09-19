@@ -165,11 +165,12 @@ impl Geometry {
 /// Whether a coded luma picture of `width` by `height` exceeds level 4.1's
 /// limits (A.4.1, Table A.8): more than `MaxLumaPs` = 2,228,224 samples, or
 /// a side longer than `sqrt(8 * MaxLumaPs)`, 4222. Only levels 5 and up
-/// admit such a picture, and they require a CTB of 32 or more.
+/// admit such a picture, and they require a CTB of 32 or more. Read off
+/// the level table the parameter sets' level is chosen from
+/// (`encode::level`), so the two cannot disagree about where level 4.1
+/// ends.
 fn beyond_level_4_1(width: u32, height: u32) -> bool {
-    const MAX_LUMA_PS: u64 = 2_228_224;
-    const MAX_SIDE: u32 = 4222;
-    u64::from(width) * u64::from(height) > MAX_LUMA_PS || width > MAX_SIDE || height > MAX_SIDE
+    crate::encode::level::h265_beyond_ctb16(width, height)
 }
 
 fn chroma_idc(c: ChromaFormat) -> u32 {
@@ -201,36 +202,43 @@ pub(crate) fn dpb(cfg: &Config) -> (u32, u32) {
 
 /// `profile_tier_level`, shared by the VPS and SPS.
 ///
-/// Twelve bytes, most of them reserved and required to be zero, plus a
-/// 43-bit reserved field that has to be written as two pieces because it does
-/// not fit a single call. Main for 8-bit 4:2:0, Main 10 for deeper, Rext for
-/// anything else — claiming a profile that does not admit the format is a
+/// Twelve bytes, most of them reserved and required to be zero. The
+/// profile is the one Table A.2 names for the format
+/// (`encode::level::h265_profile`): Main for 8-bit 4:2:0, Main 10 for 9-
+/// and 10-bit, and for anything else a format range extensions profile,
+/// told apart by the nine constraint flags that open the 43 bits after the
+/// source flags — claiming a profile that does not admit the format is a
 /// stream a decoder may refuse. The tier and level are the lowest that
-/// admit the stream (`encode::level`), derived from `cfg` alone so that the
-/// VPS and the SPS cannot claim different ones.
+/// admit the stream (`encode::level`). Both are derived from `cfg` and `g`
+/// alone, so the VPS and the SPS cannot claim different ones.
 fn write_ptl(w: &mut BitWriter, cfg: &Config, g: &Geometry) {
-    let profile = if g.chroma != ChromaFormat::Yuv420 || g.bit_depth > 10 {
-        4 // Range extensions
-    } else if g.bit_depth > 8 {
-        2 // Main 10
-    } else {
-        1 // Main
-    };
+    let profile = crate::encode::level::h265_profile(cfg, g);
     let level = crate::encode::level::h265(cfg, g);
     w.bits(2, 0); // general_profile_space
     w.flag(level.high_tier); // general_tier_flag
-    w.bits(5, profile); // general_profile_idc
+    w.bits(5, u32::from(profile.idc)); // general_profile_idc
     // general_profile_compatibility_flag[32]
     for i in 0..32 {
-        w.flag(i == profile);
+        w.flag(i == u32::from(profile.idc));
     }
     w.flag(true); // general_progressive_source_flag
     w.flag(false); // general_interlaced_source_flag
     w.flag(false); // general_non_packed_constraint_flag
     w.flag(true); // general_frame_only_constraint_flag
-    // 43 reserved zero bits, in two writes because one call takes at most 32.
-    w.zeros(43);
-    w.flag(false); // general_inbld_flag / reserved
+    if profile.idc == 4 {
+        // general_max_12bit / 10bit / 8bit / 422chroma / 420chroma /
+        // monochrome, intra, one_picture_only and lower_bit_rate
+        // constraint flags, then general_reserved_zero_34bits.
+        for f in profile.flags {
+            w.flag(f);
+        }
+        w.zeros(34);
+    } else {
+        // Main's general_reserved_zero_43bits; Main 10's seven reserved
+        // bits, a zero one_picture_only flag and 35 more, all zero alike.
+        w.zeros(43);
+    }
+    w.flag(false); // general_inbld_flag
     w.bits(8, u32::from(level.idc)); // general_level_idc
 }
 
@@ -365,7 +373,7 @@ fn write_vui(
     colour: Option<&ColourDescription>,
     chroma_loc: Option<u8>,
     cpb: Option<&Cpb>,
-    fps: u32,
+    (fps_num, fps_den): (u32, u32),
 ) {
     w.flag(false); // aspect_ratio_info_present_flag
     w.flag(false); // overscan_info_present_flag
@@ -380,11 +388,13 @@ fn write_vui(
     match cpb {
         Some(cpb) => {
             w.flag(true); // vui_timing_info_present_flag
-            w.bits(32, 1); // vui_num_units_in_tick
-            w.bits(32, fps.max(1)); // vui_time_scale — ticks per second
+            // One tick per picture, the frame rate in lowest terms: 29.97
+            // is 1001 over 30000, 30 is 1 over 30 as it always was.
+            w.bits(32, fps_den); // vui_num_units_in_tick
+            w.bits(32, fps_num); // vui_time_scale — ticks per second
             w.flag(false); // vui_poc_proportional_to_timing_flag
             w.flag(true); // vui_hrd_parameters_present_flag
-            write_hrd(w, cpb, fps);
+            write_hrd(w, cpb, fps_num);
         }
         None => w.flag(false), // vui_timing_info_present_flag
     }
@@ -525,7 +535,7 @@ pub fn write_sps(cfg: &Config, g: &Geometry, log2_max_poc_lsb: u32, cpb: Option<
     w.flag(false); // strong_intra_smoothing_enabled_flag
     if cpb.is_some() || cfg.colour.is_some() || cfg.chroma_loc.is_some() {
         w.flag(true); // vui_parameters_present_flag
-        write_vui(&mut w, cfg.colour.as_ref(), cfg.chroma_loc, cpb, cfg.fps);
+        write_vui(&mut w, cfg.colour.as_ref(), cfg.chroma_loc, cpb, cfg.frame_rate());
     } else {
         w.flag(false); // vui_parameters_present_flag
     }

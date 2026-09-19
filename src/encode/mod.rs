@@ -234,6 +234,25 @@ pub enum InterParts {
     Symmetric,
 }
 
+/// How an H.264 B slice weights its predictions (8.4.2.3) — the PPS's
+/// `weighted_bipred_idc` — see [`Config::b_weighting`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BWeighting {
+    /// `weighted_bipred_idc` 0: a one-list prediction as it is, a two-list
+    /// one the plain average of the two.
+    Default,
+    /// `weighted_bipred_idc` 2: a two-list prediction weighted by the
+    /// picture's distances in display order to its two references
+    /// (8.4.2.3.1) — two thirds and one third for a B picture a third of
+    /// the way between its anchors — a one-list one as it is. Nothing is
+    /// written per slice: the weights follow from the picture order counts.
+    Implicit,
+    /// `weighted_bipred_idc` 1: a fitted `pred_weight_table` in every B
+    /// slice, priced against a table of defaults — what
+    /// [`Config::weighted_pred`] gives B slices, and only beside it.
+    Explicit,
+}
+
 /// Everything the encoder needs that is not a picture.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -285,15 +304,26 @@ pub struct Config {
     /// constraint on a rate, and there is no rate to constrain at a fixed
     /// quantiser. Asking for one anyway refuses by name.
     pub cpb_ms: u32,
-    /// Frames per second. A target in bits per *second* is meaningless
-    /// without it, and so is a level: the level each stream claims is
-    /// chosen from its macroblocks or samples per second, among other
-    /// things (`encode::level`), so a caller who leaves the default 30
-    /// under a faster stream gets a level too low for it. The rate itself
-    /// reaches the bitstream only as the frame clock of a declared buffer's
-    /// VUI. It is declared rather than assumed so that a caller who cares
-    /// can set it.
+    /// Frames per second, or with [`Config::fps_den`] the numerator of
+    /// the frame rate: the rate is `fps / fps_den`. A target in bits per
+    /// *second* is meaningless without it, and so is a level: the level
+    /// each stream claims is chosen from its macroblocks or samples per
+    /// second, among other things (`encode::level`), so a caller who
+    /// leaves the default 30 under a faster stream gets a level too low
+    /// for it. The rate itself reaches the bitstream only as the frame
+    /// clock of a declared buffer's VUI. It is declared rather than
+    /// assumed so that a caller who cares can set it.
     pub fps: u32,
+    /// The denominator of the frame rate, `fps / fps_den` frames per
+    /// second: 1, the default, for a whole number of them, and 1001 for
+    /// the NTSC family — 30000/1001 is 29.97, 24000/1001 23.976,
+    /// 60000/1001 59.94 — or 2 for 25/2, 12.5. Everything that reads the
+    /// rate reads it exactly: the VUI clock (`num_units_in_tick` and
+    /// `time_scale`, H.264 E.2.1 / H.265 E.3.1), the rate controller's
+    /// per-picture budget and the level (`encode::level`). A whole-number
+    /// caller that never sets it writes exactly the stream it always did.
+    /// Zero is refused.
+    pub fps_den: u32,
     /// Sample adaptive offset, the second in-loop filter (H.265 only).
     ///
     /// Off by default and a switch rather than something always applied,
@@ -376,12 +406,15 @@ pub struct Config {
     /// change a reference's brightness, so without this every block of a
     /// fading picture carries the level change as residual.
     ///
-    /// H.265 weights B slices too when the GOP has B pictures: the PPS
-    /// sets `weighted_bipred_flag` and every B slice's table carries an
-    /// entry for each list's reference, fitted the same way, which the
-    /// one-list and the bi predictions both apply (8.5.3.3.4.3). H.264's B
-    /// slices keep default weighting (`weighted_bipred_idc` 0). A lossless
-    /// H.264 stream refuses it, its inter pictures being exact copies.
+    /// Both codecs weight B slices too when the GOP has B pictures: the
+    /// PPS sets H.265's `weighted_bipred_flag` or H.264's
+    /// `weighted_bipred_idc` 1, and every B slice's table carries an entry
+    /// for each list's reference, fitted the same way, which the one-list
+    /// and the bi predictions both apply (8.5.3.3.4.3, 8.4.2.3). Each
+    /// codec prices a B picture's fitted table against a table of defaults
+    /// and keeps the cheaper, and H.264 a P picture's where no fit in it is
+    /// strong (`encode::h264`'s `code_attempt`). A lossless H.264 stream
+    /// refuses it, its inter pictures being exact copies.
     /// Off, the stream is byte-identical to one from an encoder that never
     /// had it.
     pub weighted_pred: bool,
@@ -467,6 +500,31 @@ pub struct Config {
     /// -1.5% / -1.3% natural, 3840x2160 -0.8% / -0.3% synthetic and
     /// -1.4% / -1.2% natural. CPU 1.6-2.2x against `None`.
     pub inter_parts: InterParts,
+    /// H.264: how B slices weight their predictions, or `None` for the
+    /// encoder's choice — [`BWeighting::Explicit`] under
+    /// [`Config::weighted_pred`], [`BWeighting::Default`] otherwise.
+    ///
+    /// `Some(Explicit)` needs `weighted_pred` (the explicit table is its
+    /// fit); `Some(Default)` beside `weighted_pred` weights P slices and
+    /// leaves B slices to the plain average; `Some(Implicit)` weights B
+    /// slices by distance whether or not P slices are weighted. Interlaced
+    /// and lossless streams code default-weighted B pictures and refuse
+    /// `Some(Implicit)` by name. H.265 has no implicit mode: it takes
+    /// `None`, or `Some` of what it does anyway (explicit B under
+    /// `weighted_pred`, default without), and refuses the rest by name.
+    ///
+    /// Implicit weighting is asked for, not chosen, because it is not a
+    /// gain everywhere. Against default weighting over every clip of the
+    /// corpus and rivet's 640x360 set, at one to three B pictures and QP
+    /// 22..40, it gains where the picture changes between its anchors — a
+    /// fade -2.4 to -16.8% BD-rate, a gradient -1.4 to -3.4%, motion -0.3 to
+    /// -1.2% — and loses where it does not: detail +0.1 to +0.4%, testsrc2
+    /// +0.1 to +0.2%, combed interlaced frames coded progressive +0.5 to
+    /// +0.8%, with 48 of 504 cells both larger and worse. Two equally good
+    /// anchors average their noise best at equal weights. With one B
+    /// picture it is the default weighting: halfway, the weights are 32
+    /// and 32.
+    pub b_weighting: Option<BWeighting>,
 }
 
 impl Default for Config {
@@ -486,6 +544,7 @@ impl Default for Config {
             threads: 0,
             sao: false,
             fps: 30,
+            fps_den: 1,
             cpb_ms: 0,
             aq_strength: 0.0,
             lookahead: 0,
@@ -498,11 +557,33 @@ impl Default for Config {
             interlace: None,
             field_coding: FieldCoding::Paff,
             inter_parts: InterParts::None,
+            b_weighting: None,
         }
     }
 }
 
 impl Config {
+    /// The frame rate `fps / fps_den` in lowest terms, `(numerator,
+    /// denominator)` — 30000/1001 stays 30000/1001, 60/2 becomes 30/1 —
+    /// with a zero `fps` read as one frame a second, as every reader of
+    /// the rate always has. The exact value, for the VUI clock and the
+    /// level; [`Config::frame_rate_f64`] is the same number for the rate
+    /// controller.
+    pub fn frame_rate(&self) -> (u32, u32) {
+        let (num, den) = (self.fps.max(1), self.fps_den.max(1));
+        let (mut a, mut b) = (num, den);
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        (num / a, den / a)
+    }
+
+    /// [`Config::frame_rate`] as frames per second.
+    pub fn frame_rate_f64(&self) -> f64 {
+        let (num, den) = self.frame_rate();
+        f64::from(num) / f64::from(den)
+    }
+
     /// Reject what the encoder cannot legally or sensibly produce, before it
     /// has written a byte. An encoder that fails late has usually already
     /// emitted a header describing something it then cannot deliver.
@@ -515,6 +596,14 @@ impl Config {
         }
         if self.max_refs == 0 {
             return Err(crate::Error::unsupported("encode: max_refs must be at least 1"));
+        }
+        if self.fps_den == 0 {
+            return Err(crate::Error::unsupported("encode: fps_den is zero (the frame rate is fps / fps_den)"));
+        }
+        if self.frame_rate().0 > i32::MAX as u32 {
+            return Err(crate::Error::unsupported(
+                "encode: a frame rate numerator above 2^31 - 1 in lowest terms (H.264's field clock doubles it into a 32-bit time_scale)",
+            ));
         }
         if !(self.aq_strength >= 0.0) || self.aq_strength > 4.0 {
             return Err(crate::Error::unsupported("encode: aq_strength outside 0.0..=4.0"));
