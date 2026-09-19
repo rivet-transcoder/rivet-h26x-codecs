@@ -1109,6 +1109,15 @@ impl<S: Sample> Core<S> {
     /// at 70% it is within 0.4%, the fade's BD-rate against pricing every
     /// table improves by 0.2 to 0.7%, and the non-fade cells are where
     /// pricing every table put them; at 90% the fade gains nothing.
+    ///
+    /// Nor is every weak fit priced. One that removes under a tenth of the
+    /// SAD is written as the defaults outright (`p_weights`): priced, it lost
+    /// nearly every time, and it was most of the second codings on pans and
+    /// zooms at QP 40 and 45 (+31 to 40% CPU on rivet's clips). Against
+    /// pricing every weak fit, over QP 26..45 on rivet's clips and the
+    /// corpus fades, BD-rate moves by at most +0.07% (pan, cut) while the
+    /// P pictures coded twice fall from 53 to 2 on the zoom, 57 to 0 on the
+    /// cut and 92 to 26 on the pan; the fade keeps all 80 of its own.
     fn code_attempt(&self, c: &Coded, src: &[S], qp: u8) -> Result<Attempt<S>> {
         let fitted = self.code_attempt_weighted(c, src, qp, true)?;
         if !fitted.motion.weighting.on || fitted.strong_fit {
@@ -2069,8 +2078,9 @@ impl<S: Sample> Core<S> {
     /// reference `rf`, each component its own fit at the denominator
     /// [`h265_wp::LOG2_DENOM`] — the default wherever the fit is not used,
     /// and everywhere when not `fit` (the table of defaults a fitted one
-    /// is priced against) — and whether any of the fits is
-    /// [`h265_wp::PlaneFit::strong`].
+    /// is priced against) or when no fit is worth pricing
+    /// ([`h265_wp::PlaneFit::worth_pricing`]) — and whether any of the fits
+    /// is [`h265_wp::PlaneFit::strong`].
     fn p_weights(&self, planes: &[syn::Plane<'_, S>], rf: &[syn::Recon<S>], fit: bool) -> (syn::PredWeights, bool) {
         let fits: Vec<h265_wp::PlaneFit> = (0..self.plane_dims.len())
             .map(|p| {
@@ -2082,6 +2092,17 @@ impl<S: Sample> Core<S> {
                 h265_wp::fit_samples(planes[p].data, planes[p].stride, refs, pw as usize, ph as usize, self.cfg.bit_depth, h265_wp::H264_WEIGHTS)
             })
             .collect();
+        // A fit that removes under a tenth of the zero-motion SAD is the
+        // drift of a coarse reconstruction, not a change of brightness, and
+        // priced against the defaults it nearly always lost them — 33 of 33
+        // on rivet's zoom at QP 45, 47 of 49 on the cut clip, 55 of 65 on the
+        // pan — for a second coding each time. Such a table is written as the
+        // defaults outright. Fits removing a tenth to under 30% won 40 of 43
+        // on the fade and 12 of 16 on the pan, and are still priced; strong
+        // ones are kept unpriced (`code_attempt`).
+        let strong = fits.iter().any(h265_wp::PlaneFit::strong);
+        let kept = strong || fits.iter().any(h265_wp::PlaneFit::worth_pricing);
+        let fits: Vec<h265_wp::PlaneFit> = if kept { fits } else { vec![h265_wp::PlaneFit::identity(0); fits.len()] };
         // A component class the fit leaves at the defaults takes
         // denominator 0, the cheapest to write, as a B table's does.
         let luma_d = if fits[0].used() { h265_wp::LOG2_DENOM } else { 0 };
@@ -2094,7 +2115,7 @@ impl<S: Sample> Core<S> {
             table: PredWeightTable { luma_log2_denom: luma_d, chroma_log2_denom: chroma_d, lists: [vec![entry], Vec::new()] },
             chroma: self.cfg.chroma != crate::ChromaFormat::Monochrome,
         };
-        (table, fits.iter().any(h265_wp::PlaneFit::strong))
+        (table, strong)
     }
 
     /// A B picture's `pred_weight_table`: an entry for list 0's past
@@ -2947,6 +2968,61 @@ mod tests {
         assert_eq!(kept.wp_rd_default[2], 0, "bframes=2 QP 26: a fitted table lost to the defaults: {kept:?}");
         let mid = census(40, 1);
         assert!(mid.wp_rd_default[2] > 0, "bframes=1 QP 40: every fitted table was kept: {mid:?}");
+    }
+
+    /// A P picture's table follows how much of the zero-motion SAD its fit
+    /// removes: under a tenth, the defaults outright; a tenth to 30%, the
+    /// fit, to be priced; 30% and more, the fit, strong and kept unpriced.
+    /// The fixture is a textured reference and the same picture raised by
+    /// a level `k` under uniform noise of half-width 20, so the plain SAD is
+    /// about `(20^2 + k^2) / 40` a sample and the fitted one 10: k 5, 10
+    /// and 20 remove about 6%, 20% and 50%.
+    #[test]
+    fn a_p_table_follows_how_much_its_fit_removes() {
+        let core = Core::<u8>::new(Config { gop: 8, weighted_pred: true, ..cfg(64, 64, ChromaFormat::Yuv420, 8) }).unwrap();
+        let dims = [(64usize, 64usize), (32, 32), (32, 32)];
+        let reference: Vec<syn::Recon<u8>> = dims
+            .iter()
+            .enumerate()
+            .map(|(c, &(w, h))| {
+                let pad = if c == 0 { crate::h264::frame::LUMA_PAD } else { crate::h264::frame::CHROMA_PAD };
+                let mut p = syn::recon_plane(w as u32, h as u32, pad);
+                for y in 0..h {
+                    for x in 0..w {
+                        let o = p.offset(x as isize, y as isize);
+                        p.data[o] = (60 + (x * 3 + y * 5 + (x * y) / 7) % 120) as u8;
+                    }
+                }
+                p.extend_edges(false);
+                p
+            })
+            .collect();
+        let table = |k: i32| {
+            let mut seed = 0x2545_f491u32;
+            let cur: Vec<Vec<u8>> = dims
+                .iter()
+                .enumerate()
+                .map(|(c, &(w, h))| {
+                    (0..w * h)
+                        .map(|i| {
+                            let r = i32::from(reference[c].data[reference[c].offset((i % w) as isize, (i / w) as isize)]);
+                            if c > 0 {
+                                return r as u8;
+                            }
+                            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                            (r + k + (seed >> 16) as i32 % 41 - 20).clamp(0, 255) as u8
+                        })
+                        .collect()
+                })
+                .collect();
+            let planes: Vec<syn::Plane<'_, u8>> =
+                cur.iter().zip(dims).map(|(s, (w, h))| syn::Plane { data: &s[..], stride: w, width: w as u32, height: h as u32 }).collect();
+            let (t, strong) = core.p_weights(&planes, &reference, true);
+            (t.table.lists[0][0].luma_flag, strong)
+        };
+        assert_eq!(table(5), (false, false), "a fit removing about 6% is written as the defaults");
+        assert_eq!(table(10), (true, false), "a fit removing about 20% is kept, to be priced");
+        assert_eq!(table(20), (true, true), "a fit removing about half is strong");
     }
 
     /// A P picture's fitted table is priced against the defaults only when
