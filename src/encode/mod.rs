@@ -304,6 +304,29 @@ pub struct Config {
     /// constraint on a rate, and there is no rate to constrain at a fixed
     /// quantiser. Asking for one anyway refuses by name.
     pub cpb_ms: u32,
+    /// Constant bit rate: declare the buffer as `cbr_flag` 1 and keep the
+    /// promise that makes, instead of the variable rate every buffered
+    /// stream declares by default.
+    ///
+    /// Under a constant rate the bits reach the decoder's buffer at
+    /// `BitRate` without ever pausing, so a picture that spends less than
+    /// its share leaves bits that have nowhere to go: the buffer
+    /// overflows, which the standard forbids (H.264 C.3, H.265 C.4). The
+    /// encoder therefore walks the buffer exactly, in the integer terms
+    /// `encode::hrd` checks it in, and after each access unit appends a
+    /// filler data NAL unit (H.264 type 12, H.265 `FD_NUT` 38) of exactly
+    /// the bits that would otherwise overflow it at the next removal, and
+    /// each buffering period SEI after the first carries the removal delay
+    /// the buffer's actual fullness gives it. The rate controller holds
+    /// the buffer below full, so filler is what an underspend that fills
+    /// it costs rather than every picture's remainder; overspending is
+    /// prevented exactly as it is at a variable rate.
+    ///
+    /// Needs [`RateControl::Bitrate`] and a nonzero [`Config::cpb_ms`]
+    /// (a constant rate is a property of a declared buffer) and is
+    /// refused by name otherwise. Off, the default, the stream is
+    /// byte-identical to one from an encoder that never had it.
+    pub cbr: bool,
     /// Frames per second, or with [`Config::fps_den`] the numerator of
     /// the frame rate: the rate is `fps / fps_den`. A target in bits per
     /// *second* is meaningless without it, and so is a level: the level
@@ -546,6 +569,7 @@ impl Default for Config {
             fps: 30,
             fps_den: 1,
             cpb_ms: 0,
+            cbr: false,
             aq_strength: 0.0,
             lookahead: 0,
             weighted_pred: false,
@@ -611,6 +635,11 @@ impl Config {
         if self.lookahead > 0 && !matches!(self.rate, RateControl::Bitrate { .. }) {
             return Err(crate::Error::unsupported(
                 "encode: a lookahead without a bitrate target (a lookahead informs a rate controller; a fixed quantiser has none)",
+            ));
+        }
+        if self.cbr && (self.cpb_ms == 0 || !matches!(self.rate, RateControl::Bitrate { .. })) {
+            return Err(crate::Error::unsupported(
+                "encode: a constant bit rate without a declared buffer (cbr needs RateControl::Bitrate and a nonzero cpb_ms: it is the buffer's cbr_flag)",
             ));
         }
         if self.lookahead > 250 {

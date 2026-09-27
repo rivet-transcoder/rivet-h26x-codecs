@@ -45,6 +45,32 @@ pub const NAL_IDR_N_LP: u8 = 20;
 /// Supplemental enhancement information that precedes the pictures it
 /// describes. The buffering period message rides here.
 pub const NAL_PREFIX_SEI: u8 = 39;
+/// Filler data (`FD_NUT`): what a constant-rate stream stuffs an access
+/// unit with when the picture spent less than the buffer can hold.
+pub const NAL_FD: u8 = 38;
+
+/// A filler data NAL unit carrying at least `bits` bits, start code and
+/// header included — the smallest whole one that does, and never smaller
+/// than the empty unit, seven bytes.
+///
+/// `filler_data_rbsp()` (7.3.2.8) is a run of `0xFF` bytes and
+/// `rbsp_trailing_bits`, so the payload is never escaped: no `0xFF` can
+/// begin a start code, and the trailing `0x80` follows one. The header's
+/// `nuh_temporal_id_plus1` is 1, the temporal layer of every access unit
+/// this encoder writes, which a filler unit must share.
+pub fn filler_nal(bits: u64) -> Vec<u8> {
+    filler_payload(NAL_FD, 7, bits, annexb)
+}
+
+/// Shared by both codecs' filler units: `0xFF` bytes enough to bring the
+/// whole unit — `overhead` bytes of start code, header and trailing bits
+/// around them — to `bits`, then `rbsp_trailing_bits`, wrapped by `wrap`.
+pub(crate) fn filler_payload(nal_type: u8, overhead: u64, bits: u64, wrap: impl Fn(u8, &[u8]) -> Vec<u8>) -> Vec<u8> {
+    let run = bits.div_ceil(8).saturating_sub(overhead) as usize;
+    let mut payload = vec![0xffu8; run + 1];
+    payload[run] = 0x80; // rbsp_stop_one_bit and its alignment zeros
+    wrap(nal_type, &payload)
+}
 
 /// Prefix a NAL payload with the two-byte H.265 header and a start code.
 ///
@@ -268,6 +294,9 @@ pub struct Cpb {
     pub initial_delay_length: u32,
     /// `au_cpb_removal_delay_length_minus1 + 1`.
     pub removal_delay_length: u32,
+    /// `cbr_flag[0]`: whether the stream promises a constant arrival rate,
+    /// and stuffs with filler data to keep it ([`crate::encode::Config::cbr`]).
+    pub cbr: bool,
 }
 
 /// The bit-rate and buffer scales this encoder writes. Zero for both keeps
@@ -306,7 +335,13 @@ impl Cpb {
             size,
             initial_delay_length: DELAY_LENGTH,
             removal_delay_length: DELAY_LENGTH,
+            cbr: false,
         })
+    }
+
+    /// The same buffer, declared at a constant bit rate when `cbr` is set.
+    pub fn with_cbr(self, cbr: bool) -> Cpb {
+        Cpb { cbr, ..self }
     }
 
     /// `initial_cpb_removal_delay`, in the 90 kHz units the syntax counts
@@ -340,20 +375,22 @@ fn write_hrd(w: &mut BitWriter, cpb: &Cpb, fps: u32) {
     // sub_layer_hrd_parameters(0), one CPB.
     w.ue((cpb.bit_rate >> (6 + BIT_RATE_SCALE)) as u32 - 1); // bit_rate_value_minus1
     w.ue((cpb.size >> (4 + CPB_SIZE_SCALE)) as u32 - 1); // cpb_size_value_minus1
-    // cbr_flag 0: variable bit rate.
+    // cbr_flag: variable bit rate unless the caller asked for a constant
+    // one.
     //
     // Constant bit rate means the arrival never pauses, so a stream that
     // spends less than its rate must stuff the difference with filler data
-    // or the buffer overflows — that is what the flag promises. This
-    // encoder's controller targets an *average* and does not stuff, and it
-    // undershoots more often than not, so declaring a constant rate would
-    // declare something it does not do. The same rule that kept the
+    // or the buffer overflows — that is what the flag promises. The
+    // controller targets an *average* and undershoots more often than not,
+    // so the flag is set only where the encoder also stuffs (`Config::cbr`,
+    // `hrd::ConstantRate`): declaring a constant rate without the filler
+    // would declare something it does not do. The same rule that kept the
     // deblocking flag off until the filter was actually applied.
     //
     // Under a variable rate the arrival simply stops at a full buffer, a
     // full buffer is not an error, and underflow — the failure that
     // actually matters to a decoder — is checked exactly as before.
-    w.flag(false); // cbr_flag
+    w.flag(cpb.cbr); // cbr_flag
 }
 
 /// `vui_parameters` (E.2.1): the frame rate on every stream, the colour
@@ -416,6 +453,16 @@ pub use crate::encode::h264_syntax::{write_content_light_level_sei, write_master
 /// Written for every IRAP access unit, which is where a buffering period
 /// may begin.
 pub fn write_buffering_period_sei(cpb: &Cpb) -> Vec<u8> {
+    write_buffering_period_sei_at(cpb, cpb.initial_removal_delay_90k())
+}
+
+/// [`write_buffering_period_sei`] carrying `initial_delay_90k` as the
+/// initial removal delay instead of the full buffer's: what a buffering
+/// period after the first carries under a constant rate, whose arrival
+/// never pauses, so the delay is fixed by how full the buffer actually is
+/// when the period begins (C.4: between the floor and the ceiling of
+/// `90000 * (t_r,n(n) - t_af(n - 1))`), not chosen.
+pub fn write_buffering_period_sei_at(cpb: &Cpb, initial_delay_90k: u32) -> Vec<u8> {
     let mut p = BitWriter::with_capacity(16);
     p.ue(0); // bp_seq_parameter_set_id
     // sub_pic_hrd_params_present_flag is 0, so this flag is present.
@@ -423,7 +470,7 @@ pub fn write_buffering_period_sei(cpb: &Cpb) -> Vec<u8> {
     p.flag(false); // concatenation_flag
     p.bits(cpb.removal_delay_length, 0); // au_cpb_removal_delay_delta_minus1
     // nal_hrd_parameters_present_flag is 1, one CPB.
-    p.bits(cpb.initial_delay_length, cpb.initial_removal_delay_90k());
+    p.bits(cpb.initial_delay_length, initial_delay_90k);
     p.bits(cpb.initial_delay_length, 0); // initial_cpb_removal_offset
     p.rbsp_trailing_bits();
     // The raw payload: `sei_nal` sizes it as RBSP bytes and escapes the

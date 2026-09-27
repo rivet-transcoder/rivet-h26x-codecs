@@ -142,6 +142,10 @@ struct Core<S: Sample> {
     /// what the controller aims at and what the stream promises are one
     /// number. `None` writes no VUI and no SEI at all.
     cpb: Option<syn::Cpb>,
+    /// The buffer walked exactly under a constant rate
+    /// ([`super::Config::cbr`]): what sizes each access unit's filler and
+    /// each later buffering period's delay. `None` at a variable rate.
+    cbr: Option<super::hrd::ConstantRate>,
     /// Coding index of the last access unit that carried a buffering
     /// period — every `cpb_removal_delay` counts clock ticks from its
     /// removal.
@@ -834,6 +838,10 @@ impl<S: Sample> Core<S> {
                 ));
             }
         };
+        // Declared at a constant rate where the caller asked for one
+        // (`Config::validate` has refused it without a buffer).
+        let cpb = cpb.map(|c| c.with_cbr(cfg.cbr));
+        let cbr = cpb.filter(|c| c.cbr).map(|c| super::hrd::ConstantRate::new(&c, cfg.frame_rate()));
         // The level the SPS will claim: refused here, before any header
         // exists, when no level admits the stream (`encode::level`). The
         // motion search is then held to what that level allows.
@@ -843,6 +851,10 @@ impl<S: Sample> Core<S> {
             // The controller aims at the *declared* rate where a buffer
             // was declared, so the two cannot disagree by the rounding.
             RateControl::Bitrate { bps } => Some(match cpb {
+                Some(c) if c.cbr => RateController::with_cpb(
+                    c.bit_rate as u32, cfg.frame_rate_f64(), cfg.width, cfg.height, cfg.gop, cfg.bframes, Some(c.size),
+                )
+                .constant_rate(),
                 Some(c) => RateController::with_cpb(
                     c.bit_rate as u32, cfg.frame_rate_f64(), cfg.width, cfg.height, cfg.gop, cfg.bframes, Some(c.size),
                 ),
@@ -896,6 +908,7 @@ impl<S: Sample> Core<S> {
             tools,
             census: ShapeCensus::default(),
             cpb,
+            cbr,
             last_bp_encode: 0,
             recoded: 0,
             sent_sets: None,
@@ -935,16 +948,18 @@ impl<S: Sample> Core<S> {
                 .held
                 .remove(&c.display)
                 .ok_or_else(|| Error::bitstream("H.264 encode: scheduler released an absent picture"))?;
-            let access = self.code_picture(c, &src)?;
+            let mut access = self.code_picture(c, &src)?;
+            let filler = self.stuff(&mut access);
             // The ledger closes here, at the one place every picture of
             // every kind passes through, counting the whole access unit —
-            // start codes, NAL headers, parameter sets and slice payload —
-            // because that is what the target is measured against. Same
-            // shape, and the same reasoning, as the H.265 side.
+            // start codes, NAL headers, parameter sets, slice payload and
+            // any filler — because that is what the target is measured
+            // against. Same shape, and the same reasoning, as the H.265
+            // side.
             self.emitted += access.data.len() as u64 * 8;
             let emitted = self.emitted;
             if let Some(rc) = self.rc.as_mut() {
-                rc.account(access.data.len());
+                rc.account_stuffed(access.data.len(), filler);
                 debug_assert_eq!(
                     rc.bits_spent, emitted,
                     "rate-control ledger drifted: the controller has {} bits, the encoder emitted {emitted}",
@@ -954,6 +969,21 @@ impl<S: Sample> Core<S> {
             out.push(access);
         }
         Ok(out)
+    }
+
+    /// Under a constant rate, stuff a finished access unit with a filler
+    /// data NAL of the bits the buffer would otherwise overflow by at the
+    /// next removal, after its slices — filler may not precede the
+    /// primary coded picture (7.4.1.2.3) — and remove it from the walked
+    /// buffer. Returns the filler's bytes: none at a variable rate, and
+    /// none for a picture that spent what the buffer had room for.
+    fn stuff(&mut self, access: &mut Access) -> usize {
+        let Some(buffer) = self.cbr.as_mut() else { return 0 };
+        let over = buffer.filler_bits(access.data.len() as u64 * 8);
+        let filler = if over > 0 { syn::filler_nal(over) } else { Vec::new() };
+        access.data.extend_from_slice(&filler);
+        buffer.remove(access.data.len() as u64 * 8);
+        filler.len()
     }
 
     /// Code one picture, re-coding it at a higher quantiser if it will not
@@ -982,6 +1012,9 @@ impl<S: Sample> Core<S> {
             let Some(afford) = affordable else {
                 return Ok(self.commit(&c, a, qp));
             };
+            // Under a constant rate the buffer is walked exactly as well,
+            // and the exact figure is the one the stream is held to.
+            let afford = self.cbr.as_ref().map_or(afford, |b| afford.min(b.available()));
             if bits <= afford {
                 if let Some(rc) = self.rc.as_mut() {
                     rc.note_recode(qp);
@@ -1346,12 +1379,16 @@ impl<S: Sample> Core<S> {
             // reorder depth plus this picture's own displacement, never
             // negative because a picture is never displayed more than
             // `bframes` positions before it is coded.
+            //
+            // Under a constant rate a later period's initial delay is not
+            // the full buffer's: the arrival never paused, so it is how
+            // long the buffer has actually been filling for this picture.
             if idr {
-                out.extend_from_slice(&syn::annexb(
-                    syn::NAL_SEI,
-                    0,
-                    &syn::write_buffering_period_sei(cpb),
-                ));
+                let bp = match self.cbr.as_ref() {
+                    Some(buffer) => syn::write_buffering_period_sei_at(cpb, buffer.initial_delay_90k()),
+                    None => syn::write_buffering_period_sei(cpb),
+                };
+                out.extend_from_slice(&syn::annexb(syn::NAL_SEI, 0, &bp));
             }
             let removal = syn::TICKS_PER_FRAME as u64 * (c.encode - self.last_bp_encode);
             let output = syn::TICKS_PER_FRAME as i64

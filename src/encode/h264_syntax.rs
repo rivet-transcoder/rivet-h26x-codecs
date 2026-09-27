@@ -39,6 +39,20 @@ pub const NAL_SEI: u8 = 6;
 pub const NAL_SPS: u8 = 7;
 /// Picture parameter set.
 pub const NAL_PPS: u8 = 8;
+/// Filler data: what a constant-rate stream stuffs an access unit with
+/// when the picture spent less than the buffer can hold.
+pub const NAL_FILLER: u8 = 12;
+
+/// A filler data NAL unit carrying at least `bits` bits, start code and
+/// header included — the smallest whole one that does, and never smaller
+/// than the empty unit, six bytes.
+///
+/// `filler_data_rbsp()` (7.3.2.7) is a run of `0xFF` bytes and
+/// `rbsp_trailing_bits`, never escaped; `nal_ref_idc` is 0, as it must be
+/// for filler data (7.4.1).
+pub fn filler_nal(bits: u64) -> Vec<u8> {
+    crate::encode::h265_syntax::filler_payload(NAL_FILLER, 6, bits, |t, p| annexb(t, 0, p))
+}
 
 /// Width of `dpb_output_delay`, in bits — the same 24 the other two
 /// delays have (`Cpb`'s lengths), because there is no reason for the
@@ -67,10 +81,11 @@ fn write_hrd(w: &mut BitWriter, cpb: &Cpb) {
     w.bits(4, 0); // cpb_size_scale
     w.ue((cpb.bit_rate >> 6) as u32 - 1); // bit_rate_value_minus1[0]
     w.ue((cpb.size >> 4) as u32 - 1); // cpb_size_value_minus1[0]
-    // cbr_flag 0: a variable rate, for the reason the H.265 side gives —
-    // the controller targets an average and stuffs nothing, so a constant
-    // rate would declare something it does not do.
-    w.flag(false); // cbr_flag[0]
+    // cbr_flag: a variable rate unless the caller asked for a constant
+    // one, for the reason the H.265 side gives — the controller targets an
+    // average, so a constant rate is declared only where the encoder also
+    // stuffs the difference with filler data.
+    w.flag(cpb.cbr); // cbr_flag[0]
     w.bits(5, cpb.initial_delay_length - 1); // initial_cpb_removal_delay_length_minus1
     w.bits(5, cpb.removal_delay_length - 1); // cpb_removal_delay_length_minus1
     w.bits(5, OUTPUT_DELAY_LENGTH - 1); // dpb_output_delay_length_minus1
@@ -237,10 +252,19 @@ pub fn write_content_light_level_sei(c: &ContentLightLevel) -> Vec<u8> {
 /// and its offset, at the widths the SPS declared. `cpb` is what that SPS
 /// wrote.
 pub fn write_buffering_period_sei(cpb: &Cpb) -> Vec<u8> {
+    write_buffering_period_sei_at(cpb, cpb.initial_removal_delay_90k())
+}
+
+/// [`write_buffering_period_sei`] carrying `initial_delay_90k` instead of
+/// the full buffer's delay: a later buffering period of a constant-rate
+/// stream, whose delay is fixed by the buffer's actual fullness (C.3:
+/// between the floor and the ceiling of `90000 * (t_r,n(n) - t_af(n - 1))`,
+/// the arrival never pausing), not chosen.
+pub fn write_buffering_period_sei_at(cpb: &Cpb, initial_delay_90k: u32) -> Vec<u8> {
     let mut p = BitWriter::with_capacity(16);
     p.ue(0); // seq_parameter_set_id
     // NalHrdBpPresentFlag: one SchedSelIdx.
-    p.bits(cpb.initial_delay_length, cpb.initial_removal_delay_90k()); // initial_cpb_removal_delay
+    p.bits(cpb.initial_delay_length, initial_delay_90k); // initial_cpb_removal_delay
     p.bits(cpb.initial_delay_length, 0); // initial_cpb_removal_delay_offset
     p.rbsp_trailing_bits();
     sei_nal(0, &p.into_rbsp())
