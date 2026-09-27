@@ -13,8 +13,8 @@
 //!
 //! What is genuinely per-codec turned out to be only wiring, and little of
 //! it: mapping that encoder's picture kind to [`PicKind`], and calling
-//! [`RateController::pick_qp`] and [`RateController::account`] in its own
-//! loop. Both encoders already carried a per-picture quantiser against a
+//! [`RateController::pick_qp`] and [`RateController::account_stuffed`] in
+//! its own loop. Both encoders already carried a per-picture quantiser against a
 //! fixed one in the parameter set — `slice_qp_delta` in both — so neither
 //! needed new syntax to vary it.
 //!
@@ -783,6 +783,20 @@ const INSENSITIVE_RETRY: u32 = 8;
 /// deliberately not here: see the module header.
 const CPB_AIM: f64 = 0.75;
 
+/// The fullness a constant-rate stream's controller holds its buffer at,
+/// as a fraction of its size.
+///
+/// At a variable rate a full buffer is where the controller starts and
+/// is harmless to return to: the arrival pauses. At a constant rate it is
+/// where filler begins — every bit a picture leaves unspent at a full
+/// buffer is stuffed — so holding the buffer *at* full, as the
+/// bucket would (it counts from the full start), would make filler the
+/// remainder of every picture that came in under its share. Held below
+/// full, an underspend refills the headroom first and only a run of them
+/// that outlasts it is stuffed. Not lower, because the headroom is taken
+/// from the room a keyframe has to overspend into.
+const CBR_FULLNESS: f64 = 0.8;
+
 /// How many times a picture may be coded before the encoder gives up on
 /// fitting it into the buffer — the first attempt plus this many more.
 ///
@@ -1019,8 +1033,8 @@ pub struct Insensitivity {
 /// Picture-level rate control against an average bitrate.
 ///
 /// One per encoder, driven in coding order: [`RateController::pick_qp`]
-/// before each picture, [`RateController::account`] after it, with the
-/// size of the access unit the encoder actually emitted.
+/// before each picture, [`RateController::account_stuffed`] after it, with
+/// the size of the access unit the encoder actually emitted.
 pub struct RateController {
     /// Bits this picture's share of a second works out to.
     per_picture: f64,
@@ -1068,8 +1082,8 @@ pub struct RateController {
     cpb: Option<(f64, f64)>,
     /// What [`RateController::pick_qp`] chose for the picture currently
     /// being coded — kind, quantiser and lookahead cost (1 without one) —
-    /// so [`RateController::account`] can pin the model against the
-    /// quantiser and cost that actually produced the bits.
+    /// so [`RateController::account_stuffed`] can pin the model against
+    /// the quantiser and cost that actually produced the bits.
     pending: Option<(PicKind, u8, f64)>,
     /// Whether the pending pick was planned from a seed and nothing else —
     /// the stream's first under lookahead, or the first P after a keyframe
@@ -1211,6 +1225,19 @@ impl RateController {
     /// went stale would be the one nobody ran.
     pub fn affordable_bits(&self) -> Option<u64> {
         self.cpb.map(|(size, fullness)| (fullness + self.per_picture).min(size).max(0.0) as u64)
+    }
+
+    /// This controller at a constant rate: the bucket counts from
+    /// [`CBR_FULLNESS`] of the buffer rather than from its full start, so
+    /// the controller spends the difference down and then holds the buffer
+    /// there — its correction spread as every other one is, and bounded
+    /// the same way. What it spends is still the target: the arrival is,
+    /// and a steady buffer spends exactly the arrival.
+    pub fn constant_rate(mut self) -> Self {
+        if let Some((size, _)) = self.cpb {
+            self.budget = size * (1.0 - CBR_FULLNESS);
+        }
+        self
     }
 
     /// The quantiser to try next after a picture came out at `actual` bits
@@ -1460,8 +1487,18 @@ impl RateController {
     /// Updates the ledger, the bucket and the complexity estimate. Must be
     /// called exactly once for every [`RateController::pick_qp`], or the
     /// ledger assertion in the encoder will say so.
-    pub fn account(&mut self, bytes: usize) {
+    ///
+    /// `filler` of the `bytes` are filler data, a constant-rate stream's
+    /// stuffing, and zero for every other stream. The ledger, the bucket
+    /// and the buffer count the whole unit — the filler arrived, was
+    /// removed and went out as bytes like any other — but the complexity
+    /// model and the plan check see only what the picture cost: filler
+    /// says nothing about how hard the picture was to code, and pinned
+    /// into `k` it would read as complexity the next picture then spends
+    /// against.
+    pub fn account_stuffed(&mut self, bytes: usize, filler: usize) {
         let bits = (bytes as u64) * 8;
+        let coded = bits - (filler.min(bytes) as u64) * 8;
         self.bits_spent += bits;
         self.pictures += 1;
         let Some((kind, qp, cost)) = self.pending.take() else {
@@ -1488,13 +1525,13 @@ impl RateController {
         // The model check, reported never gated: how far the picture
         // landed from what it was planned at, in quantiser steps of the
         // law (six per doubling). Zero would mean the model was exact.
-        if bits > 0 && self.planned > 0.0 {
-            self.plan_error += (bits as f64 / self.planned).log2().abs() * 6.0;
+        if coded > 0 && self.planned > 0.0 {
+            self.plan_error += (coded as f64 / self.planned).log2().abs() * 6.0;
             self.plan_count += 1;
         }
-        if bits > 0 {
+        if coded > 0 {
             // Per unit of lookahead cost, which is one without a lookahead.
-            let k_obs = bits as f64 * 2f64.powf(qp as f64 / 6.0) / cost;
+            let k_obs = coded as f64 * 2f64.powf(qp as f64 / 6.0) / cost;
             self.last_observed = Some(kind);
             let c = &mut self.complexity[kind as usize];
             if c.observed {
@@ -1513,7 +1550,7 @@ impl RateController {
             // INSENSITIVE_BAND for the walk and INSENSITIVE_RETRY for how a
             // verdict is reopened.
             let was = c.response;
-            c.observe_response(qp, (bits as f64 / cost).log2());
+            c.observe_response(qp, (coded as f64 / cost).log2());
             c.observed = true;
             match (was, c.response) {
                 (Response::Confirm { .. }, Response::Insensitive { .. }) => self.insensitivity.verdicts += 1,
@@ -1522,6 +1559,13 @@ impl RateController {
                 _ => {}
             }
         }
+    }
+
+    /// [`RateController::account_stuffed`] without filler: the tests'
+    /// shorthand for every stream but a constant-rate one.
+    #[cfg(test)]
+    pub fn account(&mut self, bytes: usize) {
+        self.account_stuffed(bytes, 0);
     }
 
     /// A copy of the controller's whole state, for tests that branch one

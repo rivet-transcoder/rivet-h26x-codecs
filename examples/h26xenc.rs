@@ -131,6 +131,7 @@ fn main() {
                 (cfg.fps, cfg.fps_den) = parse_rate(&s).unwrap_or_else(|| die("--fps wants N, N/D or a decimal"));
             }
             "--cpb-ms" => cfg.cpb_ms = val(&mut i, &args, "--cpb-ms").parse().unwrap_or_else(|_| die("--cpb-ms")),
+            "--cbr" => cfg.cbr = true,
             "--gop" => cfg.gop = val(&mut i, &args, "--gop").parse().unwrap_or_else(|_| die("--gop")),
             "--bframes" => {
                 cfg.bframes = val(&mut i, &args, "--bframes").parse().unwrap_or_else(|_| die("--bframes"))

@@ -327,6 +327,10 @@ struct Core<S: Sample> {
     /// controller is handed these rather than the caller's request, so what
     /// it aims at and what the stream promises are one number.
     cpb: Option<Cpb>,
+    /// The buffer walked exactly under a constant rate
+    /// ([`super::Config::cbr`]): what sizes each access unit's filler and
+    /// each later buffering period's delay. `None` at a variable rate.
+    cbr: Option<super::hrd::ConstantRate>,
     /// The PPS switches this stream declares beyond the quantiser and the
     /// two flags `write_pps` takes by position: per-CTB quantiser deltas
     /// when adaptive quantisation is on. Fixed for the stream, like the
@@ -596,18 +600,24 @@ impl<S: Sample> Core<S> {
                 ));
             }
         };
+        // Declared at a constant rate where the caller asked for one
+        // (`Config::validate` has refused it without a buffer).
+        let cpb = cpb.map(|c| c.with_cbr(cfg.cbr));
+        let cbr = cpb.filter(|c| c.cbr).map(|c| super::hrd::ConstantRate::new(&c, cfg.frame_rate()));
         let rc = match cfg.rate {
             // The controller aims at the *declared* rate where a buffer
             // was declared, so the two cannot disagree by the rounding.
             RateControl::Bitrate { bps } => {
                 let bps = cpb.map_or(bps, |c| c.bit_rate as u32);
-                Some(RateController::with_cpb(bps, cfg.frame_rate_f64(), cfg.width, cfg.height, cfg.gop, cfg.bframes, cpb.map(|c| c.size)))
+                let rc = RateController::with_cpb(bps, cfg.frame_rate_f64(), cfg.width, cfg.height, cfg.gop, cfg.bframes, cpb.map(|c| c.size));
+                Some(if cfg.cbr { rc.constant_rate() } else { rc })
             }
             _ => None,
         };
         Ok(Self {
             geom: g,
             cpb,
+            cbr,
             pps_opts,
             census: Census::default(),
             sched: Scheduler::new(cfg.gop, cfg.bframes),
@@ -701,7 +711,8 @@ impl<S: Sample> Core<S> {
             })?;
             // The pictures released alongside this one and not yet coded
             // are part of what a lookahead can see.
-            let access = self.code_picture(c, &src, &ready[i + 1..])?;
+            let mut access = self.code_picture(c, &src, &ready[i + 1..])?;
+            let filler = self.stuff(&mut access);
             self.costs.remove(&c.display);
             // The ledger closes here, at the one place every picture of
             // every kind passes through — an accounting call inside each
@@ -710,7 +721,8 @@ impl<S: Sample> Core<S> {
             // spent less than it has.
             //
             // What is counted is the whole access unit: start codes, NAL
-            // headers, parameter sets and slice payload, because that is
+            // headers, parameter sets, slice payload and any filler (which
+            // the model is told apart, `account_stuffed`), because that is
             // what the target is measured against. Counting the payload
             // alone would run about a percent low on these clips and
             // rather more on small pictures, and nothing else here would
@@ -718,7 +730,7 @@ impl<S: Sample> Core<S> {
             self.emitted += access.data.len() as u64 * 8;
             let emitted = self.emitted;
             if let Some(rc) = self.rc.as_mut() {
-                rc.account(access.data.len());
+                rc.account_stuffed(access.data.len(), filler);
                 debug_assert_eq!(
                     rc.bits_spent, emitted,
                     "rate-control ledger drifted: the controller has {} bits, the encoder emitted {emitted}",
@@ -728,6 +740,22 @@ impl<S: Sample> Core<S> {
             out.push(access);
         }
         Ok(out)
+    }
+
+    /// Under a constant rate, stuff a finished access unit with a filler
+    /// data NAL of the bits the buffer would otherwise overflow by at the
+    /// next removal, after its slice — filler may not precede the first
+    /// VCL NAL unit of its access unit (7.4.2.4.4) — and remove it from
+    /// the walked buffer. Returns the filler's bytes: none at a variable
+    /// rate, and none for a picture that spent what the buffer had room
+    /// for.
+    fn stuff(&mut self, access: &mut Access) -> usize {
+        let Some(buffer) = self.cbr.as_mut() else { return 0 };
+        let over = buffer.filler_bits(access.data.len() as u64 * 8);
+        let filler = if over > 0 { syn::filler_nal(over) } else { Vec::new() };
+        access.data.extend_from_slice(&filler);
+        buffer.remove(access.data.len() as u64 * 8);
+        filler.len()
     }
 
     /// Code one picture, re-coding it at a higher quantiser if it will not
@@ -763,6 +791,9 @@ impl<S: Sample> Core<S> {
             let Some(afford) = affordable else {
                 return Ok(self.commit(&c, a, qp));
             };
+            // Under a constant rate the buffer is walked exactly as well,
+            // and the exact figure is the one the stream is held to.
+            let afford = self.cbr.as_ref().map_or(afford, |b| afford.min(b.available()));
             if bits <= afford {
                 if let Some(rc) = self.rc.as_mut() {
                     rc.note_recode(qp);
@@ -989,8 +1020,16 @@ impl<S: Sample> Core<S> {
         // every one of them one: the message carries the initial removal
         // delay, which is the single number the schedule cannot derive
         // from the frame rate.
+        //
+        // Under a constant rate a later period's initial delay is not the
+        // full buffer's: the arrival never paused, so it is how long the
+        // buffer has actually been filling for this picture.
         if let Some(cpb) = self.cpb.as_ref() {
-            out.extend_from_slice(&syn::annexb(syn::NAL_PREFIX_SEI, &syn::write_buffering_period_sei(cpb)));
+            let bp = match self.cbr.as_ref() {
+                Some(buffer) => syn::write_buffering_period_sei_at(cpb, buffer.initial_delay_90k()),
+                None => syn::write_buffering_period_sei(cpb),
+            };
+            out.extend_from_slice(&syn::annexb(syn::NAL_PREFIX_SEI, &bp));
         }
         // HDR10 static metadata, with every IRAP so that a stream joined at
         // any of them carries it (as x265 does with repeated headers).
