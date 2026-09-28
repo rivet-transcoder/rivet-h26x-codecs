@@ -325,6 +325,11 @@ pub fn parse_st_rps(r: &mut BitReader, idx: usize, num_sets: usize, sets: &[StRp
 /// VUI fields the decoder uses.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Vui {
+    /// `(sar_width, sar_height)` when `aspect_ratio_info_present_flag` names
+    /// one: the shape of a luma sample, which is not square on an anamorphic
+    /// source (720x576 at 64:45 is shown 16:9). `None` when absent or
+    /// unspecified, which a consumer reads as square.
+    pub sample_aspect: Option<(u16, u16)>,
     /// `video_signal_type_present_flag`: the stream states its video format
     /// and range, with or without a colour description. Without it
     /// `full_range` is the value E.3.1 infers (0), not something the stream
@@ -473,10 +478,8 @@ fn parse_vui(r: &mut BitReader, max_sub_layers_minus1: u32) -> Vui {
     let mut vui = Vui::default();
     if r.flag() {
         let idc = r.bits(8);
-        if idc == 255 {
-            r.bits(16);
-            r.bits(16);
-        }
+        let extended = if idc == 255 { (r.bits(16), r.bits(16)) } else { (0, 0) };
+        vui.sample_aspect = crate::nal::sample_aspect(idc, extended);
     }
     if r.flag() {
         r.flag(); // overscan_appropriate
@@ -928,5 +931,25 @@ mod vui_signal_type_tests {
         assert!(v.video_signal_type, "a signalled limited range is still signalled");
         assert!(!v.full_range);
         assert_eq!(v.colour_description, None);
+    }
+
+    /// libx265, 64x64 testsrc2 with `setsar=64/45`: `aspect_ratio_idc` 255.
+    const SAR_EXTENDED: &[u8] = &[
+        0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00,
+        0x03, 0x00, 0x1e, 0xa0, 0x20, 0x81, 0x05, 0x96, 0x56, 0x69, 0x24, 0xca, 0xff, 0xf0, 0x04,
+        0x00, 0x02, 0xd6, 0x80, 0x80, 0x00, 0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x0c, 0x84,
+    ];
+    /// The same with `setsar=4/3`, Table E-1's idc 14.
+    const SAR_TABLE_IDC: &[u8] = &[
+        0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00,
+        0x03, 0x00, 0x1e, 0xa0, 0x20, 0x81, 0x05, 0x96, 0x56, 0x69, 0x24, 0xca, 0xf0, 0xe6, 0x80,
+        0x80, 0x00, 0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x0c, 0x84,
+    ];
+
+    #[test]
+    fn the_sample_aspect_ratio_is_read_from_the_table_or_the_stream() {
+        assert_eq!(vui(SAR_EXTENDED).sample_aspect, Some((64, 45)));
+        assert_eq!(vui(SAR_TABLE_IDC).sample_aspect, Some((4, 3)));
+        assert_eq!(vui(FULL_RANGE_ONLY).sample_aspect, Some((1, 1)), "x265 writes idc 1 by default");
     }
 }

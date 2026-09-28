@@ -44,6 +44,11 @@ pub struct Vui {
     pub max_num_reorder_frames: Option<u32>,
     /// `max_dec_frame_buffering`, when signalled.
     pub max_dec_frame_buffering: Option<u32>,
+    /// `(sar_width, sar_height)` when `aspect_ratio_info_present_flag` names
+    /// one: the shape of a luma sample, which is not square on an anamorphic
+    /// source (720x576 at 64:45 is shown 16:9). `None` when absent or
+    /// unspecified, which a consumer reads as square.
+    pub sample_aspect: Option<(u16, u16)>,
     /// `video_signal_type_present_flag`: the stream states its video format
     /// and range, with or without a colour description. Without it
     /// `full_range` is the value E.2.1 infers (0), not something the stream
@@ -333,10 +338,8 @@ fn parse_vui(r: &mut BitReader) -> Vui {
     if r.flag() {
         // aspect_ratio_info_present_flag
         let idc = r.bits(8);
-        if idc == 255 {
-            r.bits(16);
-            r.bits(16);
-        }
+        let extended = if idc == 255 { (r.bits(16), r.bits(16)) } else { (0, 0) };
+        vui.sample_aspect = crate::nal::sample_aspect(idc, extended);
     }
     if r.flag() {
         // overscan_info_present_flag
@@ -572,5 +575,33 @@ mod vui_signal_type_tests {
         assert!(!v.video_signal_type, "the flag is absent from this SPS");
         assert!(!v.full_range, "the inferred value");
         assert_eq!(v.colour_description, None);
+    }
+
+    /// libx264, 64x64 testsrc2 with `setsar=64/45` (PAL 16:9): not in Table
+    /// E-1, so `aspect_ratio_idc` 255 and the ratio written out.
+    const SAR_EXTENDED: &[u8] = &[
+        0x67, 0x64, 0x00, 0x0a, 0xac, 0xd9, 0x44, 0x26, 0xff, 0xc0, 0x10, 0x00, 0x0b, 0x44, 0x00,
+        0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xc8, 0x3c, 0x48, 0x96, 0x58,
+    ];
+    /// The same with `setsar=16/11`, which Table E-1 names as idc 4.
+    const SAR_TABLE_IDC: &[u8] = &[
+        0x67, 0x64, 0x00, 0x0a, 0xac, 0xd9, 0x44, 0x26, 0xc1, 0x04, 0x00, 0x00, 0x03, 0x00, 0x04,
+        0x00, 0x00, 0x03, 0x00, 0xc8, 0x3c, 0x48, 0x96, 0x58,
+    ];
+
+    #[test]
+    fn the_sample_aspect_ratio_is_read_from_the_table_or_the_stream() {
+        assert_eq!(vui(SAR_EXTENDED).sample_aspect, Some((64, 45)));
+        assert_eq!(vui(SAR_TABLE_IDC).sample_aspect, Some((16, 11)));
+        assert_eq!(vui(NO_SIGNAL_TYPE).sample_aspect, Some((1, 1)), "x264 writes idc 1 by default");
+    }
+
+    #[test]
+    fn an_unspecified_or_reserved_aspect_is_no_aspect() {
+        use crate::nal::sample_aspect;
+        assert_eq!(sample_aspect(0, (0, 0)), None, "0 is Unspecified");
+        assert_eq!(sample_aspect(17, (0, 0)), None, "17..=254 are reserved");
+        assert_eq!(sample_aspect(255, (0, 11)), None, "a zero term is unspecified");
+        assert_eq!(sample_aspect(13, (0, 0)), Some((160, 99)));
     }
 }

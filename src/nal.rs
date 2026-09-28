@@ -329,3 +329,36 @@ mod tests {
         assert_eq!(HevcNalHeader::parse(&[0x40, 0x01]).unwrap().unit_type, 32);
     }
 }
+
+/// Table E-1: `aspect_ratio_idc` 1..=16 as `(sar_width, sar_height)`. Shared by
+/// H.264 (E.2.1) and H.265 (E.3.1); 255 is `Extended_SAR`, read from the stream.
+pub(crate) const SAR_TABLE: [(u16, u16); 16] = [
+    (1, 1),
+    (12, 11),
+    (10, 11),
+    (16, 11),
+    (40, 33),
+    (24, 11),
+    (20, 11),
+    (32, 11),
+    (80, 33),
+    (18, 11),
+    (15, 11),
+    (64, 33),
+    (160, 99),
+    (4, 3),
+    (3, 2),
+    (2, 1),
+];
+
+/// The sample aspect ratio an `aspect_ratio_idc` names, with the two
+/// `Extended_SAR` values read when it is 255. `None` for 0 (unspecified), a
+/// reserved value, or a ratio with a zero term, which E.2.1 calls unspecified.
+pub(crate) fn sample_aspect(idc: u32, extended: (u32, u32)) -> Option<(u16, u16)> {
+    let (w, h) = match idc {
+        1..=16 => SAR_TABLE[idc as usize - 1],
+        255 => (extended.0 as u16, extended.1 as u16),
+        _ => return None,
+    };
+    (w != 0 && h != 0).then_some((w, h))
+}
