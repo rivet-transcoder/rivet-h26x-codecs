@@ -277,7 +277,7 @@ impl<S: Sample> PicShared<S> {
             // it, judge (`wpp_gate_tests`).
             let us = hang_hook::WAKE_STALL_US.load(Ordering::Relaxed);
             let stall_row = matches!(on, WaitOn::Ctb(a) if a / pic.wc + 3 == pic.row_ctbs.len());
-            if pic.hang_hooks && us > 0 && stall_row && hang_hook::WAKE_STALL_BUDGET.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| b.checked_sub(1)).is_ok() {
+            if pic.hang_hooks && us > 0 && stall_row && hang_hook::WAKE_STALL_BUDGET.try_update(Ordering::Relaxed, Ordering::Relaxed, |b| b.checked_sub(1)).is_ok() {
                 drop(g);
                 std::thread::sleep(std::time::Duration::from_micros(us));
                 g = pic.lock.lock().unwrap();
