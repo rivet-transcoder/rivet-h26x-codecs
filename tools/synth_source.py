@@ -33,14 +33,18 @@ Recipes — each is content chosen for what it makes an encoder do:
   static     frame 0 of `detail`, held
   tff / bff  interlaced: fields woven from consecutive frames of `detail`
              at twice the rate, the top (tff) or bottom (bff) field first
-  cut        `detail` for 51 frames, then a hard cut to `zoom`
-  hfade      left half `detail`, right half flat grey, luma at gain
+  cut        `detail` at 2.5x its speed for 51 frames, then a hard cut to
+             a slower `zoom`
+  half       left half `detail`, right half flat grey
+  hfade      `half` with its luma at gain
              (1 - n/16): a pure-gain fade for weighted prediction
   wpoff      `hfade` with an offset too: luma p * (1 - n/16) - 3n
-  settle     24 frames of `detail`, then its frame 24 held
+  settle     24 frames of `detail` scrolling sideways 5% of its width a
+             frame, then its frame 24 held
   big        quarters of four unrelated contents: detail, zoom, grad, bars
-  interlace  left half a fast horizontal scroll of `detail`, right half one
-             picture held, woven into fields from a source at twice the rate
+  interlace  left half `bars` scrolling sideways 7% of its width a source
+             frame, right half one `detail` picture held, woven into fields
+             from a source at twice the rate (top field first)
   wsine      a drifting sinusoidal texture computed at full precision (its
              low bits carry the texture, not noise)
 
@@ -130,9 +134,9 @@ def detail(w, h, n, speed=1.0):
     return Y, Cb, Cr
 
 
-def zoom(w, h, n):
+def zoom(w, h, n, rate=0.92):
     x, y = _grid(w, h)
-    scale = 0.45 * (0.92 ** n)
+    scale = 0.45 * (rate ** n)
     cx, cy = -0.743643887037151, 0.131825904205330
     cre = cx + (x - w / 2) * scale / max(w, h)
     cim = cy + (y - h / 2) * scale / max(w, h)
@@ -256,13 +260,14 @@ RECIPES = {
     'static': lambda w, h, n: detail(w, h, 0),
     'tff': lambda w, h, n: weave(detail(w, h, 2 * n), detail(w, h, 2 * n + 1), True),
     'bff': lambda w, h, n: weave(detail(w, h, 2 * n), detail(w, h, 2 * n + 1), False),
-    'cut': lambda w, h, n: detail(w, h, n) if n < 51 else zoom(w, h, n - 51),
+    'cut': lambda w, h, n: detail(w, h, n, speed=2.5) if n < 51 else zoom(w, h, n - 51, rate=0.985),
     'hfade': hfade,
+    'half': lambda w, h, n: hstack(detail(w // 2, h, n), grey(w - w // 2, h, n)),
     'wpoff': lambda w, h, n: (lambda p: (np.maximum(0, p[0] - 3 * n), p[1], p[2]))(hfade(w, h, n)),
-    'settle': lambda w, h, n: detail(w, h, min(n, 24)),
+    'settle': lambda w, h, n: scroll(detail(w, h, min(n, 24)), min(n, 24), 0.05),
     'big': lambda w, h, n: vstack(hstack(detail(w // 2, h // 2, n), zoom(w - w // 2, h // 2, n)),
                                   hstack(grad(w // 2, h - h // 2, n), bars(w - w // 2, h - h // 2, n))),
-    'interlace': lambda w, h, n: weave(*[hstack(scroll(detail(w // 2, h, 2 * n + k, speed=2.0), 2 * n + k, 0.06),
+    'interlace': lambda w, h, n: weave(*[hstack(scroll(bars(w // 2, h, 0), 2 * n + k, 0.07),
                                                 detail(w - w // 2, h, 0)) for k in (0, 1)], True),
     'wsine': wsine,
 }

@@ -11,10 +11,13 @@
 # verify_encode.sh does not need a table mapping clips to dimensions, which is
 # the sort of table that goes stale silently.
 #
+# Every clip comes from synth_source.py (deterministic synthetic recipes,
+# described there); nothing here needs any other program.
+#
 # Usage: make_encode_sources.sh [dir]
 set -e
+SYNTH=$(cd "$(dirname "$0")" && pwd)/synth_source.py
 cd "${1:-$(dirname "$0")}"
-FFMPEG=${FFMPEG:-ffmpeg}
 
 # Content chosen so that a broken encoder shows up rather than averaging out:
 #   grad    smooth gradients and slow pans — intra prediction and sub-pel
@@ -70,30 +73,35 @@ FFMPEG=${FFMPEG:-ffmpeg}
 #           real content does at every shot boundary. Both halves are
 #           expensive and structurally unrelated — a cut into cheap content
 #           is easy, because the encoder simply spends less.
-gen() { # name filter frames fmt pix
-  out="src_$1_${4}.yuv"
+gen() { # name recipe frames <W>x<H>_<fmt> [synth_source options...]
+  local name=$1 recipe=$2 frames=$3 tok=$4; shift 4
+  out="src_${name}_${tok}.yuv"
   [ -f "$out" ] && { echo "have $out"; return; }
-  "$FFMPEG" -v error -y -f lavfi -i "$2" -frames:v "$3" \
-            -f rawvideo -pix_fmt "$5" "$out"
+  python "$SYNTH" "$recipe" --size "${tok%%_*}" --frames "$frames" --format "${tok#*_}" "$@" "$out"
   echo "made $out ($(stat -c %s "$out") bytes)"
 }
 
-gen grad   "gradients=size=64x64:rate=25:c0=0x2050a0:c1=0xe0b040:x0=0:y0=0:x1=63:y1=63:nb_colors=2:seed=1:speed=0.01:type=linear"                     8 64x64_420 yuv420p
-gen detail "testsrc2=size=64x64:rate=25"                      8 64x64_420 yuv420p
-gen motion "testsrc=size=64x64:rate=25"                      12 64x64_420 yuv420p
-gen detail "testsrc2=size=64x64:rate=25"                      8 64x64_422 yuv422p
-gen detail "testsrc2=size=64x64:rate=25"                      8 64x64_444 yuv444p
-gen detail "testsrc2=size=64x64:rate=25"                      8 64x64_400 gray
+gen grad   grad    8 64x64_420
+gen detail detail  8 64x64_420
+gen motion motion 12 64x64_420
+gen detail detail  8 64x64_422
+gen detail detail  8 64x64_444
+gen detail detail  8 64x64_400
 # One clip whose dimensions are not a multiple of the coding block size, since
 # cropping is signalled in the SPS and is a common place to be wrong.
-gen odd    "testsrc2=size=50x34:rate=25"                      6 50x34_420  yuv420p
-# The held frame: `loop` repeats source frame 0 for the whole clip, so every
+gen odd    detail  6 50x34_420
+# The held frame: `static` repeats frame 0 of `detail` for the whole clip, so every
 # picture is byte-identical to the first while still carrying real detail.
-gen static "testsrc2=size=64x64:rate=25,loop=loop=-1:size=1:start=0" 8 64x64_420 yuv420p
+gen static static  8 64x64_420
 # The scene cut: 51 frames of one source, then 45 of a structurally
-# unrelated one, spliced with no transition. `trim` takes the head of each
-# and `setpts` restarts the timestamps so `concat` joins them cleanly.
-gen cut    "testsrc2=size=64x64:rate=25,trim=end_frame=51,setpts=PTS-STARTPTS[a];mandelbrot=size=64x64:rate=25,trim=end_frame=45,setpts=PTS-STARTPTS[b];[a][b]concat=n=2:v=1:a=0" 96 64x64_420 yuv420p
+# unrelated one (`detail`, then `zoom` from its first frame), spliced with
+# no transition.
+# With this corpus (2026-10) two H.265 lookahead rate cells
+# (hevc-abr-la-64k / -96k) spend about twice their target in the GOP
+# holding the cut and land the window around it at 1.2x, outside 4b's
+# band, which was measured on the previous (lavfi) corpus; every other
+# cell on this clip holds.
+gen cut    cut    96 64x64_420
 # The fade: every picture is the one before it at a lower luma gain,
 # `Y * (1 - N/16)` over twelve frames, chroma untouched. Nothing above
 # changes brightness between pictures, so weighted prediction — a gain and
@@ -103,13 +111,13 @@ gen cut    "testsrc2=size=64x64:rate=25,trim=end_frame=51,setpts=PTS-STARTPTS[a]
 # unweighted reference always carries residual and one predicted from a
 # scaled reference need not.
 #
-# Its left half is testsrc2 and its right half a flat grey, deliberately:
+# Its left half is `detail` and its right half a flat grey, deliberately:
 # the four 32x32 coding tree blocks of the 64x64 clips above all have about
 # the same luma variance, so a zero-mean per-block quantiser offset rounds
 # to zero on every one of them and adaptive quantisation moved nothing on
 # this corpus except the odd-sized clip. Two busy blocks beside two flat
 # ones is the smallest picture on which it has something to move.
-gen fade   "testsrc2=size=32x64:rate=25,format=yuv420p[a];color=c=0x808080:size=32x64:rate=25,format=yuv420p[b];[a][b]hstack=inputs=2,geq=lum='p(X,Y)*(1-N/16)':cb='p(X,Y)':cr='p(X,Y)'" 12 64x64_420 yuv420p
+gen fade   hfade  12 64x64_420
 
 # The gain-and-offset fade: the fade above with an offset as well as a gain,
 # luma of picture N `p * (1 - N/16) - 3N` (clipped at 0), chroma untouched.
@@ -119,9 +127,9 @@ gen fade   "testsrc2=size=32x64:rate=25,format=yuv420p[a];color=c=0x808080:size=
 # (2026-09-14). Here the fit has an offset to carry. Its format token carries
 # its depth, `420p8`, so the untagged rows skip it the way they skip the deep
 # clips and only rows tagged `@wpoff` visit it.
-gen wpoff  "testsrc2=size=32x64:rate=25,format=yuv420p[a];color=c=0x808080:size=32x64:rate=25,format=yuv420p[b];[a][b]hstack=inputs=2,geq=lum='max(0,p(X,Y)*(1-N/16)-3*N)':cb='p(X,Y)':cr='p(X,Y)'" 12 64x64_420p8 yuv420p
+gen wpoff  wpoff  12 64x64_420p8
 
-# The settling shot: 24 frames of moving testsrc2, then its frame 24 held
+# The settling shot: 24 frames of `detail` scrolling sideways, then its frame 24 held
 # for the remaining 72 — motion that stops, a pause, a slate after a pan.
 # Ninety-six frames so the rate gate's sustained-spend property (4b) sees
 # twelve GOPs at the gate's usual length and forty-eight at two.
@@ -136,37 +144,39 @@ gen wpoff  "testsrc2=size=32x64:rate=25,format=yuv420p[a];color=c=0x808080:size=
 # a first picture already at the floor, and short GOPs keep the keyframes
 # able to spend what the held P pictures cannot. `p8` keeps untagged rows
 # off it; only `@settle` rows visit it.
-gen settle "testsrc2=size=64x64:rate=25,split=2[s0][s1];[s0]trim=end_frame=24,setpts=PTS-STARTPTS[a];[s1]trim=start_frame=24:end_frame=25,setpts=PTS-STARTPTS,loop=loop=71:size=1:start=0,setpts=N/25/TB[b];[a][b]concat=n=2:v=1:a=0" 96 64x64_420p8 yuv420p
+# With this corpus (2026-10) the h264-verdict-g2-256k row lands one
+# 3-GOP window at 1.27x in the hold, outside 4b's band; the 192k row reaches
+# its verdict and holds the band. The thresholds were measured on the
+# previous (lavfi) corpus.
+gen settle settle 96 64x64_420p8
 
 # Deep samples. The format token grows a depth suffix — `420p10` — which
-# verify_encode.sh splits into `--format 420 --depth 10` and maps to
-# ffmpeg's `yuv420p10le` for the CROSS decode; a token without a suffix is
-# 8-bit, as every clip above is. Little-endian 16-bit planar throughout,
+# verify_encode.sh splits into `--format 420 --depth 10`; a token without a
+# suffix is 8-bit, as every clip above is. Little-endian 16-bit planar throughout,
 # the layout the decoders emit and the encoders take.
 #
-# The content is NOT an 8-bit picture shifted up. `testsrc2` is drawn at
-# 8 bits and `-pix_fmt yuv420p10le` alone would scale it, leaving the low
-# two bits of every sample zero — and a depth bug that only touched those
+# The content is NOT an 8-bit picture shifted up. The recipes are drawn in
+# 8-bit units and scaling alone would leave the low two bits of every
+# sample zero — and a depth bug that only touched those
 # bits (a quantiser shift short by two, a clip at 255 << 2) would then be
-# invisible to the whole gate. So a `geq` stage adds two bits of noise per
+# invisible to the whole gate. So `--noise` adds two bits of noise per
 # sample AFTER the conversion, at the deep format, and a probe of the
 # result shows every low-bit pattern present. Four bits at 12.
-deep() { # name source frames geom fmt depth
-  noise=$(( 1 << ($6 - 8) ))
-  gen "$1" "$2,format=yuv${5}p${6}le,geq=lum='p(X,Y)+floor(random(0)*$noise)':cb='p(X,Y)+floor(random(1)*$noise)':cr='p(X,Y)+floor(random(2)*$noise)'" "$3" "${4}_${5}p${6}" "yuv${5}p${6}le"
+deep() { # name recipe frames geom fmt depth
+  gen "$1" "$2" "$3" "${4}_${5}p${6}" --noise $(( $6 - 8 ))
 }
-deep detail10 "testsrc2=size=64x64:rate=25"  8 64x64 420 10
-deep motion10 "testsrc=size=64x64:rate=25"  12 64x64 420 10
-deep detail10 "testsrc2=size=64x64:rate=25"  8 64x64 422 10
-deep detail10 "testsrc2=size=64x64:rate=25"  8 64x64 444 10
-deep detail12 "testsrc2=size=64x64:rate=25"  8 64x64 420 12
+deep detail10 detail  8 64x64 420 10
+deep motion10 motion 12 64x64 420 10
+deep detail10 detail  8 64x64 422 10
+deep detail10 detail  8 64x64 444 10
+deep detail12 detail  8 64x64 420 12
 
 # The one clip larger than 64x64, for the H.265 coding quadtree. Every
 # clip above is four 32x32 coding tree blocks (twelve 16x16 ones on the
 # odd clip), so a split decision there sees at most four CTBs of one
 # content each, and a probe of what splitting buys cannot tell a win from
 # the clip's one texture. This is forty CTBs of four unrelated contents in
-# quarters — moving detail (testsrc2), a zooming fractal (mandelbrot),
+# quarters — moving detail (`detail`), a zooming fractal (`zoom`),
 # smooth drifting gradients, and static bars with hard vertical edges —
 # so one picture holds regions where a whole 32x32 unit is right beside
 # regions where only 8x8 units are.
@@ -182,7 +192,7 @@ deep detail12 "testsrc2=size=64x64:rate=25"  8 64x64 420 12
 # identity_encode.sh skip for every row without an `@` (the deep clips'
 # rule), so this clip's arrival changed no existing row's cost — in every
 # checkout of those scripts, including ones older than the clip.
-gen big    "testsrc2=size=128x80:rate=25,format=yuv420p[a];mandelbrot=size=128x80:rate=25,format=yuv420p[b];gradients=size=128x80:rate=25:c0=0x2050a0:c1=0xe0b040:x0=0:y0=0:x1=127:y1=79:nb_colors=2:seed=1:speed=0.01:type=linear,format=yuv420p[c];smptehdbars=size=128x80:rate=25,format=yuv420p[d];[a][b]hstack=inputs=2[top];[c][d]hstack=inputs=2[bot];[top][bot]vstack=inputs=2" 16 256x160_420p8 yuv420p
+gen big    big    16 256x160_420p8
 
 # The partial-CTB clip. Under the coding quadtree the CTB is 32x32 and the
 # coded picture the smallest legal size, so a picture that is not whole
@@ -193,36 +203,37 @@ gen big    "testsrc2=size=128x80:rate=25,format=yuv420p[a];mandelbrot=size=128x8
 # the remainder 1280x720 and 3840x2160 leave at the bottom. It is the one
 # partial-CTB clip: the odd clip (50x34) is below 64 both ways, where the
 # encoder keeps whole CTBs (`Geometry::new`). 88x44 is 64 or more one way,
-# which is enough. testsrc2 moves, so inter pictures split at the edges too.
+# which is enough. `detail` moves, so inter pictures split at the edges too.
 #
 # VISITED ONLY BY ROWS THAT NAME IT (`@edge`): the `420p8` depth token keeps
 # every untagged row off it, as on the big clip.
-gen edge   "testsrc2=size=88x44:rate=25" 12 88x44_420p8 yuv420p
+gen edge   detail 12 88x44_420p8
 
 # The interlaced clip. Every clip above is progressive — each frame one
 # instant — so an interlaced encode of them has fields that agree and a
 # frame/field decision with nothing to decide. This one is 16 progressive
-# frames at 50 per second woven into 8 interlaced ones (`tinterlace`
-# interleave: the top field from one instant, the bottom from the next), so
-# its fields really are 20 ms apart. Its left half moves and its right half
-# is one picture held (`loop`), so the same frame holds a region where the
+# frames at 50 per second woven into 8 interlaced ones (the top field from
+# one instant, the bottom from the next), so its fields really are 20 ms
+# apart. Its left half moves and its right half is one picture held, so the
+# same frame holds a region where the
 # two fields disagree (field coding pays) beside one where they are the
 # same picture (frame coding pays) — which is what a per-picture and a
 # per-macroblock-pair decision need to have something to choose between.
 #
-# The left half scrolls (`scroll`, 6% of its width per source frame, about
-# three samples between a frame's two fields) because testsrc2 alone moves
-# too little to comb: its neighbouring rows still differ less than rows of
-# one field, and the encoder's PAFF screen offers field pictures only to a
-# combed frame — so on that source the PAFF rows coded frame pictures and
-# nothing else, and a broken field decision would have passed them. This
-# one measures 1.5-1.8 (frame / field vertical SAD, every frame), and its
-# PAFF rows code field pictures as well as frame pictures.
+# The left half is colour bars scrolling sideways (7% of its width per
+# source frame, about three samples between a frame's two fields): hard
+# vertical edges moving across the field interval are what combs. Content
+# that moves too little does not — its neighbouring rows still differ less
+# than rows of one field, and the encoder's PAFF screen offers field
+# pictures only to a combed frame, so on such a source the PAFF rows code
+# frame pictures and nothing else, and a broken field decision would pass
+# them. This one measures 1.6-1.9 (frame / field vertical SAD, every
+# frame).
 #
 # 96x96 rather than 64x64 so an MBAFF frame has eighteen macroblock pairs,
 # enough for pairs of both kinds to sit beside each other. The `p8` depth
 # suffix keeps every untagged row off it: only `@interlace` rows visit it.
-gen interlace "testsrc2=size=48x96:rate=50,scroll=horizontal=0.06[a];testsrc2=size=48x96:rate=50,loop=loop=-1:size=1:start=0[b];[a][b]hstack=inputs=2,tinterlace=mode=interleave_top" 8 96x96_420p8 yuv420p
+gen interlace interlace 8 96x96_420p8
 
 # The same interlaced clip at 10 bits, through `deep` (two bits of noise
 # below the up-shift, like every deep clip). A PAFF row on the progressive
@@ -230,7 +241,7 @@ gen interlace "testsrc2=size=48x96:rate=50,scroll=horizontal=0.06[a];testsrc2=si
 # pictures to choose. Its name carries `ilace`, one of verify_encode.sh's
 # EXCLUSIVE_TOKENS, so only `@ilace10` rows visit it: its `420p10` token
 # alone would have put it under every `@p10` row.
-deep ilace10 "testsrc2=size=48x96:rate=50,scroll=horizontal=0.06[a];testsrc2=size=48x96:rate=50,loop=loop=-1:size=1:start=0[b];[a][b]hstack=inputs=2,tinterlace=mode=interleave_top" 8 96x96 420 10
+deep ilace10 interlace 8 96x96 420 10
 
 # The gain-and-offset fade at 10 bits: the wpoff fade above with its offset
 # at the depth, luma of picture N `p * (1 - N/16) - 12N` (clipped at 0),
@@ -240,8 +251,8 @@ deep ilace10 "testsrc2=size=48x96:rate=50,scroll=horizontal=0.06[a];testsrc2=siz
 # so H.265's weighted rows at 10 bits proved the syntax and little else.
 # Its name carries `fdeep`, one of the EXCLUSIVE_TOKENS, so only `@fdeep10`
 # rows visit it: its `420p10` token alone would have put it under every
-# `@p10` row. md5 6c22ac2b899b2fb3980c54b401463779, generated twice.
-gen fdeep10 "testsrc2=size=32x64:rate=25,format=yuv420p[a];color=c=0x808080:size=32x64:rate=25,format=yuv420p[b];[a][b]hstack=inputs=2,format=yuv420p10le,geq=lum='min(1023,max(0,p(X,Y)*(1-N/16)-12*N)+floor(random(0)*4))':cb='min(1023,p(X,Y)+floor(random(1)*4))':cr='min(1023,p(X,Y)+floor(random(2)*4))'" 12 64x64_420p10 yuv420p10le
+# `@p10` row. md5 ea58501aa75f495c99f7c956bdffd261.
+gen fdeep10 half 12 64x64_420p10 --fade16 --luma-offset-per-frame 12 --noise 2
 
 # A native 10-bit weighted fade. fdeep10 above is 8-bit content scaled up,
 # and from QP 26 on it codes like its own 8-bit twin, so it checks the
@@ -250,8 +261,9 @@ gen fdeep10 "testsrc2=size=32x64:rate=25,format=yuv420p[a];color=c=0x808080:size
 # quarter radian per picture, `512 + 300 sin(X/5 + N/4) cos(Y/7)`, under
 # the fdeep10 gain and offset (`* (1 - N/16) - 12N`), chroma two drifting
 # waves about 512, and two bits of noise on every plane. Its low bits carry
-# the texture's gradients, so truncating it to 8 bits costs 0.84 dB of luma
-# at QP 26. Its name carries `wsine`, one of the EXCLUSIVE_TOKENS, so only
-# `@wsine10` rows visit it. md5 8e3b7d967a299d69f9cb232012421615, generated
-# three times.
-gen wsine10 "nullsrc=size=64x64:rate=25,format=yuv420p10le,geq=lum='min(1023,max(0,(512+300*sin(X/5+N/4)*cos(Y/7))*(1-N/16)-12*N+floor(random(0)*4)))':cb='min(1023,512+120*cos(X/9-N/5)+floor(random(1)*4))':cr='min(1023,512+120*sin(Y/8+N/6)+floor(random(2)*4))'" 12 64x64_420p10 yuv420p10le
+# the texture's gradients, so truncating it to 8 bits costs luma PSNR at
+# QP 26. Its name carries `wsine`, one of the EXCLUSIVE_TOKENS, so only
+# `@wsine10` rows visit it. md5 094b6a0f44798be875894ed1b6093503 (sin / cos
+# come from the platform's libm, so another machine may differ in a
+# sample).
+gen wsine10 wsine 12 64x64_420p10 --noise 2

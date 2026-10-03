@@ -12,11 +12,14 @@
 #               encoder and decoder state and is always a bug. Needs no
 #               reference data, and catches the largest class of faults.
 #
-#   2. CROSS    libavcodec decoding our output produces the same pictures our
-#               decoder does. Property 1 is self-consistent and would pass if
-#               both of our sides shared a misreading of the standard; this is
-#               what makes the bitstream legal rather than merely
-#               self-compatible.
+#   2. CROSS    the ITU-T reference decoder (JM's ldecod for H.264, HM's
+#               TAppDecoder for H.265, through tools/ref_decode.py) decoding
+#               our output produces the same pictures our decoder does.
+#               Property 1 is self-consistent and would pass if both of our
+#               sides shared a misreading of the standard; this is what makes
+#               the bitstream legal rather than merely self-compatible. (Until
+#               2026-10 this decoder was libavcodec; the reference decoders
+#               are the stricter judge, and need no third-party build.)
 #
 #   3. QUALITY  PSNR of the reconstruction against the source. The only one of
 #               the three that is a measurement rather than a check — so it is
@@ -105,8 +108,8 @@
 #               has a right answer. But neither of our conformance
 #               instruments can see it: a decoder is NOT required to check
 #               the hypothetical reference decoder and ours does not, and
-#               libavcodec decodes a violating stream as happily as any
-#               other. So h26xhrd checks it, reading the declaration out of
+#               the CROSS decoder decodes a violating stream as happily as
+#               any other. So h26xhrd checks it, reading the declaration out of
 #               the stream itself rather than being told.
 #
 #               These rows need a clip with seconds in it. On a six-to-
@@ -163,7 +166,7 @@
 #               parser is the inverse of its own writer, so a shared
 #               misreading of E.1.1 / E.2.1 round-trips cleanly. What
 #               settles it is a third reader: tools/vui_probe.py asks
-#               ffprobe, which reports the VUI as names, and the row is
+#               MediaInfo, which reports the VUI as names, and the row is
 #               green only when all four fields name exactly the codes
 #               the encoder was handed. A player that shows BT.2020 PQ as
 #               BT.709 is what this row exists to prevent.
@@ -180,26 +183,26 @@
 #               primaries/matrix swap shows.
 #
 #               The same property covers the chroma siting
-#               (`chroma_sample_loc_type`, ffprobe's chroma_location) on
-#               the rows that write one — and only those: for an absent
-#               field libavcodec reports the type 0 the standard infers
-#               ("left"), never "unspecified", so a written 0 is invisible
-#               to it and absence is not checkable here (the parser test
-#               holds "unasked, unwritten"). And it reports a siting for
-#               4:2:0 only — 4:2:2 / 4:4:4 read "unspecified" whatever the
-#               VUI says (E.2.1 wants the flag 0 there, and the encoder
-#               refuses a siting off 4:2:0 by name) — so the siting rows
-#               name 4:2:0 clips and carry non-zero codes: the H.264
-#               `@src_cut` row 1 ("center", the 2x2 box siting), the H.265
-#               `@420p10` row 2 ("topleft", BT.2100's 4:2:0 siting). Its
-#               mutation: stub the writer to the zero flag, and both rows
-#               must go red naming chroma_location while every other
-#               --color row stays green.
+#               (`chroma_sample_loc_type`, MediaInfo's
+#               ChromaSubsampling_Position) on every --color row: MediaInfo
+#               reports a written siting as `Type N`, a written 0 included,
+#               and nothing when the VUI carries none, so a row that writes
+#               one must show exactly it and a row that does not must show
+#               none. The encoder refuses a siting off 4:2:0 by name (E.2.1
+#               wants the flag 0 there), so the siting rows name 4:2:0
+#               clips and carry non-zero codes: the H.264 `@src_cut` row 1
+#               (the 2x2 box siting), the H.265 `@420p10` row 2 (BT.2100's
+#               4:2:0 siting). Its mutation: stub the writer to the zero
+#               flag, and both rows must go red naming
+#               ChromaSubsampling_Position while every other --color row
+#               stays green.
 #
 #               The same property covers the HDR10 static-metadata SEIs
 #               (mastering display colour volume, content light level)
 #               on the rows that write them: the probe is handed the
-#               values and asks ffprobe's frame side data. Its mutation:
+#               values and reads them back exactly — through HM's SEI
+#               print for H.265, through its own payload parser (checked
+#               against MediaInfo's reading) for H.264. Its mutation:
 #               swap the red and green primaries in the writer, and the
 #               row must go red naming red_x. The H.264 SEI row is a
 #               buffer row so the two SEIs travel beside a buffering
@@ -293,17 +296,14 @@ DEC=${2:-../release/examples/h26xdec.exe}
 # The buffer checker lives beside the encoder it was built with.
 HRD=${HRD:-$(dirname "$ENC")/h26xhrd.exe}
 [ -f "$HRD" ] || HRD=${HRD%.exe}
-FFMPEG=${FFMPEG:-ffmpeg}
+# The CROSS decoders (property 2): JM and HM, through ref_decode.py beside
+# this script, which finds them as LDECOD / TAPPDECODER or on the PATH.
+REF_DECODE=${REF_DECODE:-$SCRIPT_DIR/ref_decode.py}
 # The BOX checker (property 6) lives in the repo, beside this script.
 PARAM_SETS=${PARAM_SETS:-$SCRIPT_DIR/param_sets.py}
-# The VUI probe (property 8) too; it asks ffprobe, which lives beside the
-# ffmpeg named above (the same suffix, `.exe` or none), or is on the PATH
-# when ffmpeg is.
+# The VUI probe (property 8) too; it asks MediaInfo (MEDIAINFO or
+# `mediainfo` on the PATH) and, for H.265's HDR SEIs, HM's TAppDecoder.
 VUI_PROBE=${VUI_PROBE:-$SCRIPT_DIR/vui_probe.py}
-case "$FFMPEG" in
-  */*) FFPROBE=${FFPROBE:-$(dirname "$FFMPEG")/ffprobe${FFMPEG##*/ffmpeg}} ;;
-  *) FFPROBE=${FFPROBE:-ffprobe} ;;
-esac
 TAG=$$
 OUT=enc_out_$TAG
 JOBS=${JOBS:-4}
@@ -553,7 +553,7 @@ EXCLUSIVE_TOKENS="ilace fdeep wsine"
 # `weighted_bipred_idc` 2): no table, every bi-predicted block weighted by
 # the picture's distances to its anchors through the decoder's own
 # `implicit_pair`, so SELF holds the encoder to that derivation and CROSS
-# holds both to libavcodec's. It is opt-in (see `Config::b_weighting` for
+# holds both to the reference decoder's. It is opt-in (see `Config::b_weighting` for
 # the measurement: fades and motion gain, detail loses), so no other row
 # moved. One row over every 8-bit clip at two B pictures, one at three with
 # the 8x8 transform and sub-partitions under CAVLC at QP 40, the deep clips,
@@ -569,7 +569,7 @@ EXCLUSIVE_TOKENS="ilace fdeep wsine"
 # frame as two field pictures, `paff` and `mbaff` decide per picture and per
 # macroblock pair, and h26xenc's `interlace` census line counts what each cell
 # actually coded. A wrong bottom_field_flag is red under SELF, not CROSS:
-# libavcodec follows the flag exactly as our decoder does, so the two agree on
+# any decoder follows the flag exactly as ours does, so the two agree on
 # the misread stream while both differ from the encoder's reconstruction.
 # CROSS checks the field reference lists and field-geometry filtering with a
 # decoder that shares none of our code.
@@ -578,8 +578,8 @@ EXCLUSIVE_TOKENS="ilace fdeep wsine"
 # one past anchor and the future one, and its reference picture set must
 # still keep the older anchors a later P picture uses, flagged unused. When
 # it listed only the two it uses, the older anchors were marked unused, and
-# libavcodec refused the next P picture that named one ("Could not find ref
-# with POC 0"). Our decoder generates a stand-in for a missing reference and
+# the CROSS decoder of the time (libavcodec) refused the next P picture that
+# named one ("Could not find ref with POC 0"). Our decoder generates a stand-in for a missing reference and
 # counts a warning (h26xdec prints the count); SELF passed and only CROSS was
 # red, which is why SELF now also fails on any warning our decoder counts. They visit motion (and, through the tag, its 10-bit twin
 # motion10), fade and cut; --gop 250 because at --gop 8 the GOP ends before
@@ -624,8 +624,8 @@ EXCLUSIVE_TOKENS="ilace fdeep wsine"
 # two. Under that fault SELF was red on 29 of the 34 H.264 cells here (from
 # display index 4 at --gop 3 --bframes 1), all but the static clip, whose
 # anchors do not differ, and the six-picture odd clip where the second GOP
-# holds no B picture; CROSS stayed green, as libavcodec decodes the stream
-# exactly as we do. The H.265 rows are the same GOPs, which H.265 always
+# holds no B picture; CROSS (libavcodec then) stayed green, as it decoded
+# the stream exactly as we do. The H.265 rows are the same GOPs, which H.265 always
 # coded correctly (it drops its references at an IDR), held there.
 CONFIGS=${CONFIGS:-"
 lossless-intra|--codec h264 --lossless --gop 0
@@ -911,8 +911,8 @@ one() {
   # 1. SELF.
   ours="$OUT/$base.$name.ours.yuv"
   # H.264 4:0:0: ask the decoder for the samples the codec produced rather
-  # than the grey-chroma padding it adds to match libavcodec yuv420p, since
-  # the CROSS check below asks ffmpeg for gray.
+  # than the grey-chroma padding it adds by default, since the CROSS check
+  # below asks the reference decoder for the luma plane alone.
   if ! H26XDEC_NO_CHROMA_PAD=1 "$DEC" "$bs" "$ours" > /dev/null 2> "$OUT/$base.$name.dec.log"; then
     echo "SELF-FAIL   $tag: our decoder rejected our bitstream: $(tail -1 "$OUT/$base.$name.dec.log" | head -c 80)"
     return 1
@@ -938,25 +938,18 @@ one() {
   fi
 
   # 2. CROSS.
-  theirs="$OUT/$base.$name.ff.yuv"
-  # 4:0:0 needs extractplanes, not -pix_fmt gray. libavcodec emits H.264
-  # monochrome as yuv420p with grey chroma, so asking swscale for gray makes
-  # it convert — and it treats yuv420p as limited range and gray as full, so
-  # every luma sample comes out expanded: 68 becomes 61. That is an artefact
-  # of the comparison, not a difference in the bitstream, and it cost a false
-  # CROSS failure to find.
-  # Above 8 bits libavcodec emits little-endian 16-bit planes natively
-  # (`yuv420p10le` and friends) — the layout our decoder packs, so the
-  # comparison stays a plain `cmp` at every depth.
-  ffargs="-pix_fmt $(ffpix "$fmt")"
-  case "$chroma" in 400|gray) ffargs="-vf extractplanes=y -pix_fmt $(ffpix "$fmt")" ;; esac
-  if ! "$FFMPEG" -v error -y -i "$bs" -f rawvideo $ffargs "$theirs" \
-       > "$OUT/$base.$name.ff.log" 2>&1; then
-    echo "CROSS-FAIL  $tag: libavcodec rejected our bitstream: $(tail -1 "$OUT/$base.$name.ff.log" | head -c 80)"
+  theirs="$OUT/$base.$name.ref.yuv"
+  # The reference decoder's pictures in our decoder's layout (planar, bytes
+  # at 8 bits, little-endian 16-bit words above, the luma plane alone for
+  # 4:0:0 as asked of ours above), so the comparison is a plain `cmp` at
+  # every depth and format.
+  if ! python "$REF_DECODE" decode --codec "$ext" --luma-only "$bs" "$theirs" \
+       > "$OUT/$base.$name.ref.log" 2>&1; then
+    echo "CROSS-FAIL  $tag: the reference decoder rejected our bitstream: $(tail -1 "$OUT/$base.$name.ref.log" | head -c 80)"
     return 1
   fi
   if ! cmp -s "$ours" "$theirs"; then
-    echo "CROSS-FAIL  $tag: libavcodec decodes our bitstream differently than we do"
+    echo "CROSS-FAIL  $tag: the reference decoder decodes our bitstream differently than we do"
     return 1
   fi
 
@@ -1035,7 +1028,7 @@ one() {
   esac
 
   # 8. VUI. Only where a colour was given. The probe is told the codes the
-  # encoder was handed and the range flag beside them, and asks ffprobe
+  # encoder was handed and the range flag beside them, and asks MediaInfo
   # whether the stream says so — the one reader here that is neither the
   # writer nor its own inverse.
   case "$flags" in
@@ -1043,7 +1036,7 @@ one() {
       colour=$(echo "$flags" | sed -n 's/.*--color \([0-9:]*\).*/\1/p')
       range=tv; case "$flags" in *--full-range*) range=pc ;; esac
       # The HDR10 static-metadata SEIs, when the row wrote them: the probe
-      # is told the same values and asks ffprobe's frame side data.
+      # is told the same values and reads them back exactly.
       hdr=""
       md=$(echo "$flags" | sed -n 's/.*--mastering-display \([^ ]*\).*/\1/p')
       [ -n "$md" ] && hdr="$hdr --mastering-display $md"
@@ -1053,7 +1046,7 @@ one() {
       # insists the stream says nothing about siting.
       loc=$(echo "$flags" | sed -n 's/.*--chroma-loc \([0-9]*\).*/\1/p')
       [ -n "$loc" ] && hdr="$hdr --chroma-loc $loc"
-      if ! out=$(FFPROBE="$FFPROBE" python "$VUI_PROBE" "$bs" "$colour" "$range" $hdr 2>&1); then
+      if ! out=$(python "$VUI_PROBE" "$bs" "$colour" "$range" $hdr 2>&1); then
         echo "VUI-FAIL    $tag: $(echo "$out" | tail -1 | head -c 120)"
         return 1
       fi
@@ -1109,21 +1102,6 @@ frame_bytes() {
     422) echo $((w * h * 2 * bps)) ;;
     444) echo $((w * h * 3 * bps)) ;;
     *) echo $((w * h * 3 / 2 * bps)) ;;
-  esac
-}
-
-# Planar chroma format token to the ffmpeg pixel format that matches how
-# this decoder packs a picture: bytes at 8 bits, little-endian 16-bit
-# planes above (`420p10` -> `yuv420p10le`, `400p10` -> `gray10le`).
-ffpix() {
-  local d
-  d=$(depth_of "$1")
-  [ "$d" = 8 ] && d="" || d="${d}le"
-  case "$(chroma_of "$1")" in
-    400|gray) echo "gray$d" ;;
-    422) echo "yuv422p$d" ;;
-    444) echo "yuv444p$d" ;;
-    *) echo "yuv420p$d" ;;
   esac
 }
 
@@ -1276,8 +1254,8 @@ PY
 RATE_WINDOW=${RATE_WINDOW:-3}
 RATE_WINDOW_LO=${RATE_WINDOW_LO:-0.85}
 RATE_WINDOW_HI=${RATE_WINDOW_HI:-1.18}
-export -f one ffpix psnr_of planes_psnr_of quality_verdict chroma_of depth_of frame_bytes gop_spend_of
-export ENC DEC HRD FFMPEG FFPROBE OUT PARAM_SETS VUI_PROBE H26X_SPEED_TABLE JOBS QBASE QTOL RATE_WINDOW RATE_WINDOW_LO RATE_WINDOW_HI
+export -f one psnr_of planes_psnr_of quality_verdict chroma_of depth_of frame_bytes gop_spend_of
+export ENC DEC HRD REF_DECODE OUT PARAM_SETS VUI_PROBE H26X_SPEED_TABLE JOBS QBASE QTOL RATE_WINDOW RATE_WINDOW_LO RATE_WINDOW_HI
 
 echo "== encode verification =="
 results="$OUT/results.txt"

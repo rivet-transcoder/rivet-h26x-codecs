@@ -3,12 +3,13 @@
 comparison of this crate's decoder against them.
 
     ref_decode.py decode STREAM OUT.yuv [--luma-only] [--rgb]
+    ref_decode.py framemd5 STREAM FRAMES [--rgb]
     ref_decode.py check  [--dec H26XDEC] [--rgb] STREAM...
 
 The reference for H.264 is JM's `ldecod`, for HEVC HM's `TAppDecoder`: the
 decoders the ITU-T / ISO/IEC joint teams publish beside the standards, used
 here only as programs (their source is not read). Which one is decided by
-the extension (`.264 .h264 .jsv .26l .avc .jvt` H.264; `.265 .hevc .bit .bin`
+the extension (`.264 .h264 .jsv .26l .avc .jvt` H.264; `.265 .h265 .hevc .bit .bin`
 HEVC) or `--codec`.
 
 `decode` writes the reference decoder's pictures in the layout h26xdec
@@ -20,6 +21,10 @@ from both. `--rgb` is for 4:4:4 H.264 streams whose VUI says
 matrix_coefficients 0: JM writes those planes as R, G, B — Cr, Y, Cb —
 which is undone here so the decoded planes are compared, not JM's file
 layout.
+
+`framemd5` decodes STREAM and prints `<i> <md5>` for each of its FRAMES
+pictures (the output split into FRAMES equal pictures; it fails if it does
+not split evenly) — the per-frame form the conformance runners compare.
 
 `check` decodes each STREAM with h26xdec (`--dec`, default `$DEC` or
 h26xdec on PATH) and with the reference, and compares the two outputs frame
@@ -46,7 +51,7 @@ import sys
 import tempfile
 
 H264_EXT = ('.264', '.h264', '.jsv', '.26l', '.avc', '.jvt')
-HEVC_EXT = ('.265', '.hevc', '.bit', '.bin')
+HEVC_EXT = ('.265', '.h265', '.hevc', '.bit', '.bin')
 
 
 def codec_of(path, forced=None):
@@ -158,6 +163,11 @@ def main():
     d.add_argument('--luma-only', action='store_true')
     d.add_argument('--rgb', action='store_true')
     d.add_argument('--plane-bytes', type=int)
+    f = sub.add_parser('framemd5')
+    f.add_argument('stream')
+    f.add_argument('frames', type=int)
+    f.add_argument('--codec', choices=('h264', 'h265'))
+    f.add_argument('--rgb', action='store_true')
     c = sub.add_parser('check')
     c.add_argument('streams', nargs='+')
     c.add_argument('--dec', default=os.environ.get('DEC') or shutil.which('h26xdec'))
@@ -170,6 +180,27 @@ def main():
         except RuntimeError as e:
             print(f'ref_decode: {e}', file=sys.stderr)
             return 1
+        return 0
+    if a.cmd == 'framemd5':
+        import hashlib
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, 'ref.yuv')
+            try:
+                reference_decode(a.stream, out, codec_of(a.stream, a.codec))
+            except RuntimeError as e:
+                print(f'ref_decode: {e}', file=sys.stderr)
+                return 1
+            data = open(out, 'rb').read()
+        if a.frames <= 0 or len(data) % a.frames:
+            print(f'ref_decode: {len(data)} bytes do not split into {a.frames} pictures', file=sys.stderr)
+            return 1
+        fs = len(data) // a.frames
+        for i in range(a.frames):
+            fr = data[i * fs:(i + 1) * fs]
+            if a.rgb:
+                ps = fs // 3
+                fr = fr[ps:2 * ps] + fr[2 * ps:] + fr[:ps]
+            print(i, hashlib.md5(fr).hexdigest())
         return 0
     if not a.dec:
         raise SystemExit('ref_decode: no h26xdec (pass --dec or set DEC)')
