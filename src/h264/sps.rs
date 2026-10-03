@@ -547,18 +547,20 @@ mod vui_signal_type_tests {
         Sps::parse(&rbsp).expect("SPS parses").vui.expect("VUI present")
     }
 
-    /// ffmpeg 8.1.1 libx264, 64x64 testsrc2, `-color_range pc` and no other
-    /// colour option. trace_headers: video_signal_type_present_flag=1
-    /// video_full_range_flag=1 colour_description_present_flag=0.
+    /// The x264 r3223 command line on a 64x64 raw source (`tools/synth_source.py detail`),
+    /// `--sar 1:1 --input-range pc --range pc` and no other colour option.
+    /// MediaInfo reads full range and no colour description:
+    /// video_signal_type_present_flag=1 video_full_range_flag=1
+    /// colour_description_present_flag=0.
     const FULL_RANGE_ONLY: &[u8] = &[
         0x67, 0x64, 0x00, 0x0a, 0xac, 0xd9, 0x44, 0x26, 0xc0, 0x5b, 0x20, 0x00, 0x00, 0x03, 0x00,
-        0x20, 0x00, 0x00, 0x07, 0x81, 0xe2, 0x44, 0xb2, 0xc0,
+        0x20, 0x00, 0x00, 0x06, 0x51, 0xe2, 0x44, 0xb2, 0xc0,
     ];
-    /// The same encode without `-color_range`. trace_headers:
+    /// The same encode with `--sar 1:1` alone; MediaInfo reports no range:
     /// video_signal_type_present_flag=0.
     const NO_SIGNAL_TYPE: &[u8] = &[
         0x67, 0x64, 0x00, 0x0a, 0xac, 0xd9, 0x44, 0x26, 0xc0, 0x44, 0x00, 0x00, 0x03, 0x00, 0x04,
-        0x00, 0x00, 0x03, 0x00, 0xf0, 0x3c, 0x48, 0x96, 0x58,
+        0x00, 0x00, 0x03, 0x00, 0xca, 0x3c, 0x48, 0x96, 0x58,
     ];
 
     #[test]
@@ -577,23 +579,24 @@ mod vui_signal_type_tests {
         assert_eq!(v.colour_description, None);
     }
 
-    /// libx264, 64x64 testsrc2 with `setsar=64/45` (PAL 16:9): not in Table
-    /// E-1, so `aspect_ratio_idc` 255 and the ratio written out.
+    /// The same encode with `--sar 64:45` (PAL 16:9): not in Table E-1, so
+    /// `aspect_ratio_idc` 255 and the ratio written out (MediaInfo: 1.422).
     const SAR_EXTENDED: &[u8] = &[
         0x67, 0x64, 0x00, 0x0a, 0xac, 0xd9, 0x44, 0x26, 0xff, 0xc0, 0x10, 0x00, 0x0b, 0x44, 0x00,
-        0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xc8, 0x3c, 0x48, 0x96, 0x58,
+        0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xca, 0x3c, 0x48, 0x96, 0x58,
     ];
-    /// The same with `setsar=16/11`, which Table E-1 names as idc 4.
+    /// The same with `--sar 16:11`, which Table E-1 names as idc 4 (MediaInfo:
+    /// 1.455).
     const SAR_TABLE_IDC: &[u8] = &[
         0x67, 0x64, 0x00, 0x0a, 0xac, 0xd9, 0x44, 0x26, 0xc1, 0x04, 0x00, 0x00, 0x03, 0x00, 0x04,
-        0x00, 0x00, 0x03, 0x00, 0xc8, 0x3c, 0x48, 0x96, 0x58,
+        0x00, 0x00, 0x03, 0x00, 0xca, 0x3c, 0x48, 0x96, 0x58,
     ];
 
     #[test]
     fn the_sample_aspect_ratio_is_read_from_the_table_or_the_stream() {
         assert_eq!(vui(SAR_EXTENDED).sample_aspect, Some((64, 45)));
         assert_eq!(vui(SAR_TABLE_IDC).sample_aspect, Some((16, 11)));
-        assert_eq!(vui(NO_SIGNAL_TYPE).sample_aspect, Some((1, 1)), "x264 writes idc 1 by default");
+        assert_eq!(vui(NO_SIGNAL_TYPE).sample_aspect, Some((1, 1)), "--sar 1:1 is idc 1");
     }
 
     #[test]
