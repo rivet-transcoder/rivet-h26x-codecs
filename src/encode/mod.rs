@@ -23,8 +23,9 @@
 //!    that catches the largest class of encoder faults, and it needs no
 //!    reference data at all.
 //!
-//! 2. **Another decoder agrees.** libavcodec decoding our output must produce
-//!    the same pictures our decoder does. Property 1 is self-consistent and
+//! 2. **Another decoder agrees.** The ITU-T reference decoder (JM for H.264,
+//!    HM for H.265) decoding our output must produce the same pictures our
+//!    decoder does. Property 1 is self-consistent and
 //!    would pass happily if both sides shared a misreading of the standard;
 //!    this is what makes the bitstream *legal* rather than merely
 //!    self-compatible. It is also the property that matters commercially,
@@ -51,7 +52,8 @@
 //! and CROSS pass whether the VUI and SEIs carry them or not, and the
 //! crate's own parsers are the writers' inverses — a shared misreading of
 //! E.1.1 round-trips cleanly. The gate therefore asks a *third* reader:
-//! `tools/vui_probe.py` has ffprobe name every field, and a `--color` row
+//! `tools/vui_probe.py` has MediaInfo name every field (and reads the HDR
+//! SEIs back exactly, through HM for H.265), and a `--color` row
 //! is green only when the names are exactly the codes the encoder was
 //! handed (`VUI-FAIL` otherwise). A player showing BT.2020 PQ as washed-out
 //! BT.709 is the failure that row exists to prevent.
@@ -458,8 +460,8 @@ pub struct Config {
     /// upsamples at the wrong siting loses about a decibel of chroma on
     /// detail; the field is what lets it not. 4:2:0 only: the siting
     /// describes a subsampled grid, E.2.1 says the flag should be 0 for
-    /// any other format, and libavcodec reports none there whatever the
-    /// VUI says — so a siting beside another format is refused by name.
+    /// any other format, and players ignore one there — so a siting
+    /// beside another format is refused by name.
     pub chroma_loc: Option<u8>,
     /// HDR10 mastering display colour volume, written as an SEI in every
     /// IDR / IRAP access unit — or `None` for no such SEI, which is what

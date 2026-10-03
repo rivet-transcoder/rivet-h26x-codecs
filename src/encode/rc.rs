@@ -32,7 +32,8 @@
 //!
 //! - **Conformance** — SELF and CROSS. The stream means what the encoder
 //!   thinks it means: our decoder reproduces the encoder's own
-//!   reconstruction byte for byte, and libavcodec agrees with our decoder.
+//!   reconstruction byte for byte, and the reference decoder (JM / HM)
+//!   agrees with ours.
 //!   *Exact*, and it has a reference: the decoder.
 //! - **Quality** — PSNR. Reported, never gated (except lossless, where it
 //!   becomes exact and therefore conformance again). A *measurement*: it

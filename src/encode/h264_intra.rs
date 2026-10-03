@@ -217,7 +217,8 @@ pub struct IntraCtx<'a, S: Sample> {
     /// deeper, which is what keeps the quantiser step the same fraction
     /// of the sample range at every depth. Feeding the *unprimed*
     /// quantiser to the tables would be exact, self-consistent and
-    /// wrong — SELF passes, libavcodec reconstructs something else — so
+    /// wrong — SELF passes, the reference decoder reconstructs something
+    /// else — so
     /// the two live under different names.
     pub qp_prime: i32,
     /// `QP'_C` per component: [`qpc`](IntraCtx::qpc) plus `QpBdOffset_C`.

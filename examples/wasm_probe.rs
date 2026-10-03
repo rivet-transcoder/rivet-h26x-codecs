@@ -12,7 +12,7 @@
 //! The hash is FNV-1a over the packed planes with each frame's dimensions
 //! mixed in — deliberately the same function and the same constants as
 //! `tests/decode.rs`, so a wasm run is held to the expectations that were
-//! anchored against libavcodec's `framemd5`, rather than merely to whatever
+//! computed from the JM and HM reference decoders' output, rather than merely to whatever
 //! the native build of the moment happens to produce. `tools/wasm.sh` reads
 //! those constants out of that file so the two cannot drift apart.
 //!

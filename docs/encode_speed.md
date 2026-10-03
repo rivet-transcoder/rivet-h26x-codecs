@@ -46,7 +46,7 @@ filtering. Those are shared with the decoder and already SIMD.
 
 Profiled with `tools/prof.sh` (samply, 8 kHz, single process) on a build
 with `CARGO_PROFILE_RELEASE_DEBUG=1 CARGO_PROFILE_RELEASE_STRIP=none`, on a
-320x240 4:2:0 clip of 60 frames of ffmpeg `testsrc2` (generated beside the
+320x240 4:2:0 clip of 60 frames of ffmpeg's `testsrc2` (the measurement predates the move to `tools/synth_source.py`; generated beside the
 gate corpus, not part of it). AMD Ryzen 9 9950X, AVX-512 rung selected for
 the decoder-shared kernels. "self %" is the outermost non-inlined function.
 

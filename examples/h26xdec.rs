@@ -1,6 +1,6 @@
 //! Decode an Annex-B H.264 or HEVC stream and print one line per output
-//! frame in libavcodec `framemd5` style (frame index and the MD5 of the
-//! packed planar picture), or write raw YUV.
+//! frame (frame index, POC, decode index, size and the MD5 of the packed
+//! planar picture), or write raw YUV.
 //!
 //!   h26xdec <input.264|.265> [out.yuv]
 //!
@@ -80,10 +80,10 @@ fn main() {
     let mut n = 0usize;
     // H26XDEC_NOMD5=1 skips hashing (and packing) to time the decoder alone.
     let no_md5 = std::env::var_os("H26XDEC_NOMD5").is_some();
-    // H.264 4:0:0 is padded with grey chroma so the output matches
-    // libavcodec's yuv420p, which is what the conformance runners compare
-    // against. An encoder gate wants the opposite: the samples the codec
-    // actually produced, matching ffmpeg -pix_fmt gray. Hence the switch.
+    // H.264 4:0:0 is padded with grey chroma so the output matches JM's
+    // (`WriteUV=1`), which is what the conformance runners compare against.
+    // An encoder gate wants the opposite: the samples the codec actually
+    // produced, the luma plane alone. Hence the switch.
     let no_chroma_pad = std::env::var_os("H26XDEC_NO_CHROMA_PAD").is_some();
     let mut emit = |pic: h26x::Picture, out: &mut Option<std::fs::File>| {
         if no_md5 && out.is_none() {
@@ -93,9 +93,9 @@ fn main() {
             let (poc, decode_index) = (pic.poc, pic.decode_index);
             let mut packed = pic.into_packed();
             if chroma == h26x::ChromaFormat::Monochrome && !hevc && !no_chroma_pad {
-                // Like libavcodec's yuv420p output for H.264 4:0:0: grey
-                // chroma planes follow the luma, so the hashes compare
-                // (its HEVC decoder outputs 4:0:0 as `gray`, luma only).
+                // Like JM's output for H.264 4:0:0: grey chroma planes
+                // follow the luma, so the hashes compare (HM writes HEVC
+                // 4:0:0 as the luma plane only, as this does).
                 let (cw, ch) = (width.div_ceil(2) as usize, height.div_ceil(2) as usize);
                 let bps = if bit_depth > 8 { 2 } else { 1 };
                 let mid = 1u16 << (bit_depth - 1);

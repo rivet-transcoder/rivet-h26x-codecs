@@ -15,7 +15,7 @@
 //! every quality question from the first round of debugging, leaving only the
 //! question of whether the bitstream is well-formed. Everything after this is
 //! a quality improvement on an envelope that is already proven against
-//! libavcodec.
+//! the reference decoder.
 
 use crate::bitwriter::BitWriter;
 use crate::cabac_enc::CabacEncoder;
@@ -1283,8 +1283,8 @@ mod tests {
     /// `master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)`
     /// and `max-cll=1000,400` — BT.2020 primaries, D65, 1000 nits down to
     /// 0.0001). There is no reader for these in the crate, so the second
-    /// writer is the fixture: it agrees with libavcodec's reading in the
-    /// gate (tools/vui_probe.py) and these bytes are what it produced.
+    /// writer is the fixture: it agrees with HM's reading in the gate
+    /// (tools/vui_probe.py) and these bytes are what it produced.
     /// The mastering display's `00 00 00 01` tail (min luminance 1) is
     /// what puts an emulation-prevention byte in the fixture, so the
     /// single escape in `sei_nal` is exercised too.
@@ -1393,7 +1393,7 @@ mod tests {
 
     /// A chroma siting describes a 4:2:0 grid and nothing else: E.2.1
     /// wants `chroma_loc_info_present_flag` 0 for any other format, and
-    /// libavcodec reports no siting there whatever is written — so the
+    /// players ignore a siting there whatever is written — so the
     /// configuration is refused by name rather than written into a VUI
     /// no reader will honour. A code above 5 is refused likewise.
     #[test]

@@ -47,7 +47,7 @@
 //!   unscaled, vertically doubled vector is the decoder's derivation, not
 //!   a second copy of it. This is the one rule self-consistency cannot
 //!   check — an encoder and a decoder sharing a wrong vector agree with
-//!   each other — so it is CROSS against libavcodec that arbitrates it.
+//!   each other — so it is CROSS against HM that arbitrates it.
 //! - The **chroma transform blocks** are placed by
 //!   `h265_intra::chroma_tbs`, which is `transform_unit`'s `here`
 //!   expression plus its `yct = yc + t * nc` stacked-pair loop.

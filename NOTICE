@@ -17,8 +17,9 @@ are not translations of any other decoder's source. The standard tables
 are reproduced from the specifications.
 
 Conformance is verified against the ITU-T / JVT and JCT-VC conformance
-bitstream suites and against the reference decoders (JM, HM) and libavcodec
-as independent oracles; none of their code is included.
+bitstream suites and against the ITU-T reference decoders (JM, HM), run as
+programs, as independent oracles; none of their code is included or was
+read.
 
 Implementations of these standards may be covered by patents. Rights under
 those patents are not granted by this licence; see the README's patent note.

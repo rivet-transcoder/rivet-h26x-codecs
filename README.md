@@ -40,28 +40,26 @@ h26x = { package = "rivet-h26x", version = "0.2" }
 Both decoders are **bit-exact**. H.264 passes **all 204** JVT conformance
 bitstreams (AVCv1 + FRExt — every profile set, every field-picture and MBAFF
 stream, the three FMO / ASO streams and the two SP streams) against the
-suite's reconstructed YUV (libavcodec's per-frame MD5s where the zip ships
-none; libavcodec itself refuses two of the FMO streams and decodes the SP
-ones silently wrong), and **all 38** JVT professional-profile bitstreams
-(High 10 / 4:2:2 / 4:4:4 Intra, CAVLC 4:4:4 Intra, High 4:4:4 Predictive at
-up to 14-bit, thirteen of them coded as separate colour planes, which
-libavcodec refuses; those thirteen — including the three 14-bit RGB FMO
-streams — are checked against the JM reference decoder, the rest against
-libavcodec). Decoding is deterministic across thread counts (every suite stream
-decoded on 1 and 12 threads gives the same bytes). It matches libavcodec on
-the workspace fixtures too (CAVLC/CABAC, B-pyramids, weighting, 8x8, slices,
-CQM, 10-bit, 4:2:2, 4:0:0, 4:4:4, lossless, x264 interlaced). H.265 passes **147 of the 147** JCT-VC HEVC_v1 conformance bitstreams
-and **all 49** RExt bitstreams against the suite's own MD5s — among them the
-17 libavcodec declines (16-bit, extended precision, CABAC bypass alignment,
-unequal luma / chroma bit depths), which the suite's MD5 and the stream's own
-decoded-picture-hash SEI are the only witnesses for — plus fifteen x265
-feature fixtures; every HM stream's decoded-picture-hash SEI is checked as
-well. Bit depths above 12, and extended precision at any depth, decode on a
+suite's reconstructed YUV (the JM reference decoder's output where the zip
+ships none), and **all 38** JVT professional-profile bitstreams (High 10 /
+4:2:2 / 4:4:4 Intra, CAVLC 4:4:4 Intra, High 4:4:4 Predictive at up to
+14-bit, thirteen of them coded as separate colour planes), which ship no
+reference output and are checked against the JM reference decoder. Decoding
+is deterministic across thread counts (every suite stream decoded on 1 and
+12 threads gives the same bytes). It matches JM on the workspace fixtures too
+(53 x264 / x265 encodes: CAVLC/CABAC, B-pyramids, weighting, 8x8, slices,
+CQM, 10-bit, 4:2:2, 4:0:0, 4:4:4, lossless, interlaced). H.265 passes **147
+of the 147** JCT-VC HEVC_v1 conformance bitstreams and **all 49** RExt
+bitstreams against the suite's own MD5s (HM's output where a zip ships
+none) — among them 16-bit, extended precision, CABAC bypass alignment and
+unequal luma / chroma bit depths — and matches HM on the x265 feature
+fixtures; every HM stream's decoded-picture-hash SEI is checked as well.
+The tools and the reference decoders are described in
+[tools/README.md](tools/README.md); none of it involves FFmpeg. Bit depths above 12, and extended precision at any depth, decode on a
 scalar `i32` pipeline beside the `i16` SIMD one the 8–12-bit streams keep.
 
 `Unsupported` is a *classification*, not a failure: rivet's decode tier list
-falls through to the next backend (libavcodec when built with the `ffmpeg`
-feature, openh264 for H.264).
+falls through to the next backend (openh264 for H.264).
 
 ## What it encodes (in progress)
 
@@ -76,8 +74,8 @@ replace it, two of them exact:
    bitstream carries, and this crate's own decoder must reproduce it byte for
    byte. A mismatch is encoder/decoder state desync: always a bug, never a
    quality question, and it needs no reference data.
-2. **CROSS** — libavcodec must decode the bitstream to the same pictures our
-   decoder does. SELF alone would pass if both of our sides shared a
+2. **CROSS** — the ITU-T reference decoder (JM for H.264, HM for H.265)
+   must decode the bitstream to the same pictures our decoder does. SELF alone would pass if both of our sides shared a
    misreading; CROSS is what makes the output *legal* rather than merely
    self-compatible.
 3. **QUALITY** — PSNR against the source, reported rather than gated, except
@@ -88,7 +86,8 @@ replace it, two of them exact:
 clips (4:0:0 through 4:4:4, plus a 50x34 one because cropping is a common
 place to be wrong) and a configuration list that grows one axis at a time.
 
-Current state: H.264 produces legal streams — verified against libavcodec —
+Current state: H.264 produces legal streams — verified against the
+reference decoder —
 for all-intra content through both entropy coders (I_PCM, exactly lossless)
 and CAVLC P/B envelopes (all-skip); the intra transform path, both residual
 writers, forward transforms and quantisation for both codecs, and the
@@ -160,9 +159,12 @@ machine or any other. `H26X_PROF=1` prints where the time went.
 
 ## Performance
 
-Against libavcodec, on the same clips, with both decoders materialising every
-frame — ffmpeg writing rawvideo to the null device, this decoder packing each
-picture and dropping it. Neither writes to disk. **Cost** is CPU seconds
+The tables below were measured (2026-09) against libavcodec, on the same
+clips, with both decoders materialising every frame. They are kept as a
+record; the tooling no longer runs any FFmpeg program, so
+`tools/benchmark.py` now regenerates them with the scalar rung as the
+baseline (a `vs scalar` column) instead of a libavcodec row. Every frame is
+materialised: this decoder packs each picture and drops it. Neither writes to disk. **Cost** is CPU seconds
 (user+kernel) for the whole process tree, best of five; **throughput** is
 frames per wall second, which is the question a multi-threaded run is actually
 asking. Regenerate with `tools/benchmark.py`.
@@ -404,7 +406,7 @@ dec.flush()?;                                    // drain the reorder buffer
 
 `examples/h26xdec.rs` decodes a raw `.264` / `.265` file and prints one line per
 output frame with the MD5 of the packed planar picture — the same layout
-`ffmpeg -f framemd5` hashes — or writes raw YUV. Debug environment variables:
+the reference decoders' YUV output holds — or writes raw YUV. Debug environment variables:
 `H26X_NO_DEBLOCK`, `H26X_NO_SAO`, `H26X_TRACE=<mbaddr>|all` (a macroblock's
 parsed layer and motion), `H26X_TRACE_IPM=1` (every syntax element with its
 bit / CABAC position — lines up with the JM reference decoder's trace) and
