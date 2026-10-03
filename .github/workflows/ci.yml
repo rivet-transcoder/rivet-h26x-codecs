@@ -88,9 +88,11 @@ jobs:
           mkdir -p ~/refdec ~/src && cd ~/src
           git clone --depth 1 --branch "$JM_REF" https://vcgit.hhi.fraunhofer.de/jvet/JM.git
           git clone --depth 1 --branch "$HM_REF" https://vcgit.hhi.fraunhofer.de/jvet/HM.git
-          cmake -S JM -B JM/build -DCMAKE_BUILD_TYPE=Release
+          # -w: the reference software builds with -Werror, and a newer gcc
+          # warns where theirs did not; the warnings are not ours to fix.
+          cmake -S JM -B JM/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS=-w -DCMAKE_CXX_FLAGS=-w
           cmake --build JM/build --config Release --target ldecod -j 4
-          cmake -S HM -B HM/build -DCMAKE_BUILD_TYPE=Release
+          cmake -S HM -B HM/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS=-w -DCMAKE_CXX_FLAGS=-w
           cmake --build HM/build --config Release --target TAppDecoder -j 4
           cp "$(find JM/bin -type f -name ldecod | head -1)" ~/refdec/
           cp "$(find HM/bin -type f -name TAppDecoder | head -1)" ~/refdec/
