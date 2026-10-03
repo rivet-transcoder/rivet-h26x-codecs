@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run every JVT AVCv1 + FRExt conformance stream through h26xdec and classify it.
 # The reference is the suite's decoded YUV in the zip (any *.yuv in the dir; whole-file
-# MD5 must match); when the zip carries none, libavcodec's per-frame MD5s are used.
+# MD5 must match); when the zip carries none, the JM reference decoder's per-frame MD5s.
 #   PASS         bit-exact
 #   UNSUPPORTED  the decoder refused it (Error::Unsupported)
 #   FAIL         mismatch or bitstream error
@@ -14,7 +14,12 @@ JOBS=${JOBS:-8}
 # decoder copy: a run that quietly tested somebody else's binary still
 # reports green.
 OUT=${OUT:-out}
-export DEC OUT H26X_THREADS=${THREADS:-4}
+# The reference decoder (JM / HM, via ref_decode.py), for streams whose
+# zip carries no reference output. REF_DECODE names the script: run from
+# the repository it is ../../ref_decode.py; from a copy under
+# $H26X_WORK/conf, point it at the repository's tools/ref_decode.py.
+REF_DECODE=${REF_DECODE:-$(cd ../.. && pwd)/ref_decode.py}
+export DEC OUT REF_DECODE H26X_THREADS=${THREADS:-4}
 mkdir -p refs "$OUT"
 one() {
   d=$1
@@ -33,12 +38,12 @@ one() {
   elif [ $status -eq 0 ] && [ -n "$ref_md5s" ] && echo "$ref_md5s" | grep -q "^$mine_md5$"; then
     echo "PASS        $name ($n_mine frames, suite yuv)"
   else
-    ref="refs/$name.framemd5"
-    [ -f "$ref" ] || ffmpeg -v error -y -i "$bs" -fps_mode passthrough -f framemd5 "$ref" 2>/dev/null
-    n_ref=$(grep -vc '^#' "$ref")
-    match=$(paste <(grep -v '^#' "$ref" | awk -F', *' '{print $6}') <(awk -F, '{print $5}' "$OUT/$name.mine") | awk '{ if ($1==$2 && $1!="") ok++ } END{print ok+0}')
+    ref="refs/$name.ref.md5"
+    [ -s "$ref" ] || python "$REF_DECODE" framemd5 "$bs" "$n_mine" > "$ref" 2> "$OUT/$name.referr" || rm -f "$ref"
+    n_ref=$(cat "$ref" 2>/dev/null | wc -l)
+    match=$(paste <(awk '{print $2}' "$ref" 2>/dev/null) <(awk -F, '{print $5}' "$OUT/$name.mine") | awk '{ if ($1==$2 && $1!="") ok++ } END{print ok+0}')
     if [ $status -eq 0 ] && [ "$n_ref" = "$n_mine" ] && [ "$match" = "$n_ref" ]; then
-      echo "PASS        $name ($n_ref frames, ffmpeg framemd5)"
+      echo "PASS        $name ($n_ref frames, JM)"
     else
       echo "FAIL        $name ref=$n_ref mine=$n_mine match=$match $(tail -1 $OUT/$name.err | head -c 120)"
     fi

@@ -1,7 +1,8 @@
 #!/bin/bash
 # jm_ref.sh <stream-name>... — per-frame MD5s of the JM reference decoder's
-# output for professional-profile streams libavcodec cannot decode, written
-# to jm/<name>.md5 in the form run_conf.sh reads ("<i> <md5>" per frame).
+# output, written to jm/<name>.md5 in the form run_conf.sh reads ("<i> <md5>"
+# per frame). run_conf.sh makes the same for every other stream itself
+# (ref_decode.py); this script is for the RGB-ordered 4:4:4 streams below.
 #
 # The MD5 is of the frame as h26xdec packs it: Y, Cb, Cr planes, 16-bit
 # little-endian above 8 bits. JM writes 4:4:4 streams whose VUI says
