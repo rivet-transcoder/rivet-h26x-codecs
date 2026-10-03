@@ -56,3 +56,54 @@ jobs:
       - run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  reference:
+    name: against the ITU-T reference decoders (JM, HM)
+    # The vendored streams (tests/decode.rs) and an encode round trip,
+    # decoded by JM's ldecod and HM's TAppDecoder — run as programs — and
+    # compared with this crate's decoder picture for picture. The tests'
+    # expected hashes were computed from these decoders' output; this job
+    # re-checks that on every push. No FFmpeg anywhere.
+    runs-on: ubuntu-latest
+    env:
+      JM_REF: master
+      HM_REF: HM-18.0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install numpy
+      - name: Cache the reference decoders
+        id: refcache
+        uses: actions/cache@v4
+        with:
+          path: ~/refdec
+          key: refdec-${{ runner.os }}-jm-${{ env.JM_REF }}-hm-${{ env.HM_REF }}-v1
+      - name: Build JM and HM
+        if: steps.refcache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/refdec ~/src && cd ~/src
+          git clone --depth 1 --branch "$JM_REF" https://vcgit.hhi.fraunhofer.de/jvet/JM.git
+          git clone --depth 1 --branch "$HM_REF" https://vcgit.hhi.fraunhofer.de/jvet/HM.git
+          cmake -S JM -B JM/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build JM/build --config Release --target ldecod -j 4
+          cmake -S HM -B HM/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build HM/build --config Release --target TAppDecoder -j 4
+          cp "$(find JM/bin -type f -name ldecod | head -1)" ~/refdec/
+          cp "$(find HM/bin -type f -name TAppDecoder | head -1)" ~/refdec/
+          ls -l ~/refdec
+      - name: Build the decoder and encoder
+        run: cargo build --release --examples
+      - name: The vendored streams against JM / HM
+        env:
+          LDECOD: /home/runner/refdec/ldecod
+          TAPPDECODER: /home/runner/refdec/TAppDecoder
+        run: python tools/ref_decode.py check --dec target/release/examples/h26xdec tests/data/tiny_cabac.264 tests/data/tiny_cavlc.264 tests/data/tiny.265
+      - name: Encode round trip against JM / HM
+        env:
+          LDECOD: /home/runner/refdec/ldecod
+          TAPPDECODER: /home/runner/refdec/TAppDecoder
+        run: bash tools/ref_roundtrip.sh target/release/examples/h26xenc target/release/examples/h26xdec
