@@ -6,7 +6,7 @@
 # dropped or reordered fails as surely as a wrong sample.
 #
 # Redirect to tools/golden.txt. Do that only after check.sh has shown every
-# fixture identical to libavcodec: a golden records what the decoder DID,
+# fixture identical to the reference decoders (JM, HM): a golden records what the decoder DID,
 # and recording one to make a red run green records the bug.
 DEC=$1
 DIR=${2:-$H26X_WORK}

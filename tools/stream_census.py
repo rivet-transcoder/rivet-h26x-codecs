@@ -4,7 +4,7 @@ what an Annex-B stream actually carries, read from its parameter sets, its
 NAL headers and the start of each slice header.
 
 This exists so make_fixtures.sh can check a fixture's NAME against its
-BYTES. Both ffmpeg encoder wrappers only warn when an option is unknown or
+BYTES. The encoders only warn when an option is unknown or
 quietly overridden, and the option string the encoder writes into its SEI
 says what it was asked for, not what it wrote. A fixture named for a coding
 tool it does not contain is a green row that tests nothing; the census is
@@ -15,7 +15,7 @@ CABAC, 8x8 transform, scaling matrices, weighted prediction, constrained
 intra, slice groups, data partitioning; pictures, slices per picture, slice
 types, IDR count.
 
-HEVC: chroma, depth, CTU and minimum CB size, scaling lists (and whether
+HEVC: profile, chroma, depth, CTU and minimum CB size, scaling lists (and whether
 explicit), AMP, SAO, PCM, TMVP, strong intra smoothing, WPP, tiles, sign
 hiding, cu_qp_delta and its depth, constrained intra, transform skip,
 weighted prediction, transquant bypass, deblocking disabled in the PPS;
@@ -222,7 +222,10 @@ def census_h264(data):
 # ----------------------------------------------------------------- HEVC
 
 def hevc_ptl(b, max_sub_layers_minus1):
-    b.u(88)  # general profile space .. general reserved bits (2+1+5+32+48)
+    """general_profile_idc (the rest of profile_tier_level skipped)."""
+    b.u(3)  # general_profile_space, general_tier_flag
+    profile = b.u(5)
+    b.u(80)  # compatibility flags .. general reserved bits (32+48)
     b.u(8)  # general_level_idc
     present = [(b.u(1), b.u(1)) for _ in range(max_sub_layers_minus1)]
     if max_sub_layers_minus1 > 0:
@@ -233,6 +236,7 @@ def hevc_ptl(b, max_sub_layers_minus1):
             b.u(88)
         if lev:
             b.u(8)
+    return profile
 
 
 def hevc_skip_scaling_list_data(b):
@@ -285,7 +289,7 @@ def hevc_sps(rb):
     b.u(4)  # sps_video_parameter_set_id
     max_sub_layers_minus1 = b.u(3)
     b.u(1)  # sps_temporal_id_nesting_flag
-    hevc_ptl(b, max_sub_layers_minus1)
+    profile = hevc_ptl(b, max_sub_layers_minus1)
     b.ue()  # sps_seq_parameter_set_id
     chroma = b.ue()
     if chroma == 3:
@@ -334,7 +338,7 @@ def hevc_sps(rb):
             b.u(1)
     tmvp = b.u(1)
     strong = b.u(1)
-    return dict(chroma=chroma, depth=depth, ctu=1 << log2_ctu, min_cb=1 << log2_min_cb,
+    return dict(profile=profile, chroma=chroma, depth=depth, ctu=1 << log2_ctu, min_cb=1 << log2_min_cb,
                 max_tb=1 << log2_max_tb, crop=crop, sl=sl, sl_data=sl_data, amp=amp, sao=sao,
                 pcm=pcm, tmvp=tmvp, strong=strong, sub_layers=max_sub_layers_minus1 + 1,
                 _w=w, _h=h)
@@ -440,7 +444,7 @@ def census_hevc(data):
 ORDER_H264 = ("profile chroma depth frame_mbs_only mbaff crop cabac t8x8 sl wp wbi cip dfc "
               "slice_groups partitioned sps pps pics slices_per_pic idr islices pslices "
               "bslices sp_si").split()
-ORDER_HEVC = ("chroma depth ctu min_cb max_tb crop sub_layers sl sl_data amp sao pcm tmvp "
+ORDER_HEVC = ("profile chroma depth ctu min_cb max_tb crop sub_layers sl sl_data amp sao pcm tmvp "
               "strong wpp tiles sbh cuqp qg_depth cip tskip wp wbi tqbypass deblock_off vps "
               "sps pps pics slices_per_pic idr cra rasl radl irap tid_max islices pslices "
               "bslices").split()
