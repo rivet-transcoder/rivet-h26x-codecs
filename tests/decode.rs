@@ -17,9 +17,13 @@
 //! `tools/verify.sh`, which runs 412 real conformance streams; they are the
 //! part of it that fits in a repository and runs everywhere.
 //!
-//! The expected hashes were taken from this decoder's output *after* checking
-//! it frame-by-frame against libavcodec's `framemd5` for all three streams, so
-//! they are anchored to an independent decoder rather than to ourselves.
+//! The streams are x264 and x265 encodes of a synthetic clip, and the
+//! expected hashes are not this decoder's output: they are computed from the
+//! output of the ITU-T reference decoders — JM's `ldecod` for the two H.264
+//! streams, HM's `TAppDecoder` for HEVC — so they are anchored to an
+//! independent decoder rather than to ourselves. `tools/make_tiny_streams.sh`
+//! makes the streams and prints the hashes; the `reference` CI job decodes
+//! these files with JM and HM again on every run and compares the pictures.
 //! Regenerating them to make a red test go green is therefore never the fix.
 
 use h26x::Picture;
@@ -91,19 +95,19 @@ fn decode_hevc(data: &[u8]) -> (usize, u64) {
 fn h264_cabac_decodes_to_the_expected_bytes() {
     let (frames, hash) = decode_h264(include_bytes!("data/tiny_cabac.264"));
     assert_eq!(frames, 12, "frame count");
-    assert_eq!(hash, 0xf9c88492eba65cad, "output bytes");
+    assert_eq!(hash, 0xb088ec5117978d88, "output bytes");
 }
 
 #[test]
 fn h264_cavlc_decodes_to_the_expected_bytes() {
     let (frames, hash) = decode_h264(include_bytes!("data/tiny_cavlc.264"));
     assert_eq!(frames, 12, "frame count");
-    assert_eq!(hash, 0xd3f30ea4806b6fa1, "output bytes");
+    assert_eq!(hash, 0x83f3b2dd61096b23, "output bytes");
 }
 
 #[test]
 fn hevc_decodes_to_the_expected_bytes() {
     let (frames, hash) = decode_hevc(include_bytes!("data/tiny.265"));
     assert_eq!(frames, 12, "frame count");
-    assert_eq!(hash, 0x55a0af35d7a74a68, "output bytes");
+    assert_eq!(hash, 0xed1d0d0c4d5124ca, "output bytes");
 }
