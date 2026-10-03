@@ -58,8 +58,9 @@ The tools and the reference decoders are described in
 [tools/README.md](tools/README.md); none of it involves FFmpeg. Bit depths above 12, and extended precision at any depth, decode on a
 scalar `i32` pipeline beside the `i16` SIMD one the 8–12-bit streams keep.
 
-`Unsupported` is a *classification*, not a failure: rivet's decode tier list
-falls through to the next backend (openh264 for H.264).
+`Unsupported` is a *classification*, not a failure: it names what the
+stream uses that this decoder does not. In rivet, h26x is the last software
+tier, so such a stream is refused with that reason rather than handed on.
 
 ## What it encodes (in progress)
 
