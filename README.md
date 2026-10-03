@@ -2,7 +2,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/rivet-h26x.svg)](https://crates.io/crates/rivet-h26x)
 [![docs.rs](https://docs.rs/rivet-h26x/badge.svg)](https://docs.rs/rivet-h26x)
-[![CI](https://github.com/rivet-transcoder/rivet-h26x-codecs/actions/workflows/ci.yml/badge.svg)](https://github.com/rivet-transcoder/rivet-h26x-codecs/actions/workflows/ci.yml)
+[![CI](https://github.com/safewords/rivet-h26x-codecs/actions/workflows/ci.yml/badge.svg)](https://github.com/safewords/rivet-h26x-codecs/actions/workflows/ci.yml)
 
 Native **H.264/AVC** and **H.265/HEVC** decoders in Rust: no C, no system
 libraries, no build script, nothing to install on a build host. Bit-exact
@@ -16,7 +16,7 @@ AArch64's `sdot` has no intrinsic on stable Rust yet
 that one instruction goes through a stable `asm!` wrapper carrying the
 signature the intrinsic will have. Swapping it back is a one-line change.
 
-Written for the **[rivet](https://github.com/rivet-transcoder/rivet)**
+Written for the **[rivet](https://github.com/safewords/rivet)**
 transcoder, where they are the software decode tier for the two codecs every
 camera, phone and broadcast chain emits — under the GPU decoders (NVDEC / AMF /
 QSV) so a machine without a usable GPU still decodes — and usable on their own
