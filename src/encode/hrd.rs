@@ -1091,12 +1091,11 @@ mod tests {
         // the controller has to meet the stop with filler and the restart
         // without underflowing.
         //
-        // A second, because a longer stop is more than this buffer's
-        // controller can climb out of at any rate: the still pictures walk
-        // the quantiser down, and the first moving picture after two
-        // seconds of them misses the 300 ms buffer even after the three
-        // codings `rc::MAX_ATTEMPTS` allows — refused by name, a variable
-        // rate exactly as a constant one.
+        // The still pictures walk the quantiser down, and the first moving
+        // picture after them is planned far too fine. Until the last
+        // attempt went to quantiser 51 (`rc::MAX_ATTEMPTS`) a stop of two
+        // seconds was refused by name, the law's three codings all missing
+        // the 300 ms buffer; a three-second stop now conforms too.
         let mixed: Vec<Vec<u8>> = (0..n).map(|i| if (4 * FPS as usize..5 * FPS as usize).contains(&i) { still[0].clone() } else { moving[i].clone() }).collect();
         let encode = |h264: bool, cfg: &Config, frames: &[Vec<u8>]| -> (Vec<Access>, Vec<Vec<u8>>) {
             let mut units = Vec::new();
@@ -1293,5 +1292,113 @@ mod tests {
         }
         let ok = Config { rate: RateControl::Bitrate { bps: 100_000 }, cpb_ms: 500, ..base };
         assert!(ok.validate().is_ok());
+    }
+
+    /// A constant-rate stream keeps the model it declares whatever it
+    /// carries: pure noise (more than any quantiser can bring down to the
+    /// rate at a fine one), hard scene cuts that do not fall on a keyframe,
+    /// fast motion and a held picture, each in H.264, H.265, and H.265
+    /// planning through its lookahead, at a one-second buffer and a short
+    /// one.
+    ///
+    /// What the standards require of it (H.264 C.1 / C.3, H.265 C.1 /
+    /// C.4): the coded picture buffer neither underflows nor, with
+    /// `cbr_flag` set, overflows — checked by [`verify`] off the bytes.
+    /// That model bounds every interval directly: the bits removed over
+    /// one second cannot exceed what arrived in it (the rate) plus what
+    /// the buffer held at its start (at most its size), so no one-second
+    /// window of pictures spends more than the rate plus the buffer. That
+    /// consequence is asserted separately, from the access unit sizes
+    /// alone, because it is what a player's network sees. And the average
+    /// is the declared rate within ten percent.
+    #[test]
+    fn constant_rate_holds_its_model_across_content() {
+        use crate::encode::{Config, RateControl};
+        const W: usize = 64;
+        const H: usize = 64;
+        const FPS: u32 = 30;
+        const SECONDS: usize = 6;
+        const BPS: u32 = 160_000;
+        let n = FPS as usize * SECONDS;
+        let mut seed = 0x9e37_79b9u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let frame = |luma: &dyn Fn(usize, usize) -> u8, chroma: u8| {
+            let mut f = vec![chroma; W * H * 3 / 2];
+            for y in 0..H {
+                for x in 0..W {
+                    f[y * W + x] = luma(x, y);
+                }
+            }
+            f
+        };
+        let noise: Vec<Vec<u8>> = (0..n).map(|_| (0..W * H * 3 / 2).map(|_| rnd() as u8).collect()).collect();
+        let motion: Vec<Vec<u8>> = (0..n).map(|i| frame(&|x, y| (((x + 5 * i) * 9) ^ ((y + 3 * i) * 7)) as u8, 128)).collect();
+        let held = vec![frame(&|x, y| ((x * 3) ^ (y * 5)) as u8, 120); n];
+        // Four unrelated scenes, cut every 41 pictures — never on the
+        // 30-picture GOP — between smooth, detailed, noisy and moving.
+        let cuts: Vec<Vec<u8>> = (0..n)
+            .map(|i| match (i / 41) % 4 {
+                0 => frame(&|x, y| (x + y + i) as u8, 128),
+                1 => held[0].clone(),
+                2 => noise[i].clone(),
+                _ => motion[i].clone(),
+            })
+            .collect();
+        for (codec, lookahead) in [("H.264", 0u32), ("H.265", 0), ("H.265 lookahead", 8)] {
+            let h264 = codec == "H.264";
+            for (content, frames) in [("noise", &noise), ("cuts", &cuts), ("motion", &motion), ("held", &held)] {
+                for cpb_ms in [1000u32, 300] {
+                    let tag = format!("{codec} {content} {cpb_ms} ms");
+                    let cfg = Config {
+                        width: W as u32,
+                        height: H as u32,
+                        fps: FPS,
+                        gop: 30,
+                        rate: RateControl::Bitrate { bps: BPS },
+                        cpb_ms,
+                        cbr: true,
+                        lookahead,
+                        max_cu_depth: if h264 { None } else { Some(1) },
+                        ..Config::default()
+                    };
+                    let mut sizes = Vec::new();
+                    let mut stream = Vec::new();
+                    let mut take = |units: Vec<crate::encode::Access>| {
+                        for u in units {
+                            sizes.push(u.data.len() as u64 * 8);
+                            stream.extend_from_slice(&u.data);
+                        }
+                    };
+                    if h264 {
+                        let mut e = crate::encode::h264::H264Encoder::new(cfg.clone()).unwrap();
+                        for f in frames.iter() {
+                            take(e.push(f).unwrap_or_else(|err| panic!("{tag}: {err}")));
+                        }
+                        take(e.flush().unwrap_or_else(|err| panic!("{tag}: {err}")));
+                    } else {
+                        let mut e = crate::encode::h265::H265Encoder::new(cfg.clone()).unwrap();
+                        for f in frames.iter() {
+                            take(e.push(f).unwrap_or_else(|err| panic!("{tag}: {err}")));
+                        }
+                        take(e.flush().unwrap_or_else(|err| panic!("{tag}: {err}")));
+                    }
+                    assert_eq!(sizes.len(), n, "{tag}");
+                    let r = verify(&stream).unwrap_or_else(|err| panic!("{tag}: {err}"));
+                    assert!(r.conforms(), "{tag}: {:?} {:?}", r.underflow, r.overflow);
+                    let (rate, size) = (r.bit_rate as f64, r.cpb_size as f64);
+                    let total: u64 = sizes.iter().sum();
+                    let average = total as f64 / SECONDS as f64;
+                    assert!((average / f64::from(BPS) - 1.0).abs() <= 0.10, "{tag}: {average:.0} b/s against {BPS}");
+                    let peak = sizes.windows(FPS as usize).map(|w| w.iter().sum::<u64>()).max().unwrap() as f64;
+                    assert!(peak <= rate + size, "{tag}: a one-second window spent {peak:.0} bits, over the rate plus the buffer ({:.0})", rate + size);
+                    eprintln!("{tag}: average {:.3}x, peak one-second window {:.3}x of rate + buffer", average / rate, peak / (rate + size));
+                }
+            }
+        }
     }
 }

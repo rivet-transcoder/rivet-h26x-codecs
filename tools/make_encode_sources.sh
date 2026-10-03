@@ -96,11 +96,13 @@ gen static static  8 64x64_420
 # The scene cut: 51 frames of one source, then 45 of a structurally
 # unrelated one (`detail`, then `zoom` from its first frame), spliced with
 # no transition.
-# With this corpus (2026-10) two H.265 lookahead rate cells
-# (hevc-abr-la-64k / -96k) spend about twice their target in the GOP
-# holding the cut and land the window around it at 1.2x, outside 4b's
-# band, which was measured on the previous (lavfi) corpus; every other
-# cell on this clip holds.
+# With this corpus (2026-10) it found a fault the previous (lavfi) one
+# hid: the H.265 lookahead priced the pictures past the cut at the old
+# scene's bits per cost, saw them as nearly free, and gave the pictures
+# before the cut up to four times their share — hevc-abr-la-64k / -96k
+# landed the 3-GOP window around it at 1.20x / 1.24x, outside 4b's band.
+# The window now stops at a cut (encode::h265 SCENE_CUT_RATIO): 1.12x /
+# 1.16x.
 gen cut    cut    96 64x64_420
 # The fade: every picture is the one before it at a lower luma gain,
 # `Y * (1 - N/16)` over twelve frames, chroma untouched. Nothing above
@@ -144,10 +146,10 @@ gen wpoff  wpoff  12 64x64_420p8
 # a first picture already at the floor, and short GOPs keep the keyframes
 # able to spend what the held P pictures cannot. `p8` keeps untagged rows
 # off it; only `@settle` rows visit it.
-# With this corpus (2026-10) the h264-verdict-g2-256k row lands one
-# 3-GOP window at 1.27x in the hold, outside 4b's band; the 192k row reaches
-# its verdict and holds the band. The thresholds were measured on the
-# previous (lavfi) corpus.
+# With this corpus (2026-10) the h264-verdict-g2-256k row releases its
+# verdict late in the hold and repays the budget the hold saved: 1.27x over
+# three of its two-picture GOPs, 1.12x over the 24 pictures 4b's thresholds
+# were measured on, which is the window 4b now takes (verify_encode.sh 4b).
 gen settle settle 96 64x64_420p8
 
 # Deep samples. The format token grows a depth suffix — `420p10` — which

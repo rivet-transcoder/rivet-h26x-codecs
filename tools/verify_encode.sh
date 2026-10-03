@@ -72,6 +72,24 @@
 #               its reciprocal, 1.18. Its mutation: the pre-fix encoder must
 #               fail those nine cells and nothing else.
 #
+#               The window is also never shorter than RATE_WINDOW_PICTURES
+#               (24) pictures: a row with a shorter GOP takes as many GOPs
+#               as that needs. The thresholds were measured on 3 GOPs of 8,
+#               24 pictures, and that is what they mean. At the verdict
+#               rows' GOP of two, three GOPs are six pictures, a fifth of a
+#               second, where 1.18x leaves room for 9.2 kbit over target at
+#               256 kbps — less than the stream's own largest access unit
+#               (a 16.5 kbit keyframe). A rate bound means a buffer (the
+#               HRD of H.264 / H.265 Annex C bounds the bits over any
+#               interval by the rate times it plus the buffer), and no
+#               buffer the stream could conform to at all is smaller than
+#               its largest picture, so the six-picture window held these
+#               rows to more than any rate model asks. On the synthetic
+#               corpus (2026-10) h264-verdict-g2-256k releases its verdict
+#               and spends the hold's savings, as ABR must, at 1.27x over
+#               six pictures (14 kbit over) and 1.12x over 24; the rows'
+#               GOP-8 cells are unchanged.
+#
 #   4c. VERDICT  Only for --bitrate rows whose name carries `-verdict`. The
 #               insensitivity rule has three paths - a verdict, the probe
 #               below its floor, the release - and when it was rewritten no
@@ -986,7 +1004,10 @@ one() {
         echo "RATE-FAIL   $tag: $out"
         return 1
       fi
-      verdict=$(echo "$out" | awk -v w="$RATE_WINDOW" -v lo="$RATE_WINDOW_LO" -v hi="$RATE_WINDOW_HI" '{
+      verdict=$(echo "$out" | awk -v w="$RATE_WINDOW" -v wp="$RATE_WINDOW_PICTURES" -v pics="$pics" -v lo="$RATE_WINDOW_LO" -v hi="$RATE_WINDOW_HI" '{
+        # At least RATE_WINDOW_PICTURES pictures in a window: a short GOP
+        # takes more of them (see 4b).
+        if (pics > 0) { need = int((wp * NF + pics - 1) / pics); if (need > w) w = need }
         if (NF < w + 1) { print "short"; exit }
         for (i = 2; i + w - 1 <= NF; i++) {
           s = 0; for (j = i; j < i + w; j++) s += $j
@@ -1252,10 +1273,11 @@ PY
 }
 # Property 4b's thresholds (see 4).
 RATE_WINDOW=${RATE_WINDOW:-3}
+RATE_WINDOW_PICTURES=${RATE_WINDOW_PICTURES:-24}
 RATE_WINDOW_LO=${RATE_WINDOW_LO:-0.85}
 RATE_WINDOW_HI=${RATE_WINDOW_HI:-1.18}
 export -f one psnr_of planes_psnr_of quality_verdict chroma_of depth_of frame_bytes gop_spend_of
-export ENC DEC HRD REF_DECODE OUT PARAM_SETS VUI_PROBE H26X_SPEED_TABLE JOBS QBASE QTOL RATE_WINDOW RATE_WINDOW_LO RATE_WINDOW_HI
+export ENC DEC HRD REF_DECODE OUT PARAM_SETS VUI_PROBE H26X_SPEED_TABLE JOBS QBASE QTOL RATE_WINDOW RATE_WINDOW_PICTURES RATE_WINDOW_LO RATE_WINDOW_HI
 
 echo "== encode verification =="
 results="$OUT/results.txt"

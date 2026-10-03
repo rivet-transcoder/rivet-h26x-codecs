@@ -154,6 +154,10 @@ struct Core<S: Sample> {
     /// came out too large for it and were coded again at a higher
     /// quantiser. Reported rather than hidden, as on the H.265 side.
     recoded: u64,
+    /// How many P pictures went out as every macroblock `P_Skip` because
+    /// not even quantiser 51 fitted the declared buffer, or kept it from
+    /// draining (`RateController::starving`; [`Core::skip_fallback`]).
+    skipped: u64,
     /// The SPS and PPS payloads a decoder of the stream so far holds —
     /// what the last committed access unit to carry them carried — or
     /// `None` before the first. See [`Core::param_sets`].
@@ -609,6 +613,12 @@ impl H264Encoder {
         with_core!(&self.inner, e => e.recoded)
     }
 
+    /// How many P pictures were coded as all `P_Skip` because not even
+    /// quantiser 51 fitted the declared buffer. Zero without a buffer.
+    pub fn buffer_skips(&self) -> u64 {
+        with_core!(&self.inner, e => e.skipped)
+    }
+
     /// How many bytes one source picture must be: one per sample at 8
     /// bits, two (little-endian) deeper.
     pub fn frame_bytes(&self) -> usize {
@@ -911,6 +921,7 @@ impl<S: Sample> Core<S> {
             cbr,
             last_bp_encode: 0,
             recoded: 0,
+            skipped: 0,
             sent_sets: None,
         })
     }
@@ -998,7 +1009,8 @@ impl<S: Sample> Core<S> {
     /// this existed.
     fn code_picture(&mut self, c: Coded, src: &[S]) -> Result<Access> {
         let mut qp = self.pick_picture_qp(&c);
-        for attempt in 0..super::rc::MAX_ATTEMPTS {
+        // One attempt beyond the escalations: see `rc::MAX_ATTEMPTS`.
+        for attempt in 0..=super::rc::MAX_ATTEMPTS {
             let a = match (self.fields.is_some(), self.cfg.field_coding) {
                 (false, _) => self.code_attempt(&c, src, qp)?,
                 (true, FieldCoding::Field) => self.code_attempt_fields(&c, src, qp)?,
@@ -1015,13 +1027,38 @@ impl<S: Sample> Core<S> {
             // Under a constant rate the buffer is walked exactly as well,
             // and the exact figure is the one the stream is held to.
             let afford = self.cbr.as_ref().map_or(afford, |b| afford.min(b.available()));
-            if bits <= afford {
+            let starving = self.rc.as_ref().is_some_and(|rc| rc.starving(qp, bits));
+            if bits <= afford && !starving {
                 if let Some(rc) = self.rc.as_mut() {
                     rc.note_recode(qp);
                 }
                 return Ok(self.commit(&c, a, qp));
             }
-            if attempt + 1 == super::rc::MAX_ATTEMPTS || qp >= 51 {
+            if qp >= 51 {
+                // Not even the coarsest quantiser fits. A P picture still
+                // has one coding whose size does not depend on the
+                // content: every macroblock P_Skip, the reference repeated
+                // — a handful of bits, and a picture the next ones correct.
+                // That keeps the buffer the stream declares, which is the
+                // promise; a picture held for one frame is the price.
+                if let Some(skip) = self.skip_fallback(&c, src, qp)? {
+                    let skipped = skip.access.data.len() as u64 * 8;
+                    if skipped <= afford {
+                        self.skipped += 1;
+                        if let Some(rc) = self.rc.as_mut() {
+                            rc.note_recode(qp);
+                            rc.note_unmodelled();
+                        }
+                        return Ok(self.commit(&c, skip, qp));
+                    }
+                }
+                if bits <= afford {
+                    // Starving, with no fallback to give way to: it fits.
+                    if let Some(rc) = self.rc.as_mut() {
+                        rc.note_recode(qp);
+                    }
+                    return Ok(self.commit(&c, a, qp));
+                }
                 // The declared buffer is smaller than this content can be
                 // coded into: a configuration error, refused by name rather
                 // than shipped as a stream that violates what it declares.
@@ -1031,7 +1068,7 @@ impl<S: Sample> Core<S> {
                 )));
             }
             self.recoded += 1;
-            qp = RateController::escalate(qp, bits, afford);
+            qp = RateController::next_attempt_qp(attempt, qp, bits, afford);
         }
         unreachable!("the loop returns or errors on its last attempt")
     }
@@ -1212,11 +1249,11 @@ impl<S: Sample> Core<S> {
     /// P pictures coded twice fall from 53 to 2 on the zoom, 57 to 0 on the
     /// cut and 92 to 26 on the pan; the fade keeps all 80 of its own.
     fn code_attempt(&self, c: &Coded, src: &[S], qp: u8) -> Result<Attempt<S>> {
-        let fitted = self.code_attempt_weighted(c, src, qp, true)?;
+        let fitted = self.code_attempt_weighted(c, src, qp, true, false)?;
         if !fitted.motion.weighting.on || fitted.strong_fit {
             return Ok(fitted);
         }
-        let mut plain = self.code_attempt_weighted(c, src, qp, false)?;
+        let mut plain = self.code_attempt_weighted(c, src, qp, false, false)?;
         let scale = f64::from(1u32 << (2 * (self.cfg.bit_depth - 8)));
         let lam = f64::from(super::h264_intra::lambda(i32::from(qp))) * scale;
         let cost = |a: &Attempt<S>| ssd_packed(src, &a.rec) as f64 + lam * (a.access.data.len() * 8) as f64;
@@ -1230,6 +1267,20 @@ impl<S: Sample> Core<S> {
         Ok(fitted)
     }
 
+    /// The coding of a P picture that fits any buffer that can hold a
+    /// picture at all: every macroblock `P_Skip`, the reference repeated,
+    /// for when not even quantiser 51 fits (see [`Self::code_picture`]).
+    /// `None` where that spelling is not available — not a P picture, a
+    /// field or MBAFF picture, or under weighted prediction, where
+    /// `P_Skip` predicts through the table and the all-skip path, which
+    /// copies the reference, would not be what a decoder makes of it.
+    fn skip_fallback(&self, c: &Coded, src: &[S], qp: u8) -> Result<Option<Attempt<S>>> {
+        if c.kind != Kind::P || self.fields.is_some() || self.cfg.weighted_pred || matches!(self.cfg.rate, RateControl::Lossless) {
+            return Ok(None);
+        }
+        self.code_attempt_weighted(c, src, qp, false, true).map(Some)
+    }
+
     /// Code one picture at a given quantiser, keeping nothing: parameter
     /// sets, the buffer SEI where a buffer is declared, slice header, then
     /// the slice data of whichever path the configuration selects — the
@@ -1238,7 +1289,10 @@ impl<S: Sample> Core<S> {
     /// weighted P or B picture under a table of defaults whatever its fit
     /// says: the alternative [`Self::code_attempt`] prices a fitted table
     /// against.
-    fn code_attempt_weighted(&self, c: &Coded, src: &[S], qp: u8, fit: bool) -> Result<Attempt<S>> {
+    ///
+    /// `skip` codes a P picture as every macroblock `P_Skip` whatever the
+    /// configuration: the buffer's last resort ([`Self::skip_fallback`]).
+    fn code_attempt_weighted(&self, c: &Coded, src: &[S], qp: u8, fit: bool, skip: bool) -> Result<Attempt<S>> {
         let g = self.geom;
         let idr = c.kind == Kind::Idr;
         // Reference lists, by picture order count: list0 runs backwards from
@@ -1337,7 +1391,7 @@ impl<S: Sample> Core<S> {
         let transform_intra = idr && lossy;
         // Whether a P picture takes the motion-search path rather than
         // all-skip: the same envelope as the intra transform path.
-        let transform_p = !idr && c.kind == Kind::P && lossy;
+        let transform_p = !idr && c.kind == Kind::P && lossy && !skip;
         // B pictures share the envelope: inside it every picture type is
         // transform-coded, so a colocated picture's motion is always the
         // real record the direct derivation needs; outside it everything

@@ -281,6 +281,15 @@ struct Core<S: Sample> {
     /// The display-size luma of the last picture pushed, which the next
     /// one's inter cost is measured against. `None` without a lookahead.
     last_luma: Option<Vec<S>>,
+    /// Display indices at which the lookahead saw the scene change
+    /// ([`scene_cut`]): a picture whose own texture, its intra cost, is
+    /// more than [`SCENE_CUT_RATIO`] away from the picture before it. The
+    /// rate controller's window stops at one (see
+    /// [`Core::lookahead_window`]). Empty without a lookahead.
+    cuts: std::collections::BTreeSet<u64>,
+    /// The intra cost of the last picture pushed, which the next one's is
+    /// compared with for [`scene_cut`].
+    last_intra: u64,
     /// The quantiser the last kept picture was coded at, which is what
     /// the lookahead's inter-cost floor ([`PicCost::inter_floor`]) is
     /// scaled by: a picture predicted from a reference carries that
@@ -634,6 +643,8 @@ impl<S: Sample> Core<S> {
             offered: 0,
             costs: std::collections::BTreeMap::new(),
             last_luma: None,
+            cuts: std::collections::BTreeSet::new(),
+            last_intra: 0,
             last_qp: None,
             refs: Vec::new(),
         })
@@ -672,6 +683,10 @@ impl<S: Sample> Core<S> {
             // luma is kept aside for exactly this.
             let (dw, dh) = (self.cfg.width as usize, self.cfg.height as usize);
             let cost = PicCost::measure(&samples[..dw * dh], dw, dh, self.last_luma.as_deref(), self.cfg.bit_depth);
+            if self.last_luma.is_some() && scene_cut(self.last_intra, cost.intra) {
+                self.cuts.insert(display);
+            }
+            self.last_intra = cost.intra;
             self.costs.insert(display, cost);
             self.last_luma = Some(samples[..dw * dh].to_vec());
         }
@@ -714,6 +729,12 @@ impl<S: Sample> Core<S> {
             let mut access = self.code_picture(c, &src, &ready[i + 1..])?;
             let filler = self.stuff(&mut access);
             self.costs.remove(&c.display);
+            // A cut at or below every picture still held separates none of
+            // them from another.
+            match self.costs.keys().next() {
+                Some(&first) => self.cuts = self.cuts.split_off(&first),
+                None => self.cuts.clear(),
+            }
             // The ledger closes here, at the one place every picture of
             // every kind passes through — an accounting call inside each
             // coding path could be forgotten in one of them, and the
@@ -775,7 +796,8 @@ impl<S: Sample> Core<S> {
     fn code_picture(&mut self, c: Coded, src: &[S], upcoming: &[Coded]) -> Result<Access> {
         let mut qp = self.pick_picture_qp(&c, upcoming)?;
         let bypass = matches!(self.cfg.rate, RateControl::Lossless);
-        for attempt in 0..super::rc::MAX_ATTEMPTS {
+        // One attempt beyond the escalations: see `rc::MAX_ATTEMPTS`.
+        for attempt in 0..=super::rc::MAX_ATTEMPTS {
             let a = self.code_attempt(c, src, qp, bypass)?;
             let bits = a.access.data.len() as u64 * 8;
             // A picture planned from a seed and nothing else: its own bits
@@ -800,19 +822,20 @@ impl<S: Sample> Core<S> {
                 }
                 return Ok(self.commit(&c, a, qp));
             }
-            if attempt + 1 == super::rc::MAX_ATTEMPTS || qp >= 51 {
+            if qp >= 51 {
                 // The declared buffer is smaller than this content can be
-                // coded into. That is a configuration error, and emitting
-                // a stream that declares a buffer it violates is the one
-                // outcome this whole feature exists to prevent — so it
-                // refuses by name rather than shipping it.
+                // coded into even at the coarsest quantiser. That is a
+                // configuration error, and emitting a stream that declares
+                // a buffer it violates is the one outcome this whole
+                // feature exists to prevent — so it refuses by name rather
+                // than shipping it.
                 return Err(Error::unsupported(format!(
-                    "H.265 encode: picture {} needs {bits} bits and the declared buffer affords {afford}                      even at quantiser {qp} (the coded picture buffer is too small for this content)",
+                    "H.265 encode: picture {} needs {bits} bits and the declared buffer affords {afford} even at quantiser {qp} (the coded picture buffer is too small for this content)",
                     c.poc
                 )));
             }
             self.recoded += 1;
-            qp = RateController::escalate(qp, bits, afford);
+            qp = RateController::next_attempt_qp(attempt, qp, bits, afford);
         }
         unreachable!("the loop returns or errors on its last attempt")
     }
@@ -862,11 +885,19 @@ impl<S: Sample> Core<S> {
             let cost = if kind.is_intra() { pc.intra } else { pc.inter_cost(qp_ref, self.cfg.weighted_pred) };
             (cost as f64).max(1.0)
         };
+        // Only the pictures of this picture's own scene: none with a cut
+        // between it and this one. See `scene_cut` for why.
+        let same_scene = |display: u64| {
+            let (lo, hi) = if display < c.display { (display, c.display) } else { (c.display, display) };
+            self.cuts.range(lo + 1..=hi).next().is_none()
+        };
         let mine = cost_of(c.kind, c.display);
         let mut window = vec![(pic_kind(c.kind), mine)];
-        window.extend(upcoming.iter().map(|u| (pic_kind(u.kind), cost_of(u.kind, u.display))));
+        window.extend(upcoming.iter().filter(|u| same_scene(u.display)).map(|u| (pic_kind(u.kind), cost_of(u.kind, u.display))));
         let ahead = self.next_display - self.offered;
-        window.extend(self.sched.preview(ahead).iter().map(|p| (pic_kind(p.kind), cost_of(p.kind, p.display))));
+        window.extend(
+            self.sched.preview(ahead).iter().filter(|p| same_scene(p.display)).map(|p| (pic_kind(p.kind), cost_of(p.kind, p.display))),
+        );
         (mine, window)
     }
 
@@ -1760,6 +1791,39 @@ const REF_NOISE_HALVING: f64 = 12.0;
 /// 0.888: its end pictures had been cancelling an under-spent keyframe,
 /// and a cheaper price uncaps more of them.
 const CAP_DC_PRICE: u64 = 16;
+
+/// How far a picture's intra cost may move from the picture before it,
+/// as a ratio either way, and still be the same scene to the lookahead.
+///
+/// The lookahead plans a picture by its share of the window — `k * cost`
+/// over the window's mean — and prices every picture in the window with
+/// the bits per cost (`k`) the controller has measured so far. That `k`
+/// is a property of the scene as much as of the codec: the inter cost is
+/// taken at zero motion, so content the motion search follows well (a
+/// pan) codes far below its cost and content it follows badly (a zoom)
+/// far above it. On the cut clip (`detail` panning, then `zoom`) the
+/// P pictures' `k` went from 0.4 before the cut to 2.8 after it. Priced at
+/// the old scene's `k`, the new scene looked nearly free, so the pictures
+/// before the cut took two to four times their share of a window that was
+/// in truth all expensive, and the scene after it then repaid the debt:
+/// at 96 kbps under `--lookahead 8` the GOP before the cut spent 1.51x of
+/// target and the one after it 0.68x.
+///
+/// A picture past a cut is therefore left out of the window: until the
+/// new scene has been coded, nothing the controller knows prices it. A
+/// picture's intra cost — its texture against each block's own mean,
+/// with no reference — moves smoothly through motion, pans, fades and
+/// dissolves, and jumps at a cut between unrelated content (149k to 48k
+/// on that clip). Two is the smallest ratio no picture of the encode
+/// corpus crosses except at its cut.
+const SCENE_CUT_RATIO: f64 = 2.0;
+
+/// Whether a picture of intra cost `now`, after one of `before`, starts
+/// a new scene to the lookahead ([`SCENE_CUT_RATIO`]).
+fn scene_cut(before: u64, now: u64) -> bool {
+    let (a, b) = (before.max(1) as f64, now.max(1) as f64);
+    a / b > SCENE_CUT_RATIO || b / a > SCENE_CUT_RATIO
+}
 
 impl PicCost {
     /// The cost an inter picture is planned at, predicted from a reference

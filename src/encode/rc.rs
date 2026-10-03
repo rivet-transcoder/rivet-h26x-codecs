@@ -798,14 +798,25 @@ const CPB_AIM: f64 = 0.75;
 /// from the room a keyframe has to overspend into.
 const CBR_FULLNESS: f64 = 0.8;
 
-/// How many times a picture may be coded before the encoder gives up on
-/// fitting it into the buffer — the first attempt plus this many more.
+/// How many times a picture may be coded at a quantiser the law chose
+/// before the encoder stops trusting the law — the first attempt plus
+/// this many more.
 ///
 /// Two, because the correction is computed rather than searched: the same
 /// law the controller steers by says how many quantiser steps a given
 /// overshoot needs, so one re-code should land. The second exists because
 /// the law is an approximation and the first correction can undershoot;
 /// a third would be chasing a model that more attempts do not improve.
+///
+/// After them comes one more, at quantiser 51
+/// ([`RateController::next_attempt_qp`]), and only then a refusal. The
+/// law is fitted to the stream's recent pictures, and across a scene cut
+/// they say nothing: a held picture followed by noise was planned at
+/// quantiser 10, escalated to 30 by the law, still needed 27168 bits of a
+/// 14832-bit buffer, and the encoder refused a constant-rate stream that
+/// quantiser 51 codes inside its buffer. A declared buffer is a promise
+/// the stream keeps (H.264 / H.265 Annex C); the refusal is for content
+/// no quantiser fits, not for content the model mispredicted.
 pub const MAX_ATTEMPTS: u32 = 3;
 
 /// Quantiser bounds. The syntax allows 0..=51 and both ends are legal;
@@ -1091,6 +1102,8 @@ pub struct RateController {
     /// that was coded again — so [`RateController::seed_recode`] may ask
     /// for it to be coded again too.
     pending_seeded: bool,
+    /// See [`RateController::note_unmodelled`].
+    pending_unmodelled: bool,
     /// Whether the stream's first picture was coded again by
     /// [`RateController::seed_recode`]. From then on its bits per cost is a
     /// measurement at a quantiser the picture shipped at, and a kind that
@@ -1176,6 +1189,7 @@ impl RateController {
             pictures: 0,
             pending: None,
             pending_seeded: false,
+            pending_unmodelled: false,
             keyframe_recoded: false,
             last_cost: [None; 3],
             last_observed: None,
@@ -1255,6 +1269,41 @@ impl RateController {
         }
         let steps = (6.0 * (actual as f64 / affordable as f64).log2()).ceil() as i32 + 1;
         (qp as i32 + steps.max(1)).clamp(QP_MIN, QP_MAX) as u8
+    }
+
+    /// The quantiser for the next coding of a picture whose attempt
+    /// number `attempt` (from 0) came out at `actual` bits at `qp` when
+    /// `affordable` were available: the law's correction
+    /// ([`RateController::escalate`]) for the first [`MAX_ATTEMPTS`], then
+    /// the coarsest quantiser the syntax has.
+    pub fn next_attempt_qp(attempt: u32, qp: u8, actual: u64, affordable: u64) -> u8 {
+        if attempt + 1 >= MAX_ATTEMPTS { QP_MAX as u8 } else { Self::escalate(qp, actual, affordable) }
+    }
+
+    /// Whether a picture that came out at `bits` at quantiser `qp` and
+    /// fits the declared buffer should still give way to a coding whose
+    /// size does not depend on the content (H.264's all-skip P picture).
+    ///
+    /// When even quantiser 51 spends more than a picture's arrival, the
+    /// content is beyond what the quantiser can bring to the rate: every
+    /// such picture drains the buffer, and the picture that finally cannot
+    /// fit is often a keyframe, which has no such coding. So once the
+    /// buffer would be left below half full, a P picture at 51 that still
+    /// overspends goes out as the fallback, and the buffer refills by the
+    /// arrival it no longer spends. Never without a declared buffer.
+    pub fn starving(&self, qp: u8, bits: u64) -> bool {
+        let Some((size, fullness)) = self.cpb else { return false };
+        let after = (fullness + self.per_picture).min(size) - bits as f64;
+        i32::from(qp) >= QP_MAX && bits as f64 > self.per_picture && after < 0.5 * size
+    }
+
+    /// Tell the controller the pending picture's bits say nothing about
+    /// its content — it went out in a spelling whose size does not depend
+    /// on it (H.264's all-skip last resort) — so they are counted in the
+    /// ledger, the bucket and the buffer like any other, and not pinned
+    /// into the model.
+    pub fn note_unmodelled(&mut self) {
+        self.pending_unmodelled = true;
     }
 
     /// Tell the controller the quantiser the picture was **actually** coded
@@ -1526,6 +1575,9 @@ impl RateController {
         // The model check, reported never gated: how far the picture
         // landed from what it was planned at, in quantiser steps of the
         // law (six per doubling). Zero would mean the model was exact.
+        if std::mem::take(&mut self.pending_unmodelled) {
+            return;
+        }
         if coded > 0 && self.planned > 0.0 {
             self.plan_error += (coded as f64 / self.planned).log2().abs() * 6.0;
             self.plan_count += 1;
@@ -1585,6 +1637,7 @@ impl RateController {
             cpb: self.cpb,
             pending: self.pending,
             pending_seeded: self.pending_seeded,
+            pending_unmodelled: self.pending_unmodelled,
             keyframe_recoded: self.keyframe_recoded,
             last_cost: self.last_cost,
             last_observed: self.last_observed,

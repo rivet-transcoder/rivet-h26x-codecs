@@ -419,6 +419,9 @@ fn main() {
     if enc.recodes() != 0 {
         eprintln!("rate: {} extra codings to fit the declared buffer", enc.recodes());
     }
+    if enc.buffer_skips() != 0 {
+        eprintln!("rate: {} P pictures coded all-skip to fit the declared buffer", enc.buffer_skips());
+    }
     // Parsed by the gate, as on the H.265 path.
     if let Some(i) = enc.rate_insensitivity() {
         eprintln!("rate: insensitivity verdicts {}, probes {}, releases {}", i.verdicts, i.probes, i.releases);
