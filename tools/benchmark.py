@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""benchmark.py — this decoder against libavcodec, per instruction-set tier.
+"""benchmark.py — this decoder per instruction-set tier.
 
 Emits Markdown tables: one per stream, rows for each SIMD tier this CPU can
-run and for ffmpeg, columns for single-threaded and all-threads. The point of
+run, columns for single-threaded and all-threads, each tier's single-thread
+cost also given against the scalar reference. The point of
 splitting by tier is that "how fast is it" has no answer without saying which
 instructions it was allowed to use — and the tier a machine actually takes is
 chosen at run time, so the table doubles as a map of what different hardware
 gets.
 
-Both sides decode and materialise every frame: ffmpeg writes rawvideo to the
-null device, this decoder packs each picture and drops it. Neither writes to
-disk. Cost is CPU seconds (user+kernel) — wall time on a machine doing
+Every frame is decoded and materialised: the decoder packs each picture and
+drops it, writing nothing to disk. Cost is CPU seconds (user+kernel) — wall time on a machine doing
 anything else measures the scheduler — and throughput is frames per wall
 second, which is what a multi-threaded run is actually for.
 
@@ -20,7 +20,7 @@ opposite of the choice `ab.py` makes, and for the opposite reason — comparing
 two builds divides one noisy measurement by another, and there the minimum is
 the statistic a single lucky run can poison.
 
-  python benchmark.py [--runs N] [--dec PATH] [--ffmpeg PATH] [--streams a,b]
+  python benchmark.py [--runs N] [--dec PATH] [--streams a,b]
 """
 import argparse
 import ctypes
@@ -80,11 +80,10 @@ class JobAccounting(ctypes.Structure):
 def job_cpu_seconds(job):
     """CPU time of every process that ran in `job`, finished or not.
 
-    A process is the wrong unit to measure. `ffmpeg` on this machine is a
-    136 KB scoop shim that spawns the real binary as a child, so asking the
-    process we launched how much CPU it used answered 0.03 seconds for work
-    that took 1.44 — a 46x understatement that reads as a spectacular win for
-    whatever it is being compared against. A job object catches the children.
+    A process is the wrong unit to measure. A launcher or package-manager
+    shim spawns the real binary as a child, so asking the process we launched
+    how much CPU it used once answered 0.03 seconds for work that took 1.44 —
+    a 46x understatement. A job object catches the children.
     """
     info = JobAccounting()
     ok = ctypes.windll.kernel32.QueryInformationJobObject(
@@ -139,7 +138,7 @@ def run_best(cmd, env_extra, runs):
     """
     env = dict(os.environ)
     env.update(env_extra)
-    single = env.get("H26X_THREADS") == "1" or "-threads" in cmd
+    single = env.get("H26X_THREADS") == "1"
     best_cpu, best_wall = float("inf"), float("inf")
     for _ in range(runs):
         cpu, wall = run_once(cmd, env, pin=single)
@@ -148,8 +147,8 @@ def run_best(cmd, env_extra, runs):
                 f"refusing to report {cpu:.3f} CPU s against {wall:.3f} wall s"
                 f" for a single-threaded run of: {' '.join(map(str, cmd))}."
                 " Work escaped the measurement — the usual cause is a launcher"
-                " or shim that runs the real program as a child. Point --ffmpeg"
-                " or --dec at the real executable.")
+                " or shim that runs the real program as a child. Point --dec"
+                " at the real executable.")
         best_cpu, best_wall = min(best_cpu, cpu), min(best_wall, wall)
     return best_cpu, best_wall
 
@@ -183,7 +182,7 @@ def available_tiers():
             ("scalar", {"H26X_NO_SIMD": "1"})]
 
 
-def control_line(name, selected_row, control_row, f1, fm, frames):
+def control_line(name, selected_row, control_row, scalar, frames):
     """Per-column spread between two runs of the *same* configuration.
 
     Every figure in a table is worth exactly as much as the difference
@@ -202,7 +201,7 @@ def control_line(name, selected_row, control_row, f1, fm, frames):
     a, b = selected_row, control_row
     cols = [
         ("1-thread CPU", a[1], b[1]),
-        ("vs libav", a[1] / f1 if f1 else 0, b[1] / f1 if f1 else 0),
+        ("vs scalar", a[1] / scalar if scalar else 0, b[1] / scalar if scalar else 0),
         ("1-thread fps", a[2], b[2]),
         ("all-thread CPU", a[3], b[3]),
         ("all-thread fps", a[4], b[4]),
@@ -253,8 +252,7 @@ def check_ladder(name, rows, tol=0.05):
 def quietest_core():
     """A (mask, index) for the quieter half of the least busy SMT pair.
 
-    Single-threaded rows are pinned to it, both this decoder's and ffmpeg's,
-    so that the column the ladder comparison rests on survives a machine that
+    Single-threaded rows are pinned to it, so that the column the ladder comparison rests on survives a machine that
     is doing other things. It is the same reasoning as tools/ab.py: picking
     the quietest logical processor is not enough, because a busy SMT sibling
     shares the execution units and costs as much as a busy core.
@@ -328,11 +326,9 @@ def main():
     ap.add_argument("--runs", type=int, default=5)
     ap.add_argument("--dec", default="../release/examples/h26xdec.exe" if WINDOWS
                     else "../release/examples/h26xdec")
-    ap.add_argument("--ffmpeg", default=os.environ.get("FFMPEG", "ffmpeg"))
     ap.add_argument("--streams", default="")
     args = ap.parse_args()
 
-    null = "NUL" if WINDOWS else "/dev/null"
     # Long enough that the clock is not the instrument: process CPU time comes
     # in ~15.6 ms steps on Windows, so a clip that decodes in a fifth of a
     # second is quantised to within a few per cent of itself and every
@@ -353,7 +349,7 @@ def main():
     busy = f" Machine {load:.0f}% busy before the run." if load is not None else ""
     print(f"**{cpu_name()}**, {threads} hardware threads, "
           f"selecting **{picked or 'unknown'}**.{busy} Single-threaded rows "
-          f"are pinned to core {pin_core} (both decoders). Best of {args.runs}. "
+          f"are pinned to core {pin_core}. Best of {args.runs}. "
           f"Cost is CPU seconds, throughput is frames per wall second.\n")
 
     clean = True
@@ -361,13 +357,9 @@ def main():
         frames, w, h = stream_info(args.dec, path)
         codec = "H.265" if path.endswith((".265", ".hevc")) else "H.264"
         print(f"### `{path}` — {codec}, {w}x{h}, {frames} frames\n")
-        print("| instructions | 1 thread: CPU s | vs libav | fps | "
+        print("| instructions | 1 thread: CPU s | vs scalar | fps | "
               "all threads: CPU s | fps |")
         print("|---|---:|---:|---:|---:|---:|")
-        f1, _ = run_best([args.ffmpeg, "-threads", "1", "-i", path, "-f",
-                          "rawvideo", "-y", null], {}, args.runs)
-        fm, fmw = run_best([args.ffmpeg, "-i", path, "-f", "rawvideo", "-y",
-                            null], {}, args.runs)
         rows = []
         for name, extra in tiers:
             e1 = dict(extra, H26X_THREADS="1", H26XDEC_NOMD5="1")
@@ -376,13 +368,12 @@ def main():
             cm, wm = run_best([args.dec, path], em, args.runs)
             rows.append((name, c1, frames / c1 if c1 else 0, cm,
                          frames / wm if wm else 0))
+        f1 = rows[-1][1]  # the scalar reference, the ladder's last rung
         for i, (name, c1, fps1, cm, fpsm) in enumerate(rows):
             # The rung this CPU selects on its own is the one a user gets.
             tag = f"**{name}**" if i == selected else name
             print(f"| {tag} | {c1:.3f} | {c1 / f1:.2f}x | {fps1:.0f} | "
                   f"{cm:.3f} | {fpsm:.0f} |")
-        print(f"| libavcodec | {f1:.3f} | 1.00x | {frames / f1 if f1 else 0:.0f} | "
-              f"{fm:.3f} | {frames / fmw if fmw else 0:.0f} |")
         # The control: the selected rung again, nothing changed.
         sel = tiers[selected] if 0 <= selected < len(tiers) else tiers[0]
         ce1 = dict(sel[1], H26X_THREADS="1", H26XDEC_NOMD5="1")
@@ -392,14 +383,13 @@ def main():
         ctl = ("control", cc1, frames / cc1 if cc1 else 0, ccm,
                frames / ccw if ccw else 0)
         control_line(path, rows[selected if 0 <= selected < len(rows) else 0],
-                     ctl, f1, fm, frames)
+                     ctl, f1, frames)
 
         clean &= check_ladder(path, rows)
         best = rows[0]
-        print(f"\nWidest rung against libavcodec: **{best[1] / f1:.2f}x** its "
-              f"single-threaded CPU time, **{best[3] / fm:.2f}x** with every "
-              f"thread; SIMD is worth **{rows[-1][1] / best[1]:.1f}x** over the "
-              f"scalar reference.\n")
+        print(f"\nWidest rung: SIMD is worth **{rows[-1][1] / best[1]:.1f}x** "
+              f"over the scalar reference single-threaded, and every thread "
+              f"brings its CPU seconds to **{best[3]:.3f}**.\n")
     if not clean:
         print("At least one table failed the ladder check; exiting non-zero "
               "so a regeneration cannot publish it unnoticed.", file=sys.stderr)

@@ -16,7 +16,7 @@
 #      counts and output hashes both. Those expectations are read out of that
 #      file rather than copied here, because a copy drifts and the stale one is
 #      the one somebody trusts; they were anchored frame-by-frame against
-#      libavcodec, so passing here means what it means natively.
+#      the reference decoders, so passing here means what it means natively.
 #
 #   2. Does the simd128 tier still decode to the same bytes as the scalar one?
 #      With FIXTURES set, every fixture is decoded by both builds and the

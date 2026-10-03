@@ -10,13 +10,14 @@ Read this whole file before touching code. Every rule here was paid for.
   Rivet's software H.264/H.265 encode tier: `crates/codec/src/encode/h26x_sw.rs`.
 - Scratch/corpus dir for the gates: `/c/Users/elyci/PhpstormProjects/rivet/target/h26x`
   (`H26X_WORK`). Clips `src_*.yuv` there are NOT versioned; `tools/make_encode_sources.sh` makes them.
-- ffmpeg: `C:/Users/elyci/scoop/apps/ffmpeg/current/bin/ffmpeg.exe` (the REAL binary; the scoop
-  shim in `scoop/shims` lies to process accounting). ffprobe beside it.
+- Reference decoders (CROSS and the conformance fallbacks; tools/ref_decode.py): JM's ldecod
+  (`LDECOD`) and HM's TAppDecoder (`TAPPDECODER`), built with cmake from vcgit.hhi.fraunhofer.de.
+  The VUI probe also needs MediaInfo's CLI (`MEDIAINFO`). No FFmpeg program is used anywhere.
 - Shell is Git Bash on Windows. Python 3 is `python`. No `time`, no `flock`.
 
 ## The standard — every encoder change must hold FOUR exact properties + BOX
 1. SELF   our decoder reproduces the encoder's own reconstruction byte for byte.
-2. CROSS  libavcodec agrees with our decoder (catches what SELF cannot: a shared misreading).
+2. CROSS  the reference decoder (JM / HM) agrees with ours (catches what SELF cannot: a shared misreading).
 3. QUALITY PSNR, reported never gated (except lossless: exact).
 4. RATE/HRD did the encoder hit the objective it was handed (`RATE-FAIL`, `HRD-FAIL`).
 6. BOX    exactly one VPS/SPS/PPS per stream (`PS-FAIL`, tools/param_sets.py) — Annex-B cannot
@@ -31,7 +32,7 @@ cd <your worktree> && cargo test --quiet && cargo test --release --quiet && carg
 rm -f <wt>/target/release/examples/h26xenc.exe   # cargo does not always rebuild; delete first
 cargo build --release --examples --quiet
 H26X_WORK=/c/Users/elyci/PhpstormProjects/rivet/target/h26x \
-FFMPEG="C:/Users/elyci/scoop/apps/ffmpeg/current/bin/ffmpeg.exe" \
+LDECOD=<JM>/bin/.../ldecod.exe TAPPDECODER=<HM>/bin/.../TAppDecoder.exe MEDIAINFO=<path>/MediaInfo.exe \
 bash tools/verify_encode.sh <wt>/target/release/examples/h26xenc.exe <wt>/target/release/examples/h26xdec.exe
 # decoder unchanged? still run the decode baseline if you touched dsp/ or anything under src/h264 src/hevc:
 cd /c/Users/elyci/PhpstormProjects/rivet/target/h26x && bash verify.sh --baseline baseline.txt "<wt>/target/release/examples/h26xdec.exe"
